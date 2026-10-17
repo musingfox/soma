@@ -7,6 +7,7 @@ import type { Harness } from "@earendil-works/pi-durable";
 import { createHerdrAgentPort } from "./adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "./adapters/herdr/client.ts";
 import { readCard } from "./adapters/obsidian/card.ts";
+import { runTelegram, telegramConfig } from "./adapters/telegram/index.ts";
 import { runTerminal } from "./adapters/terminal/index.ts";
 import { clock } from "./core/extensions/clock/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
@@ -61,14 +62,19 @@ await reconcileDispatches(root, agents, context);
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 
 const human = await openHumanPort(harness, root, context);
+const telegram = telegramConfig(process.env);
+const stopTelegram = new AbortController();
+const telegramDone = telegram && runTelegram({ ...telegram, human, signal: stopTelegram.signal });
 const shutdown = () => {
 	unlisten();
-	void human
-		.close()
+	stopTelegram.abort();
+	void Promise.resolve(telegramDone)
+		.then(() => human.close())
 		.then(() => harness.close(context))
 		.then(() => Promise.all(mcpClients.map(({ client }) => client.close())))
 		.then(() => process.exit(0));
 };
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, shutdown);
 await runTerminal({ human, input: process.stdin, output: process.stdout, env: process.env });
-shutdown();
+// With Telegram on, soma also runs without a terminal (stdin at EOF under launchd) until a signal stops it.
+if (telegram === undefined) shutdown();

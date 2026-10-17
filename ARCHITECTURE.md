@@ -146,6 +146,7 @@ soma 除了調派 agent，本身也要有助理的基本能力：讀 email、看
 - **送出**：`submit({ type: "input", content, entry: { kind: "<來源>", data }, requestId })`。`requestId` 用該平台的訊息 id，重送也只會處理一次。終端機沒有訊息 id，用 `terminal:<毫秒時間戳>`：`requestId` 在整個對話內去重，重啟後從 1 重新計數會把新輸入當成重送吞掉。
 - **訂閱**：程序內的介面卡經 `src/core/human-port.ts` 的 HumanPort 訂閱，它把 `watchEvents()` 和派工清單的 `watchDoc()` 轉成 soma 的事件型別；派工狀態取自派工清單，所以誰寫進清單，介面卡就看得到。程序外的客戶端改經客戶端 socket 連入。
 - **通知**：核心要主動找人時（卡住或報告寫好），寫一筆帶 `kind: "notice"` 的紀錄，`data.kind` 是 `question`（卡住要人回答）或 `report`（報告寫好），各介面卡自己決定要不要推播。由 `schedule:` 開頭的 `requestId` 啟動的那一輪回答，介面卡也當成通知推給人。`digest:` 那一輪不推，因為彙報任務會把它的回答寫成 `data.kind: "report"` 的 `notice` 紀錄，再推一次就重複了。
+- **Telegram 只認一個聊天室。** `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_CHAT_ID` 都設了才啟動，其他聊天室的訊息一律丟掉，因為找到這個 bot 的任何人都能派 agent 在這台機器上跑。訊息 id 只在同一聊天室內唯一，所以只認一個聊天室也讓 `telegram:<message id>` 不會撞號。介面卡以 `telegram:` 前綴認自己的輪次，不記送過哪些 id，所以核心在重啟後才答完的那一輪仍會送回手機。
 
 客戶端 socket 的現況：
 

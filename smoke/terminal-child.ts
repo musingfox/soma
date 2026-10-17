@@ -8,7 +8,8 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { createHerdrAgentPort } from "../src/adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "../src/adapters/herdr/client.ts";
 import { runTerminal } from "../src/adapters/terminal/index.ts";
-import { dispatchExtension, reconcileDispatches } from "../src/core/extensions/dispatch/index.ts";
+import { eventBridge, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
+import { dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { openHumanPort } from "../src/core/human-port.ts";
 
@@ -34,11 +35,18 @@ const models = createModels();
 models.setProvider(faux.provider);
 
 const agents = createHerdrAgentPort({ client: createHerdrClient({ socketPath: process.env.SOMA_HERDR_SOCKET }) });
-const harness = await openHarness(db, [dispatchExtension(agents)], context, { models });
+const harness = await openHarness(
+	db,
+	[dispatchExtension(agents, async (_repo, card) => `# ${card}\n\n只回覆 ok 兩個字，不要使用任何工具。`)],
+	context,
+	{ models },
+);
 const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 harness.resume();
 await reconcileDispatches(root, agents, context);
+const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 const human = await openHumanPort(harness, root, context);
 await runTerminal({ human, input: process.stdin, output: process.stdout, env: process.env });
+unlisten();
 await human.close();
 await harness.close(context);

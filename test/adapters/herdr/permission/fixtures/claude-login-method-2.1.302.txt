@@ -1,0 +1,31 @@
+
+The default interactive shell is now zsh.
+To update your account to use zsh, please run `chsh -s /bin/zsh`.
+For more details, please visit https://support.apple.com/kb/HT208050.
+macmini:fleet-probe-auth-mvcweu5m me$ export CLAUDE_CONFIG_DIR=/private/tmp/claude-501/-Users-me--herdr-worktrees-soma-fleet-answer-blocked/97c579f9-4c50-43
+db-9d65-5f543f447572/scratchpad/probe/cfg
+macmini:fleet-probe-auth-mvcweu5m me$ claude --session-id 02c3ce48-3201-46f3-98e8-28904b2d8160
+Welcome to Claude Code v2.1.302
+..........................................................
+
+     *                                       █████▓▓░
+                                 *         ███▓░     ░░
+            ░░░░░░                        ███▓░
+    ░░░   ░░░░░░░░░░                      ███▓░
+   ░░░░░░░░░░░░░░░░░░░    *                ██▓░░      ▓
+                                             ░▓▓███▓▓░
+ *                                 ░░░░
+                                 ░░░░░░░░
+                               ░░░░░░░░░░░░░░░░
+       █████████                                        *
+      ██▄█████▄██                        *
+       █████████      *
+.......█ █   █ █..........................................
+
+ Claude Code can be used with your Claude subscription or billed based on API usage through your Console account.
+
+ Select login method:
+
+ ❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise
+   2. Anthropic Console account · API usage billing
+   3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, Google Vertex AI

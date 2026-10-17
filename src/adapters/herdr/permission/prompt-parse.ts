@@ -42,9 +42,10 @@ export type PromptDialect = "claude" | "omp";
  * What the terminal is waiting for. A permission prompt is a gate the agent
  * needs opened; a question is an answer only the user has. They are the same
  * shape on the wire and different upstream: an unanswered permission may decay
- * to a deny, while a question has no safe default to decay to.
+ * to a deny, while a question has no safe default to decay to. An auth dialog
+ * asks for credentials, which only the human may give.
  */
-export type PromptKind = "permission" | "question";
+export type PromptKind = "permission" | "question" | "auth";
 
 export interface ParsedPrompt {
 	dialect: PromptDialect;
@@ -78,6 +79,12 @@ const PROCEED_MARKER = /do you want to proceed\?/i;
 
 /** A bare horizontal rule. Box-drawing rows inside claude's banner start with `│`. */
 const RULE = /^\s*─{20,}\s*$/;
+
+/** The dashed rule claude 2.1.302 draws above and below a prompt's arguments. */
+const FENCE = /^╌{20,}$/;
+
+/** claude's own advertisement above a prompt, not part of the question. */
+const TIP = /^Tip:/;
 
 /** `❯ 1. Yes` / `   3. No` — the cursor caret is optional. */
 const OPTION_LINE = /^\s*(?:[❯>]\s*)?(\d+)\.\s+(\S.*?)\s*$/;
@@ -157,11 +164,25 @@ export function parseBlockedPrompt(input: { text: string }): ParsedPrompt | null
 
 	const toolLabel = header[0] ?? "";
 	const body = header.slice(1);
-	// With two or more body lines the last is claude's summary and the rest are
-	// the arguments (a Write prompt shows several argument lines). With one there
-	// is nothing to summarise, so it is the argument.
-	const description = body.length >= 2 ? body[body.length - 1] : undefined;
-	const argumentText = (body.length >= 2 ? body.slice(0, -1) : body).join("\n");
+	const fences = body.flatMap((line, index) => (FENCE.test(line) ? [index] : []));
+	const [open, close] = [fences[0], fences.at(-1)];
+	let description: string | undefined;
+	let argumentText: string;
+	if (open !== undefined && close !== undefined && open < close) {
+		// Claude Code 2.1.302 fences the arguments in dashed rules and puts its
+		// summary, after an optional tip, above them.
+		description = body
+			.slice(0, open)
+			.filter((line) => !TIP.test(line))
+			.at(-1);
+		argumentText = body.slice(open + 1, close).join("\n");
+	} else {
+		// With two or more body lines the last is claude's summary and the rest are
+		// the arguments (a Write prompt shows several argument lines). With one there
+		// is nothing to summarise, so it is the argument.
+		description = body.length >= 2 ? body[body.length - 1] : undefined;
+		argumentText = (body.length >= 2 ? body.slice(0, -1) : body).join("\n");
+	}
 
 	// ── options: numbered lines below the marker, up to the next rule ──────────
 	const options: PromptOption[] = [];

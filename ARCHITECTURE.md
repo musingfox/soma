@@ -64,7 +64,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 | 元件 | Pi Durable 機制 | 說明 |
 |---|---|---|
 | 派工清單 | document（對話層級） | 記錄每件工作的卡片、agent 名稱、session id 和狀態，和對話紀錄在同一筆提交裡更新 |
-| 派工工具 | tool，`replay: "safe"` | agent 名稱從任務 id 推出，啟動前先查佇列和同名 agent 是否存在，崩潰後重跑也不會重複啟動；詳見「派工的冪等」 |
+| 派工工具 | tool，`replay: "safe"` | agent 名稱取卡片名，啟動前先查派工清單和同名 agent 是否存在，崩潰後重跑也不會重複啟動；詳見「派工的冪等」 |
 | 查詢與讀取工具 | tool，`replay: "safe"` | 列出 agent、讀對話紀錄 |
 | 回應工具 | tool，不可重跑 | 回答卡住的 agent；崩潰中斷時會告知模型，不會自動重送 |
 | 事件橋 | 主機端程式碼，不是 LLM | 見下節 |
@@ -92,11 +92,12 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 
 ### 派工的冪等
 
-cc-mobile 的 `POST /api/launch` 以 obw 卡片為單位，佇列用 `vault + cardPath` 當 key 去重，但只記在記憶體裡，而且只涵蓋排隊中和啟動中的項目（`server/launch-queue.ts:153-176`、`server/launch.ts:312`）。claude 的 session id 是每次 `randomUUID()`（`server/launch.ts:210`）。因此：
+派工走 herdr 介面卡（待決事項 1 的決定），agent 名稱就是卡片名。2026-10-18 對 herdr 0.9.5 實測：`agent.start` 一回應，`agent.list` 就列出這個名稱（`launch_pending: true`）；同名的第二次 `agent.start` 會被 herdr 以 `agent_name_taken` 拒絕。因此：
 
-- 派工工具拿到回應後，要把回傳的 session id 和 agent 名稱寫進派工清單，和工具結果同一筆提交。
-- 重跑時先查派工清單有沒有這張卡，再查佇列和 `agent.list`。三處都沒有才重送。
-- 殘餘的空窗是「cc-mobile 已啟動 agent、herdr 還沒列出來」那一瞬間。M1 的 `kill -9` 驗收要刻意打在這個空窗，看會不會重複啟動；會的話就要在 cc-mobile 端加以卡片為 key 的冪等檢查。
+- session id 由派工工具先用 `api.memo` 存下再交給 `agent.start`，因為 claude 回報 `agent_session` 之前，herdr 讀不到它。
+- 重跑時先查派工清單有沒有這張卡，再查 `agent.list` 有沒有同名 agent。兩處都沒有才啟動。
+- 派工清單在工具結果之前另用一筆 `api.commit` 寫入；工具結果的提交由 harness 負責，無法合併。殘餘的空窗是「`agent.start` 已回應、派工清單還沒寫」，重跑會在 `agent.list` 找到同名 agent 而不重啟。`npm run smoke:dispatch` 就打在這個空窗。
+- 「`worktree.create` 之後、`agent.start` 之前」崩潰，重跑時改用 `worktree.open` 開回同一個 worktree。
 
 ### 定時彙報
 

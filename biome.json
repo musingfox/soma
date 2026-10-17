@@ -31,5 +31,111 @@
 				"organizeImports": "on"
 			}
 		}
-	}
+	},
+	"overrides": [
+		{
+			"includes": ["src/core/**"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"patterns": [
+									{
+										"group": ["**/adapters/**"],
+										"message": "Core must not import adapters; depend on src/ports only."
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		},
+		{
+			"includes": ["src/core/domain/**"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"patterns": [
+									{
+										"group": ["**/adapters/**"],
+										"message": "Core must not import adapters; depend on src/ports only."
+									},
+									{
+										"group": ["@earendil-works/*", "@earendil-works/*/**"],
+										"message": "Pi types stay out of this layer."
+									},
+									{
+										"group": ["**/extensions/**"],
+										"message": "The domain must not import Pi Durable extensions."
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		},
+		{
+			"includes": ["src/ports/**"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"patterns": [
+									{
+										"group": ["**/adapters/**"],
+										"message": "Core must not import adapters; depend on src/ports only."
+									},
+									{
+										"group": ["**/core/**"],
+										"message": "This layer must not import core."
+									},
+									{
+										"group": ["@earendil-works/*", "@earendil-works/*/**"],
+										"message": "Pi types stay out of this layer."
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		},
+		{
+			"includes": ["src/adapters/**"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"patterns": [
+									{
+										"group": ["@earendil-works/pi-durable", "@earendil-works/pi-durable/**"],
+										"message": "Adapters must not touch Pi Durable; depend on src/ports only."
+									},
+									{
+										"group": ["**/core/**"],
+										"message": "This layer must not import core."
+									},
+									{
+										"group": ["../*/**", "!../../**"],
+										"message": "Adapters must not import each other."
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		}
+	]
 }

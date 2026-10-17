@@ -44,7 +44,7 @@ describe("statesFromSnapshot — pane status mapping", () => {
 			resolveOne,
 			["u1"],
 		);
-		expect(states).toEqual({ u1: "working" });
+		expect(states).toEqual({ u1: { state: "working" } });
 	});
 
 	test("a blocked pane reads as blocked", () => {
@@ -53,16 +53,16 @@ describe("statesFromSnapshot — pane status mapping", () => {
 			resolveOne,
 			["u1"],
 		);
-		expect(states).toEqual({ u1: "blocked" });
+		expect(states).toEqual({ u1: { state: "blocked", kind: "permission" } });
 	});
 
 	test("`done` and `idle` stay distinct", () => {
 		expect(
 			statesFromSnapshot(snapshot([{ pane_id: "p1", workspace_id: "w1", agent_status: "done" }]), resolveOne, ["u1"]),
-		).toEqual({ u1: "done" });
+		).toEqual({ u1: { state: "done" } });
 		expect(
 			statesFromSnapshot(snapshot([{ pane_id: "p1", workspace_id: "w1", agent_status: "idle" }]), resolveOne, ["u1"]),
-		).toEqual({ u1: "idle" });
+		).toEqual({ u1: { state: "idle" } });
 	});
 
 	test("a pane without a status falls back to the matching agent record", () => {
@@ -73,7 +73,7 @@ describe("statesFromSnapshot — pane status mapping", () => {
 			resolveOne,
 			["u1"],
 		);
-		expect(states).toEqual({ u1: "working" });
+		expect(states).toEqual({ u1: { state: "working" } });
 	});
 
 	test("`unknown` yields no key at all — a missing state is not idle", () => {

@@ -4,7 +4,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 
 名字取自神經元的細胞體：它從樹突收集訊號、整合之後，再經軸突送出去。
 
-狀態：規劃中，還沒有程式碼。本文件的外部事實查證於 2026-10-18，並經三份獨立複核（Pi 原始碼、cc-mobile 原始碼、外部文件）修正過引用。
+狀態：M0 到 M3.5 的程式碼已在 main（2026-10-18），真模型、Telegram 手機端與 Google 帳號的驗收待憑證到位後再跑，見各 obw 任務卡的 Notes。本文件的外部事實查證於 2026-10-18，並經三份獨立複核（Pi 原始碼、cc-mobile 原始碼、外部文件）修正過引用。
 
 出處縮寫：
 
@@ -241,7 +241,7 @@ cc-mobile `server/` 裡有 2,971 行（含註解與空行）只在清單內互�
 
 ## 待決事項
 
-1. **派工要怎麼接 herdr。** 有三條路：
+1. **（已決，2026-10-18）派工要怎麼接 herdr。** 有三條路：
    - **(建議 M1 採用) 呼叫 cc-mobile 現成的 `POST /api/launch`。** 這條路由依序做驗證 bearer token、檢查、進佇列、建 worktree（`launch.ts:196`）、重新檢查（`:212`）、建 session、寫綁定檔、送提示（`server/launch.ts:196-349`）。好處是 soma 不用複製任何程式碼，並發上限自然共用，obw 回寫掛鉤應照常運作（未追查）。代價有兩個：soma 依賴 cc-mobile 程序在線，而 M4 又讓 cc-mobile 成為 soma 的客戶端，兩個程序都不能把啟動卡在對方身上；派工以 obw 卡片為單位，沒有卡片的臨時工作走不了這條路。
    - **把純函式複製進 soma**，註明來源 commit。代價是兩份程式碼會分岔，並發上限也要另外協調。
    - **抽成共用套件**，由兩邊共同依賴。這最乾淨，但要先改 cc-mobile，適合留到 M4。
@@ -252,7 +252,7 @@ cc-mobile `server/` 裡有 2,971 行（含註解與空行）只在清單內互�
 2. **shikigami 跑在哪台機器。** 如果和核心同一台，就在本機直接連；如果在筆電上，就經 Tailscale 連，和 cc-mobile 被手機連的方式一樣。
 3. **報告存放位置，以及要不要另有一份每日總結。** 十分鐘短報告寫進 `notice` 紀錄由介面卡分送；是否再寫進 Obsidian vault 的日記或對應的 obw 卡片，待定。
 4. **沒有 obw 卡片的臨時工作怎麼派。** `POST /api/launch` 以卡片為單位；要嘛 soma 先替臨時工作建卡，要嘛走自己的派工路徑。
-5. **email 與行事曆用哪個 MCP server，憑證放哪裡。**
+5. **（已決，2026-10-18）email 與行事曆用哪個 MCP server，憑證放哪裡。**
 
    2026-10-18 決定：用 [workspace-mcp](https://github.com/taylorwilsdon/google_workspace_mcp)（MIT，未封存，v2.1.0 於 2026-10-09 發布），一個 stdio server 同時提供 Gmail 與 Calendar，以 Google OAuth 登入個人帳號。啟動指令是 `uvx workspace-mcp@2.1.0 --single-user --permissions gmail:readonly calendar:readonly`；2026-10-18 經 soma 的轉接層實際啟動，`tools/list` 只列出讀取類工具，其中有 `search_gmail_messages`（`query` 直接交給 Gmail，可用 `is:unread is:important`）和 `get_events`（`time_min`、`time_max`）。每個工具都有 `user_google_email` 參數。只加 `--single-user` 時這個參數仍是必填，而且帶了憑證目錄裡沒有的帳號就直接失敗、不會改用別的憑證（workspace-mcp 2.1.0 `auth/google_auth.py` 的 single-user 分支）；所以 `env` 還要設 `USER_GOOGLE_EMAIL`，server 會把參數改成選填並自動填入這個帳號（`core/server.py` 的 `USER_GOOGLE_EMAIL` 處理，2026-10-18 經轉接層實測 `tools/list` 的 `required` 已不含它）。
 

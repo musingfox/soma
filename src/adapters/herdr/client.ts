@@ -1,0 +1,230 @@
+// Ported from musingfox/cc-mobile server/herdr/client.ts @ d9f0690.
+import type { ZodType } from "zod";
+import { HerdrProtocolError } from "./errors.ts";
+import {
+	type AgentInfo,
+	AgentInfoResultSchema,
+	AgentListResultSchema,
+	type AgentStatus,
+	type IntegrationInfo,
+	IntegrationListResultSchema,
+	OkResultSchema,
+	type PaneRead,
+	PaneReadResultSchema,
+	type PongResult,
+	PongResultSchema,
+	type ReadSource,
+	type SessionSnapshot,
+	SessionSnapshotResultSchema,
+} from "./schema.ts";
+import {
+	type SubscribeEventsOptions,
+	type SubscriptionHandle,
+	subscribeEvents as startSubscription,
+} from "./subscribe.ts";
+import {
+	createHerdrTransport,
+	createUnixConnect,
+	type HerdrConnect,
+	type HerdrRequestOptions,
+	type HerdrTransport,
+	resolveSocketPath,
+} from "./transport.ts";
+
+/**
+ * The single herdr wire protocol version this client understands (see ADR-015 / issue #20).
+ *
+ * herdr counts one number for two protocols: the bincode terminal-attach wire
+ * and this JSON-RPC socket API. 17 -> 18 (e7fc85bf, kitty key releases) and
+ * 18 -> 19 (b76adc15, input lease lifecycle) both changed only the former,
+ * which cc-mobile never speaks -- every method and result shape used here is
+ * byte-identical between herdr v0.7.5 and v0.8.0. 19 -> 20 (v0.8.2) is the
+ * same story: an audit of the daemon's own bundled schema (`herdr api schema
+ * --json`, 2026-08-24) found every surface cc-mobile speaks unchanged -- all
+ * 14 methods, every field this client requires, the ReadSource enum, all seven
+ * result discriminators, both request param sets, and the `pane.updated`
+ * subscription (still `required: [type]`, still `data.pane: PaneInfo`).
+ * So a bump usually means nothing to us, and the equality check stays strict
+ * anyway: herdr's own client does the same (src/cli/protocol_guard.rs), and a
+ * floor check would trade one clear boot error for Zod failures scattered
+ * across call sites.
+ *
+ * 20 -> 22 (v0.9.0) is the first bump that cost something. The same audit
+ * (`herdr api schema --json`, 2026-09-12) found every method cc-mobile speaks
+ * unchanged -- all 11 live methods, their required params, the ReadSource
+ * enum, the error envelope, and the `pane.updated` subscription (still
+ * `required: [type, pane]`, still the full PaneInfo). `workspace_created` and
+ * `agent_started` each gained a required field (`tab`, `argv`), both of which
+ * cc-mobile ignores. The one real drift is `pong.capabilities`: it became a
+ * mixed-value record (`endpoint_protocol_generation` is an integer) and left
+ * `pong`'s required list, which broke the schema that pinned it to booleans --
+ * see PongResultSchema. Because the pong is parsed before the number is
+ * compared, that drift surfaced as a ZodError at boot rather than the clean
+ * protocol error this comment promises.
+ */
+export const SUPPORTED_PROTOCOL = 22;
+
+/** Default daemon-side wait budget when the caller passes no timeout_ms. */
+const DEFAULT_AGENT_WAIT_TIMEOUT_MS = 60_000;
+/** Client read-deadline margin so the daemon's own timeout always fires first. */
+const AGENT_WAIT_DEADLINE_MARGIN_MS = 5_000;
+/**
+ * integration.list is awaited inline by the `get_server_config` reply, which
+ * otherwise answers at once; a hung daemon should cost the phone a couple of
+ * seconds, not the transport's 10 s default.
+ */
+const INTEGRATION_LIST_TIMEOUT_MS = 2_000;
+/** Same reason for the launch queue's occupancy read: unknown must come back fast. */
+export const AGENT_COUNT_TIMEOUT_MS = 2_000;
+
+export interface HerdrClientOptions {
+	/** Explicit socket path; falls back to $HERDR_SOCKET_PATH, then ~/.config/herdr/herdr.sock. */
+	socketPath?: string;
+	/** DI seam: injectable connection factory (used by transport and subscriptions). */
+	connect?: HerdrConnect;
+	/** DI seam: injectable transport (unit tests). */
+	transport?: HerdrTransport;
+}
+
+export function createHerdrClient(options: HerdrClientOptions = {}) {
+	const socketPath = resolveSocketPath(options.socketPath);
+	const connect = options.connect ?? createUnixConnect(socketPath);
+	const transport = options.transport ?? createHerdrTransport({ connect });
+
+	/**
+	 * Raw escape hatch: issue any herdr RPC; when `schema` is given the result
+	 * payload is validated and typed, otherwise returned as `unknown`.
+	 */
+	async function call<T = unknown>(
+		method: string,
+		params: unknown,
+		schema?: ZodType<T>,
+		requestOptions?: HerdrRequestOptions,
+	): Promise<T> {
+		const result = await transport.request(method, params, requestOptions);
+		return schema ? schema.parse(result) : (result as T);
+	}
+
+	/**
+	 * Pings the daemon and fails loudly when it speaks a protocol other than
+	 * SUPPORTED_PROTOCOL — one clear error instead of downstream schema garbage.
+	 */
+	async function assertCompatible(): Promise<PongResult> {
+		const pong = await call("ping", {}, PongResultSchema);
+		if (pong.protocol !== SUPPORTED_PROTOCOL) {
+			throw new HerdrProtocolError(
+				`herdr daemon (version ${pong.version}) speaks protocol ${pong.protocol}; ` +
+					`this client requires protocol ${SUPPORTED_PROTOCOL}`,
+			);
+		}
+		return pong;
+	}
+
+	/**
+	 * Fetches the full daemon session state as one validated snapshot.
+	 * Agent entries expose the monotonic cursors `revision` / `state_change_seq`.
+	 */
+	async function sessionSnapshot(): Promise<SessionSnapshot> {
+		const result = await call("session.snapshot", {}, SessionSnapshotResultSchema);
+		return result.snapshot;
+	}
+
+	/**
+	 * Types `text` into the target pane exactly as given. Never submits:
+	 * the daemon's pane.send_text does not press Enter (use paneSendKeys).
+	 */
+	async function paneSendText(pane_id: string, text: string): Promise<void> {
+		await call("pane.send_text", { pane_id, text }, OkResultSchema);
+	}
+
+	/** Lists all detected agents across the daemon. */
+	async function agentList(options?: { timeoutMs?: number }): Promise<AgentInfo[]> {
+		const result = await call(
+			"agent.list",
+			{},
+			AgentListResultSchema,
+			options?.timeoutMs === undefined ? undefined : { timeoutMs: options.timeoutMs },
+		);
+		return result.agents;
+	}
+
+	/** Every agent integration herdr knows, installed or not, with its state. */
+	async function integrationList(): Promise<IntegrationInfo[]> {
+		const result = await call("integration.list", {}, IntegrationListResultSchema, {
+			timeoutMs: INTEGRATION_LIST_TIMEOUT_MS,
+		});
+		return result.integrations;
+	}
+
+	/**
+	 * Fetches one pane's agent info by target (accepts a pane id).
+	 * Panes without a detected agent reject with code "agent_not_found".
+	 */
+	async function agentGet(target: string): Promise<AgentInfo> {
+		const result = await call("agent.get", { target }, AgentInfoResultSchema);
+		return result.agent;
+	}
+
+	/**
+	 * Blocks until the agent reaches one of the requested statuses. The daemon
+	 * holds the connection open and responds on resolve or its own timeout
+	 * (typed HerdrRpcError code "timeout"). The resolved budget is always sent
+	 * on the wire (herdr waits indefinitely when timeout_ms is absent), and the
+	 * client read deadline sits AGENT_WAIT_DEADLINE_MARGIN_MS past it so the
+	 * daemon's typed timeout always fires before the client's transport error.
+	 */
+	async function agentWait(params: { target: string; until?: AgentStatus[]; timeout_ms?: number }): Promise<AgentInfo> {
+		const daemonBudgetMs = params.timeout_ms ?? DEFAULT_AGENT_WAIT_TIMEOUT_MS;
+		const result = await call("agent.wait", { ...params, timeout_ms: daemonBudgetMs }, AgentInfoResultSchema, {
+			timeoutMs: daemonBudgetMs + AGENT_WAIT_DEADLINE_MARGIN_MS,
+		});
+		return result.agent;
+	}
+
+	/**
+	 * Reads pane content. `source` is required and forwarded verbatim —
+	 * beware: `"recent"` / `"recent_unwrapped"` are empty on fresh panes;
+	 * use `"visible"` for what is on screen. Returns text plus the pane's
+	 * monotonic `revision`.
+	 */
+	async function paneRead(params: {
+		pane_id: string;
+		source: ReadSource;
+		lines?: number;
+		format?: string;
+		strip_ansi?: boolean;
+	}): Promise<PaneRead> {
+		const result = await call("pane.read", params, PaneReadResultSchema);
+		return result.read;
+	}
+
+	/** Presses named keys (e.g. "Enter") in the target pane. */
+	async function paneSendKeys(pane_id: string, keys: string[]): Promise<void> {
+		await call("pane.send_keys", { pane_id, keys }, OkResultSchema);
+	}
+
+	/**
+	 * Opens a long-lived event stream over its own connection; resolves after
+	 * the daemon's subscription ack. On reconnect the consumer re-aligns from a
+	 * fresh session.snapshot via onResync (gap events are not replayed).
+	 */
+	function subscribeEvents(subscribeOptions: SubscribeEventsOptions): Promise<SubscriptionHandle> {
+		return startSubscription(subscribeOptions, { connect, fetchSnapshot: sessionSnapshot });
+	}
+
+	return {
+		assertCompatible,
+		call,
+		subscribeEvents,
+		sessionSnapshot,
+		agentList,
+		agentGet,
+		agentWait,
+		integrationList,
+		paneRead,
+		paneSendText,
+		paneSendKeys,
+	};
+}
+
+export type HerdrClient = ReturnType<typeof createHerdrClient>;

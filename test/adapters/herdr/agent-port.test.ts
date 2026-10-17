@@ -1,6 +1,9 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { expect, test } from "vitest";
 import { createHerdrAgentPort } from "../../../src/adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "../../../src/adapters/herdr/client.ts";
+import { readBlockedScreen } from "../../../src/adapters/herdr/permission/blocked-screen.ts";
 
 const agent = (name: string | null, agent_status: string) => ({
 	terminal_id: "t",
@@ -85,11 +88,91 @@ test("start refuses when the hangar already runs cap agents, counting agents som
 	expect(calls.map((c) => c.method)).toEqual(["agent.list"]);
 });
 
+const screen = (name: string) =>
+	readFileSync(join(import.meta.dirname, "permission", "fixtures", `${name}.txt`), "utf8");
+const BASH = screen("claude-bash-prompt-2.1.302");
+const TRUST = screen("claude-trust-dialog-2.1.302");
+const API_KEY = screen("claude-custom-api-key-2.1.302");
+const fingerprintOf = (text: string) => readBlockedScreen(text).prompt?.fingerprint ?? "";
+
+/** A pane whose status and screen the test sets; every RPC is recorded. */
+function pane(status: string, text: string) {
+	const calls: { method: string; params: Record<string, unknown> }[] = [];
+	const state = { status, text };
+	const client = createHerdrClient({
+		transport: {
+			async request(method, params) {
+				calls.push({ method, params: params as Record<string, unknown> });
+				if (method === "agent.get") return { type: "agent_info", agent: agent("card-a", state.status) };
+				if (method === "agent.list") return { type: "agent_list", agents: [agent("card-a", state.status)] };
+				if (method === "pane.read") {
+					return {
+						type: "pane_read",
+						read: { pane_id: "w1:p1", source: "detection", text: state.text, revision: 1, truncated: false },
+					};
+				}
+				if (method === "pane.send_keys") return { type: "ok" };
+				throw new Error(`unexpected ${method}`);
+			},
+		},
+	});
+	const keys = () => calls.filter((call) => call.method === "pane.send_keys").map((call) => call.params.keys);
+	return { client, calls, state, keys, port: createHerdrAgentPort({ client, cap: 1, redrawMs: 0 }) };
+}
+
 test("list names each named agent with its state; unknown is no claim", async () => {
-	const { client } = herdr([agent("a", "blocked"), agent("b", "unknown"), agent(null, "working")]);
+	const { client } = herdr([agent("a", "idle"), agent("b", "unknown"), agent(null, "working")]);
 
 	expect(await createHerdrAgentPort({ client, cap: 1 }).list()).toEqual([
-		{ name: "a", status: { state: "blocked", kind: "permission" } },
+		{ name: "a", status: { state: "idle" } },
 		{ name: "b", status: undefined },
 	]);
+});
+
+test("list reads a blocked agent's screen for its kind, prompt and fingerprint", async () => {
+	const { port } = pane("blocked", API_KEY);
+	const [listed] = await port.list();
+	expect(listed?.status).toMatchObject({ state: "blocked", kind: "auth", fingerprint: fingerprintOf(API_KEY) });
+	expect(listed?.status?.msg).toContain("Do you want to use this API key?");
+});
+
+test("respond presses the chosen option's key after a fresh status and screen read", async () => {
+	const { port, calls, keys } = pane("blocked", BASH);
+	expect(await port.respond("card-a", { option: "1", fingerprint: fingerprintOf(BASH) })).toEqual({ sent: true });
+	expect(calls.map((call) => call.method)).toEqual(["agent.get", "pane.read", "pane.send_keys"]);
+	expect(keys()).toEqual([["1"]]);
+});
+
+test("respond travels from the cursor on an unnumbered dialog", async () => {
+	const { port, keys } = pane("blocked", TRUST);
+	expect(await port.respond("card-a", { option: "2", fingerprint: fingerprintOf(TRUST) })).toEqual({ sent: true });
+	expect(keys()).toEqual([["Down", "Enter"]]);
+});
+
+test("respond refuses, sending nothing, when the screen changed since the answer was decided", async () => {
+	const { port, keys } = pane("blocked", BASH);
+	expect(await port.respond("card-a", { option: "2", fingerprint: fingerprintOf(TRUST) })).toEqual({
+		sent: false,
+		refusal: "stale",
+	});
+	expect(keys()).toEqual([]);
+});
+
+test("respond refuses an auth dialog, an agent no longer blocked, and an option not offered", async () => {
+	const auth = pane("blocked", API_KEY);
+	expect(await auth.port.respond("card-a", { option: "1", fingerprint: fingerprintOf(API_KEY) })).toEqual({
+		sent: false,
+		refusal: "auth",
+	});
+	const moved = pane("working", BASH);
+	expect(await moved.port.respond("card-a", { option: "1", fingerprint: fingerprintOf(BASH) })).toEqual({
+		sent: false,
+		refusal: "not_blocked",
+	});
+	const unknown = pane("blocked", BASH);
+	expect(await unknown.port.respond("card-a", { option: "9", fingerprint: fingerprintOf(BASH) })).toEqual({
+		sent: false,
+		refusal: "unknown_option",
+	});
+	expect([...auth.keys(), ...moved.keys(), ...unknown.keys()]).toEqual([]);
 });

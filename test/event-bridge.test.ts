@@ -99,9 +99,29 @@ test("a finished agent updates the dispatch list without a model call", async ()
 	await soma.settle();
 
 	expect(soma.calls() - before).toBe(0);
-	expect(await soma.job("card-a")).toMatchObject({ status: { state: "done" } });
+	expect(await soma.job("card-a")).toMatchObject({ status: { state: "done" }, outcome: "完成" });
 	expect((await soma.job("card-a"))?.launch).toBeUndefined();
-	expect(await entriesOf(soma.root, JOB_DONE)).toMatchObject([{ data: { agent: "card-a", state: "done" } }]);
+	expect(await entriesOf(soma.root, JOB_DONE)).toMatchObject([
+		{ data: { agent: "card-a", state: "done", outcome: "完成" } },
+	]);
+});
+
+test("each finished turn records the outcome its reply states, and a reply without one is unknown", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await dispatched(await database(), agents, "card-a");
+	agents.emit("card-a", { state: "idle" });
+	await soma.settle();
+
+	agents.finish("card-a", "結果：需要你\n要用哪個 server？");
+	await soma.settle();
+	expect(await soma.job("card-a")).toMatchObject({ outcome: "需要你" });
+
+	agents.emit("card-a", { state: "working" });
+	agents.finish("card-a", "改好了。");
+	await soma.settle();
+	expect(await soma.job("card-a")).toMatchObject({ outcome: "未知" });
+	const outcomes = (await entriesOf(soma.root, JOB_DONE)).map((entry) => (entry.data as { outcome: string }).outcome);
+	expect(outcomes.sort()).toEqual(["未知", "需要你"].sort());
 });
 
 test("a blocked agent wakes the model once, however often the snapshot repeats it", async () => {

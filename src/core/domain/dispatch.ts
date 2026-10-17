@@ -1,4 +1,5 @@
 import type { AgentState, BlockedKind } from "../../ports/agent.ts";
+import type { Outcome } from "./report.ts";
 
 // Type aliases, not interfaces: a job is stored as JSON, and only aliases and mutable arrays fit its JsonValue type.
 export type Decision = {
@@ -17,6 +18,8 @@ export type Job = {
 	readonly seq?: number;
 	// The first prompt, held until the agent can take it: claude refuses prompts until its trust dialog is answered.
 	readonly launch?: string;
+	// Read off the result line of the agent's last finished turn.
+	readonly outcome?: Outcome | "未知";
 	readonly decisions: Decision[];
 };
 

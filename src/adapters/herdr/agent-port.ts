@@ -70,7 +70,15 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 
 		async list(): Promise<readonly AgentListing[]> {
 			return (await client.agentList()).flatMap((agent) =>
-				agent.name ? [{ name: agent.name, status: STATE_BY_AGENT_STATUS[agent.agent_status] }] : [],
+				agent.name
+					? [
+							{
+								name: agent.name,
+								status: STATE_BY_AGENT_STATUS[agent.agent_status],
+								sessionId: agent.agent_session?.value,
+							},
+						]
+					: [],
 			);
 		},
 

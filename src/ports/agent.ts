@@ -17,6 +17,7 @@ export interface AgentListing {
 	readonly name: string;
 	// Absent when the agent side cannot tell, which is no claim either way.
 	readonly status?: AgentState;
+	readonly sessionId?: string;
 }
 
 export interface AgentStatusEvent {

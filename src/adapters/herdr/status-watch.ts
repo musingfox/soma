@@ -10,7 +10,7 @@
  * and a repeated snapshot reports nothing.
  */
 
-import type { AgentStatusEvent } from "../../ports/agent.ts";
+import type { AgentState, AgentStatusEvent } from "../../ports/agent.ts";
 import { STATE_BY_AGENT_STATUS } from "./agent-state.ts";
 import type { AgentInfo, SessionSnapshot } from "./schema.ts";
 import type { SubscribeEventsOptions, SubscriptionHandle } from "./subscribe.ts";
@@ -39,6 +39,8 @@ export interface StatusWatchOptions {
 	subscribe: (options: SubscribeEventsOptions) => Promise<SubscriptionHandle>;
 	snapshot: () => Promise<Pick<SessionSnapshot, "agents">>;
 	onStatus: (event: AgentStatusEvent) => void;
+	/** Reads what a blocked agent is blocked on; herdr's status alone does not say. Must not reject. */
+	blocked?: (agent: AgentInfo) => Promise<AgentState>;
 	/** Whether anyone waits on what the poll reads; defaults to always. */
 	listening?: () => boolean;
 	pushing?: () => boolean;
@@ -78,27 +80,34 @@ export function createStatusWatch(options: StatusWatchOptions) {
 	let dueNext = false;
 	let listeningLastTick = false;
 
-	function observe(agent: Pick<AgentInfo, "name" | "agent_status" | "state_change_seq">): void {
+	async function observe(agent: AgentInfo): Promise<void> {
 		const { name, agent_status: status, state_change_seq: seq } = agent;
 		const state = STATE_BY_AGENT_STATUS[status];
 		// An unnamed agent was not started by agent.start; without a counter nothing proves a repeat.
 		if (!name || state === undefined || seq === undefined) return;
 		const last = seen.get(name);
 		if (last?.seq === seq && last.status === status) return;
+		const reported = state.state === "blocked" && options.blocked ? await options.blocked(agent) : state;
 		seen.set(name, { status, seq });
-		onStatus({ agent: name, status: state, seq });
+		onStatus({ agent: name, status: reported, seq });
 	}
 
-	function observeSnapshot(current: Pick<SessionSnapshot, "agents">): void {
+	/** Snapshots are observed one after another, so a slow read of a blocked screen is never overtaken. */
+	let observing = Promise.resolve();
+	function observeSnapshot(current: Pick<SessionSnapshot, "agents">): Promise<void> {
 		agentsRunning = current.agents.some((agent) => STATE_BY_AGENT_STATUS[agent.agent_status] !== undefined);
-		for (const agent of current.agents) observe(agent);
+		const run = observing.then(async () => {
+			for (const agent of current.agents) await observe(agent);
+		});
+		observing = run.catch(() => {});
+		return run;
 	}
 
 	async function pollOnce(): Promise<void> {
 		if (polling || stopped) return;
 		polling = true;
 		try {
-			observeSnapshot(await snapshot());
+			await observeSnapshot(await snapshot());
 			pollFailing = false;
 		} catch (error) {
 			if (!pollFailing) {
@@ -134,7 +143,7 @@ export function createStatusWatch(options: StatusWatchOptions) {
 					dueNext = true;
 				},
 				// The stream carries no sequence numbers, so a reconnect re-aligns from a fresh snapshot.
-				onResync: observeSnapshot,
+				onResync: (current) => void observeSnapshot(current).catch(onError),
 				onError,
 			});
 			if (stopped) opened.stop();

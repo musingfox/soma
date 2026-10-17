@@ -10,8 +10,7 @@ import {
 import type { AgentState } from "../ports/agent.ts";
 import type { HumanPort, NoticeKind, SomaEvent } from "../ports/human.ts";
 import { Dispatches } from "./extensions/dispatch/index.ts";
-
-const NOTICE = "notice";
+import { NOTICE, noticeEntry } from "./notice.ts";
 
 const textOf = (entry: EntryRecord) =>
 	(entry.model ?? [])
@@ -93,7 +92,7 @@ export async function openHumanPort(
 			return () => listeners.delete(listener);
 		},
 		async notify(content, kind) {
-			await root.submit({ type: "write", entry: { kind: NOTICE, data: { kind, content } } }, context);
+			await root.submit({ type: "write", entry: noticeEntry(kind, content) }, context);
 		},
 		async close() {
 			await Promise.all([events.stop(), watch.stop()]);

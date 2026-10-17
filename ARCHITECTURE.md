@@ -66,7 +66,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 | 派工清單 | document（對話層級） | 記錄每件工作的卡片、agent 名稱、session id 和狀態，和對話紀錄在同一筆提交裡更新 |
 | 派工工具 | tool，`replay: "safe"` | agent 名稱取卡片名，啟動前先查派工清單和同名 agent 是否存在，崩潰後重跑也不會重複啟動；詳見「派工的冪等」 |
 | 查詢與讀取工具 | tool，`replay: "safe"` | 列出 agent、讀對話紀錄 |
-| 回應工具 | tool，不可重跑 | 回答卡住的 agent；崩潰中斷時會告知模型，不會自動重送 |
+| 回應工具 | tool，不可重跑 | `respond` 回答卡住的 agent，`escalate` 轉給人；兩者都把判斷和理由寫進派工清單。崩潰中斷時會告知模型，不會自動重送（spec:2944、3393-3397） |
 | 事件橋 | 主機端程式碼，不是 LLM | 見下節 |
 | 排程 | tool + 背景任務 | `schedule(at, instruction)` 建一個睡到 `at` 的背景任務，時間到送一則 input（`requestId: schedule:<id>`）；定時彙報是它的一個固定實例。見「定時彙報」 |
 | 記憶 | section + document + tool | 移植 shikigami 的設計，見下節 |
@@ -78,7 +78,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 
 | 事件 | 處理方式 | 叫醒模型嗎 |
 |---|---|---|
-| agent 卡住（blocked） | 送一則 `input` 進根對話，`requestId` 為 `herdr:<agent>:<state_change_seq>` | 會。模型自行判斷要代答還是轉給人，`kind=auth` 例外，一律轉人。每次判斷連同理由寫進派工清單，彙報時一併列出，讓人事後能檢查它的判斷 |
+| agent 卡住（blocked） | 送一則 `input` 進根對話，`requestId` 為 `herdr:<agent>:<state_change_seq>` | 會。模型自行判斷要代答還是轉給人。`kind=auth` 例外：不叫醒模型，事件橋在提交 seq 的同一筆 commit 裡寫一筆 `notice`（question）給人，並記一筆 escalated 判斷。每次判斷連同理由寫進派工清單，彙報時一併列出，讓人事後能檢查它的判斷 |
 | agent 做完（進入 idle 或 done） | 用 `conversation.commit` 寫進派工清單並追加紀錄 | 不會 |
 | 使用者主動詢問 | 由介面卡送出 `input` | 會 |
 
@@ -163,7 +163,7 @@ soma 除了調派 agent，本身也要有助理的基本能力：讀 email、看
 | 送出提示 | 確認狀態是 idle 或 done 且輸入框為空（`send-routing.ts:62`） → `pane.send_text` → `pane.send_keys Enter` → 可選的確認啟動，沒動就補按 Enter（`server/herdr/send-routing.ts:207-266`，只有 `/api/launch` 打開這個選項） |
 | 狀態事件 | 原生狀態有 idle、working、blocked、done、unknown；前四種對應成 idle、running、requires_action，unknown 直接丟棄（`server/herdr/agent-state.ts:20-30`）。soma 內部改用 OSC 7501 的詞彙，見下節 |
 | 讀結果 | 讀對話紀錄（見上一節） |
-| 回應卡住 | `pane.read source:detection` 解析提示（`native-permission.ts:172`） → 比對指紋 → 送出前再讀一次畫面比對 → `pane.send_keys`（`server/herdr/permission/native-permission.ts:334-440`） |
+| 回應卡住 | `pane.read source:detection` 解析提示（`native-permission.ts:172`） → 比對指紋 → 送出前再讀一次畫面比對 → `pane.send_keys`（`server/herdr/permission/native-permission.ts:334-440`）。soma 在 blocked 時讀畫面補上 `kind` 和指紋，指紋隨叫醒模型的 input 交給模型，模型回答時帶回來比對 |
 | 停止 | `workspace.close`（`server/herdr/backend.ts:477`、`registry.ts:252`） |
 
 soma 和 cc-mobile 都把工作派進同一個 herdr 機庫 session。機庫名稱來自 `ecosystem.config.cjs:48` 的環境變數，目前是 `fleet`，程式裡沒有預設值（`server/config.ts:131-138`）。並發上限的算法是效能核心數減 2、最少 1，讀不到核心數時預設 4，可用 `CC_MOBILE_HANGAR_CAP` 覆寫（`server/hangar-cap.ts:1, 52`）。cc-mobile 的佔用數取自機庫裡實際在跑的 agent 數（`server/sided-backend.ts:168-171`），所以 soma 直接派進機庫的 agent 也會被它算到；反過來 soma 若自己派工，也要用同樣的算法。

@@ -105,3 +105,37 @@ test.each([
 ])("pollEvery(listening=%s, pushing=%s, running=%s) is %i ticks", (listening, pushing, running, ticks) => {
 	expect(pollEvery(listening, pushing, running)).toBe(ticks);
 });
+
+test("a blocked agent is reported as read off its screen, and a slow read is not overtaken", async () => {
+	let rows: Row[] = [{ name: "a", agent_status: "blocked", state_change_seq: 1 }];
+	let release: () => void = () => {};
+	const events: AgentStatusEvent[] = [];
+	let resync: ((snapshot: Pick<SessionSnapshot, "agents">) => void) | undefined;
+	const watch = createStatusWatch({
+		subscribe: async (options) => {
+			resync = options.onResync as typeof resync;
+			return { stop() {} };
+		},
+		snapshot: async () => ({ agents: rows.map((row) => ({ pane_id: "p", ...row })) }) as never,
+		onStatus: (event) => events.push(event),
+		blocked: (agent) =>
+			new Promise((resolve) => {
+				release = () => resolve({ state: "blocked", kind: "auth", msg: `${agent.pane_id} wants a key` });
+			}),
+		setIntervalFn: () => 1,
+		clearIntervalFn: () => {},
+	});
+	await watch.start();
+	resync?.({ agents: rows.map((row) => ({ pane_id: "p", ...row })) } as never);
+	rows = [{ name: "a", agent_status: "idle", state_change_seq: 2 }];
+	resync?.({ agents: rows.map((row) => ({ pane_id: "p", ...row })) } as never);
+	await new Promise((resolve) => setImmediate(resolve));
+	expect(events).toEqual([]);
+
+	release();
+	await new Promise((resolve) => setImmediate(resolve));
+	expect(events).toEqual([
+		{ agent: "a", status: { state: "blocked", kind: "auth", msg: "p wants a key" }, seq: 1 },
+		{ agent: "a", status: { state: "idle" }, seq: 2 },
+	]);
+});

@@ -3,9 +3,10 @@ import type { Job } from "./dispatch.ts";
 
 /**
  * launch: send the job's held launch prompt. wake: hand the blocked agent to the model.
+ * escalate: hand it to the human without the model, as every kind=auth block is.
  * complete: record a finished turn without the model.
  */
-export type BridgeAction = "none" | "launch" | "wake" | "complete";
+export type BridgeAction = "none" | "launch" | "wake" | "escalate" | "complete";
 
 /**
  * Folds one observation of a job's agent into the job. `seq` is the agent side's transition
@@ -22,7 +23,10 @@ export function observe(job: Job, status: AgentState, seq: number): { job: Job; 
 	const turned = job.seq !== undefined;
 	switch (status.state) {
 		case "blocked":
-			return { job: launch === undefined ? next : { ...next, launch }, action: "wake" };
+			return {
+				job: launch === undefined ? next : { ...next, launch },
+				action: status.kind === "auth" ? "escalate" : "wake",
+			};
 		case "idle":
 			if (launch !== undefined) return { job: next, action: "launch" };
 			// done → idle is herdr settling after the turn that `done` already recorded.

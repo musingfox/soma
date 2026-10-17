@@ -1,10 +1,19 @@
 import { constants } from "node:fs";
 import { copyFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { AgentListing, AgentPort, AgentStatusEvent, StartRequest } from "../../ports/agent.ts";
+import type {
+	AgentListing,
+	AgentPort,
+	AgentState,
+	AgentStatusEvent,
+	Answer,
+	AnswerOutcome,
+	StartRequest,
+} from "../../ports/agent.ts";
 import { STATE_BY_AGENT_STATUS } from "./agent-state.ts";
 import type { HerdrClient } from "./client.ts";
 import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "./hangar-cap.ts";
+import { answerKeys, readBlockedScreen } from "./permission/blocked-screen.ts";
 import { waitForAvailableShell, waitForInteractiveReady } from "./readiness.ts";
 import {
 	AgentStartedResultSchema,
@@ -24,7 +33,11 @@ export interface HerdrAgentPortOptions {
 	onError?: StatusWatchOptions["onError"];
 	/** Where claude keeps its transcripts; defaults to ~/.claude/projects. */
 	projectsDir?: string;
+	/** Pause between reads of a blocked screen that did not parse yet; claude may still be drawing it. */
+	redrawMs?: number;
 }
+
+const BLOCKED_READS = 3;
 
 /**
  * Starts each card's claude in its own `fleet/<card>` worktree of the repo at
@@ -43,6 +56,27 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 		return worktrees.some((worktree) => worktree.branch === branch)
 			? client.call("worktree.open", params, WorktreeOpenedResultSchema)
 			: client.call("worktree.create", { ...params, label }, WorktreeOpenedResultSchema);
+	}
+
+	const redrawMs = options.redrawMs ?? 500;
+
+	async function readScreen(paneId: string) {
+		return readBlockedScreen((await client.paneRead({ pane_id: paneId, source: "detection" })).text);
+	}
+
+	/** Never rejects: a screen that cannot be read is still a block, just one nobody can answer. */
+	async function blockedState(paneId: string): Promise<AgentState> {
+		try {
+			let screen = await readScreen(paneId);
+			for (let read = 1; read < BLOCKED_READS && screen.prompt === undefined; read++) {
+				await new Promise((resolve) => setTimeout(resolve, redrawMs));
+				screen = await readScreen(paneId);
+			}
+			const { kind, msg, prompt } = screen;
+			return { state: "blocked", kind, msg, ...(prompt ? { fingerprint: prompt.fingerprint } : {}) };
+		} catch (error) {
+			return { state: "blocked", kind: "permission", msg: `pane.read failed: ${(error as Error).message}` };
+		}
 	}
 
 	const notYet = (what: string) => () => Promise.reject(new Error(`herdr AgentPort: ${what} is not implemented`));
@@ -80,16 +114,16 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 		},
 
 		async list(): Promise<readonly AgentListing[]> {
-			return (await client.agentList()).flatMap((agent) =>
-				agent.name
-					? [
-							{
-								name: agent.name,
-								status: STATE_BY_AGENT_STATUS[agent.agent_status],
-								sessionId: agent.agent_session?.value,
-							},
-						]
-					: [],
+			const named = (await client.agentList()).filter((agent) => agent.name);
+			return Promise.all(
+				named.map(async (agent) => ({
+					name: agent.name as string,
+					status:
+						agent.agent_status === "blocked"
+							? await blockedState(agent.pane_id)
+							: STATE_BY_AGENT_STATUS[agent.agent_status],
+					sessionId: agent.agent_session?.value,
+				})),
 			);
 		},
 
@@ -108,6 +142,7 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 					onStatus: (event) => {
 						for (const each of listeners) each(event);
 					},
+					blocked: (agent) => blockedState(agent.pane_id),
 					listening: options.listening,
 					onError: options.onError,
 				});
@@ -129,7 +164,23 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 			const path = await resolveTranscriptPath(sessionId, info.cwd, options.projectsDir);
 			return path === undefined ? undefined : readFinalAnswer(path);
 		},
-		respond: notYet("respond"),
+
+		// cc-mobile native-permission.ts:334-440: fresh status, fresh screen, then the keys read off that screen.
+		async respond(agent: string, answer: Answer): Promise<AnswerOutcome> {
+			const info = await client.agentGet(agent);
+			if (info.agent_status !== "blocked") return { sent: false, refusal: "not_blocked" };
+			const { kind, prompt } = await readScreen(info.pane_id);
+			if (kind === "auth") return { sent: false, refusal: "auth" };
+			if (prompt === undefined) return { sent: false, refusal: "unreadable" };
+			if (prompt.fingerprint !== answer.fingerprint) return { sent: false, refusal: "stale" };
+			if (!prompt.options.some((option) => option.id === answer.option)) {
+				return { sent: false, refusal: "unknown_option" };
+			}
+			const keys = answerKeys(prompt, answer.option);
+			if (keys === undefined) return { sent: false, refusal: "unreadable" };
+			await client.paneSendKeys(info.pane_id, keys);
+			return { sent: true };
+		},
 		stop: notYet("stop"),
 	};
 }

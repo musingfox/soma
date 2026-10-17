@@ -128,7 +128,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 soma 除了調派 agent，本身也要有助理的基本能力：讀 email、看行事曆、記憶、在指定時間處理工作。原則是不為任何一種能力在核心寫專用碼：
 
 - **排程。** 「指定時間處理工作」和定時彙報用同一個機制：模型呼叫 `schedule` 工具，核心建一個背景任務睡到指定時間，到時把指令當成一則 input 送回根對話。等待期間不佔 session、不花 token；週期任務靠每輪推進 checkpoint。排程清單存在 document 裡，模型可以列出和取消。
-- **email 與行事曆。** 經 pi-mcp 轉接層接 MCP server，soma 只負責把 MCP 工具掛進 harness。用哪個 Gmail／Google Calendar MCP server、憑證放哪裡，待定（待決事項 5）。對模型來說，這些和派工工具一樣都是工具，差別只在它們不可重跑（寄信不能 replay）。
+- **email 與行事曆。** 經 pi-mcp 轉接層接 MCP server，soma 只負責把 MCP 工具掛進 harness。Gmail 與 Google Calendar 用 workspace-mcp，憑證放在 repo 外的 `~/.config/soma/`（待決事項 5 的決定）。對模型來說，這些和派工工具一樣都是工具，差別只在它們不可重跑（寄信不能 replay）。
 - **記憶。** 見下節。因為報告和排程都會用到，記憶要提前到 M2。
 
 ### 記憶：移植 shikigami 的設計
@@ -208,7 +208,7 @@ cc-mobile `server/` 裡有 2,971 行（含註解與空行）只在清單內互�
 - **Pi 套件。** `@earendil-works/pi-durable`、`pi-ai`、`chord`、`pi-mcp` 目前都是 1.3.0，要求 Node >=22.19.0。pi-durable README 第 3 行寫明「Experimental. The API changes without notice between releases.」，版本要釘死。
 - **Bun 沒有現成的儲存介面卡。** README:688 說核心可以在 Bun 上跑，但要自備 `SqliteDatabase` facade。這個抽象層定義在 chord（`chord/src/sqlite/database.ts:2-38`），共六個非同步方法：`exec`、`run`、`get`、`all`、`transaction`、`close`。Node 版 `chord/src/sqlite/node.ts` 有 201 行，`bun:sqlite` 版的行數未驗證。conformance suite 是 `registerStorageConformance`，從 `@earendil-works/pi-durable/testing` 匯出，但它只測儲存層，不測整個 harness 在 Bun 上跑。
 - **模型供應商。** pi-ai 支援 Anthropic API key，也支援 Claude Pro/Max 訂閱的 OAuth（`ai/src/providers/anthropic.ts:19-90`）。走 OAuth 時它會偽裝成 Claude Code：送出 `user-agent: claude-cli/...` 和 `x-app: cli`（`ai/src/api/anthropic-messages.ts:1059-1062`）、加上 Claude Code 的 beta 標頭（`:1142`）、注入「You are Claude Code」系統提示（`:1227-1232`），原始碼自己稱之為「Stealth mode」（`:95`）。Anthropic 的官方立場是不允許的：[Claude Code 法律合規頁](https://code.claude.com/docs/en/legal-and-compliance)寫明訂閱 OAuth「is designed to support ordinary use of Claude Code and other native Anthropic applications」，且「Anthropic does not permit third-party developers to offer Claude.ai login into their own applications, or to route requests through Free, Pro, or Max plan credentials」；[Consumer Terms](https://www.anthropic.com/legal/consumer-terms) 禁止以 API key 以外、未經明示許可的自動化方式存取服務。所以 soma 預設用 API key。
-- **MCP。** `@earendil-works/pi-mcp` 是獨立的客戶端，支援 stdio、Streamable HTTP 和 OAuth。接到 pi-durable 需要一個轉接層，大小未驗證。shikigami-bridge 的瀏覽器與 macOS 控制就經由這條路接進來。
+- **MCP。** `@earendil-works/pi-mcp` 是獨立的客戶端，支援 stdio、Streamable HTTP 和 OAuth。接到 pi-durable 的轉接層是 `src/core/extensions/mcp/index.ts`，目前只接 stdio server。shikigami-bridge 的瀏覽器與 macOS 控制就經由這條路接進來。
 
 ## 里程碑
 
@@ -251,4 +251,13 @@ cc-mobile `server/` 裡有 2,971 行（含註解與空行）只在清單內互�
 2. **shikigami 跑在哪台機器。** 如果和核心同一台，就在本機直接連；如果在筆電上，就經 Tailscale 連，和 cc-mobile 被手機連的方式一樣。
 3. **報告存放位置，以及要不要另有一份每日總結。** 十分鐘短報告寫進 `notice` 紀錄由介面卡分送；是否再寫進 Obsidian vault 的日記或對應的 obw 卡片，待定。
 4. **沒有 obw 卡片的臨時工作怎麼派。** `POST /api/launch` 以卡片為單位；要嘛 soma 先替臨時工作建卡，要嘛走自己的派工路徑。
-5. **email 與行事曆用哪個 MCP server，憑證放哪裡。** 候選未查證。
+5. **email 與行事曆用哪個 MCP server，憑證放哪裡。**
+
+   2026-10-18 決定：用 [workspace-mcp](https://github.com/taylorwilsdon/google_workspace_mcp)（MIT，未封存，v2.1.0 於 2026-10-09 發布），一個 stdio server 同時提供 Gmail 與 Calendar，以 Google OAuth 登入個人帳號。啟動指令是 `uvx workspace-mcp@2.1.0 --single-user --permissions gmail:readonly calendar:readonly`；2026-10-18 經 soma 的轉接層實際啟動，`tools/list` 只列出讀取類工具，其中有 `search_gmail_messages`（`query` 直接交給 Gmail，可用 `is:unread is:important`）和 `get_events`（`time_min`、`time_max`）。每個工具都有 `user_google_email` 參數。只加 `--single-user` 時這個參數仍是必填，而且帶了憑證目錄裡沒有的帳號就直接失敗、不會改用別的憑證（workspace-mcp 2.1.0 `auth/google_auth.py` 的 single-user 分支）；所以 `env` 還要設 `USER_GOOGLE_EMAIL`，server 會把參數改成選填並自動填入這個帳號（`core/server.py` 的 `USER_GOOGLE_EMAIL` 處理，2026-10-18 經轉接層實測 `tools/list` 的 `required` 已不含它）。
+
+   憑證不進 repo。soma 讀 `~/.config/soma/mcp.json`（環境變數 `SOMA_MCP_CONFIG` 可覆寫路徑），格式是 `{"servers": {"<名稱>": {"command", "args", "env"}}}`。server 自己的憑證路徑寫在 `env` 裡：OAuth client 用 `GOOGLE_OAUTH_CLIENT_ID`、`GOOGLE_OAUTH_CLIENT_SECRET`（或 `GOOGLE_CLIENT_SECRET_PATH` 指向 client_secret.json），token 目錄用 `WORKSPACE_MCP_CREDENTIALS_DIR`，建議設為 `~/.config/soma/google`；帳號用 `USER_GOOGLE_EMAIL`。Google OAuth app 停在 Testing 模式時 refresh token 七天後失效（[google-calendar-mcp README](https://github.com/nspady/google-calendar-mcp)），要發布成 production 才不用每週重新授權。
+
+   沒選的候選：
+   - Google 官方的 [Gmail](https://developers.google.com/workspace/gmail/api/guides/configure-mcp-server) 與 [Calendar](https://developers.google.com/workspace/calendar/api/guides/configure-mcp-server) MCP server 還在 Developer Preview，只有 Streamable HTTP，個人帳號能否加入未驗證。正式發布後可以改用，轉接層要先加 HTTP 與 OAuth。
+   - [@cocal/google-calendar-mcp](https://github.com/nspady/google-calendar-mcp) 加 [@klodr/gmail-mcp](https://github.com/klodr/gmail-mcp) 是兩個 Node server，要分開設定憑證；後者只有一位維護者。
+   - [GongRzhe/Gmail-MCP-Server](https://github.com/GongRzhe/Gmail-MCP-Server) 已封存。

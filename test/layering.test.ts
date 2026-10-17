@@ -26,6 +26,8 @@ const cases: readonly (readonly [string, string, boolean])[] = [
 	["src/adapters/x/d.ts", "../fake-human/index.ts", true],
 	["src/adapters/x/e.ts", "../../ports/agent.ts", false],
 	["src/adapters/x/f.ts", "./local.ts", false],
+	["src/adapters/terminal/a.ts", "@earendil-works/pi-durable", true],
+	["src/adapters/terminal/b.ts", "../herdr/client.ts", true],
 ];
 
 const root = mkdtempSync(join(tmpdir(), "soma-layering-"));

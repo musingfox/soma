@@ -21,7 +21,7 @@ export type Child = {
 };
 
 export function run(args: string[], script = CHILD, env: NodeJS.ProcessEnv = process.env): Child {
-	const child = spawn(process.execPath, [script, ...args], { stdio: ["ignore", "pipe", "inherit"], env });
+	const child = spawn(process.execPath, [script, ...args], { stdio: ["pipe", "pipe", "inherit"], env });
 	if (child.stdout === null) throw new Error("child has no stdout");
 	const lines: Line[] = [];
 	const waiters: { event: string; resolve(line: Line): void }[] = [];

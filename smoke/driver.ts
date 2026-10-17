@@ -13,15 +13,15 @@ const CHILD = fileURLToPath(new URL("./child.ts", import.meta.url));
 const LATE_TOLERANCE_MS = 2_000;
 
 type Line = Record<string, unknown> & { event?: string };
-type Child = {
+export type Child = {
 	process: ChildProcess;
 	lines: Line[];
 	next(event: string): Promise<Line>;
 	exited: Promise<number | null>;
 };
 
-function run(args: string[]): Child {
-	const child = spawn(process.execPath, [CHILD, ...args], { stdio: ["ignore", "pipe", "inherit"] });
+export function run(args: string[], script = CHILD): Child {
+	const child = spawn(process.execPath, [script, ...args], { stdio: ["ignore", "pipe", "inherit"] });
 	if (child.stdout === null) throw new Error("child has no stdout");
 	const lines: Line[] = [];
 	const waiters: { event: string; resolve(line: Line): void }[] = [];

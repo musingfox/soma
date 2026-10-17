@@ -1,8 +1,16 @@
-import type { AgentListing, AgentPort, AgentState, AgentStatusEvent, StartRequest } from "../../ports/agent.ts";
+import type {
+	AgentListing,
+	AgentPort,
+	AgentState,
+	AgentStatusEvent,
+	Answer,
+	AnswerOutcome,
+	StartRequest,
+} from "../../ports/agent.ts";
 
 export class FakeAgentPort implements AgentPort {
 	readonly prompts: { readonly agent: string; readonly text: string }[] = [];
-	readonly responses: { readonly agent: string; readonly answer: string }[] = [];
+	readonly responses: { readonly agent: string; readonly answer: Answer }[] = [];
 	readonly started: StartRequest[] = [];
 	readonly stopped = new Set<string>();
 	readonly #listeners = new Set<(event: AgentStatusEvent) => void>();
@@ -33,9 +41,15 @@ export class FakeAgentPort implements AgentPort {
 		return this.#results.get(agent);
 	}
 
-	async respond(agent: string, answer: string): Promise<void> {
+	/** Sends only to the blocked status last emitted, matched by fingerprint, as the herdr adapter does. */
+	async respond(agent: string, answer: Answer): Promise<AnswerOutcome> {
+		const status = this.#states.get(agent)?.status;
+		if (status?.state !== "blocked") return { sent: false, refusal: "not_blocked" };
+		if (status.kind === "auth") return { sent: false, refusal: "auth" };
+		if (status.fingerprint !== answer.fingerprint) return { sent: false, refusal: "stale" };
 		this.responses.push({ agent, answer });
 		this.emit(agent, { state: "working" });
+		return { sent: true };
 	}
 
 	async stop(agent: string): Promise<void> {

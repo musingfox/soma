@@ -11,21 +11,31 @@ test("fake AgentPort delivers blocked and done to subscribers", async () => {
 
 	await agents.start({ name: "job-a", card: "pm/a.md", cwd: "/tmp", sessionId: "s-a" });
 	await agents.prompt("job-a", "go");
-	for (const kind of ["permission", "question", "auth"] satisfies BlockedKind[]) {
-		agents.emit("job-a", { state: "blocked", kind });
-		await agents.respond("job-a", `answer ${kind}`);
+	for (const kind of ["permission", "question"] satisfies BlockedKind[]) {
+		agents.emit("job-a", { state: "blocked", kind, fingerprint: kind });
+		expect(await agents.respond("job-a", { option: "1", fingerprint: "stale" })).toEqual({
+			sent: false,
+			refusal: "stale",
+		});
+		expect(await agents.respond("job-a", { option: "1", fingerprint: kind })).toEqual({ sent: true });
 	}
+	agents.emit("job-a", { state: "blocked", kind: "auth", fingerprint: "auth" });
+	expect(await agents.respond("job-a", { option: "1", fingerprint: "auth" })).toEqual({
+		sent: false,
+		refusal: "auth",
+	});
+	agents.emit("job-a", { state: "working" });
 	agents.finish("job-a", "結果：完成");
 
 	expect(await agents.list()).toEqual([{ name: "job-a", status: { state: "done" }, seq: seen.at(-1)?.seq }]);
 	expect(seen.map((e) => e.status)).toEqual([
 		{ state: "idle" },
 		{ state: "working" },
-		{ state: "blocked", kind: "permission" },
+		{ state: "blocked", kind: "permission", fingerprint: "permission" },
 		{ state: "working" },
-		{ state: "blocked", kind: "question" },
+		{ state: "blocked", kind: "question", fingerprint: "question" },
 		{ state: "working" },
-		{ state: "blocked", kind: "auth" },
+		{ state: "blocked", kind: "auth", fingerprint: "auth" },
 		{ state: "working" },
 		{ state: "done" },
 	]);

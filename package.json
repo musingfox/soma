@@ -15,7 +15,8 @@
 		"smoke:schedule": "node smoke/schedule.ts",
 		"smoke:dispatch": "node smoke/dispatch.ts",
 		"smoke:terminal": "node smoke/terminal.ts",
-		"smoke:bridge": "node smoke/bridge.ts"
+		"smoke:bridge": "node smoke/bridge.ts",
+		"smoke:digest": "node smoke/digest.ts"
 	},
 	"dependencies": {
 		"@earendil-works/chord": "1.3.0",

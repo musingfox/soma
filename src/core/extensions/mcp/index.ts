@@ -20,7 +20,12 @@ export function loadMcpConfig(path: string): Record<string, StdioServer> {
 
 export async function connectStdio(server: StdioServer): Promise<McpClient> {
 	const client = new McpClient({ name: "soma", version: "0.0.0" });
-	await client.connect(new StdioTransport({ ...server, stderr: "pipe" }));
+	const transport = new StdioTransport({ ...server, stderr: "pipe" });
+	try {
+		await client.connect(transport);
+	} catch (error) {
+		throw new Error(`${server.command} did not start: ${transport.stderr.trim()}`, { cause: error });
+	}
 	return client;
 }
 

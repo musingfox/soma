@@ -13,6 +13,10 @@ export type Job = {
 	readonly agent: string;
 	readonly sessionId: string;
 	readonly status: AgentState;
+	// The agent side's transition counter at `status`; an event carrying the same one was already handled.
+	readonly seq?: number;
+	// The first prompt, held until the agent can take it: claude refuses prompts until its trust dialog is answered.
+	readonly launch?: string;
 	readonly decisions: Decision[];
 };
 

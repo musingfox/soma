@@ -18,6 +18,8 @@ export interface AgentListing {
 	// Absent when the agent side cannot tell, which is no claim either way.
 	readonly status?: AgentState;
 	readonly sessionId?: string;
+	// herdr's state_change_seq, when the agent side counts transitions.
+	readonly seq?: number;
 }
 
 export interface AgentStatusEvent {

@@ -8,6 +8,7 @@ import { createHerdrAgentPort } from "./adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "./adapters/herdr/client.ts";
 import { readCard } from "./adapters/obsidian/card.ts";
 import { runTerminal } from "./adapters/terminal/index.ts";
+import { clock } from "./core/extensions/clock/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
 import { dispatchExtension } from "./core/extensions/dispatch/index.ts";
@@ -42,6 +43,7 @@ const mcpClients = (
 	)
 ).flat();
 const extensions = [
+	clock(),
 	sleeper,
 	memory,
 	schedule((id, c) => harness.abortTask(id, c)),

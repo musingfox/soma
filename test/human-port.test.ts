@@ -19,7 +19,7 @@ async function setup() {
 	const models = createModels();
 	models.setProvider(faux.provider);
 	const registry = createRegistry();
-	registry.install(dispatchExtension(new FakeAgentPort()));
+	registry.install(dispatchExtension(new FakeAgentPort(), async (_repo, card) => `# ${card}`));
 	const harness = await Harness.open(new MemoryStorage(), { models, registry }, context);
 	cleanup.push(() => harness.close(context));
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });

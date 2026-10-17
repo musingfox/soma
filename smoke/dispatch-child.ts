@@ -10,7 +10,8 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createHerdrAgentPort } from "../src/adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "../src/adapters/herdr/client.ts";
-import { Dispatches, dispatchExtension, reconcileDispatches } from "../src/core/extensions/dispatch/index.ts";
+import { reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
+import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
 import type { AgentPort } from "../src/ports/agent.ts";
 
@@ -50,7 +51,12 @@ faux.setResponses(
 const models = createModels();
 models.setProvider(faux.provider);
 
-const harness = await openHarness(db, [dispatchExtension(agents)], context, { models });
+const harness = await openHarness(
+	db,
+	[dispatchExtension(agents, async (_repo, card) => `# ${card}\n\n只回覆 ok 兩個字，不要使用任何工具。`)],
+	context,
+	{ models },
+);
 const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 harness.resume();
 await reconcileDispatches(root, agents, context);

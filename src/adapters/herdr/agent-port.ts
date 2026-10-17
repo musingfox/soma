@@ -1,22 +1,26 @@
 import { constants } from "node:fs";
 import { copyFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { AgentListing, AgentPort, StartRequest } from "../../ports/agent.ts";
+import type { AgentListing, AgentPort, AgentStatusEvent, StartRequest } from "../../ports/agent.ts";
 import { STATE_BY_AGENT_STATUS } from "./agent-state.ts";
 import type { HerdrClient } from "./client.ts";
 import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "./hangar-cap.ts";
-import { waitForAvailableShell } from "./readiness.ts";
+import { waitForAvailableShell, waitForInteractiveReady } from "./readiness.ts";
 import {
 	AgentStartedResultSchema,
 	PaneProcessInfoResultSchema,
 	WorktreeListResultSchema,
 	WorktreeOpenedResultSchema,
 } from "./schema.ts";
+import { createStatusWatch, type StatusWatchOptions } from "./status-watch.ts";
 
 export interface HerdrAgentPortOptions {
 	/** A client on the hangar session's socket: every agent there counts against the cap. */
 	client: HerdrClient;
 	cap?: number;
+	/** Poll tier inputs for onStatus; see status-watch.ts. */
+	listening?: StatusWatchOptions["listening"];
+	onError?: StatusWatchOptions["onError"];
 }
 
 /**
@@ -39,6 +43,10 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 	}
 
 	const notYet = (what: string) => () => Promise.reject(new Error(`herdr AgentPort: ${what} is not implemented`));
+
+	// One watch for every listener, open while there is one.
+	const listeners = new Set<(event: AgentStatusEvent) => void>();
+	let watch: ReturnType<typeof createStatusWatch> | undefined;
 
 	return {
 		async start(request: StartRequest): Promise<void> {
@@ -82,9 +90,32 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 			);
 		},
 
-		prompt: notYet("prompt"),
-		onStatus: () => {
-			throw new Error("herdr AgentPort: onStatus is not implemented");
+		async prompt(agent: string, text: string): Promise<void> {
+			// herdr refuses agent.prompt with agent_not_ready until claude's composer is up.
+			await waitForInteractiveReady({ agentGet: client.agentGet, paneId: agent });
+			await client.call("agent.prompt", { target: agent, text });
+		},
+
+		onStatus(listener: (event: AgentStatusEvent) => void): () => void {
+			listeners.add(listener);
+			if (watch === undefined) {
+				watch = createStatusWatch({
+					subscribe: client.subscribeEvents,
+					snapshot: client.sessionSnapshot,
+					onStatus: (event) => {
+						for (const each of listeners) each(event);
+					},
+					listening: options.listening,
+					onError: options.onError,
+				});
+				void watch.start();
+			}
+			return () => {
+				listeners.delete(listener);
+				if (listeners.size > 0) return;
+				watch?.stop();
+				watch = undefined;
+			};
 		},
 		readResult: notYet("readResult"),
 		respond: notYet("respond"),

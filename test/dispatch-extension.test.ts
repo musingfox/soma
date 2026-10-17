@@ -4,7 +4,8 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
-import { Dispatches, dispatchExtension, reconcileDispatches } from "../src/core/extensions/dispatch/index.ts";
+import { reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
+import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 
 const context = BACKGROUND_CONTEXT;
 const open: Harness[] = [];
@@ -18,7 +19,12 @@ async function setup() {
 	const models = createModels();
 	models.setProvider(faux.provider);
 	const registry = createRegistry();
-	registry.install(dispatchExtension(agents));
+	registry.install(
+		dispatchExtension(agents, async (_repo, card) => {
+			if (card === "missing") throw new Error(`no card ${card}`);
+			return `# ${card}`;
+		}),
+	);
 	const harness = await Harness.open(new MemoryStorage(), { models, registry }, context);
 	open.push(harness);
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
@@ -47,7 +53,14 @@ test("dispatch starts an agent named after the card and records the job with its
 	const [started] = agents.started;
 	expect(started).toMatchObject({ name: "card-a", card: "card-a", cwd: "/repo" });
 	expect(await jobs()).toEqual([
-		{ card: "card-a", agent: "card-a", sessionId: started?.sessionId, status: { state: "idle" }, decisions: [] },
+		{
+			card: "card-a",
+			agent: "card-a",
+			sessionId: started?.sessionId,
+			status: { state: "idle" },
+			launch: expect.stringMatching(/以下是任務卡：\n\n# card-a$/),
+			decisions: [],
+		},
 	]);
 });
 
@@ -79,4 +92,13 @@ test("reconcile writes what changed while the core was down", async () => {
 	await reconcileDispatches(root, agents, context);
 
 	expect(await jobs()).toMatchObject([{ card: "card-a", status: { state: "done" } }]);
+});
+
+test("a card that cannot be read starts nothing", async () => {
+	const { agents, dispatch, jobs } = await setup();
+
+	await dispatch("missing", "r1");
+
+	expect(agents.started).toEqual([]);
+	expect(await jobs()).toEqual([]);
 });

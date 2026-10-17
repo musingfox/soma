@@ -7,7 +7,7 @@ export class FakeAgentPort implements AgentPort {
 	readonly stopped = new Set<string>();
 	readonly #listeners = new Set<(event: AgentStatusEvent) => void>();
 	readonly #results = new Map<string, string>();
-	readonly #states = new Map<string, AgentState>();
+	readonly #states = new Map<string, { status: AgentState; seq: number }>();
 	#seq = 0;
 
 	async start(request: StartRequest): Promise<void> {
@@ -16,7 +16,7 @@ export class FakeAgentPort implements AgentPort {
 	}
 
 	async list(): Promise<readonly AgentListing[]> {
-		return [...this.#states].map(([name, status]) => ({ name, status }));
+		return [...this.#states].map(([name, { status, seq }]) => ({ name, status, seq }));
 	}
 
 	async prompt(agent: string, text: string): Promise<void> {
@@ -43,9 +43,10 @@ export class FakeAgentPort implements AgentPort {
 		this.#states.delete(agent);
 	}
 
-	emit(agent: string, status: AgentState): void {
-		this.#states.set(agent, status);
-		const event = { agent, status, seq: ++this.#seq };
+	/** `seq` defaults to the next one; passing the last one again replays an observation. */
+	emit(agent: string, status: AgentState, seq = ++this.#seq): void {
+		this.#states.set(agent, { status, seq });
+		const event = { agent, status, seq };
 		for (const listener of this.#listeners) listener(event);
 	}
 

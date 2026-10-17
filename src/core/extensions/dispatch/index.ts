@@ -1,10 +1,9 @@
 import { randomUUID } from "node:crypto";
-import type { Context } from "@earendil-works/chord/context";
 import { Type } from "@earendil-works/pi-ai";
-import { type Conversation, defineDoc, defineExtension, defineTool } from "@earendil-works/pi-durable";
+import { defineDoc, defineExtension, defineTool } from "@earendil-works/pi-durable";
 import type { AgentPort } from "../../../ports/agent.ts";
 import type { Job } from "../../domain/dispatch.ts";
-import { reconcile } from "../../domain/reconcile.ts";
+import { composeLaunchPrompt } from "../../domain/launch-prompt.ts";
 
 /** Every job dispatched from this conversation; one per card. */
 export const Dispatches = defineDoc<{ jobs: Job[] }>({
@@ -18,7 +17,8 @@ export const Dispatches = defineDoc<{ jobs: Job[] }>({
 
 const text = (value: unknown) => ({ output: [{ type: "text" as const, text: JSON.stringify(value) }] });
 
-export function dispatchExtension(agents: AgentPort) {
+/** `readCard` returns the card's markdown, read from wherever the repo's cards live. */
+export function dispatchExtension(agents: AgentPort, readCard: (repo: string, card: string) => Promise<string>) {
 	const dispatch = defineTool({
 		name: "dispatch",
 		description:
@@ -38,6 +38,8 @@ export function dispatchExtension(agents: AgentPort) {
 			);
 			if (recorded) return text(recorded);
 
+			// Read before anything starts, so a card that does not exist starts nothing.
+			const launch = composeLaunchPrompt(await readCard(repo, card));
 			const listed = (await agents.list()).find((agent) => agent.name === card);
 			if (listed === undefined) await agents.start({ name: card, card, cwd: repo, sessionId });
 			const job: Job = {
@@ -45,6 +47,7 @@ export function dispatchExtension(agents: AgentPort) {
 				agent: card,
 				sessionId: listed?.sessionId ?? sessionId,
 				status: listed?.status ?? { state: "idle" },
+				launch,
 				decisions: [],
 			};
 			await api.commit(async (tx) => {
@@ -64,13 +67,4 @@ export function dispatchExtension(agents: AgentPort) {
 	});
 
 	return defineExtension({ name: "soma.dispatch", tools: [dispatch, jobs] });
-}
-
-/** Startup step after `harness.resume()`: catch the dispatch list up with what changed while the core was down. */
-export async function reconcileDispatches(conversation: Conversation, agents: AgentPort, context: Context) {
-	const listed = await agents.list();
-	await conversation.commit(async (tx) => {
-		const doc = await tx.doc(Dispatches, conversation.id);
-		doc.jobs = [...reconcile(doc.jobs, listed)];
-	}, context);
 }

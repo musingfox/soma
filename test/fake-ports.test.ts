@@ -17,7 +17,7 @@ test("fake AgentPort delivers blocked and done to subscribers", async () => {
 	}
 	agents.finish("job-a", "結果：完成");
 
-	expect(await agents.list()).toEqual([{ name: "job-a", status: { state: "done" } }]);
+	expect(await agents.list()).toEqual([{ name: "job-a", status: { state: "done" }, seq: seen.at(-1)?.seq }]);
 	expect(seen.map((e) => e.status)).toEqual([
 		{ state: "idle" },
 		{ state: "working" },

@@ -1,0 +1,152 @@
+import { createInterface } from "node:readline";
+import type { AgentState } from "../../ports/agent.ts";
+import type { HumanPort, SomaEvent } from "../../ports/human.ts";
+import {
+	formatProgramStatus,
+	isProgramStatusReply,
+	PROGRAM_STATUS_QUERY,
+	type ProgramStatus,
+} from "./program-status.ts";
+
+export interface TerminalInput extends NodeJS.ReadableStream {
+	readonly isTTY?: boolean;
+	setRawMode?(raw: boolean): unknown;
+}
+
+export interface TerminalOutput extends NodeJS.WritableStream {
+	readonly isTTY?: boolean;
+}
+
+export interface TerminalOptions {
+	readonly human: HumanPort;
+	readonly input: TerminalInput;
+	readonly output: TerminalOutput;
+	/** `SOMA_PROGRAM_STATUS=1` sends OSC 7501 without asking the terminal, `0` never sends it. */
+	readonly env?: Readonly<Record<string, string | undefined>>;
+	readonly probeTimeoutMs?: number;
+}
+
+const DEVICE_ATTRIBUTES_QUERY = "\x1b[c";
+const DEVICE_ATTRIBUTES_REPLY = "\x1b[?";
+const PROGRAM_STATUS_REPLY = "\x1b]7501;?";
+// Rounds started by these sources produce something the human did not ask for here: show them as notices.
+const PUSHED_SOURCES = ["schedule:", "digest:"];
+
+/**
+ * Ask whether the terminal supports OSC 7501. Every terminal answers the device attributes query that follows it,
+ * so a 7501 reply arriving first means supported, and the DA reply alone means not. Raw mode keeps the replies
+ * off the screen and out of the line reader.
+ */
+export async function detectProgramStatus(
+	input: TerminalInput,
+	output: TerminalOutput,
+	env: Readonly<Record<string, string | undefined>>,
+	timeoutMs = 1000,
+): Promise<boolean> {
+	const override = env.SOMA_PROGRAM_STATUS;
+	if (override === "1" || override === "0") return override === "1";
+	if (!input.isTTY || !output.isTTY || input.setRawMode === undefined) return false;
+	input.setRawMode(true);
+	let received = "";
+	try {
+		return await new Promise<boolean>((resolve) => {
+			const done = (supported: boolean) => {
+				clearTimeout(timer);
+				input.off("data", onData);
+				resolve(supported);
+			};
+			const onData = (chunk: Buffer | string) => {
+				received += chunk.toString();
+				const da = received.indexOf(DEVICE_ATTRIBUTES_REPLY);
+				if (da < 0 || !received.slice(da).includes("c")) return;
+				const before = received.slice(0, da);
+				const reply = before.indexOf(PROGRAM_STATUS_REPLY);
+				done(reply >= 0 && isProgramStatusReply(before.slice(reply)));
+			};
+			const timer = setTimeout(() => done(false), timeoutMs);
+			input.on("data", onData);
+			output.write(PROGRAM_STATUS_QUERY + DEVICE_ATTRIBUTES_QUERY);
+		});
+	} finally {
+		input.setRawMode(false);
+		input.pause();
+	}
+}
+
+/** `job/<card>`, cut and cleaned to the spec's 32-byte segment. */
+export function jobRecordId(card: string): string {
+	return `job/${card.replace(/[^A-Za-z0-9_.+-]/g, "-").slice(0, 32) || "-"}`;
+}
+
+const firstLine = (text: string) => text.trim().split("\n")[0] ?? "";
+
+function jobStatus(card: string, status: AgentState): ProgramStatus {
+	const { state, msg } = status;
+	const kind = status.state === "blocked" ? status.kind : undefined;
+	return { state, id: jobRecordId(card), title: card, ...(kind && { kind }), ...(msg && { message: msg }) };
+}
+
+/**
+ * The development terminal client: each stdin line is an input, answers to this client's inputs and notices are
+ * printed, and soma's state goes to the terminal as OSC 7501 records when the terminal supports them.
+ * Resolves when stdin ends.
+ */
+export async function runTerminal(options: TerminalOptions): Promise<void> {
+	const { human, input, output } = options;
+	const programStatus = await detectProgramStatus(input, output, options.env ?? {}, options.probeTimeoutMs);
+	const print = (line: string) => output.write(`${line}\n`);
+
+	let running = false;
+	// What waits for the human: a question blocks soma, a report is done until the human types again.
+	let attention: ProgramStatus | undefined;
+	let lastRoot = "";
+	const report = (status: ProgramStatus) => {
+		if (programStatus) output.write(formatProgramStatus(status));
+	};
+	const reportRoot = () => {
+		const status: ProgramStatus =
+			attention?.state === "blocked" ? attention : running ? { state: "working" } : (attention ?? { state: "idle" });
+		const sequence = formatProgramStatus({ ...status, app: "soma" });
+		if (sequence === lastRoot) return;
+		lastRoot = sequence;
+		report({ ...status, app: "soma" });
+	};
+	const notice = (kind: "question" | "report", content: string) => {
+		print(`[${kind === "question" ? "問題" : "通知"}] ${content}`);
+		if (attention?.state !== "blocked" || kind === "question") {
+			attention =
+				kind === "question"
+					? { state: "blocked", kind: "question", message: firstLine(content) }
+					: { state: "done", message: firstLine(content) };
+		}
+	};
+
+	const mine = new Set<string>();
+	const onEvent = (event: SomaEvent) => {
+		if (event.type === "run") running = event.state === "working";
+		else if (event.type === "notice") notice(event.kind, event.content);
+		else if (event.type === "answer") {
+			if (mine.delete(event.requestId)) print(event.content);
+			else if (PUSHED_SOURCES.some((source) => event.requestId.startsWith(source))) notice("report", event.content);
+		} else if (event.type === "job") report(jobStatus(event.card, event.status));
+		reportRoot();
+	};
+	const unsubscribe = human.subscribe(onEvent);
+
+	// requestIds dedupe for the conversation's whole life, so a counter restarting at 1 would swallow inputs.
+	let last = 0;
+	const lines = createInterface({ input, terminal: false });
+	try {
+		for await (const line of lines) {
+			if (line.trim() === "") continue;
+			last = Math.max(last + 1, Date.now());
+			const requestId = `terminal:${last}`;
+			mine.add(requestId);
+			attention = undefined;
+			reportRoot();
+			await human.submit({ content: line, entry: { kind: "chat.terminal" }, requestId });
+		}
+	} finally {
+		unsubscribe();
+	}
+}

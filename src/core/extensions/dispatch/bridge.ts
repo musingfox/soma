@@ -1,10 +1,11 @@
 import type { Context } from "@earendil-works/chord/context";
 import type { Conversation } from "@earendil-works/pi-durable";
-import type { AgentPort, AgentStatusEvent } from "../../../ports/agent.ts";
+import type { AgentPort, AgentState, AgentStatusEvent } from "../../../ports/agent.ts";
 import { observe } from "../../domain/bridge.ts";
-import type { Job } from "../../domain/dispatch.ts";
+import type { Decision, Job } from "../../domain/dispatch.ts";
 import { reconcile } from "../../domain/reconcile.ts";
 import { outcomeOf } from "../../domain/report.ts";
+import { noticeEntry } from "../../notice.ts";
 import { Dispatches } from "./index.ts";
 
 /** Entry kind of a turn the bridge recorded as finished; it carries no model message. */
@@ -14,12 +15,25 @@ export const AGENT_BLOCKED = "soma.dispatch.blocked";
 
 export const blockedRequestId = (agent: string, seq: number) => `herdr:${agent}:${seq}`;
 
+function wakeContent(job: Job, status: Extract<AgentState, { state: "blocked" }>): string {
+	const { kind, msg, fingerprint } = status;
+	const head = `[herdr] agent ${job.agent}（卡片 ${job.card}）卡住了，kind=${kind}。`;
+	const screen = msg ? `\n畫面：\n${msg}\n` : "\n";
+	const how =
+		fingerprint === undefined
+			? "畫面讀不出選項，無法代答：用 escalate 工具轉給人並寫下理由。"
+			: `用 respond 工具代答（card=${job.card}、fingerprint=${fingerprint}、option 填選項編號、寫下理由），` +
+				"或用 escalate 工具轉給人並寫下理由。";
+	return head + screen + how;
+}
+
 /**
  * Host-side rules over agent status, outside the model loop (ARCHITECTURE.md「事件橋」).
  * A finished turn is committed to the dispatch list and the transcript with the outcome its
- * reply's first line states, which starts no run;
- * only a blocked agent submits an input. Its requestId is the agent's transition counter, so a
- * resent event, from a repeated snapshot or a restarted core, is admitted once.
+ * reply's first line states, which starts no run; only a blocked agent submits an input, and a
+ * kind=auth block not even that: it is committed as a notice to the human together with the
+ * decision, so the model never sees it to answer. The input's requestId is the agent's transition
+ * counter, so a resent event, from a repeated snapshot or a restarted core, is admitted once.
  */
 export function eventBridge(conversation: Conversation, agents: AgentPort, context: Context) {
 	// One event at a time: each reads the job, acts, then commits what it saw.
@@ -45,13 +59,11 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 		// Each side effect precedes the commit of its seq, so a crash in between redoes it on restart:
 		// the requestId makes the second submit return the first.
 		if (action === "wake" && event.status.state === "blocked") {
-			const { kind, msg } = event.status;
+			const { kind } = event.status;
 			await conversation.submit(
 				{
 					type: "input",
-					content:
-						`[herdr] agent ${job.agent}（卡片 ${job.card}）卡住了，kind=${kind}${msg ? `：${msg}` : ""}。` +
-						"判斷要代答還是轉給人；kind=auth 一律轉給人，不要代答。",
+					content: wakeContent(job, event.status),
 					whenBusy: "followUp",
 					entry: { kind: AGENT_BLOCKED, data: { agent: job.agent, card: job.card, kind, seq: event.seq } },
 					requestId: blockedRequestId(job.agent, event.seq),
@@ -64,8 +76,26 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 		await conversation.commit(async (tx) => {
 			const doc = await tx.doc(Dispatches, conversation.id);
 			const index = doc.jobs.findIndex((candidate) => candidate.agent === event.agent);
-			if (index === -1 || doc.jobs[index]?.seq === event.seq) return;
-			doc.jobs[index] = next;
+			const current = doc.jobs[index];
+			if (current === undefined || current.seq === event.seq) return;
+			// Decisions come from the current job, not the one read above: a respond tool may have added one since.
+			const { launch: _held, ...kept } = current;
+			const { decisions: _read, ...fields } = next;
+			doc.jobs[index] = { ...kept, ...fields };
+			if (action === "escalate") {
+				const decision: Decision = {
+					at: new Date().toISOString(),
+					kind: "auth",
+					action: "escalated",
+					reason: "kind=auth 一律轉給人，事件橋沒有叫醒模型",
+				};
+				doc.jobs[index] = { ...kept, ...fields, decisions: [...kept.decisions, decision] };
+				const msg = event.status.msg ? `\n${event.status.msg}` : "";
+				await tx.appendEntry(
+					conversation.id,
+					noticeEntry("question", `agent ${next.agent}（卡片 ${next.card}）在等登入或憑證，需要你處理。${msg}`),
+				);
+			}
 			if (action === "complete") {
 				await tx.appendEntry(conversation.id, {
 					kind: JOB_DONE,

@@ -108,6 +108,9 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 - **`sleep(until)` 本身不會被儲存。** 它只是記憶體裡的計時器。等待之所以能撐過重啟，是因為 `until` 寫在 checkpoint 裡：重開後任務回到 pending，phase 重跑，時間已過就立刻返回（types.ts:240、scheduler.ts:1816-1827、spec:1930）。
 - **每輪都必須推進 checkpoint，否則任務會被判定故障**（spec:1919-1921）。同一個 phase 內只要 checkpoint 內容有變就算推進，所以單一個 `tick` phase 每輪把 `next` 往後推、計數加一就夠了，不必拆成兩個 phase（`durable/test/examples/13-recovery.ts:21-47` 就是這樣寫）。
 - **時間到才叫醒模型。** 任務送一則 input 到根對話（`runtime.conversation(id).submit`），帶 `requestId: "digest:<until>"`，否則在送出和 checkpoint 之間崩潰會送兩次。背景任務可以對閒置中的自家對話啟動一輪，範例在 `durable/test/examples/23-subagent-background.ts:108-116`。模型讀派工清單裡這段時間做完的工作，寫成一份報告。
+- **「新完成」以事件橋的完成紀錄為準。** 任務讀根對話裡 `soma.dispatch.done` 紀錄，checkpoint 存最後一筆已報過的紀錄 id。不用派工清單的 `seq` 判斷，因為 done 轉 idle 的收尾也會換新 seq，會重報。
+- **送出前先釘住範圍。** 送 input 之前，先把這次涵蓋到哪一筆紀錄寫進 checkpoint。否則崩潰後重跑時，中間新完成的工作會被算進範圍，但重送被去重，報告裡沒有它，它就漏報了。
+- **報告和下一個 checkpoint 同一個 commit。** 任務等這一輪答完，把回答寫成 `notice` 紀錄，和推進的 checkpoint 一起提交，所以崩潰在哪裡都只會有一份通知。模型這一輪失敗時（例如沒有 API key），通知改放原始的工作清單，這段時間的工作不會因此沒人看到。
 - **沒有內建的 cron。** `sleep(until)` 是唯一的計時原語（types.ts:240）。
 
 一天叫醒模型的次數約為「卡住次數 + 有新完成工作的十分鐘區間數 + 使用者主動詢問次數」，和工作跑多久無關。每次叫醒是一輪（run），一輪內會有多次模型請求，因為工具呼叫會多繞幾回（spec:2335-2338）。
@@ -142,7 +145,7 @@ soma 除了調派 agent，本身也要有助理的基本能力：讀 email、看
 
 - **送出**：`submit({ type: "input", content, entry: { kind: "<來源>", data }, requestId })`。`requestId` 用該平台的訊息 id，重送也只會處理一次。終端機沒有訊息 id，用 `terminal:<毫秒時間戳>`：`requestId` 在整個對話內去重，重啟後從 1 重新計數會把新輸入當成重送吞掉。
 - **訂閱**：程序內的介面卡經 `src/core/human-port.ts` 的 HumanPort 訂閱，它把 `watchEvents()` 和派工清單的 `watchDoc()` 轉成 soma 的事件型別；派工狀態取自派工清單，所以誰寫進清單，介面卡就看得到。程序外的客戶端改經客戶端 socket 連入。
-- **通知**：核心要主動找人時（卡住或報告寫好），寫一筆帶 `kind: "notice"` 的紀錄，`data.kind` 是 `question`（卡住要人回答）或 `report`（報告寫好），各介面卡自己決定要不要推播。由 `schedule:`、`digest:` 開頭的 `requestId` 啟動的那一輪回答，介面卡也當成通知推給人。
+- **通知**：核心要主動找人時（卡住或報告寫好），寫一筆帶 `kind: "notice"` 的紀錄，`data.kind` 是 `question`（卡住要人回答）或 `report`（報告寫好），各介面卡自己決定要不要推播。由 `schedule:` 開頭的 `requestId` 啟動的那一輪回答，介面卡也當成通知推給人。`digest:` 那一輪不推，因為彙報任務會把它的回答寫成 `data.kind: "report"` 的 `notice` 紀錄，再推一次就重複了。
 
 客戶端 socket 的現況：
 

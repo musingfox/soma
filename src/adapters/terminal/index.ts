@@ -30,7 +30,8 @@ const DEVICE_ATTRIBUTES_QUERY = "\x1b[c";
 const DEVICE_ATTRIBUTES_REPLY = "\x1b[?";
 const PROGRAM_STATUS_REPLY = "\x1b]7501;?";
 // Rounds started by these sources produce something the human did not ask for here: show them as notices.
-const PUSHED_SOURCES = ["schedule:", "digest:"];
+// A digest round is not among them: its report arrives as a notice entry of its own.
+const PUSHED_SOURCES = ["schedule:"];
 
 /**
  * Ask whether the terminal supports OSC 7501. Every terminal answers the device attributes query that follows it,

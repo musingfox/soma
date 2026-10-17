@@ -96,6 +96,7 @@ test("each line is an input with a fresh terminal requestId; only this client's 
 	human.emit({ type: "answer", requestId: "terminal:1", content: "another terminal's answer" });
 	human.emit({ type: "answer", requestId: "telegram:7", content: "telegram's answer" });
 	human.emit({ type: "answer", requestId: "schedule:3", content: "提醒：喝水" });
+	human.emit({ type: "answer", requestId: "digest:1", content: "報告的那一輪" });
 	human.emit({ type: "notice", kind: "report", content: "報告" });
 
 	expect(take()).toBe("已派工。\n[通知] 提醒：喝水\n[通知] 報告\n");
@@ -120,12 +121,12 @@ test("the root record follows runs, questions and reports; jobs get child record
 		`[問題] a 要權限，准嗎？\n細節\n${root({ state: "blocked", kind: "question", message: "a 要權限，准嗎？" })}`,
 	);
 	human.emit({ type: "run", state: "idle" });
-	human.emit({ type: "answer", requestId: "digest:1", content: "十分鐘報告" });
+	human.emit({ type: "notice", kind: "report", content: "十分鐘報告" });
 	expect(take()).toBe("[通知] 十分鐘報告\n");
 
 	await type("准");
 	expect(take()).toBe(root({ state: "idle" }));
-	human.emit({ type: "answer", requestId: "digest:2", content: "下一份報告" });
+	human.emit({ type: "notice", kind: "report", content: "下一份報告" });
 	expect(take()).toBe(`[通知] 下一份報告\n${root({ state: "done", message: "下一份報告" })}`);
 	await end();
 });

@@ -4,6 +4,7 @@ import type { AgentPort, AgentStatusEvent } from "../../../ports/agent.ts";
 import { observe } from "../../domain/bridge.ts";
 import type { Job } from "../../domain/dispatch.ts";
 import { reconcile } from "../../domain/reconcile.ts";
+import { outcomeOf } from "../../domain/report.ts";
 import { Dispatches } from "./index.ts";
 
 /** Entry kind of a turn the bridge recorded as finished; it carries no model message. */
@@ -15,7 +16,8 @@ export const blockedRequestId = (agent: string, seq: number) => `herdr:${agent}:
 
 /**
  * Host-side rules over agent status, outside the model loop (ARCHITECTURE.md「事件橋」).
- * A finished turn is committed to the dispatch list and the transcript, which starts no run;
+ * A finished turn is committed to the dispatch list and the transcript with the outcome its
+ * reply's first line states, which starts no run;
  * only a blocked agent submits an input. Its requestId is the agent's transition counter, so a
  * resent event, from a repeated snapshot or a restarted core, is admitted once.
  */
@@ -32,8 +34,13 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			return found && (JSON.parse(JSON.stringify(found)) as Job);
 		}, context);
 		if (job === undefined) return;
-		const { job: next, action } = observe(job, event.status, event.seq);
-		if (next === job) return;
+		const observed = observe(job, event.status, event.seq);
+		if (observed.job === job) return;
+		const { action } = observed;
+		const next: Job =
+			action === "complete"
+				? { ...observed.job, outcome: outcomeOf(await agents.readResult(job.agent)) }
+				: observed.job;
 
 		// Each side effect precedes the commit of its seq, so a crash in between redoes it on restart:
 		// the requestId makes the second submit return the first.
@@ -62,7 +69,13 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			if (action === "complete") {
 				await tx.appendEntry(conversation.id, {
 					kind: JOB_DONE,
-					data: { agent: next.agent, card: next.card, state: next.status.state, seq: event.seq },
+					data: {
+						agent: next.agent,
+						card: next.card,
+						state: next.status.state,
+						outcome: next.outcome ?? "未知",
+						seq: event.seq,
+					},
 				});
 			}
 		}, context);

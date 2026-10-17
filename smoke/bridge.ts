@@ -5,7 +5,8 @@
 //   3. a reopened core sees the same block again: its requestId must make the submit a no-op, with no
 //      model call in that process;
 //   4. the trust prompt is answered; the reopened core sends the held launch prompt, the agent finishes,
-//      and the dispatch list and transcript must record it with no model call.
+//      and the dispatch list and transcript must record it, with the outcome read off claude's own
+//      transcript, and no model call.
 // It runs in a throwaway git repo: claude keeps folder trust per repo root, so a repo it has seen before
 // shows no trust prompt and nothing blocks. The repo, the card's worktree and its agent go at the end.
 //   node smoke/bridge.ts
@@ -22,7 +23,14 @@ const card = `smoke-${Date.now().toString(36)}`;
 const herdr = createHerdrClient();
 const log = (step: string, value: unknown) => console.log(`${step.padEnd(10)} ${JSON.stringify(value)}`);
 
-type Job = { agent: string; seq?: number; status: { state: string }; launchHeld: boolean; wake?: string };
+type Job = {
+	agent: string;
+	seq?: number;
+	status: { state: string };
+	outcome?: string;
+	launchHeld: boolean;
+	wake?: string;
+};
 type Report = { calls: number; blocked: unknown[]; done: unknown[]; jobs: Job[] };
 
 function check(ok: boolean, message: string): void {
@@ -101,6 +109,7 @@ try {
 	const after = reports(second).at(-1) as Report;
 	check(after.calls === 0, `the finished turn cost ${after.calls} model calls`);
 	check(after.done.length === 1, `${after.done.length} done records`);
+	check(jobOf(after)?.outcome === "完成", `the job's outcome is ${jobOf(after)?.outcome}`);
 	const transcript = await herdr.call("agent.read", { target: card, source: "visible" });
 	log("done", {
 		calls: after.calls,

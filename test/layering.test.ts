@@ -59,3 +59,10 @@ test("biome rejects exactly the cross-layer imports", () => {
 			.sort(),
 	);
 });
+
+test("no source file calls Bun", () => {
+	const run = spawnSync("git", ["grep", "-n", "--untracked", "Bun\\.", "--", "src"], { cwd: repo, encoding: "utf8" });
+	// git grep exits 1 when nothing matches.
+	expect(run.stdout).toBe("");
+	expect(run.status).toBe(1);
+});

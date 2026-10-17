@@ -13,6 +13,7 @@ import {
 	WorktreeOpenedResultSchema,
 } from "./schema.ts";
 import { createStatusWatch, type StatusWatchOptions } from "./status-watch.ts";
+import { readFinalAnswer, resolveTranscriptPath } from "./transcript.ts";
 
 export interface HerdrAgentPortOptions {
 	/** A client on the hangar session's socket: every agent there counts against the cap. */
@@ -21,6 +22,8 @@ export interface HerdrAgentPortOptions {
 	/** Poll tier inputs for onStatus; see status-watch.ts. */
 	listening?: StatusWatchOptions["listening"];
 	onError?: StatusWatchOptions["onError"];
+	/** Where claude keeps its transcripts; defaults to ~/.claude/projects. */
+	projectsDir?: string;
 }
 
 /**
@@ -117,7 +120,15 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 				watch = undefined;
 			};
 		},
-		readResult: notYet("readResult"),
+
+		/** The agent's last assistant message, read off its claude transcript; undefined while there is none. */
+		async readResult(agent: string): Promise<string | undefined> {
+			const info = await client.agentGet(agent);
+			const sessionId = info.agent_session?.value;
+			if (!sessionId) return undefined;
+			const path = await resolveTranscriptPath(sessionId, info.cwd, options.projectsDir);
+			return path === undefined ? undefined : readFinalAnswer(path);
+		},
 		respond: notYet("respond"),
 		stop: notYet("stop"),
 	};

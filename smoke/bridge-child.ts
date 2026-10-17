@@ -1,6 +1,6 @@
 // The core as the event-bridge smoke runs it: main.ts's startup with the event bridge listening, the faux
 // model standing in for one that calls `dispatch` (no API key on this machine), and a stub card that
-// asks for a one-word answer. Talks to the herdr session at $HERDR_SOCKET_PATH.
+// asks for a result line and a one-word answer. Talks to the herdr session at $HERDR_SOCKET_PATH.
 //   run <db> [<card> <repo>]   start up, submit 「派 <card> <repo>」 when given, then report once a second
 // Each report line carries the faux request count of this process, the bridge's entries and the jobs.
 // SOMA_SMOKE_HANG_AFTER_WAKE=1 freezes the process once a wake's run has finished, before the bridge
@@ -42,7 +42,8 @@ faux.setResponses(
 );
 const models = createModels();
 models.setProvider(faux.provider);
-const stubCard = async (_repo: string, card: string) => `# ${card}\n\n只回覆 ok 兩個字，不要使用任何工具。`;
+const stubCard = async (_repo: string, card: string) =>
+	`# ${card}\n\n第一行寫「結果：完成」，第二行只寫 ok 兩個字，不要使用任何工具。`;
 
 const harness = await openHarness(db, [dispatchExtension(agents, stubCard)], context, { models });
 const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });

@@ -1,4 +1,4 @@
-// Ported from musingfox/cc-mobile server/hangar-cap.ts @ d9f0690; Bun.spawnSync → node:child_process,
+// Ported from musingfox/cc-mobile server/hangar-cap.ts @ d9f0690; Bun's spawnSync → node:child_process,
 // override read from SOMA_HANGAR_CAP, describeHangarCap dropped.
 import { spawnSync } from "node:child_process";
 

@@ -1,4 +1,4 @@
-import type { HumanInput, HumanPort, SomaEvent } from "../../ports/human.ts";
+import type { HumanInput, HumanPort, NoticeKind, SomaEvent } from "../../ports/human.ts";
 
 export class FakeHumanPort implements HumanPort {
 	readonly inputs: HumanInput[] = [];
@@ -14,8 +14,8 @@ export class FakeHumanPort implements HumanPort {
 		return () => this.#listeners.delete(listener);
 	}
 
-	async notify(content: string): Promise<void> {
-		this.emit({ type: "notice", content });
+	async notify(content: string, kind: NoticeKind): Promise<void> {
+		this.emit({ type: "notice", kind, content });
 	}
 
 	emit(event: SomaEvent): void {

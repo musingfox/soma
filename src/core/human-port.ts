@@ -1,0 +1,102 @@
+import type { JsonValue } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
+import {
+	type Conversation,
+	type EntryId,
+	type EntryRecord,
+	type Harness,
+	watchEvents,
+} from "@earendil-works/pi-durable";
+import type { AgentState } from "../ports/agent.ts";
+import type { HumanPort, NoticeKind, SomaEvent } from "../ports/human.ts";
+import { Dispatches } from "./extensions/dispatch/index.ts";
+
+const NOTICE = "notice";
+
+const textOf = (entry: EntryRecord) =>
+	(entry.model ?? [])
+		.flatMap((message) => (message.role === "assistant" ? message.content : []))
+		.flatMap((block) => (block.type === "text" ? [block.text] : []))
+		.join("");
+
+/**
+ * The in-process HumanPort over the root conversation. A new subscriber first gets the current run state and every
+ * job, so it can show them without waiting for the next change.
+ */
+export async function openHumanPort(
+	harness: Harness,
+	root: Conversation,
+	context: Context,
+): Promise<HumanPort & { close(): Promise<void> }> {
+	const listeners = new Set<(event: SomaEvent) => void>();
+	const emit = (event: SomaEvent) => {
+		for (const listener of listeners) listener(event);
+	};
+
+	const events = await watchEvents(harness, root.id, context);
+	let running = events.snapshot.run !== undefined;
+	const setRunning = (next: boolean) => {
+		if (next === running) return;
+		running = next;
+		emit({ type: "run", state: running ? "working" : "idle" });
+	};
+	events.start(async (batch) => {
+		// An answer's entry and its submission settle in the same commit, so the same batch.
+		const answers = new Map<EntryId, string>();
+		for (const event of batch) {
+			if (event.type === "snapshot") {
+				for (const entry of event.entries) answers.set(entry.id, textOf(entry));
+				setRunning(event.run !== undefined);
+			} else if (event.type === "run_start") setRunning(true);
+			else if (event.type === "run_end") setRunning(false);
+			else if (event.type === "message_end") answers.set(event.entry.id, textOf(event.entry));
+			else if (event.type === "entry_appended" && event.entry.kind === NOTICE) {
+				const { kind, content } = event.entry.data as { kind: NoticeKind; content: string };
+				emit({ type: "notice", kind, content });
+			} else if (event.type === "submission") {
+				const { record } = event;
+				if (record.type !== "input" || record.status !== "done" || record.requestId === undefined) continue;
+				emit({ type: "answer", requestId: record.requestId, content: answers.get(record.answer) ?? "" });
+			}
+		}
+	});
+
+	// Event-bridge and reconcile write job states into the dispatch list; the doc is where a change shows.
+	await root.commit((tx) => tx.doc(Dispatches, root.id), context);
+	const watch = await harness.watchDoc(Dispatches, root.id, context);
+	if (watch === undefined) throw new Error("the dispatch list is missing");
+	const jobs = new Map<string, { agent: string; status: AgentState }>();
+	const updateJobs = (value: typeof watch.value) => {
+		for (const job of value?.jobs ?? []) {
+			const seen = jobs.get(job.card);
+			if (seen !== undefined && JSON.stringify(seen.status) === JSON.stringify(job.status)) continue;
+			jobs.set(job.card, { agent: job.agent, status: job.status });
+			emit({ type: "job", card: job.card, agent: job.agent, status: job.status });
+		}
+	};
+	updateJobs(watch.value);
+	watch.start(async (value) => updateJobs(value));
+
+	return {
+		async submit(input) {
+			const { kind, data } = input.entry;
+			const entry = data === undefined ? { kind } : { kind, data: data as JsonValue };
+			await root.submit(
+				{ type: "input", content: input.content, entry, requestId: input.requestId, whenBusy: "followUp" },
+				context,
+			);
+		},
+		subscribe(listener) {
+			listener({ type: "run", state: running ? "working" : "idle" });
+			for (const [card, job] of jobs) listener({ type: "job", card, ...job });
+			listeners.add(listener);
+			return () => listeners.delete(listener);
+		},
+		async notify(content, kind) {
+			await root.submit({ type: "write", entry: { kind: NOTICE, data: { kind, content } } }, context);
+		},
+		async close() {
+			await Promise.all([events.stop(), watch.stop()]);
+		},
+	};
+}

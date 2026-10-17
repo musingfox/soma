@@ -42,9 +42,9 @@ test("fake HumanPort delivers notices to subscribers", async () => {
 	const seen: SomaEvent[] = [];
 	human.subscribe((event) => seen.push(event));
 
-	await human.notify("job-a is blocked on auth");
+	await human.notify("job-a is blocked on auth", "question");
 
-	expect(seen).toEqual([{ type: "notice", content: "job-a is blocked on auth" }]);
+	expect(seen).toEqual([{ type: "notice", kind: "question", content: "job-a is blocked on auth" }]);
 });
 
 test("fake HumanPort processes a requestId once", async () => {

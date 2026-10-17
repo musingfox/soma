@@ -1,0 +1,46 @@
+#!/bin/sh
+# Copied from ~/.githooks/commit-msg (the global hook): setting core.hooksPath
+# to .githooks opts this repository out of it, so it carries its own copy.
+#
+# Global commit-msg hook: enforce Conventional Commits on the subject line.
+#
+#   <type>[(scope)][!]: <description>
+#
+# Reached via `git config --global core.hooksPath ~/.githooks`, so it applies to
+# every repository that does not set core.hooksPath itself. A repository that does
+# set it opts out entirely — that is git's rule, not this hook's — and is expected
+# to carry its own copy.
+#
+# core.hooksPath REPLACES .git/hooks rather than adding to it, so this hook runs
+# the repository's own commit-msg first when one is still sitting there. A global
+# default must not silently disable a local hook.
+#
+# Exempt: fixup! / squash! subjects, which `git rebase --autosquash` depends on,
+# and the merge and revert subjects git writes itself.
+
+repo_hook="$(git rev-parse --git-dir 2>/dev/null)/hooks/commit-msg"
+if [ -x "$repo_hook" ]; then
+  "$repo_hook" "$@" || exit $?
+fi
+
+subject=$(sed -n '1p' "$1")
+
+case "$subject" in
+  ''|'#'*) exit 0 ;;
+  'fixup! '*|'squash! '*|'Merge '*|'Revert '*) exit 0 ;;
+esac
+
+types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
+
+if printf '%s\n' "$subject" | grep -qE "^($types)(\([a-z0-9._/-]+\))?!?: .+"; then
+  exit 0
+fi
+
+echo "commit-msg: subject is not a Conventional Commit." >&2
+echo >&2
+echo "  got:      $subject" >&2
+echo "  expected: <type>[(scope)][!]: <description>" >&2
+echo "  type:     $types" >&2
+echo >&2
+echo "Put the component name in the scope, not the type: 'feat(auth): …', not 'auth: …'." >&2
+exit 1

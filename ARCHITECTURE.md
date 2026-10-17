@@ -68,8 +68,9 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 | 查詢與讀取工具 | tool，`replay: "safe"` | 列出 agent、讀對話紀錄 |
 | 回應工具 | tool，不可重跑 | 回答卡住的 agent；崩潰中斷時會告知模型，不會自動重送 |
 | 事件橋 | 主機端程式碼，不是 LLM | 見下節 |
-| 定時彙報 | 背景任務 | 見下節 |
+| 排程 | tool + 背景任務 | `schedule(at, instruction)` 建一個睡到 `at` 的背景任務，時間到送一則 input（`requestId: schedule:<id>`）；定時彙報是它的一個固定實例。見「定時彙報」 |
 | 記憶 | section + document + tool | 移植 shikigami 的設計，見下節 |
+| 外部工具 | pi-mcp 轉接層 | email、行事曆等能力以 MCP server 接入，核心不為任何一種服務寫專用碼。見「助理基本能力」 |
 
 ### 事件橋：監控不花 token
 
@@ -115,6 +116,14 @@ cc-mobile 的 `POST /api/launch` 以 obw 卡片為單位，佇列用 `vault + ca
 - **找得到紀錄檔。** 派工時以 `--session-id <uuid>` 啟動 claude，紀錄檔位置就是 `~/.claude/projects/<cwd 非英數字元換成 '-'>/<uuid>.jsonl`（cc-mobile `server/transcript/path.ts:56-58`）。編碼路徑沒命中時，`path.ts:90-101` 會掃整個 projects 目錄找。
 - **讀取邏輯可以沿用。** cc-mobile 的 `server/transcript/reader.ts` 以位元組偏移量增量讀取；`records.ts:96-123` 只留下 user 和 assistant 兩種紀錄。
 - **要自己寫「取出最終回答」。** cc-mobile 沒有這個函式（未全庫搜尋確認）。做法是取 agent 做完後的最後一則助理訊息。cc-mobile 的派工提示（`server/launch-prompt.ts`）要求回覆第一行寫「結果：完成／需要你／失敗」，soma 可以直接解析這一行來分類。
+
+### 助理基本能力
+
+soma 除了調派 agent，本身也要有助理的基本能力：讀 email、看行事曆、記憶、在指定時間處理工作。原則是不為任何一種能力在核心寫專用碼：
+
+- **排程。** 「指定時間處理工作」和定時彙報用同一個機制：模型呼叫 `schedule` 工具，核心建一個背景任務睡到指定時間，到時把指令當成一則 input 送回根對話。等待期間不佔 session、不花 token；週期任務靠每輪推進 checkpoint。排程清單存在 document 裡，模型可以列出和取消。
+- **email 與行事曆。** 經 pi-mcp 轉接層接 MCP server，soma 只負責把 MCP 工具掛進 harness。用哪個 Gmail／Google Calendar MCP server、憑證放哪裡，待定（待決事項 5）。對模型來說，這些和派工工具一樣都是工具，差別只在它們不可重跑（寄信不能 replay）。
+- **記憶。** 見下節。因為報告和排程都會用到，記憶要提前到 M2。
 
 ### 記憶：移植 shikigami 的設計
 
@@ -201,11 +210,12 @@ cc-mobile `server/` 裡有 2,971 行（含註解與空行）只在清單內互�
 
 - **M0 Node 冒煙測試。** 在 Node 上跑一個最小 durable 任務：`sleep` 到時、`kill -9`、重開、`resume()`、任務續跑。沿用程式碼的三個 Bun API 換成 `node:net`、`node:fs`、`node:child_process`。這一步同時產出 M2 要用的骨架。
 - **M1 派工能撐過崩潰。** 只做核心、herdr 介面卡和終端機客戶端（含 OSC 7501 發送）。驗收：派出兩件工作、`kill -9` 核心、重開；其中一件在核心停掉期間做完，重開後仍會被回報，而且沒有重複啟動 agent。`kill -9` 要包含「派工已送出、agent 尚未列出」的空窗。
-- **M2 定時彙報。** 驗收：十分鐘內有工作完成時，背景任務產出一份涵蓋這些工作的報告；沒有完成的區間不叫醒模型；核心在等待期間重啟，也不會漏報或重複報。
+- **M2 排程、彙報與記憶。** 驗收：`schedule` 排一件兩分鐘後的事，核心中途重啟，時間到仍只執行一次；十分鐘彙報有新完成的工作才叫醒模型，等待期間重啟不漏報、不重複報；記憶 section 在下一輪請求出現在系統提示裡。
 - **M3 Telegram。** 這是最小的人類介面，在手機上驗證報告的品質。
-- **M4 客戶端 socket，cc-mobile 加上助理分頁。**
-- **M5 shikigami 改成客戶端。** 刪掉它的大腦，記憶改由 soma 的 extension 提供。
-- **之後** 再視需要做 ACP 和 HTTP 兩種 agent 介面，以及接上 MCP。
+- **M3.5 email 與行事曆。** pi-mcp 轉接層加上選定的 MCP server。驗收：在 Telegram 問「今天有什麼會」得到正確答案。
+- **M4 客戶端 socket。** 給程序外的介面卡用。
+- **延後：cc-mobile 助理分頁、shikigami 改成客戶端。** 2026-10-18 決定先做 soma 本身的能力；這兩個專案的修改延後，或之後把它們的功能直接移植進 soma。
+- **之後** 再視需要做 ACP 和 HTTP 兩種 agent 介面。
 
 先不做的事：一開始就把三種 agent 介面寫齊、做通用的外掛框架（port 要有，註冊表和動態載入不要）、上雲。
 
@@ -233,3 +243,4 @@ cc-mobile `server/` 裡有 2,971 行（含註解與空行）只在清單內互�
 2. **shikigami 跑在哪台機器。** 如果和核心同一台，就在本機直接連；如果在筆電上，就經 Tailscale 連，和 cc-mobile 被手機連的方式一樣。
 3. **報告存放位置，以及要不要另有一份每日總結。** 十分鐘短報告寫進 `notice` 紀錄由介面卡分送；是否再寫進 Obsidian vault 的日記或對應的 obw 卡片，待定。
 4. **沒有 obw 卡片的臨時工作怎麼派。** `POST /api/launch` 以卡片為單位；要嘛 soma 先替臨時工作建卡，要嘛走自己的派工路徑。
+5. **email 與行事曆用哪個 MCP server，憑證放哪裡。** 候選未查證。

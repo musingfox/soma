@@ -45,7 +45,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 ```
 
 - **核心只依賴兩個 port 的型別**，不 import 任何介面卡；介面卡只依賴 port，不互相 import，也不碰 Pi Durable 的型別。Pi Durable 的 `Conversation`、`Entry`、`Harness` 只出現在核心內部。
-- **HumanPort** 就是「人類側契約」那三個動作：送出、訂閱、通知。核心暴露的是 soma 自己的事件型別（回答、通知、派工狀態），不是 Pi 的 `watch()` 原始事件；程序內和程序外的介面卡拿到的是同一套型別，差別只在中間多一條 socket。
+- **HumanPort** 就是「人類側契約」那三個動作：送出、訂閱、通知。核心暴露的是 soma 自己的事件型別（回答、通知、派工狀態、根對話這一輪是否在跑），不是 Pi 的 `watch()` 原始事件；程序內和程序外的介面卡拿到的是同一套型別，差別只在中間多一條 socket。
 - **AgentPort** 就是「agent 側契約」那六個動作，狀態用 OSC 7501 的詞彙。「呼叫 cc-mobile `/api/launch`」是其中一個實作，和未來直連 herdr 或 ACP 的實作可以互換。
 - **領域物件在核心**：派工清單、工作狀態機、報告。它們是純 TypeScript，不知道 Pi Durable 的存在；Pi Durable extension 是把它們掛進 harness 的那一層。
 - **測試縫**：M1 的 `kill -9` 驗收用真 herdr；其餘單元測試用記憶體內的假 AgentPort 和假 HumanPort，不碰 socket。
@@ -138,9 +138,9 @@ soma 除了調派 agent，本身也要有助理的基本能力：讀 email、看
 
 ### 人類側（介面卡 → 核心）
 
-- **送出**：`submit({ type: "input", content, entry: { kind: "<來源>", data }, requestId })`。`requestId` 用該平台的訊息 id，重送也只會處理一次。
-- **訂閱**：程序內的介面卡直接使用 `watch()` 或 `watchEvents()`。程序外的客戶端改經客戶端 socket 連入。
-- **通知**：核心要主動找人時（卡住或報告寫好），寫一筆帶 `kind: "notice"` 的紀錄，各介面卡自己決定要不要推播。
+- **送出**：`submit({ type: "input", content, entry: { kind: "<來源>", data }, requestId })`。`requestId` 用該平台的訊息 id，重送也只會處理一次。終端機沒有訊息 id，用 `terminal:<毫秒時間戳>`：`requestId` 在整個對話內去重，重啟後從 1 重新計數會把新輸入當成重送吞掉。
+- **訂閱**：程序內的介面卡經 `src/core/human-port.ts` 的 HumanPort 訂閱，它把 `watchEvents()` 和派工清單的 `watchDoc()` 轉成 soma 的事件型別；派工狀態取自派工清單，所以誰寫進清單，介面卡就看得到。程序外的客戶端改經客戶端 socket 連入。
+- **通知**：核心要主動找人時（卡住或報告寫好），寫一筆帶 `kind: "notice"` 的紀錄，`data.kind` 是 `question`（卡住要人回答）或 `report`（報告寫好），各介面卡自己決定要不要推播。由 `schedule:`、`digest:` 開頭的 `requestId` 啟動的那一輪回答，介面卡也當成通知推給人。
 
 客戶端 socket 的現況：
 

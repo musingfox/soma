@@ -89,6 +89,8 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 - **`write` 和 `commit` 都不會啟動一輪推理。** 出處是 pi `packages/durable` 的規格 spec:2343-2355 與 README:421。例外是對話閒置、收件匣卻還有排隊項目、而且這筆 write 不是純顯示用時，才會補跑一輪（spec:2363-2367）。
 - **`requestId` 在整個對話範圍內去重**（spec:2358）。根對話共用，所以每個來源要有自己的前綴：`herdr:<agent>:<seq>`、`telegram:<msgid>`、`digest:<until>`。
 - **光靠 herdr 的事件流不可靠。** cc-mobile 另外用 `session.snapshot` 補洞，靠 `state_change_seq` 判斷狀態是否真的變過。計時器每秒一拍，但 snapshot 的頻率依聽眾分級，每 1、3、5 或 30 拍一次（`server/herdr/pane-events.ts:77, 94-98, 436-458`）。事件橋要照做。所以監控不花 token 是靠程式輪詢，而不是單靠事件推送。
+- **派工的第一則提示由事件橋送出，不在 `agent.start` 之後立刻送。** 2026-10-18 對 herdr 0.9.5 實測：`agent.start` 剛回應時 `agent.prompt` 回 `agent_not_ready`；把提示放進 claude 的啟動參數，herdr 以 `invalid_agent_argument` 拒絕；新 repo 的 claude 先停在資料夾信任對話框（herdr 回報 blocked）。所以派工工具只把提示（cc-mobile `server/launch-prompt.ts` 的規則加卡片內容）存進該筆工作，事件橋第一次看到 agent 進入 idle 時才送出。看到 working 或 done 就丟掉沒送的提示，因為那表示已經有人給了它工作，這也避免崩潰重啟後重送。
+- **每次觀察都先比對 `state_change_seq`。** 派工清單記下每筆工作最後處理過的 seq；同一個 seq 再來（重複的 snapshot、重啟後的對帳）就什麼都不做。叫醒模型的 input 在提交 seq 之前送出，崩潰在兩者之間時，重啟會以同一個 `requestId` 再送一次，被去重。
 
 ### 派工的冪等
 

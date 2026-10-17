@@ -8,6 +8,7 @@ import { createHerdrAgentPort } from "./adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "./adapters/herdr/client.ts";
 import { readCard } from "./adapters/obsidian/card.ts";
 import { runTerminal } from "./adapters/terminal/index.ts";
+import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
 import { dispatchExtension } from "./core/extensions/dispatch/index.ts";
 import { memory } from "./core/extensions/memory/index.ts";
@@ -22,17 +23,20 @@ models.setProvider(anthropicProvider());
 // The hangar session, never $HERDR_SOCKET_PATH: that names whichever session soma itself runs in.
 const socketPath = process.env.SOMA_HERDR_SOCKET ?? join(homedir(), ".config/herdr/sessions/fleet/herdr.sock");
 const agents = createHerdrAgentPort({ client: createHerdrClient({ socketPath }) });
+const digests = digest(agents);
 const extensions = [
 	sleeper,
 	memory,
 	schedule((id, c) => harness.abortTask(id, c)),
 	dispatchExtension(agents, readCard),
+	digests.extension,
 ];
 const harness: Harness = await openHarness(process.env.SOMA_DB ?? "soma.sqlite", extensions, context, { models });
 const root = await harness.root(context, {
 	agent: { model: { provider: "anthropic", modelId: process.env.SOMA_MODEL ?? "claude-opus-5-5" } },
 });
 harness.resume();
+await digests.startDigest(root, DIGEST_PERIOD_MS, context);
 await reconcileDispatches(root, agents, context);
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 

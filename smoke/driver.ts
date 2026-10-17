@@ -20,8 +20,8 @@ export type Child = {
 	exited: Promise<number | null>;
 };
 
-export function run(args: string[], script = CHILD): Child {
-	const child = spawn(process.execPath, [script, ...args], { stdio: ["ignore", "pipe", "inherit"] });
+export function run(args: string[], script = CHILD, env: NodeJS.ProcessEnv = process.env): Child {
+	const child = spawn(process.execPath, [script, ...args], { stdio: ["ignore", "pipe", "inherit"], env });
 	if (child.stdout === null) throw new Error("child has no stdout");
 	const lines: Line[] = [];
 	const waiters: { event: string; resolve(line: Line): void }[] = [];
@@ -46,7 +46,7 @@ export function run(args: string[], script = CHILD): Child {
 	return { process: child, lines, next, exited };
 }
 
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+export const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export type SmokeReport = { until: number; killedAt: number; reopenedAt: number; firedAt: number; wakeups: number };
 

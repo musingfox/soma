@@ -95,6 +95,8 @@ export const AgentInfoSchema = z
 		revision: z.number(),
 		state_change_seq: z.number().optional(),
 		agent: z.string().optional(),
+		// The name agent.start gave it; herdr refuses a second agent with the same one (agent_name_taken).
+		name: z.string().nullish(),
 		agent_session: AgentSessionSchema.nullish(),
 		interactive_ready: z.boolean().optional(),
 		cwd: z.string().optional(),
@@ -278,6 +280,32 @@ export const IntegrationListResultSchema = z
 	})
 	.passthrough();
 export type IntegrationListResult = z.infer<typeof IntegrationListResultSchema>;
+
+/**
+ * worktree.create and worktree.open (with `already_open`) answer with the same
+ * shape; these are the fields a dispatch reads.
+ */
+export const WorktreeOpenedResultSchema = z
+	.object({
+		type: z.enum(["worktree_created", "worktree_opened"]),
+		root_pane: z.object({ pane_id: z.string() }).passthrough(),
+		worktree: z.object({ path: z.string() }).passthrough(),
+	})
+	.passthrough();
+
+export const WorktreeListResultSchema = z
+	.object({
+		type: z.literal("worktree_list"),
+		worktrees: z.array(z.object({ path: z.string(), branch: z.string().nullish() }).passthrough()),
+	})
+	.passthrough();
+
+export const AgentStartedResultSchema = z
+	.object({
+		type: z.literal("agent_started"),
+		agent: AgentInfoSchema,
+	})
+	.passthrough();
 
 export const OkResultSchema = z
 	.object({

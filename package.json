@@ -12,7 +12,8 @@
 		"smoke": "node smoke/driver.ts",
 		"prepare": "if git rev-parse --git-dir >/dev/null 2>&1; then git config --worktree core.hooksPath .githooks; fi",
 		"smoke:herdr": "node smoke/herdr.ts",
-		"smoke:schedule": "node smoke/schedule.ts"
+		"smoke:schedule": "node smoke/schedule.ts",
+		"smoke:dispatch": "node smoke/dispatch.ts"
 	},
 	"dependencies": {
 		"@earendil-works/chord": "1.3.0",

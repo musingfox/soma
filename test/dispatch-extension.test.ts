@@ -1,0 +1,82 @@
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createModels } from "@earendil-works/pi-ai/models";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
+import { afterEach, expect, test } from "vitest";
+import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
+import { Dispatches, dispatchExtension, reconcileDispatches } from "../src/core/extensions/dispatch/index.ts";
+
+const context = BACKGROUND_CONTEXT;
+const open: Harness[] = [];
+afterEach(async () => {
+	for (const harness of open.splice(0)) await harness.close(context);
+});
+
+async function setup() {
+	const agents = new FakeAgentPort();
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const registry = createRegistry();
+	registry.install(dispatchExtension(agents));
+	const harness = await Harness.open(new MemoryStorage(), { models, registry }, context);
+	open.push(harness);
+	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+	harness.resume();
+
+	async function dispatch(card: string, requestId: string) {
+		faux.setResponses([
+			fauxAssistantMessage([fauxToolCall("dispatch", { card, repo: "/repo" }, { id: requestId })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("ok"),
+		]);
+		const submission = await root.submit({ type: "input", content: `派 ${card}`, requestId }, context);
+		expect((await submission.wait(context)).status).toBe("done");
+	}
+	const jobs = async () => (await harness.snapshot(Dispatches, root.id, context))?.jobs ?? [];
+	return { agents, root, dispatch, jobs };
+}
+
+test("dispatch starts an agent named after the card and records the job with its session id", async () => {
+	const { agents, dispatch, jobs } = await setup();
+
+	await dispatch("card-a", "r1");
+
+	expect(agents.started).toHaveLength(1);
+	const [started] = agents.started;
+	expect(started).toMatchObject({ name: "card-a", card: "card-a", cwd: "/repo" });
+	expect(await jobs()).toEqual([
+		{ card: "card-a", agent: "card-a", sessionId: started?.sessionId, status: { state: "idle" }, decisions: [] },
+	]);
+});
+
+test("a card already in the dispatch list is not started again", async () => {
+	const { agents, dispatch, jobs } = await setup();
+
+	await dispatch("card-a", "r1");
+	await dispatch("card-a", "r2");
+
+	expect(agents.started).toHaveLength(1);
+	expect(await jobs()).toHaveLength(1);
+});
+
+test("a card whose agent is already listed is recorded without starting it", async () => {
+	const { agents, dispatch, jobs } = await setup();
+	agents.emit("card-a", { state: "working" });
+
+	await dispatch("card-a", "r1");
+
+	expect(agents.started).toEqual([]);
+	expect(await jobs()).toMatchObject([{ card: "card-a", status: { state: "working" } }]);
+});
+
+test("reconcile writes what changed while the core was down", async () => {
+	const { agents, root, dispatch, jobs } = await setup();
+	await dispatch("card-a", "r1");
+	agents.finish("card-a", "結果：完成");
+
+	await reconcileDispatches(root, agents, context);
+
+	expect(await jobs()).toMatchObject([{ card: "card-a", status: { state: "done" } }]);
+});

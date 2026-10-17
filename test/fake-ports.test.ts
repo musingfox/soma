@@ -9,7 +9,7 @@ test("fake AgentPort delivers blocked and done to subscribers", async () => {
 	const seen: AgentStatusEvent[] = [];
 	const unsubscribe = agents.onStatus((event) => seen.push(event));
 
-	const { sessionId } = await agents.start({ name: "job-a", card: "pm/a.md", cwd: "/tmp" });
+	await agents.start({ name: "job-a", card: "pm/a.md", cwd: "/tmp", sessionId: "s-a" });
 	await agents.prompt("job-a", "go");
 	for (const kind of ["permission", "question", "auth"] satisfies BlockedKind[]) {
 		agents.emit("job-a", { state: "blocked", kind });
@@ -17,7 +17,7 @@ test("fake AgentPort delivers blocked and done to subscribers", async () => {
 	}
 	agents.finish("job-a", "結果：完成");
 
-	expect(sessionId).toBe("fake-job-a");
+	expect(await agents.list()).toEqual([{ name: "job-a", status: { state: "done" } }]);
 	expect(seen.map((e) => e.status)).toEqual([
 		{ state: "idle" },
 		{ state: "working" },

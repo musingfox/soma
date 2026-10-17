@@ -71,13 +71,13 @@ describe("agent_status tolerance", () => {
 		const states = statesFromSnapshot(snapshot, (uuid) => (uuid === "u1" ? "p1" : "p2"), ["u1", "u2"]);
 
 		// No key for u1 — a status nobody understands is never guessed as idle.
-		expect(states).toEqual({ u2: "working" });
+		expect(states).toEqual({ u2: { state: "working" } });
 	});
 
 	test("known values are unaffected", () => {
 		const snapshot = SessionSnapshotResultSchema.parse(snapshotWithStatus("blocked", "idle")).snapshot;
 
 		expect(snapshot.panes[0]?.agent_status).toBe("blocked");
-		expect(statesFromSnapshot(snapshot, () => "p1", ["u1"])).toEqual({ u1: "blocked" });
+		expect(statesFromSnapshot(snapshot, () => "p1", ["u1"])).toEqual({ u1: { state: "blocked", kind: "permission" } });
 	});
 });

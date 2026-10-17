@@ -12,25 +12,21 @@
  *, so every mapping rule below is testable without a daemon.
  */
 
+import type { AgentState } from "../../ports/agent.ts";
 import type { SessionSnapshot } from "./schema.ts";
-
-/**
- * OSC 7501 status vocabulary, soma's internal agent state (ARCHITECTURE.md
- * 「agent 狀態模型」). herdr never reports `error`; `blocked`'s kind is filled
- * in later by permission parsing.
- */
-export type AgentState = "idle" | "working" | "blocked" | "done" | "error";
 
 /**
  * herdr agent_status → OSC 7501 state; `unknown` is dropped. Shared by the
  * snapshot and the event stream so the two can never disagree about what a
- * status means.
+ * status means. herdr never reports `error`, and says nothing about why an
+ * agent is blocked: `permission` stands in until permission parsing reads the
+ * prompt and names the real kind.
  */
 export const STATE_BY_AGENT_STATUS: Record<string, AgentState | undefined> = {
-	idle: "idle",
-	working: "working",
-	blocked: "blocked",
-	done: "done",
+	idle: { state: "idle" },
+	working: { state: "working" },
+	blocked: { state: "blocked", kind: "permission" },
+	done: { state: "done" },
 };
 
 /**

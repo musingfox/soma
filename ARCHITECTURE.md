@@ -170,7 +170,7 @@ herdr 的連線方式不是 JSON-RPC 2.0。每次呼叫開一條新的 unix sock
 
 soma 要支援它，分成兩邊：
 
-- **內部狀態模型直接用 7501 的詞彙。** herdr 的 idle／working／blocked／done 對應過來，`blocked` 的 `kind` 由權限解析補上，cc-mobile 的 idle／running／requires_action 不再沿用。這樣 herdr 對應和未來的 7501 來源餵進同一個形狀，事件橋的「只有 question 可代答」規則也直接寫在 `kind` 上。
+- **內部狀態模型直接用 7501 的詞彙。** herdr 的 idle／working／blocked／done 對應過來，`blocked` 的 `kind` 由權限解析補上，cc-mobile 的 idle／running／requires_action 不再沿用。這樣 herdr 對應和未來的 7501 來源餵進同一個形狀，事件橋的「`kind=auth` 一律轉人」規則也直接寫在 `kind` 上。
 - **發送：soma 的終端機客戶端回報自己的狀態。** 根紀錄是 soma 本身（有一輪在跑是 `working`，助理要問人是 `blocked:kind=question`，報告寫好是 `done`），每件派出去的工作一筆子紀錄 `id=job/<task>`。Pi 的 emitter 可以直接沿用（`tui/src/program-status.ts`，53 行，只支援根紀錄，要補 `id` 和 `title`），Pi 自己的狀態對應表在 `coding-agent/docs/terminal-setup.md:221-233`。這是 M1 的一部分，成本約一打行。
 - **接收：pty 是 herdr 的，soma 不自己讀。** 7501 要到 soma，得等 herdr 把它當成狀態來源。herdr 0.9.5 的文件和 release notes 都沒提 7501；對應的提案 [herdrdev/herdr#5069](https://github.com/herdrdev/herdr/issues/5069) 於 2026-10-08 被關掉並導向 discussions。Claude Code 2.1.295 起會送 7501，但只在終端機先回應探測時才送（[anthropics/claude-code#103022](https://github.com/anthropics/claude-code/issues/103022) 在要求一個不用探測的開關）。因此「在 herdr 裡的 Claude Code 目前不會送 7501」是推論，未實測。如果之後 soma 自己用 pty 跑 agent（ACP 路線），就要在那一層回應探測並解析 7501。
 
@@ -240,6 +240,8 @@ cc-mobile `server/` 裡有 2,971 行（含註解與空行）只在清單內互�
    - **抽成共用套件**，由兩邊共同依賴。這最乾淨，但要先改 cc-mobile，適合留到 M4。
 
    讀狀態和讀對話紀錄不經過派工路由，所以 M1 的事件橋仍然需要 herdr 的連線與訂閱程式碼。
+
+   2026-10-18 決定：M1 改由 herdr 介面卡直接派進 `fleet` 機庫 session，用 herdr 自己的 `worktree.create` 開 `fleet/<card>` 分支，再 `agent.start` 帶 `--session-id`。理由是 `/api/launch` 要 soma 持有 cc-mobile 的 launch token 並依賴 cc-mobile 在線，而 herdr 介面卡本來就要寫；並發上限照 cc-mobile 的算法計算機庫裡在跑的 agent 數，兩邊算到的是同一批。`/api/launch` 留作 AgentPort 的另一個實作。
 2. **shikigami 跑在哪台機器。** 如果和核心同一台，就在本機直接連；如果在筆電上，就經 Tailscale 連，和 cc-mobile 被手機連的方式一樣。
 3. **報告存放位置，以及要不要另有一份每日總結。** 十分鐘短報告寫進 `notice` 紀錄由介面卡分送；是否再寫進 Obsidian vault 的日記或對應的 obw 卡片，待定。
 4. **沒有 obw 卡片的臨時工作怎麼派。** `POST /api/launch` 以卡片為單位；要嘛 soma 先替臨時工作建卡，要嘛走自己的派工路徑。

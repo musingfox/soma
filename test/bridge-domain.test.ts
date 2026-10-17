@@ -23,6 +23,13 @@ describe("observe", () => {
 	test.each([
 		["blocked wakes, and keeps the held launch prompt", job({ state: "idle" }, 1, "L"), blocked, "wake", "L"],
 		[
+			"an auth block escalates instead of waking",
+			job({ state: "working" }, 1),
+			{ state: "blocked", kind: "auth" },
+			"escalate",
+			undefined,
+		],
+		[
 			"the first idle after launch sends the launch prompt",
 			job(blocked, 1, "L"),
 			{ state: "idle" },

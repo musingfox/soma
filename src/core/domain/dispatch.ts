@@ -6,6 +6,8 @@ export type Decision = {
 	readonly at: string;
 	readonly kind: BlockedKind;
 	readonly action: "answered" | "escalated";
+	// The option pressed, when answered.
+	readonly option?: string;
 	readonly reason: string;
 };
 

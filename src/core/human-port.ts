@@ -18,9 +18,24 @@ const textOf = (entry: EntryRecord) =>
 		.flatMap((block) => (block.type === "text" ? [block.text] : []))
 		.join("");
 
+// Durable spec 8.3: the reasons an input settles unanswered with; model_error and faulted carry the error text.
+const REASONS: Record<string, string> = {
+	model_error: "模型出錯",
+	no_model: "找不到模型",
+	aborted: "這一輪被中止",
+	faulted: "內部錯誤",
+};
+
+const failureReason = (reason: string, detail: unknown) => {
+	const head = REASONS[reason] ?? reason;
+	const text = typeof detail === "string" ? detail : detail === undefined ? "" : JSON.stringify(detail);
+	return text === "" ? head : `${head}：${text}`;
+};
+
 /**
  * The in-process HumanPort over the root conversation. A new subscriber first gets the current run state and every
- * job, so it can show them without waiting for the next change.
+ * job, so it can show them without waiting for the next change. The event snapshot holds no submissions, so an
+ * answer or failure settled before attachment, say before a restart, is never emitted again.
  */
 export async function openHumanPort(
 	harness: Harness,
@@ -54,8 +69,11 @@ export async function openHumanPort(
 				emit({ type: "notice", kind, content });
 			} else if (event.type === "submission") {
 				const { record } = event;
-				if (record.type !== "input" || record.status !== "done" || record.requestId === undefined) continue;
-				emit({ type: "answer", requestId: record.requestId, content: answers.get(record.answer) ?? "" });
+				if (record.type !== "input" || record.requestId === undefined) continue;
+				const { requestId } = record;
+				if (record.status === "done") emit({ type: "answer", requestId, content: answers.get(record.answer) ?? "" });
+				else if (record.status === "unanswered")
+					emit({ type: "failure", requestId, reason: failureReason(record.reason, record.detail) });
 			}
 		}
 	});

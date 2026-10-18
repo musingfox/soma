@@ -1,6 +1,6 @@
 import { createInterface } from "node:readline";
 import type { AgentState } from "../../ports/agent.ts";
-import type { HumanPort, SomaEvent } from "../../ports/human.ts";
+import { type HumanPort, PUSHED_FAILURES, type SomaEvent } from "../../ports/human.ts";
 import {
 	formatProgramStatus,
 	isProgramStatusReply,
@@ -88,8 +88,8 @@ function jobStatus(card: string, status: AgentState): ProgramStatus {
 }
 
 /**
- * The development terminal client: each stdin line is an input, answers to this client's inputs and notices are
- * printed, and soma's state goes to the terminal as OSC 7501 records when the terminal supports them.
+ * The development terminal client: each stdin line is an input, answers and failures of this client's inputs,
+ * failures of rounds the core started, and notices are printed, and soma's state goes to the terminal as OSC 7501 records when the terminal supports them.
  * Resolves when stdin ends.
  */
 export async function runTerminal(options: TerminalOptions): Promise<void> {
@@ -98,7 +98,8 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 	const print = (line: string) => output.write(`${line}\n`);
 
 	let running = false;
-	// What waits for the human: a question blocks soma, a report is done until the human types again.
+	// What waits for the human: a question blocks soma, a report is done and a failed round is an error until the
+	// human types again.
 	let attention: ProgramStatus | undefined;
 	let lastRoot = "";
 	const report = (status: ProgramStatus) => {
@@ -122,6 +123,11 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 		}
 	};
 
+	const fail = (content: string) => {
+		print(`[失敗] ${content}`);
+		if (attention?.state !== "blocked") attention = { state: "error", message: firstLine(content) };
+	};
+
 	const mine = new Set<string>();
 	const onEvent = (event: SomaEvent) => {
 		if (event.type === "run") running = event.state === "working";
@@ -129,6 +135,10 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 		else if (event.type === "answer") {
 			if (mine.delete(event.requestId)) print(event.content);
 			else if (PUSHED_SOURCES.some((source) => event.requestId.startsWith(source))) notice("report", event.content);
+		} else if (event.type === "failure") {
+			if (mine.delete(event.requestId)) fail(event.reason);
+			else if (PUSHED_FAILURES.some((source) => event.requestId.startsWith(source)))
+				fail(`${event.requestId} 那一輪：${event.reason}`);
 		} else if (event.type === "job") report(jobStatus(event.card, event.status));
 		reportRoot();
 	};

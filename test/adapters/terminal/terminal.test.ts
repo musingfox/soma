@@ -131,6 +131,29 @@ test("the root record follows runs, questions and reports; jobs get child record
 	await end();
 });
 
+test("a failed round of this client or of the core is printed and turns the root record to error", async () => {
+	const { human, type, take, end } = await session({ SOMA_PROGRAM_STATUS: "1" });
+	const mine = await type("你好");
+	take();
+
+	human.emit({ type: "failure", requestId: "telegram:7", reason: "模型出錯：x" });
+	human.emit({ type: "failure", requestId: "terminal:1", reason: "模型出錯：x" });
+	human.emit({ type: "failure", requestId: "digest:1", reason: "模型出錯：x" });
+	expect(take()).toBe("");
+	human.emit({ type: "failure", requestId: mine, reason: "模型出錯：Provider is not configured: anthropic" });
+	expect(take()).toBe(
+		`[失敗] 模型出錯：Provider is not configured: anthropic\n${root({ state: "error", message: "模型出錯：Provider is not configured: anthropic" })}`,
+	);
+	human.emit({ type: "failure", requestId: "herdr:a:3", reason: "內部錯誤：boom" });
+	expect(take()).toBe(
+		`[失敗] herdr:a:3 那一輪：內部錯誤：boom\n${root({ state: "error", message: "herdr:a:3 那一輪：內部錯誤：boom" })}`,
+	);
+
+	await type("再試一次");
+	expect(take()).toBe(root({ state: "idle" }));
+	await end();
+});
+
 test("an unsupported terminal gets no OSC 7501 bytes", async () => {
 	const { human, type, take, end } = await session({ SOMA_PROGRAM_STATUS: "0" });
 	await type("派 a");

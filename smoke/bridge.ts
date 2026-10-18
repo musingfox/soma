@@ -20,7 +20,7 @@ import { type Child, delay, run } from "./driver.ts";
 
 const CHILD = fileURLToPath(new URL("./bridge-child.ts", import.meta.url));
 const card = `smoke-${Date.now().toString(36)}`;
-const herdr = createHerdrClient();
+const herdr = createHerdrClient({ socketPath: process.env.HERDR_SOCKET_PATH });
 const log = (step: string, value: unknown) => console.log(`${step.padEnd(10)} ${JSON.stringify(value)}`);
 
 type Job = {

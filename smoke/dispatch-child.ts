@@ -20,7 +20,7 @@ const [mode, db, card, repo] = process.argv.slice(2);
 if (db === undefined) throw new Error("usage: dispatch-child.ts dispatch <db> <card> <repo> | reopen <db>");
 const emit = (record: object) => console.log(JSON.stringify(record));
 
-const herdr = createHerdrAgentPort({ client: createHerdrClient() });
+const herdr = createHerdrAgentPort({ client: createHerdrClient({ socketPath: process.env.HERDR_SOCKET_PATH }) });
 const agents: AgentPort =
 	process.env.SOMA_SMOKE_HANG_AFTER_START === "1"
 		? {

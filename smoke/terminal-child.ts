@@ -1,6 +1,7 @@
 // main.ts's startup and terminal client, with the faux model standing in for one that calls `dispatch` on
 // 「派 <card> <repo>」 (no API key on this machine). Talks to the herdr session at $SOMA_HERDR_SOCKET.
 //   node smoke/terminal-child.ts <db>
+import { homedir } from "node:os";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -8,6 +9,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { createHerdrAgentPort } from "../src/adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "../src/adapters/herdr/client.ts";
 import { runTerminal } from "../src/adapters/terminal/index.ts";
+import { resolveConfig } from "../src/config.ts";
 import { eventBridge, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
@@ -46,7 +48,8 @@ harness.resume();
 await reconcileDispatches(root, agents, context);
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 const human = await openHumanPort(harness, root, context);
-await runTerminal({ human, input: process.stdin, output: process.stdout, env: process.env });
+const { programStatus } = resolveConfig(undefined, process.env, homedir());
+await runTerminal({ human, input: process.stdin, output: process.stdout, programStatus });
 unlisten();
 await human.close();
 await harness.close(context);

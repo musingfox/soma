@@ -47,7 +47,7 @@ const BLOCKED_READS = 3;
  */
 export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort {
 	const { client } = options;
-	const cap = options.cap ?? resolveHangarCapWithSource(process.env.SOMA_HANGAR_CAP, readPerfCoresViaSysctl).cap;
+	const cap = options.cap ?? resolveHangarCapWithSource(undefined, readPerfCoresViaSysctl).cap;
 
 	// A crash between worktree.create and agent.start leaves the worktree behind; its rerun opens it.
 	async function openWorktree(cwd: string, branch: string, label: string) {

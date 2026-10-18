@@ -5,7 +5,7 @@ import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durab
 import { afterEach, expect, test, vi } from "vitest";
 import { FakeHumanPort } from "../../../src/adapters/fake-human/index.ts";
 import { FakeBotApi } from "../../../src/adapters/fake-telegram/index.ts";
-import { runTelegram, splitMessage, telegramConfig } from "../../../src/adapters/telegram/index.ts";
+import { runTelegram, splitMessage } from "../../../src/adapters/telegram/index.ts";
 import { openHumanPort } from "../../../src/core/human-port.ts";
 import type { HumanPort } from "../../../src/ports/human.ts";
 
@@ -47,20 +47,6 @@ async function core() {
 	cleanup.push(() => human.close());
 	return { faux, root, human };
 }
-
-test("the client is on only with a token and a numeric chat id", () => {
-	expect(telegramConfig({})).toBeUndefined();
-	expect(telegramConfig({ TELEGRAM_BOT_TOKEN: "t" })).toBeUndefined();
-	expect(telegramConfig({ TELEGRAM_BOT_TOKEN: "t", TELEGRAM_CHAT_ID: "me" })).toBeUndefined();
-	expect(telegramConfig({ TELEGRAM_BOT_TOKEN: "t", TELEGRAM_CHAT_ID: "-100" })).toEqual({
-		token: "t",
-		chatId: -100,
-		apiBase: "https://api.telegram.org",
-	});
-	expect(
-		telegramConfig({ TELEGRAM_BOT_TOKEN: "t", TELEGRAM_CHAT_ID: "1", TELEGRAM_API_BASE: "http://x" })?.apiBase,
-	).toBe("http://x");
-});
 
 test("splitMessage cuts at a line break near the limit, keeps pairs whole, and never sends empty text", () => {
 	expect(splitMessage("short")).toEqual(["short"]);

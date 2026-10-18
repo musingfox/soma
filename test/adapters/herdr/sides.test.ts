@@ -8,11 +8,8 @@ import { afterEach, describe, expect, test } from "vitest";
 import { createHerdrClient, SUPPORTED_PROTOCOL } from "../../../src/adapters/herdr/client.ts";
 import { hangarKey, resolveHerdrSides, routeSessionKey } from "../../../src/adapters/herdr/sides.ts";
 
-const savedEnv = process.env.HERDR_SOCKET_PATH;
 const dirs: string[] = [];
 afterEach(() => {
-	if (savedEnv === undefined) delete process.env.HERDR_SOCKET_PATH;
-	else process.env.HERDR_SOCKET_PATH = savedEnv;
 	for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
@@ -29,24 +26,21 @@ function fakeDaemon(path: string): Promise<Server> {
 
 describe("resolveHerdrSides", () => {
 	test("T1: no hangar yields only the default cockpit socket", () => {
-		delete process.env.HERDR_SOCKET_PATH;
 		const sides = resolveHerdrSides(null);
 		expect(sides).toEqual([{ side: "cockpit", socketPath: join(homedir(), ".config/herdr/herdr.sock") }]);
 		expect(sides).toHaveLength(1);
 	});
 
-	test("T2: env moves only the cockpit; hangar binds its session socket", () => {
-		process.env.HERDR_SOCKET_PATH = "/tmp/cockpit.sock";
-		expect(resolveHerdrSides("fleet", "/h")).toEqual([
+	test("T2: a cockpit socket moves only the cockpit; hangar binds its session socket", () => {
+		expect(resolveHerdrSides("fleet", "/h", "/tmp/cockpit.sock")).toEqual([
 			{ side: "cockpit", socketPath: "/tmp/cockpit.sock" },
 			{ side: "hangar", name: "fleet", socketPath: "/h/.config/herdr/sessions/fleet/herdr.sock" },
 		]);
 	});
 
-	test("T3: an explicit socket path binds even when HERDR_SOCKET_PATH points elsewhere", async () => {
+	test("T3: an explicit socket path binds", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "hs-"));
 		dirs.push(dir);
-		process.env.HERDR_SOCKET_PATH = join(dir, "none.sock");
 		const server = await fakeDaemon(join(dir, "h.sock"));
 		try {
 			const client = createHerdrClient({ socketPath: join(dir, "h.sock") });

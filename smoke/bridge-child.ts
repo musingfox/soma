@@ -27,7 +27,7 @@ const [mode, db, card, repo] = process.argv.slice(2);
 if (mode !== "run" || db === undefined) throw new Error("usage: bridge-child.ts run <db> [<card> <repo>]");
 const emit = (record: object) => console.log(JSON.stringify(record));
 
-const agents = createHerdrAgentPort({ client: createHerdrClient() });
+const agents = createHerdrAgentPort({ client: createHerdrClient({ socketPath: process.env.HERDR_SOCKET_PATH }) });
 const faux = fauxProvider();
 faux.setResponses(
 	Array.from({ length: 20 }, () => (transcript: { messages: { role: string; content: unknown }[] }) => {

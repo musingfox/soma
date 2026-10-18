@@ -133,7 +133,7 @@ test("a scheduled round that fails is shown to the human through the terminal", 
 	output.on("data", (chunk: Buffer) => {
 		written += chunk.toString();
 	});
-	const terminal = runTerminal({ human, input, output, env: { SOMA_PROGRAM_STATUS: "0" } });
+	const terminal = runTerminal({ human, input, output, programStatus: false });
 	cleanup.push(() => {
 		input.end();
 		return terminal;

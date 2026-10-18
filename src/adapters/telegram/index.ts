@@ -38,14 +38,6 @@ const ResponseSchema = z.union([
 	z.object({ ok: z.literal(false), description: z.string().optional() }).passthrough(),
 ]);
 
-/** `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` both set turn the client on; `TELEGRAM_API_BASE` points it elsewhere. */
-export function telegramConfig(env: Readonly<Record<string, string | undefined>>): TelegramConfig | undefined {
-	const token = env.TELEGRAM_BOT_TOKEN;
-	const chatId = Number(env.TELEGRAM_CHAT_ID);
-	if (!token || !env.TELEGRAM_CHAT_ID || !Number.isSafeInteger(chatId)) return undefined;
-	return { token, chatId, apiBase: env.TELEGRAM_API_BASE ?? "https://api.telegram.org" };
-}
-
 /** Cut text into sendMessage-sized parts, at a line break when one is near, never inside a surrogate pair. */
 export function splitMessage(text: string, limit = MESSAGE_LIMIT): string[] {
 	const parts: string[] = [];

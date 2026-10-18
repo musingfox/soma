@@ -22,7 +22,7 @@ const CHILD = fileURLToPath(new URL("./dispatch-child.ts", import.meta.url));
 const [repo] = process.argv.slice(2);
 if (repo === undefined) throw new Error("usage: dispatch.ts <repo>");
 const card = `smoke-${Date.now().toString(36)}`;
-const herdr = createHerdrClient();
+const herdr = createHerdrClient({ socketPath: process.env.HERDR_SOCKET_PATH });
 const log = (step: string, value: unknown) => console.log(`${step.padEnd(10)} ${JSON.stringify(value)}`);
 const named = async () => (await herdr.agentList()).filter((agent) => agent.name === card);
 

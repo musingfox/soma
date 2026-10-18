@@ -3,7 +3,7 @@
 import { createHerdrClient } from "../src/adapters/herdr/client.ts";
 import type { EventEnvelope } from "../src/adapters/herdr/schema.ts";
 
-const client = createHerdrClient();
+const client = createHerdrClient({ socketPath: process.env.HERDR_SOCKET_PATH });
 
 const pong = await client.assertCompatible();
 console.log(`ping: herdr ${pong.version}, protocol ${pong.protocol}`);

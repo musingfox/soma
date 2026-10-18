@@ -1,5 +1,5 @@
 // Ported from musingfox/cc-mobile server/hangar-cap.ts @ d9f0690; Bun's spawnSync → node:child_process,
-// override read from SOMA_HANGAR_CAP, describeHangarCap dropped.
+// override passed in by the caller, describeHangarCap dropped.
 import { spawnSync } from "node:child_process";
 
 export const FALLBACK_HANGAR_CAP = 4;

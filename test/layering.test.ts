@@ -66,3 +66,25 @@ test("no source file calls Bun", () => {
 	expect(run.stdout).toBe("");
 	expect(run.status).toBe(1);
 });
+
+test("biome rejects process.env in adapters only", () => {
+	const dir = mkdtempSync(join(root, "env-"));
+	copyFileSync(join(repo, "biome.json"), join(dir, "biome.json"));
+	for (const file of ["src/adapters/x/a.ts", "src/main.ts"]) {
+		mkdirSync(dirname(join(dir, file)), { recursive: true });
+		writeFileSync(join(dir, file), "export const y = process.env.SOMA_X;\n");
+	}
+	const run = spawnSync(
+		join(repo, "node_modules/.bin/biome"),
+		["lint", "--vcs-enabled=false", "--reporter=json", "."],
+		{
+			cwd: dir,
+			encoding: "utf8",
+		},
+	);
+	const report = JSON.parse(run.stdout) as { diagnostics: { category: string; location: { path: string } }[] };
+	const rejected = report.diagnostics
+		.filter((d) => d.category === "lint/style/noProcessEnv")
+		.map((d) => d.location.path);
+	expect(rejected).toEqual(["src/adapters/x/a.ts"]);
+});

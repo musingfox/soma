@@ -9,8 +9,12 @@ export type HerdrSideSocket =
 	| { side: "cockpit"; socketPath: string }
 	| { side: "hangar"; name: string; socketPath: string };
 
-export function resolveHerdrSides(hangarSession: string | null, home: string = homedir()): HerdrSideSocket[] {
-	const sides: HerdrSideSocket[] = [{ side: "cockpit", socketPath: resolveSocketPath() }];
+export function resolveHerdrSides(
+	hangarSession: string | null,
+	home: string = homedir(),
+	cockpitSocket?: string,
+): HerdrSideSocket[] {
+	const sides: HerdrSideSocket[] = [{ side: "cockpit", socketPath: resolveSocketPath(cockpitSocket) }];
 	if (hangarSession !== null) {
 		sides.push({
 			side: "hangar",

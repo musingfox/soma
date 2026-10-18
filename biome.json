@@ -114,6 +114,9 @@
 			"linter": {
 				"rules": {
 					"style": {
+						"noProcessEnv": {
+							"level": "error"
+						},
 						"noRestrictedImports": {
 							"level": "error",
 							"options": {

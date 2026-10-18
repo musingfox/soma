@@ -78,7 +78,7 @@ const INTEGRATION_LIST_TIMEOUT_MS = 2_000;
 export const AGENT_COUNT_TIMEOUT_MS = 2_000;
 
 export interface HerdrClientOptions {
-	/** Explicit socket path; falls back to $HERDR_SOCKET_PATH, then ~/.config/herdr/herdr.sock. */
+	/** Explicit socket path; falls back to ~/.config/herdr/herdr.sock. */
 	socketPath?: string;
 	/** DI seam: injectable connection factory (used by transport and subscriptions). */
 	connect?: HerdrConnect;

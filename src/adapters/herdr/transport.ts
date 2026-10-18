@@ -39,7 +39,7 @@ export type ClearTimeoutFn = (handle: TimerHandle) => void;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 
 export function resolveSocketPath(explicit?: string): string {
-	return explicit ?? process.env.HERDR_SOCKET_PATH ?? join(homedir(), ".config", "herdr", "herdr.sock");
+	return explicit ?? join(homedir(), ".config", "herdr", "herdr.sock");
 }
 
 export function createUnixConnect(socketPath: string): HerdrConnect {

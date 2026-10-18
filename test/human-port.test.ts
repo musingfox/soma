@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
@@ -5,6 +8,7 @@ import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durab
 import { afterEach, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
+import { openHarness } from "../src/core/harness.ts";
 import { openHumanPort } from "../src/core/human-port.ts";
 import type { SomaEvent } from "../src/ports/human.ts";
 
@@ -81,4 +85,57 @@ test("a job state written to the dispatch list reaches subscribers once, and new
 	const late: SomaEvent[] = [];
 	human.subscribe((event) => late.push(event));
 	expect(late).toEqual([{ type: "run", state: "idle" }, blocked]);
+});
+
+const boom = () => {
+	throw new Error("401 invalid x-api-key");
+};
+
+test("a round whose model throws reaches subscribers as one failure with its requestId and the reason", async () => {
+	const { faux, root, human, seen } = await setup();
+	faux.setResponses([boom]);
+
+	await human.submit({ content: "你好", entry: { kind: "chat.terminal" }, requestId: "terminal:1" });
+	await root.waitForIdle(context);
+
+	await vi.waitFor(() => expect(seen.some((event) => event.type === "failure")).toBe(true));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	const failures = seen.filter((event) => event.type === "failure");
+	expect(failures).toEqual([{ type: "failure", requestId: "terminal:1", reason: expect.stringMatching(/\S/) }]);
+	expect(failures[0]?.reason).toContain("401 invalid x-api-key");
+	expect(seen.filter((event) => event.type === "answer")).toEqual([]);
+});
+
+test("a failure settled before a restart is not delivered again", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "soma-failure-restart-"));
+	cleanup.push(() => rm(directory, { recursive: true, force: true }));
+	const open = async () => {
+		const faux = fauxProvider();
+		const models = createModels();
+		models.setProvider(faux.provider);
+		faux.setResponses([boom]);
+		const harness = await openHarness(join(directory, "soma.sqlite"), [], context, { models });
+		const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+		harness.resume();
+		const human = await openHumanPort(harness, root, context);
+		const seen: SomaEvent[] = [];
+		human.subscribe((event) => seen.push(event));
+		const close = async () => {
+			await human.close();
+			await harness.close(context);
+		};
+		return { root, human, seen, close };
+	};
+
+	const first = await open();
+	await first.human.submit({ content: "你好", entry: { kind: "chat.terminal" }, requestId: "terminal:1" });
+	await first.root.waitForIdle(context);
+	await vi.waitFor(() => expect(first.seen.filter((event) => event.type === "failure")).toHaveLength(1));
+	await first.close();
+
+	const second = await open();
+	cleanup.push(second.close);
+	await second.root.waitForIdle(context);
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	expect(second.seen.filter((event) => event.type === "failure")).toEqual([]);
 });

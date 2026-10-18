@@ -96,6 +96,43 @@ test("a message is answered in its chat, and Telegram delivering it again after 
 	});
 });
 
+test("this client's failed round goes back to its chat; another client's failure does not", async () => {
+	const { faux, root, human } = await core();
+	const boom = () => {
+		throw new Error("401 invalid x-api-key");
+	};
+	faux.setResponses([boom, boom]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	await human.submit({ content: "你好", entry: { kind: "chat.terminal" }, requestId: "terminal:1" });
+	await root.waitForIdle(context);
+	api.deliver("你好", CHAT);
+
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	expect(api.sent).toEqual([{ chat_id: CHAT, text: "[失敗] 模型出錯：401 invalid x-api-key" }]);
+});
+
+test("failures of schedule and event-bridge rounds are pushed; digest and other clients' failures are not", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	human.emit({ type: "failure", requestId: "terminal:1", reason: "x" });
+	human.emit({ type: "failure", requestId: "schedule:4", reason: "模型出錯：y" });
+	human.emit({ type: "failure", requestId: "digest:1", reason: "找不到模型" });
+
+	human.emit({ type: "failure", requestId: "herdr:a:3", reason: "內部錯誤：z" });
+
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	expect(api.sent.map((message) => message.text)).toEqual([
+		"[失敗] schedule:4 那一輪：模型出錯：y",
+		"[失敗] herdr:a:3 那一輪：內部錯誤：z",
+	]);
+});
+
 test("each message becomes an input keyed by its message id; other chats are ignored", async () => {
 	const human = new FakeHumanPort();
 	const { api, apiBase } = await bot();

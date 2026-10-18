@@ -1,6 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
-import type { HumanPort, NoticeKind } from "../../ports/human.ts";
+import { type HumanPort, type NoticeKind, PUSHED_FAILURES } from "../../ports/human.ts";
 
 export interface TelegramConfig {
 	readonly token: string;
@@ -64,8 +64,8 @@ export function splitMessage(text: string, limit = MESSAGE_LIMIT): string[] {
 const label = (kind: NoticeKind, content: string) => `[${kind === "question" ? "問題" : "通知"}] ${content}`;
 
 /**
- * The Telegram client: each text message from the configured chat is an input, and answers to this client's inputs
- * and notices go back to that chat. A message Telegram delivers again keeps its requestId, so the core admits it
+ * The Telegram client: each text message from the configured chat is an input, and answers and failures of this
+ * client's inputs, failures of rounds the core started, and notices go back to that chat. A message Telegram delivers again keeps its requestId, so the core admits it
  * once; the update offset only lives in memory. Resolves when `signal` aborts.
  */
 export async function runTelegram(options: TelegramOptions): Promise<void> {
@@ -105,6 +105,10 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			if (event.requestId.startsWith(REQUEST_PREFIX)) send(event.content);
 			else if (PUSHED_SOURCES.some((source) => event.requestId.startsWith(source)))
 				send(label("report", event.content));
+		} else if (event.type === "failure") {
+			if (event.requestId.startsWith(REQUEST_PREFIX)) send(`[失敗] ${event.reason}`);
+			else if (PUSHED_FAILURES.some((source) => event.requestId.startsWith(source)))
+				send(`[失敗] ${event.requestId} 那一輪：${event.reason}`);
 		}
 	});
 

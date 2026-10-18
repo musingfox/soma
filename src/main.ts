@@ -7,8 +7,9 @@ import type { Harness } from "@earendil-works/pi-durable";
 import { createHerdrAgentPort } from "./adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "./adapters/herdr/client.ts";
 import { readCard } from "./adapters/obsidian/card.ts";
-import { runTelegram, telegramConfig } from "./adapters/telegram/index.ts";
+import { runTelegram } from "./adapters/telegram/index.ts";
 import { runTerminal } from "./adapters/terminal/index.ts";
+import { anthropicAuthContext, type Config, ConfigError, loadConfig } from "./config.ts";
 import { clock } from "./core/extensions/clock/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
@@ -20,15 +21,24 @@ import { sleeper } from "./core/extensions/sleeper/index.ts";
 import { openHarness } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
 
+const configPath = join(homedir(), ".config/soma/config.json");
+let config: Config;
+try {
+	config = loadConfig(configPath, process.env, homedir());
+} catch (error) {
+	if (!(error instanceof ConfigError)) throw error;
+	console.error(`[soma] ${error.message}`);
+	process.exit(1);
+}
 const context = BACKGROUND_CONTEXT;
-const models = createModels();
+const models = createModels({ authContext: anthropicAuthContext(config.anthropicApiKey) });
 models.setProvider(anthropicProvider());
-// The hangar session, never $HERDR_SOCKET_PATH: that names whichever session soma itself runs in.
-const socketPath = process.env.SOMA_HERDR_SOCKET ?? join(homedir(), ".config/herdr/sessions/fleet/herdr.sock");
-const agents = createHerdrAgentPort({ client: createHerdrClient({ socketPath }) });
+const agents = createHerdrAgentPort({
+	client: createHerdrClient({ socketPath: config.herdrSocket }),
+	...(config.hangarCap !== undefined && { cap: config.hangarCap }),
+});
 const digests = digest(agents);
-// Outside the repo: each server's entry names where its own OAuth credentials live.
-const mcpServers = loadMcpConfig(process.env.SOMA_MCP_CONFIG ?? join(homedir(), ".config/soma/mcp.json"));
+const mcpServers = loadMcpConfig(config.mcpConfig);
 // One server that fails to start (say, an expired token) leaves soma running without its tools.
 const mcpClients = (
 	await Promise.all(
@@ -52,9 +62,9 @@ const extensions = [
 	digests.extension,
 	...(await Promise.all(mcpClients.map(({ name, client }) => mcpExtension(name, client)))),
 ];
-const harness: Harness = await openHarness(process.env.SOMA_DB ?? "soma.sqlite", extensions, context, { models });
+const harness: Harness = await openHarness(config.db, extensions, context, { models });
 const root = await harness.root(context, {
-	agent: { model: { provider: "anthropic", modelId: process.env.SOMA_MODEL ?? "claude-opus-5-5" } },
+	agent: { model: { provider: "anthropic", modelId: config.model } },
 });
 harness.resume();
 await digests.startDigest(root, DIGEST_PERIOD_MS, context);
@@ -62,7 +72,7 @@ await reconcileDispatches(root, agents, context);
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 
 const human = await openHumanPort(harness, root, context);
-const telegram = telegramConfig(process.env);
+const { telegram } = config;
 const stopTelegram = new AbortController();
 const telegramDone = telegram && runTelegram({ ...telegram, human, signal: stopTelegram.signal });
 const shutdown = () => {
@@ -75,6 +85,6 @@ const shutdown = () => {
 		.then(() => process.exit(0));
 };
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, shutdown);
-await runTerminal({ human, input: process.stdin, output: process.stdout, env: process.env });
+await runTerminal({ human, input: process.stdin, output: process.stdout, programStatus: config.programStatus });
 // With Telegram on, soma also runs without a terminal (stdin at EOF under launchd) until a signal stops it.
 if (telegram === undefined) shutdown();

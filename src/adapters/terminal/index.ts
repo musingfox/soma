@@ -21,8 +21,8 @@ export interface TerminalOptions {
 	readonly human: HumanPort;
 	readonly input: TerminalInput;
 	readonly output: TerminalOutput;
-	/** `SOMA_PROGRAM_STATUS=1` sends OSC 7501 without asking the terminal, `0` never sends it. */
-	readonly env?: Readonly<Record<string, string | undefined>>;
+	/** `true` sends OSC 7501 without asking the terminal, `false` never sends it. */
+	readonly programStatus?: boolean;
 	readonly probeTimeoutMs?: number;
 }
 
@@ -41,11 +41,10 @@ const PUSHED_SOURCES = ["schedule:"];
 export async function detectProgramStatus(
 	input: TerminalInput,
 	output: TerminalOutput,
-	env: Readonly<Record<string, string | undefined>>,
+	override: boolean | undefined,
 	timeoutMs = 1000,
 ): Promise<boolean> {
-	const override = env.SOMA_PROGRAM_STATUS;
-	if (override === "1" || override === "0") return override === "1";
+	if (override !== undefined) return override;
 	if (!input.isTTY || !output.isTTY || input.setRawMode === undefined) return false;
 	input.setRawMode(true);
 	let received = "";
@@ -94,7 +93,7 @@ function jobStatus(card: string, status: AgentState): ProgramStatus {
  */
 export async function runTerminal(options: TerminalOptions): Promise<void> {
 	const { human, input, output } = options;
-	const programStatus = await detectProgramStatus(input, output, options.env ?? {}, options.probeTimeoutMs);
+	const programStatus = await detectProgramStatus(input, output, options.programStatus, options.probeTimeoutMs);
 	const print = (line: string) => output.write(`${line}\n`);
 
 	let running = false;

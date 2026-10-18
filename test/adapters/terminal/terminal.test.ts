@@ -20,32 +20,32 @@ function tty(answer?: string) {
 
 test("a 7501 reply before the device attributes reply means supported", async () => {
 	const { input, output } = tty(`\x1b]7501;?:states=idle,working,done,blocked,error\x1b\\${DA_REPLY}`);
-	expect(await detectProgramStatus(input, output, {})).toBe(true);
+	expect(await detectProgramStatus(input, output, undefined)).toBe(true);
 	expect(input.setRawMode.mock.calls).toEqual([[true], [false]]);
 });
 
 test("a device attributes reply alone means unsupported, as under tmux", async () => {
 	const { input, output } = tty(DA_REPLY);
-	expect(await detectProgramStatus(input, output, {}, 5000)).toBe(false);
+	expect(await detectProgramStatus(input, output, undefined, 5000)).toBe(false);
 });
 
 test("no reply at all times out as unsupported", async () => {
 	const { input, output } = tty();
-	expect(await detectProgramStatus(input, output, {}, 20)).toBe(false);
+	expect(await detectProgramStatus(input, output, undefined, 20)).toBe(false);
 });
 
 test("a stream that is not a terminal is never queried", async () => {
 	const input = new PassThrough();
 	const output = Object.assign(new PassThrough(), { isTTY: false });
 	const write = vi.spyOn(output, "write");
-	expect(await detectProgramStatus(input, output, {})).toBe(false);
+	expect(await detectProgramStatus(input, output, undefined)).toBe(false);
 	expect(write).not.toHaveBeenCalled();
 });
 
-test("SOMA_PROGRAM_STATUS forces the answer without a query", async () => {
+test("an override forces the answer without a query", async () => {
 	const { input, output, written } = tty(DA_REPLY);
-	expect(await detectProgramStatus(input, output, { SOMA_PROGRAM_STATUS: "1" })).toBe(true);
-	expect(await detectProgramStatus(input, output, { SOMA_PROGRAM_STATUS: "0" })).toBe(false);
+	expect(await detectProgramStatus(input, output, true)).toBe(true);
+	expect(await detectProgramStatus(input, output, false)).toBe(false);
 	expect(written()).toBe("");
 });
 
@@ -55,7 +55,7 @@ test("jobRecordId keeps a card within one id segment", () => {
 	expect(jobRecordId("x y")).toBe("job/x-y");
 });
 
-async function session(env: Record<string, string>) {
+async function session(programStatus: boolean) {
 	const human = new FakeHumanPort();
 	const input = new PassThrough();
 	const output = new PassThrough();
@@ -63,7 +63,7 @@ async function session(env: Record<string, string>) {
 	output.on("data", (chunk: Buffer) => {
 		written += chunk.toString();
 	});
-	const running = runTerminal({ human, input, output, env });
+	const running = runTerminal({ human, input, output, programStatus });
 	const type = async (line: string) => {
 		const count = human.inputs.length;
 		input.write(`${line}\n`);
@@ -85,7 +85,7 @@ async function session(env: Record<string, string>) {
 const root = (status: Parameters<typeof formatProgramStatus>[0]) => formatProgramStatus({ ...status, app: "soma" });
 
 test("each line is an input with a fresh terminal requestId; only this client's answers are printed", async () => {
-	const { human, type, take, end } = await session({ SOMA_PROGRAM_STATUS: "0" });
+	const { human, type, take, end } = await session(false);
 	const first = await type("派 a");
 	const second = await type("還有嗎");
 
@@ -104,7 +104,7 @@ test("each line is an input with a fresh terminal requestId; only this client's 
 });
 
 test("the root record follows runs, questions and reports; jobs get child records", async () => {
-	const { human, type, take, end } = await session({ SOMA_PROGRAM_STATUS: "1" });
+	const { human, type, take, end } = await session(true);
 	await type("派 a");
 	expect(take()).toBe(root({ state: "idle" }));
 
@@ -132,7 +132,7 @@ test("the root record follows runs, questions and reports; jobs get child record
 });
 
 test("a failed round of this client or of the core is printed and turns the root record to error", async () => {
-	const { human, type, take, end } = await session({ SOMA_PROGRAM_STATUS: "1" });
+	const { human, type, take, end } = await session(true);
 	const mine = await type("你好");
 	take();
 
@@ -155,7 +155,7 @@ test("a failed round of this client or of the core is printed and turns the root
 });
 
 test("an unsupported terminal gets no OSC 7501 bytes", async () => {
-	const { human, type, take, end } = await session({ SOMA_PROGRAM_STATUS: "0" });
+	const { human, type, take, end } = await session(false);
 	await type("派 a");
 	human.emit({ type: "run", state: "working" });
 	human.emit({ type: "job", card: "a", agent: "a", status: { state: "blocked", kind: "auth" } });

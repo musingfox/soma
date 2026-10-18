@@ -5,6 +5,7 @@
 // stdin lines go to the terminal client; what it prints comes out as {event: "terminal"} lines. A report line
 // each second carries this process's model calls, the Telegram inputs and the finished jobs.
 // SOMA_SMOKE_KILL_IN_DISPATCH=1 kills the process with SIGKILL when the model is asked to dispatch.
+import { homedir } from "node:os";
 import { PassThrough } from "node:stream";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -12,8 +13,9 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createHerdrAgentPort } from "../src/adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "../src/adapters/herdr/client.ts";
-import { runTelegram, telegramConfig } from "../src/adapters/telegram/index.ts";
+import { runTelegram } from "../src/adapters/telegram/index.ts";
 import { runTerminal } from "../src/adapters/terminal/index.ts";
+import { resolveConfig } from "../src/config.ts";
 import { digest } from "../src/core/extensions/digest/index.ts";
 import { eventBridge, JOB_DONE, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
@@ -23,7 +25,7 @@ import { openHumanPort } from "../src/core/human-port.ts";
 const context = BACKGROUND_CONTEXT;
 const [db, period] = process.argv.slice(2);
 if (db === undefined || period === undefined) throw new Error("usage: telegram-child.ts <db> <digestPeriodMs>");
-const telegram = telegramConfig(process.env);
+const { telegram } = resolveConfig(undefined, process.env, homedir());
 if (telegram === undefined) throw new Error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set");
 const emit = (record: object) => console.log(JSON.stringify(record));
 
@@ -67,7 +69,7 @@ const screen = new PassThrough();
 screen.setEncoding("utf8").on("data", (chunk: string) => {
 	for (const line of chunk.split("\n").filter(Boolean)) emit({ event: "terminal", line });
 });
-void runTerminal({ human, input: process.stdin, output: screen, env: { SOMA_PROGRAM_STATUS: "0" } });
+void runTerminal({ human, input: process.stdin, output: screen, programStatus: false });
 emit({ event: "started", pid: process.pid });
 
 for (;;) {

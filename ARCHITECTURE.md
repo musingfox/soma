@@ -147,7 +147,7 @@ soma 除了調派 agent，本身也要有助理的基本能力：讀 email、看
 - **訂閱**：程序內的介面卡經 `src/core/human-port.ts` 的 HumanPort 訂閱，它把 `watchEvents()` 和派工清單的 `watchDoc()` 轉成 soma 的事件型別；派工狀態取自派工清單，所以誰寫進清單，介面卡就看得到。程序外的客戶端改經客戶端 socket 連入。
 - **通知**：核心要主動找人時（卡住或報告寫好），寫一筆帶 `kind: "notice"` 的紀錄，`data.kind` 是 `question`（卡住要人回答）或 `report`（報告寫好），各介面卡自己決定要不要推播。由 `schedule:` 開頭的 `requestId` 啟動的那一輪回答，介面卡也當成通知推給人。`digest:` 那一輪不推，因為彙報任務會把它的回答寫成 `data.kind: "report"` 的 `notice` 紀錄，再推一次就重複了。
 - **失敗**：一輪的 input 在 Pi Durable 裡結束成 `unanswered`（`model_error`、`no_model`、`aborted`、`faulted` 或孤兒化的原因，見 durable spec 8.3）時，HumanPort 發 `failure` 事件，帶 `requestId` 和人看得懂的原因，`model_error` 附上供應商的錯誤文字。介面卡把自己那一輪的失敗當回答送回；`schedule:` 和 `herdr:` 開頭（`src/ports/human.ts` 的 `PUSHED_FAILURES`）是核心自己發起的輪次，沒有人在等，所以每個介面卡都把它們的失敗當通知推給人。`digest:` 那一輪的失敗不推，因為彙報任務已經把失敗原因和原始工作清單寫成通知。終端機的 7501 根紀錄在失敗後報 `error`，直到人再輸入。事件快照不含 submission，所以重啟後不會再發一次已經發過的失敗。
-- **Telegram 只認一個聊天室。** `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_CHAT_ID` 都設了才啟動，其他聊天室的訊息一律丟掉，因為找到這個 bot 的任何人都能派 agent 在這台機器上跑。訊息 id 只在同一聊天室內唯一，所以只認一個聊天室也讓 `telegram:<message id>` 不會撞號。介面卡以 `telegram:` 前綴認自己的輪次，不記送過哪些 id，所以核心在重啟後才答完的那一輪仍會送回手機。
+- **Telegram 只認一個聊天室。** bot token 和聊天室 id 都設了才啟動（見「設定」），其他聊天室的訊息一律丟掉，因為找到這個 bot 的任何人都能派 agent 在這台機器上跑。訊息 id 只在同一聊天室內唯一，所以只認一個聊天室也讓 `telegram:<message id>` 不會撞號。介面卡以 `telegram:` 前綴認自己的輪次，不記送過哪些 id，所以核心在重啟後才答完的那一輪仍會送回手機。
 
 客戶端 socket 的現況：
 
@@ -212,6 +212,28 @@ cc-mobile `server/` 裡有 2,971 行（含註解與空行）只在清單內互�
 - **模型供應商。** pi-ai 支援 Anthropic API key，也支援 Claude Pro/Max 訂閱的 OAuth（`ai/src/providers/anthropic.ts:19-90`）。走 OAuth 時它會偽裝成 Claude Code：送出 `user-agent: claude-cli/...` 和 `x-app: cli`（`ai/src/api/anthropic-messages.ts:1059-1062`）、加上 Claude Code 的 beta 標頭（`:1142`）、注入「You are Claude Code」系統提示（`:1227-1232`），原始碼自己稱之為「Stealth mode」（`:95`）。Anthropic 的官方立場是不允許的：[Claude Code 法律合規頁](https://code.claude.com/docs/en/legal-and-compliance)寫明訂閱 OAuth「is designed to support ordinary use of Claude Code and other native Anthropic applications」，且「Anthropic does not permit third-party developers to offer Claude.ai login into their own applications, or to route requests through Free, Pro, or Max plan credentials」；[Consumer Terms](https://www.anthropic.com/legal/consumer-terms) 禁止以 API key 以外、未經明示許可的自動化方式存取服務。所以 soma 預設用 API key。
 - **MCP。** `@earendil-works/pi-mcp` 是獨立的客戶端，支援 stdio、Streamable HTTP 和 OAuth。接到 pi-durable 的轉接層是 `src/core/extensions/mcp/index.ts`，目前只接 stdio server。shikigami-bridge 的瀏覽器與 macOS 控制就經由這條路接進來。
 
+## 設定
+
+soma 啟動時讀一次 `~/.config/soma/config.json`。每個值先看環境變數，再看設定檔，最後用預設值；欄位、對應的環境變數和預設值都在 `src/config.ts` 的 `resolveConfig`。檔案不存在就只用環境變數和預設值。JSON 壞掉、欄位型別不對或有不認得的欄位時，soma 印出檔案路徑和欄位名稱後以狀態 1 結束，不帶著部分設定跑。範例：
+
+```json
+{
+  "herdrSocket": "/Users/me/.config/herdr/sessions/fleet/herdr.sock",
+  "mcpConfig": "/Users/me/.config/soma/mcp.json",
+  "db": "/Users/me/.local/share/soma/soma.sqlite",
+  "model": "claude-opus-5-5",
+  "hangarCap": 4,
+  "programStatus": true,
+  "anthropic": { "apiKey": "sk-ant-..." },
+  "telegram": { "botToken": "123456:ABC...", "chatId": 123456789 }
+}
+```
+
+- **路徑不展開 `~`。** 請寫絕對路徑；`db` 寫相對路徑時以啟動時的目錄為準。
+- **模型 key 不寫進 `process.env`。** `anthropic.apiKey` 經 pi-ai 的 `createModels({ authContext })` 傳進去：soma 的 `env()` 先問 pi-ai 預設的環境變數查詢，`ANTHROPIC_API_KEY` 沒設時才回設定檔的 key。provider 依序找 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_OAUTH_TOKEN`、`ANTHROPIC_API_KEY`，所以任何一個環境變數都蓋過設定檔。沒有用 pi-ai 的 credential store，因為存進去的憑證會蓋過環境變數（pi-ai README 的 Credential Store 一節），優先順序就反了。
+- **權限。** 設定檔裡有 key 或 token，而且群組或其他人可讀時，啟動會印出警告，請 `chmod 600`。
+- **`mcp.json` 仍是獨立的檔案**，格式見待決事項第 5 點。
+
 ## 里程碑
 
 每個里程碑都只有一個可觀察的結果。
@@ -257,7 +279,7 @@ cc-mobile `server/` 裡有 2,971 行（含註解與空行）只在清單內互�
 
    2026-10-18 決定：用 [workspace-mcp](https://github.com/taylorwilsdon/google_workspace_mcp)（MIT，未封存，v2.1.0 於 2026-10-09 發布），一個 stdio server 同時提供 Gmail 與 Calendar，以 Google OAuth 登入個人帳號。啟動指令是 `uvx workspace-mcp@2.1.0 --single-user --permissions gmail:readonly calendar:readonly`；2026-10-18 經 soma 的轉接層實際啟動，`tools/list` 只列出讀取類工具，其中有 `search_gmail_messages`（`query` 直接交給 Gmail，可用 `is:unread is:important`）和 `get_events`（`time_min`、`time_max`）。每個工具都有 `user_google_email` 參數。只加 `--single-user` 時這個參數仍是必填，而且帶了憑證目錄裡沒有的帳號就直接失敗、不會改用別的憑證（workspace-mcp 2.1.0 `auth/google_auth.py` 的 single-user 分支）；所以 `env` 還要設 `USER_GOOGLE_EMAIL`，server 會把參數改成選填並自動填入這個帳號（`core/server.py` 的 `USER_GOOGLE_EMAIL` 處理，2026-10-18 經轉接層實測 `tools/list` 的 `required` 已不含它）。
 
-   憑證不進 repo。soma 讀 `~/.config/soma/mcp.json`（環境變數 `SOMA_MCP_CONFIG` 可覆寫路徑），格式是 `{"servers": {"<名稱>": {"command", "args", "env"}}}`。server 自己的憑證路徑寫在 `env` 裡：OAuth client 用 `GOOGLE_OAUTH_CLIENT_ID`、`GOOGLE_OAUTH_CLIENT_SECRET`（或 `GOOGLE_CLIENT_SECRET_PATH` 指向 client_secret.json），token 目錄用 `WORKSPACE_MCP_CREDENTIALS_DIR`，建議設為 `~/.config/soma/google`；帳號用 `USER_GOOGLE_EMAIL`。Google OAuth app 停在 Testing 模式時 refresh token 七天後失效（[google-calendar-mcp README](https://github.com/nspady/google-calendar-mcp)），要發布成 production 才不用每週重新授權。
+   憑證不進 repo。soma 讀 `~/.config/soma/mcp.json`（環境變數 `SOMA_MCP_CONFIG` 或設定檔的 `mcpConfig` 可覆寫路徑），格式是 `{"servers": {"<名稱>": {"command", "args", "env"}}}`。server 自己的憑證路徑寫在 `env` 裡：OAuth client 用 `GOOGLE_OAUTH_CLIENT_ID`、`GOOGLE_OAUTH_CLIENT_SECRET`（或 `GOOGLE_CLIENT_SECRET_PATH` 指向 client_secret.json），token 目錄用 `WORKSPACE_MCP_CREDENTIALS_DIR`，建議設為 `~/.config/soma/google`；帳號用 `USER_GOOGLE_EMAIL`。Google OAuth app 停在 Testing 模式時 refresh token 七天後失效（[google-calendar-mcp README](https://github.com/nspady/google-calendar-mcp)），要發布成 production 才不用每週重新授權。
 
    沒選的候選：
    - Google 官方的 [Gmail](https://developers.google.com/workspace/gmail/api/guides/configure-mcp-server) 與 [Calendar](https://developers.google.com/workspace/calendar/api/guides/configure-mcp-server) MCP server 還在 Developer Preview，只有 Streamable HTTP，個人帳號能否加入未驗證。正式發布後可以改用，轉接層要先加 HTTP 與 OAuth。

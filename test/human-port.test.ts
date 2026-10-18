@@ -1,13 +1,16 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
 import { afterEach, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
+import { runTerminal } from "../src/adapters/terminal/index.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
+import { schedule } from "../src/core/extensions/schedule/index.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { openHumanPort } from "../src/core/human-port.ts";
 import type { SomaEvent } from "../src/ports/human.ts";
@@ -104,6 +107,43 @@ test("a round whose model throws reaches subscribers as one failure with its req
 	expect(failures).toEqual([{ type: "failure", requestId: "terminal:1", reason: expect.stringMatching(/\S/) }]);
 	expect(failures[0]?.reason).toContain("401 invalid x-api-key");
 	expect(seen.filter((event) => event.type === "answer")).toEqual([]);
+});
+
+// The schedule extension starts the round, so no client owns it; the terminal shows it the way it shows a notice.
+test("a scheduled round that fails is shown to the human through the terminal", { timeout: 15_000 }, async () => {
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	faux.setResponses([
+		fauxAssistantMessage([fauxToolCall("schedule", { at: "PT1S", instruction: "喝水" })], { stopReason: "toolUse" }),
+		fauxAssistantMessage("好。"),
+		boom,
+	]);
+	const registry = createRegistry();
+	registry.install(schedule((id, c) => harness.abortTask(id, c)));
+	const harness: Harness = await Harness.open(new MemoryStorage(), { models, registry }, context);
+	cleanup.push(() => harness.close(context));
+	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+	harness.resume();
+	const human = await openHumanPort(harness, root, context);
+	cleanup.push(() => human.close());
+	const input = new PassThrough();
+	const output = new PassThrough();
+	let written = "";
+	output.on("data", (chunk: Buffer) => {
+		written += chunk.toString();
+	});
+	const terminal = runTerminal({ human, input, output, env: { SOMA_PROGRAM_STATUS: "0" } });
+	cleanup.push(() => {
+		input.end();
+		return terminal;
+	});
+
+	input.write("提醒我 喝水\n");
+
+	await vi.waitFor(() => expect(written).toMatch(/\[失敗\] schedule:\d+ 那一輪：模型出錯：401 invalid x-api-key\n/), {
+		timeout: 10_000,
+	});
 });
 
 test("a failure settled before a restart is not delivered again", async () => {

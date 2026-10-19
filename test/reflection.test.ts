@@ -32,11 +32,15 @@ const said = (message: { content: unknown } | undefined) => JSON.stringify(messa
  * A core with memory, dispatch and reflection over a FakeAgentPort, the event bridge and the human port. The faux
  * model answers a blocked agent with option 1 on the fingerprint the wake names, unless it answered that one before.
  * Asked to reflect, it revises memory line 1 citing every decision id the input lists and opens a card on the same
- * ids, then writes the three sections.
+ * ids, then writes the three sections. With `failStart`, starting an agent fails as herdr would refuse it.
  */
-async function core() {
+async function core({ failStart = false } = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "soma-reflection-"));
 	const agents = new FakeAgentPort();
+	if (failStart)
+		agents.start = async () => {
+			throw new Error("agent_name_taken");
+		};
 	const faux = fauxProvider();
 	const answered = new Set<string>();
 	faux.setResponses(
@@ -84,6 +88,7 @@ async function core() {
 			return true;
 		},
 		readCard: async (_repo, card) => cards.get(card) ?? "",
+		agents,
 	});
 	const harness: Harness = await openHarness(
 		join(directory, "soma.sqlite"),
@@ -154,6 +159,19 @@ async function core() {
 				(entry) => entry.kind === REFLECTION,
 			),
 		history: async () => (await harness.snapshot(Curated, context))?.history ?? [],
+		/** The text of every result the tool returned, oldest first. */
+		results: (tool: string) =>
+			root
+				.entries({ order: "ascending" }, 1000, undefined, context)
+				.then(({ items }) =>
+					items.flatMap((entry) =>
+						(entry.model ?? []).flatMap((message) =>
+							message.role === "toolResult" && message.toolName === tool
+								? message.content.flatMap((block) => (block.type === "text" ? [block.text] : []))
+								: [],
+						),
+					),
+				),
 	};
 }
 
@@ -188,9 +206,10 @@ test("three answers of one kind and a block again lead to a memory revision citi
 	]);
 	expect(soma.notices).toEqual([
 		expect.stringContaining("soma 修改了長期記憶 #1"),
-		expect.stringContaining("soma 開了一張改程式碼的卡 fix-reblock"),
+		expect.stringMatching(/^soma 開了一張改程式碼的卡 fix-reblock：.*已派進 fleet（agent fix-reblock）/),
 		"觀察：…\n證據 id：…\n改動：…",
 	]);
+	expect(soma.agents.started).toEqual([expect.objectContaining({ name: "fix-reblock", cwd: "/soma" })]);
 	expect(soma.cards.get("fix-reblock")).toContain("decision:card-a#0、decision:card-a#1、decision:card-a#2");
 });
 
@@ -245,10 +264,20 @@ test("the same problem the next day wakes no model and tells the human once that
 	expect(await soma.reflections()).toHaveLength(1);
 });
 
-test("SIGKILL while waiting and again during the reflection's run keeps it on time and runs it once", {
-	timeout: 60_000,
+test("a card whose dispatch fails stays todo, and both the model and the human are told", {
+	timeout: 30_000,
 }, async () => {
-	await runReflectionSmoke(4_000);
+	const soma = await core({ failStart: true });
+	await soma.dispatched();
+	await soma.trajectory(["f001", "f002", "f003"]);
+	await soma.start();
+	await until(() => soma.notices.some((notice) => notice.startsWith("觀察：")));
+
+	expect(soma.notices).toContainEqual(
+		expect.stringMatching(/^soma 開了一張改程式碼的卡 fix-reblock：.*派進 fleet 失敗：agent_name_taken。卡片停在 todo/),
+	);
+	expect(await soma.results("open_card")).toEqual([expect.stringContaining("派進 fleet 失敗：agent_name_taken")]);
+	expect([...soma.cards.keys()]).toEqual(["fix-reblock"]);
 });
 
 test("failed rounds are one problem per cause, whatever ids or times they carry", () => {
@@ -265,4 +294,10 @@ test("failed rounds are one problem per cause, whatever ids or times they carry"
 	expect(subjects[0]).toBe(subjects[1]);
 	expect(subjects[2]).toBe(subjects[3]);
 	expect(subjects[0]).not.toBe(subjects[2]);
+});
+
+test("SIGKILL while waiting and again during the reflection's run keeps it on time and runs it once", {
+	timeout: 60_000,
+}, async () => {
+	await runReflectionSmoke(4_000);
 });

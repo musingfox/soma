@@ -11,6 +11,7 @@ import {
 	type EntryRecord,
 	type Tx,
 } from "@earendil-works/pi-durable";
+import type { AgentPort } from "../../../ports/agent.ts";
 import type { Fact } from "../../domain/memory.ts";
 import {
 	type Action,
@@ -22,7 +23,7 @@ import {
 	triage,
 } from "../../domain/reflection.ts";
 import { noticeEntry } from "../../notice.ts";
-import { Dispatches } from "../dispatch/index.ts";
+import { Dispatches, startJob } from "../dispatch/index.ts";
 import { Curated, Facts } from "../memory/index.ts";
 
 export const REFLECTION_PERIOD_MS = 24 * 60 * 60_000;
@@ -93,12 +94,29 @@ const textOf = (entry: EntryRecord | undefined) =>
 
 const answer = (output: string) => ({ output: [{ type: "text" as const, text: output }] });
 
+/** The human's notice and the model's tool result for a card once its dispatch was tried. */
+function outcome({ card, title, evidence, dispatch }: OpenedCard) {
+	const head = `soma 開了一張改程式碼的卡 ${card}：${title}。證據：${evidence.join("、")}。`;
+	if (dispatch === "started") {
+		return {
+			notice: `${head}已派進 fleet（agent ${card}），合併要等你或派工 session 審查。`,
+			result: `已開卡 ${card} 並派進 fleet（agent ${card}），也通知了使用者。`,
+		};
+	}
+	return {
+		notice: `${head}派進 fleet 失敗：${dispatch}。卡片停在 todo，要你或派工 session 處理。`,
+		result: `已開卡 ${card}，但派進 fleet 失敗：${dispatch}。卡片停在 todo，已通知使用者；不要再開同一張卡。`,
+	};
+}
+
 export interface ReflectionOptions {
 	/** soma's own repository: the code-change cards go to the vault project its `.obsidian.yaml` names. */
 	repo: string;
 	/** Creates an obw task card; false when one of that name exists. */
 	createCard: (repo: string, card: string, content: { title: string; body: string }) => Promise<boolean>;
 	readCard: (repo: string, card: string) => Promise<string>;
+	/** Where a code-change card is dispatched. */
+	agents: AgentPort;
 }
 
 /**
@@ -108,7 +126,7 @@ export interface ReflectionOptions {
  * moves its checkpoint on, without the model. Otherwise it submits one input asking the model to reflect, and commits
  * the answer as a notice together with the next checkpoint.
  */
-export function reflection({ repo, createCard, readCard }: ReflectionOptions) {
+export function reflection({ repo, createCard, readCard, agents }: ReflectionOptions) {
 	const Reflection = defineTask<{ periodMs: number; since: number }, Checkpoint, null>({
 		name: "soma.reflection",
 		version: 1,
@@ -154,7 +172,7 @@ export function reflection({ repo, createCard, readCard }: ReflectionOptions) {
 				await runtime.commit(async (tx, current) => {
 					const { signals, cards } = await pending(tx, current.conversationId, cursor, pinnedUpto);
 					const jobs = JSON.parse(JSON.stringify((await tx.doc(Dispatches, current.conversationId)).jobs));
-					content = reflectionPrompt({ ...window, signals, jobs, cards, repo });
+					content = reflectionPrompt({ ...window, signals, jobs, cards });
 				}, context);
 				const root = await runtime.conversation(runtime.conversationId, context);
 				const submission = await root?.submit(
@@ -186,8 +204,8 @@ export function reflection({ repo, createCard, readCard }: ReflectionOptions) {
 	const openCard = defineTool({
 		name: "open_card",
 		description:
-			"要改 soma 的程式碼時，在 soma 的 obw 專案開一張任務卡（status todo），並通知使用者。" +
-			"正文要寫明問題和證據；開好之後用 dispatch 派進 fleet。同名的卡已存在就不會再開。soma 不能合併任何東西。",
+			"要改 soma 的程式碼時，在 soma 的 obw 專案開一張任務卡（status todo），接著把它派進 fleet，並通知使用者。" +
+			"正文要寫明問題和證據。同名的卡已存在就不會再開。soma 不能合併任何東西。",
 		parameters: Type.Object({
 			card: Type.String({ pattern: "^[a-z0-9][a-z0-9-]*$", description: "卡片檔名，kebab-case，不含 .md" }),
 			title: Type.String({ description: "卡片標題" }),
@@ -196,42 +214,52 @@ export function reflection({ repo, createCard, readCard }: ReflectionOptions) {
 				description: "至少一個證據 id，格式同 revise_memory",
 			}),
 		}),
-		// A rerun after a crash finds its own card by the call id written into it, instead of refusing it as taken.
+		// A rerun after a crash finds its own card by the call id written into it, instead of refusing it as taken, and
+		// dispatching checks the dispatch list and the agents listed before it starts anything.
 		replay: "safe",
 		execute: async (args, api, context) => {
 			const refused = refuseCard(args.evidence);
 			if (refused !== undefined) return answer(refused);
-			const recorded = await api.commit(
-				async (tx) => (await tx.doc(Reflections, api.conversationId)).cards.some((card) => card.callId === api.callId),
-				context,
-			);
-			if (recorded)
-				return answer(`已開卡 ${args.card}，接著用 dispatch（card=${args.card}、repo=${repo}）派進 fleet。`);
-			const mark = `由 soma 反省開立（${api.callId}）。`;
-			const body = `${args.body.trim()}\n\n證據：${args.evidence.join("、")}\n\n${mark}`;
-			const created =
-				(await createCard(repo, args.card, { title: args.title, body })) ||
-				(await readCard(repo, args.card)).includes(mark);
-			if (!created) return answer(`沒有開卡：已經有一張叫 ${args.card} 的卡。`);
-			const card: OpenedCard = {
-				card: args.card,
-				title: args.title,
-				at: Date.now(),
-				evidence: [...args.evidence],
-				callId: api.callId,
+			const find = async (tx: Tx) => {
+				const found = (await tx.doc(Reflections, api.conversationId)).cards.find((card) => card.callId === api.callId);
+				return found && (JSON.parse(JSON.stringify(found)) as OpenedCard);
 			};
+			let opened = await api.commit(find, context);
+			if (opened?.dispatch !== undefined) return answer(outcome(opened).result);
+			if (opened === undefined) {
+				const mark = `由 soma 反省開立（${api.callId}）。`;
+				const body = `${args.body.trim()}\n\n證據：${args.evidence.join("、")}\n\n${mark}`;
+				const created =
+					(await createCard(repo, args.card, { title: args.title, body })) ||
+					(await readCard(repo, args.card)).includes(mark);
+				if (!created) return answer(`沒有開卡：已經有一張叫 ${args.card} 的卡。`);
+				opened = {
+					card: args.card,
+					title: args.title,
+					at: Date.now(),
+					evidence: [...args.evidence],
+					callId: api.callId,
+				};
+				const card = opened;
+				await api.commit(async (tx) => {
+					(await tx.doc(Reflections, api.conversationId)).cards.push(card);
+				}, context);
+			}
+			let dispatch = "started";
+			try {
+				await startJob(agents, readCard, api, { card: opened.card, repo }, context);
+			} catch (error) {
+				dispatch = error instanceof Error ? error.message : String(error);
+			}
+			const done: OpenedCard = { ...opened, dispatch };
+			const { notice, result } = outcome(done);
 			await api.commit(async (tx) => {
-				(await tx.doc(Reflections, api.conversationId)).cards.push(card);
-				await tx.appendEntry(
-					api.conversationId,
-					noticeEntry(
-						"report",
-						`soma 開了一張改程式碼的卡 ${args.card}：${args.title}。證據：${args.evidence.join("、")}。` +
-							"它會被派進 fleet，合併要等你或派工 session 審查。",
-					),
-				);
+				const { cards } = await tx.doc(Reflections, api.conversationId);
+				const index = cards.findIndex((card) => card.callId === api.callId);
+				cards[index] = done;
+				await tx.appendEntry(api.conversationId, noticeEntry("report", notice));
 			}, context);
-			return answer(`已開卡 ${args.card} 並通知使用者，接著用 dispatch（card=${args.card}、repo=${repo}）派進 fleet。`);
+			return answer(result);
 		},
 	});
 

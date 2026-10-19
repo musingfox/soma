@@ -42,7 +42,12 @@ const agents = createHerdrAgentPort({
 });
 const digests = digest(agents);
 // soma's own repository: the reflection's code-change cards go to the obw project its .obsidian.yaml names.
-const reflections = reflection({ repo: dirname(dirname(fileURLToPath(import.meta.url))), createCard, readCard });
+const reflections = reflection({
+	repo: dirname(dirname(fileURLToPath(import.meta.url))),
+	createCard,
+	readCard,
+	agents,
+});
 const mcpServers = loadMcpConfig(config.mcpConfig);
 // One server that fails to start (say, an expired token) leaves soma running without its tools.
 const mcpClients = (

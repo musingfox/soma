@@ -144,6 +144,9 @@ soma 除了調派 agent，本身也要有助理的基本能力：讀 email、看
 - **證據 id。** 自我檢視工具回傳的每一筆和記憶修訂引用的證據用同一種格式：`entry:<EntryId>`、`submission:<SubmissionId>`、`task:<TaskId>`，或 `document:<DocumentId>@<Seq>` 表示某份文件在某個 commit 的那一版（Pi Durable 沒有獨立的文件修訂紀錄，一版由文件 id 和 commit 序號決定）。數字都是 Pi Durable 的 id（`durable/src/types.ts:27-36`）。檢查用的正規式是 `src/core/domain/memory.ts` 的 `EVIDENCE_ID`。
 - **事實層** 對應一份 document，由程式寫入，不經模型萃取。
 - **`recall`** 是一個搜尋舊對話紀錄的工具，不呼叫就不花成本。
+- **`inspect`** 讓模型唯讀查自己的執行軌跡：失敗的輪次、每輪 token 與成本、代答與轉人、每張派工卡的最後狀態，回傳的每一筆都帶可引用的 id，超過筆數上限只回最新的幾筆並註明總數。
+  - pi-durable 1.3.0 的 `Tx` 和 `Session` 都不能掃 submission，所以這個工具拿 Harness 自己的 `Storage` 來掃，而且只在 `api.commit` 的回呼裡掃：回呼占住 Session 的提交線，讀不到提交到一半的狀態，和 `Tx` 的讀取一樣。
+  - 派工清單是 `history: "latest"`，舊版本無法經公開 API 讀回，所以代答與轉人的 id 是「卡片#序號」。決定只會追加，序號不會變。
 
 ## 兩份契約
 

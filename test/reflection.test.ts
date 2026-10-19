@@ -6,6 +6,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { Harness, TaskId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
+import { runReflectionSmoke } from "../smoke/reflection.ts";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { SIGNAL } from "../src/core/domain/signal.ts";
 import { eventBridge } from "../src/core/extensions/dispatch/bridge.ts";
@@ -226,4 +227,10 @@ test("the same problem the next day opens no second card and revises nothing aga
 	expect(await soma.reflections()).toHaveLength(1);
 	expect(await soma.history()).toHaveLength(1);
 	expect([...soma.cards.keys()]).toEqual(["fix-reblock"]);
+});
+
+test("SIGKILL while waiting and again during the reflection's run keeps it on time and runs it once", {
+	timeout: 60_000,
+}, async () => {
+	await runReflectionSmoke(4_000);
 });

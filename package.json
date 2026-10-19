@@ -21,7 +21,8 @@
 		"smoke:telegram": "node smoke/telegram.ts",
 		"smoke:memory": "node smoke/memory.ts",
 		"smoke:inspect": "node smoke/inspect.ts",
-		"smoke:signals": "node smoke/signals.ts"
+		"smoke:signals": "node smoke/signals.ts",
+		"smoke:reflection": "node smoke/reflection.ts"
 	},
 	"dependencies": {
 		"@earendil-works/chord": "1.3.0",

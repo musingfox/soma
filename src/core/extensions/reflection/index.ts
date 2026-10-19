@@ -12,7 +12,15 @@ import {
 	type Tx,
 } from "@earendil-works/pi-durable";
 import type { Fact } from "../../domain/memory.ts";
-import { type OpenedCard, reflectionPrompt, refuseCard, unhandled } from "../../domain/reflection.ts";
+import {
+	type Action,
+	type OpenedCard,
+	type Recurrence,
+	reflectionPrompt,
+	refuseCard,
+	renderRecurrence,
+	triage,
+} from "../../domain/reflection.ts";
 import { noticeEntry } from "../../notice.ts";
 import { Dispatches } from "../dispatch/index.ts";
 import { Curated, Facts } from "../memory/index.ts";
@@ -23,14 +31,17 @@ export const REFLECTION = "soma.reflection";
 
 export const reflectionRequestId = (until: number) => `reflection:${until}`;
 
-/** The conversation's one reflection task, and the cards reflections opened. */
-export const Reflections = defineDoc<{ taskId?: number; cards: OpenedCard[] }>({
+/**
+ * The conversation's one reflection task, the cards reflections opened, and the actions (`Action.id`) whose problem
+ * recurred and was already reported to the human.
+ */
+export const Reflections = defineDoc<{ taskId?: number; cards: OpenedCard[]; alerted: string[] }>({
 	kind: "soma.reflection",
 	version: 1,
 	scope: "conversation",
 	history: "latest",
 	fork: "initial",
-	initial: () => ({ cards: [] }),
+	initial: () => ({ cards: [], alerted: [] }),
 });
 
 type Checkpoint = {
@@ -44,17 +55,34 @@ type Checkpoint = {
 	upto?: number;
 };
 
-/** Signals in rows [cursor, upto) whose problem no revision and no opened card has acted on. */
+const ACTION = { revise: "修改", forget: "刪除", restore: "還原" } as const;
+
+/**
+ * Signals in rows [cursor, upto) split by whether a memory revision or an opened card already acted on their problem.
+ * Docs are live proxies only valid inside their commit, so what leaves it is copied out as JSON.
+ */
 async function pending(tx: Tx, conversationId: ConversationId, cursor: number, upto?: number) {
 	const rows = (await tx.doc(Facts)).rows;
-	const { cards } = await tx.doc(Reflections, conversationId);
-	const cited = [
-		...(await tx.doc(Curated)).history.flatMap((revision) => revision.evidence),
-		...cards.flatMap((card) => card.evidence),
+	const reflections = await tx.doc(Reflections, conversationId);
+	const actions: Action[] = [
+		...(await tx.doc(Curated)).history.map((revision, n) => ({
+			id: `revision:${n}`,
+			label: `長期記憶 #${revision.line} 在 ${new Date(revision.at).toISOString()} 的${ACTION[revision.action]}`,
+			evidence: revision.evidence,
+		})),
+		...reflections.cards.map((card) => ({
+			id: `opened:${card.card}`,
+			label: `卡片 ${card.card}`,
+			evidence: card.evidence,
+		})),
 	];
-	// Docs are live proxies only valid inside their commit, so what leaves it is copied out as JSON.
-	const signals: Fact[] = JSON.parse(JSON.stringify(unhandled(rows, rows.slice(cursor, upto), cited)));
-	return { end: upto ?? rows.length, signals, cards: JSON.parse(JSON.stringify(cards)) as OpenedCard[] };
+	const { unhandled, recurrences } = triage(rows, rows.slice(cursor, upto), actions, reflections.alerted);
+	return {
+		end: upto ?? rows.length,
+		signals: JSON.parse(JSON.stringify(unhandled)) as Fact[],
+		recurrences: JSON.parse(JSON.stringify(recurrences)) as Recurrence[],
+		cards: JSON.parse(JSON.stringify(reflections.cards)) as OpenedCard[],
+	};
 }
 
 const textOf = (entry: EntryRecord | undefined) =>
@@ -75,9 +103,10 @@ export interface ReflectionOptions {
 
 /**
  * A daily background reflection (ARCHITECTURE.md「反省」), run like the digest: each tick reads the outcome signals
- * recorded since the last one and drops those whose problem a memory revision or an opened card already cites; with
- * none left it only moves its checkpoint on, without the model. Otherwise it submits one input asking the model to
- * reflect, and commits the answer as a notice together with the next checkpoint.
+ * recorded since the last one. A problem a memory revision or an opened card already acted on that shows up again is
+ * not the model's to handle twice: the program tells the human, once per action. With nothing else left the tick only
+ * moves its checkpoint on, without the model. Otherwise it submits one input asking the model to reflect, and commits
+ * the answer as a notice together with the next checkpoint.
  */
 export function reflection({ repo, createCard, readCard }: ReflectionOptions) {
 	const Reflection = defineTask<{ periodMs: number; since: number }, Checkpoint, null>({
@@ -104,7 +133,13 @@ export function reflection({ repo, createCard, readCard }: ReflectionOptions) {
 				if (upto === undefined) {
 					let pinned: number | undefined;
 					await runtime.commit(async (tx, current) => {
-						const { end, signals } = await pending(tx, current.conversationId, cursor);
+						const { end, signals, recurrences } = await pending(tx, current.conversationId, cursor);
+						// A recurring problem goes to the human from the program, in the commit that moves past its signals.
+						const { alerted } = await tx.doc(Reflections, current.conversationId);
+						for (const recurrence of recurrences) {
+							await tx.appendEntry(current.conversationId, noticeEntry("report", renderRecurrence(recurrence)));
+							alerted.push(...recurrence.actions.map((action) => action.id));
+						}
 						if (signals.length === 0) return advance(end);
 						pinned = end;
 						return { status: "running", checkpoint: { ...checkpoint, upto: end } };

@@ -6,8 +6,9 @@ export type Decision = {
 	readonly at: string;
 	readonly kind: BlockedKind;
 	readonly action: "answered" | "escalated";
-	// The option pressed, when answered.
+	// The option pressed, and the prompt it was pressed on, when answered.
 	readonly option?: string;
+	readonly fingerprint?: string;
 	readonly reason: string;
 };
 

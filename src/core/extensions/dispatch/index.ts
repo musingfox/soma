@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import type { Context } from "@earendil-works/chord/context";
 import { Type } from "@earendil-works/pi-ai";
-import { defineDoc, defineExtension, defineTool } from "@earendil-works/pi-durable";
+import { defineDoc, defineExtension, defineTool, type ToolExecutionApi } from "@earendil-works/pi-durable";
 import type { AgentPort } from "../../../ports/agent.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
 import { composeLaunchPrompt } from "../../domain/launch-prompt.ts";
@@ -18,6 +19,43 @@ export const Dispatches = defineDoc<{ jobs: Job[] }>({
 
 const text = (value: unknown) => ({ output: [{ type: "text" as const, text: JSON.stringify(value) }] });
 
+/**
+ * Starts the card's agent unless the dispatch list or the agents listed already have it. Shared by every tool that
+ * dispatches: a rerun after a crash checks both before it starts anything, and memoizes the session id under the call.
+ */
+export async function startJob(
+	agents: AgentPort,
+	readCard: (repo: string, card: string) => Promise<string>,
+	api: ToolExecutionApi,
+	{ card, repo }: { card: string; repo: string },
+	context: Context,
+): Promise<Job> {
+	const sessionId = await api.memo("sessionId", randomUUID(), context);
+	const recorded = await api.commit(async (tx) => {
+		const found = (await tx.doc(Dispatches, api.conversationId)).jobs.find((job) => job.card === card);
+		// Copied out as JSON: a doc is a live proxy only valid inside its commit.
+		return found && (JSON.parse(JSON.stringify(found)) as Job);
+	}, context);
+	if (recorded) return recorded;
+
+	// Read before anything starts, so a card that does not exist starts nothing.
+	const launch = composeLaunchPrompt(await readCard(repo, card));
+	const listed = (await agents.list()).find((agent) => agent.name === card);
+	if (listed === undefined) await agents.start({ name: card, card, cwd: repo, sessionId });
+	const job: Job = {
+		card,
+		agent: card,
+		sessionId: listed?.sessionId ?? sessionId,
+		status: listed?.status ?? { state: "idle" },
+		launch,
+		decisions: [],
+	};
+	await api.commit(async (tx) => {
+		(await tx.doc(Dispatches, api.conversationId)).jobs.push(job);
+	}, context);
+	return job;
+}
+
 /** `readCard` returns the card's markdown, read from wherever the repo's cards live. */
 export function dispatchExtension(agents: AgentPort, readCard: (repo: string, card: string) => Promise<string>) {
 	const dispatch = defineTool({
@@ -31,31 +69,8 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 		}),
 		// A rerun after a crash checks the dispatch list, then the agents listed, before it starts anything.
 		replay: "safe",
-		execute: async ({ card, repo }, api, context) => {
-			const sessionId = await api.memo("sessionId", randomUUID(), context);
-			const recorded = await api.commit(
-				async (tx) => (await tx.doc(Dispatches, api.conversationId)).jobs.find((job) => job.card === card),
-				context,
-			);
-			if (recorded) return text(recorded);
-
-			// Read before anything starts, so a card that does not exist starts nothing.
-			const launch = composeLaunchPrompt(await readCard(repo, card));
-			const listed = (await agents.list()).find((agent) => agent.name === card);
-			if (listed === undefined) await agents.start({ name: card, card, cwd: repo, sessionId });
-			const job: Job = {
-				card,
-				agent: card,
-				sessionId: listed?.sessionId ?? sessionId,
-				status: listed?.status ?? { state: "idle" },
-				launch,
-				decisions: [],
-			};
-			await api.commit(async (tx) => {
-				(await tx.doc(Dispatches, api.conversationId)).jobs.push(job);
-			}, context);
-			return text(job);
-		},
+		execute: async ({ card, repo }, api, context) =>
+			text(await startJob(agents, readCard, api, { card, repo }, context)),
 	});
 
 	const jobs = defineTool({

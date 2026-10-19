@@ -14,11 +14,12 @@ import { clock } from "./core/extensions/clock/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
 import { dispatchExtension } from "./core/extensions/dispatch/index.ts";
+import { inspectExtension } from "./core/extensions/inspect/index.ts";
 import { connectStdio, loadMcpConfig, mcpExtension } from "./core/extensions/mcp/index.ts";
 import { memory } from "./core/extensions/memory/index.ts";
 import { schedule } from "./core/extensions/schedule/index.ts";
 import { sleeper } from "./core/extensions/sleeper/index.ts";
-import { openHarness } from "./core/harness.ts";
+import { openHarness, openStorage } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
 
 const configPath = join(homedir(), ".config/soma/config.json");
@@ -53,6 +54,7 @@ const mcpClients = (
 		),
 	)
 ).flat();
+const storage = await openStorage(config.db);
 const extensions = [
 	clock(),
 	sleeper,
@@ -60,9 +62,10 @@ const extensions = [
 	schedule((id, c) => harness.abortTask(id, c)),
 	dispatchExtension(agents, readCard),
 	digests.extension,
+	inspectExtension(storage),
 	...(await Promise.all(mcpClients.map(({ name, client }) => mcpExtension(name, client)))),
 ];
-const harness: Harness = await openHarness(config.db, extensions, context, { models });
+const harness: Harness = await openHarness(storage, extensions, context, { models });
 const root = await harness.root(context, {
 	agent: { model: { provider: "anthropic", modelId: config.model } },
 });

@@ -73,8 +73,19 @@ const revise = (text: string, evidence: string[] = ["submission:3"]) =>
 	call("revise_memory", { line: 1, text, reason: "使用者說改到十點了", evidence });
 
 test("evidence ids follow the format agreed with the self-inspect tool", () => {
-	for (const id of ["entry:12", "submission:3", "task:7", "document:2@41"]) expect(id).toMatch(EVIDENCE_ID);
-	for (const id of ["", "entry", "entry:", "entry:x", "turn:3", "document:2", " entry:1", "entry:1 "]) {
+	for (const id of ["entry:12", "submission:3", "task:7", "document:2@41", "decision:card-a#0"])
+		expect(id).toMatch(EVIDENCE_ID);
+	for (const id of [
+		"",
+		"entry",
+		"entry:",
+		"entry:x",
+		"turn:3",
+		"document:2",
+		" entry:1",
+		"entry:1 ",
+		"decision:card a#0",
+	]) {
 		expect(id).not.toMatch(EVIDENCE_ID);
 	}
 });

@@ -149,6 +149,17 @@ soma 除了調派 agent，本身也要有助理的基本能力：讀 email、看
   - pi-durable 1.3.0 的 `Tx` 和 `Session` 都不能掃 submission，所以這個工具拿 Harness 自己的 `Storage` 來掃，而且只在 `api.commit` 的回呼裡掃：回呼占住 Session 的提交線，讀不到提交到一半的狀態，和 `Tx` 的讀取一樣。
   - 每張派工卡的證據是它的完成紀錄（`soma.dispatch.done` entry）；還沒完成的卡，證據是記下這份工作的那次 `dispatch` 工具結果 entry。派工清單本身讀不回舊版本，所以不用 `document:` 引用。
 
+### 反省
+
+soma 每天讀一次自己的結果訊號，改進自己（`src/core/extensions/reflection/`）。權限照 2026-10-18 的決定：行為層直接改，程式碼開卡派工，soma 不合併任何東西。
+
+- **做法和定時彙報相同**：背景任務的 checkpoint 存下次時間和事實層讀到第幾筆（事實層只追加，所以用位置當游標），送出前釘住範圍，模型的回答和下一個 checkpoint 同一個 commit 寫成 `notice`。不用 `schedule` 工具的提醒任務，因為它時間到一定叫醒模型。`requestId` 是 `reflection:<until>`，介面卡不另外推這一輪，理由同 `digest:`。
+- **沒有待處理的訊號就不叫醒模型。** 待處理是指游標之後的 `signal.*`，再扣掉已經處理過的問題。
+- **同一個問題只處理一次。** 每筆訊號歸到一個問題：有卡片的以卡片為準，失敗的輪次以 `requestId` 前綴為準，其他每筆各自一個。某個問題的證據只要被任一筆記憶修訂或反省開的卡引用過，之後同一個問題的訊號就不再叫醒模型。這是程式的規則，不靠模型自己記得。代價是修訂沒有修好時，同一張卡的問題不會自動再檢討，要靠人看修訂通知處理。
+- **訊號換成證據 id。** 代答後又卡住的訊號沒有自己的 entry，所以 refs 另記那次沒奏效的代答在派工清單的序號，引用成 `decision:<卡片>#<序號>`；失敗的輪次引用 `submission:`，其他引用 `entry:`。反省的輸入也列出相關卡片的每個代答與轉人決定，讓模型能引用整串。
+- **要改程式碼時**，模型呼叫 `open_card`，在 soma 自己 repo 的 obw 專案開一張 todo 卡並通知人，再呼叫 `dispatch` 派進 fleet。建卡照 obw pm 的慣例：`create template=task`，property 一次設一個。2026-10-19 對 obsidian CLI 實測兩件事。第一，帶模板時 `content` 會被忽略，所以正文要讀回填好的模板再 `create overwrite`。第二，對已存在的路徑再 `create` 不會失敗，而是另建 `<卡片> 1.md`，所以建之前先 `read` 確認不存在。卡片正文寫入工具呼叫的 call id，崩潰後重跑時，工具認得這張卡是自己開的。
+- 冒煙測試：`npm run smoke:reflection` 在等待中和反省那一輪各 `kill -9` 一次；`npm run smoke:reflection-card -- <repo>` 用真 obsidian 和真 herdr 開卡派工，再把卡、worktree 和分支刪掉。
+
 ## 兩份契約
 
 ### 人類側（介面卡 → 核心）

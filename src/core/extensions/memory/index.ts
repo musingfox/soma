@@ -55,8 +55,11 @@ export const Facts = defineDoc<{ rows: Fact[] }>({
 	initial: () => ({ rows: [] }),
 });
 
+/** A fact whose key is already recorded is not recorded again. */
 export async function recordFact(tx: Tx, fact: Fact): Promise<void> {
-	(await tx.doc(Facts)).rows.push(fact);
+	const facts = await tx.doc(Facts);
+	if (fact.key !== undefined && facts.rows.some((row) => row.key === fact.key)) return;
+	facts.rows.push(fact);
 }
 
 const text = (message: { content: string | readonly { type: string; text?: string }[] }) =>

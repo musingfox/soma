@@ -118,7 +118,7 @@ test.each([
 		if (recorded === 1) {
 			expect(signals[0]).toMatchObject({
 				kind: SIGNAL.reblocked,
-				refs: { card: "card-a", agent: "card-a" },
+				refs: { card: "card-a", agent: "card-a", decision: 0 },
 				text: expect.stringContaining("fingerprint=f00d"),
 			});
 		}

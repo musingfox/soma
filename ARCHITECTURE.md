@@ -141,7 +141,7 @@ soma 除了調派 agent，本身也要有助理的基本能力：讀 email、看
   - 修改前的原文、修訂時間、理由和證據存在同一份文件的 `history` 裡，和改動同一個 commit。歷史不進系統提示，也不算進容量上限；容量上限只算現存的行。
   - 模型改寫過的行一律算模型寫的，即使原文是使用者寫的，所以會加稽核前綴並放進圍欄。還原則照存下來的原樣放回，使用者的原文還原後仍算使用者的。
   - 每次修訂都在同一個 commit 寫一筆 `data.kind: "report"` 的 `notice` 給人，內容寫明改了哪一條、改前改後、理由和證據。不併進十分鐘彙報，因為改錯的記憶從下一輪起就會影響回答，人應該立刻看到。
-- **證據 id。** 自我檢視工具回傳的每一筆和記憶修訂引用的證據用同一種格式：`entry:<EntryId>`、`submission:<SubmissionId>`、`task:<TaskId>`，或 `document:<DocumentId>@<Seq>` 表示某份文件在某個 commit 的那一版（Pi Durable 沒有獨立的文件修訂紀錄，一版由文件 id 和 commit 序號決定）。數字都是 Pi Durable 的 id（`durable/src/types.ts:27-36`）。檢查用的正規式是 `src/core/domain/memory.ts` 的 `EVIDENCE_ID`。
+- **證據 id。** 自我檢視工具回傳的每一筆和記憶修訂引用的證據用同一種格式：`entry:<EntryId>`、`submission:<SubmissionId>`、`task:<TaskId>`，或 `document:<DocumentId>@<Seq>` 表示某份文件在某個 commit 的那一版（Pi Durable 沒有獨立的文件修訂紀錄，一版由文件 id 和 commit 序號決定），或 `decision:<卡片>#<序號>` 表示派工清單裡某張卡的第幾個代答或轉人決定（從 0 起算）。派工清單是 `history: "latest"`，舊版本讀不回來，所以決定不能用 `document:` 引用；決定只會追加，序號不會變。數字都是 Pi Durable 的 id（`durable/src/types.ts:27-36`）。檢查用的正規式是 `src/core/domain/memory.ts` 的 `EVIDENCE_ID`。
 - **事實層** 對應一份 document，由程式寫入，不經模型萃取。
 - **`recall`** 是一個搜尋舊對話紀錄的工具，不呼叫就不花成本。
 - **`inspect`** 讓模型唯讀查自己的執行軌跡：失敗的輪次、每輪 token 與成本、代答與轉人、每張派工卡的最後狀態，回傳的每一筆都帶可引用的 id，超過筆數上限只回最新的幾筆並註明總數。

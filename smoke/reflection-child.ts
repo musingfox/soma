@@ -6,6 +6,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import type { Harness, TaskId } from "@earendil-works/pi-durable";
+import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { SIGNAL } from "../src/core/domain/signal.ts";
 import { memory, recordFact } from "../src/core/extensions/memory/index.ts";
 import { REFLECTION, Reflections, reflection } from "../src/core/extensions/reflection/index.ts";
@@ -36,6 +37,7 @@ const reflections = reflection({
 		throw new Error("no card in this smoke");
 	},
 	readCard: async () => "",
+	agents: new FakeAgentPort(),
 });
 const harness: Harness = await openHarness(db, [memory, reflections.extension], context, { models });
 const root = await harness.root(context, { agent: { model: { provider: faux.provider.id, modelId: "faux-1" } } });

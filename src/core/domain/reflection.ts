@@ -9,6 +9,8 @@ export type OpenedCard = {
 	readonly at: number;
 	readonly evidence: string[];
 	readonly callId: string;
+	/** How dispatching it went: "started", or why it failed. Absent until the dispatch was tried. */
+	readonly dispatch?: string;
 };
 
 export const isSignal = (fact: Fact) => fact.kind.startsWith("signal.");
@@ -111,8 +113,6 @@ export interface Reflection {
 	readonly signals: readonly Fact[];
 	readonly jobs: DispatchList;
 	readonly cards: readonly OpenedCard[];
-	/** soma's own repository, where a code change's card goes. */
-	readonly repo: string;
 }
 
 /**
@@ -145,7 +145,7 @@ export function reflectionPrompt(reflection: Reflection): string {
 		`${FENCE_OPEN}\n${observed.join("\n")}\n${FENCE_CLOSE}\n\n` +
 		"回覆分三段，標題依序是「觀察」「證據 id」「改動」：觀察寫哪個行為該改；證據 id 列出上面引用的 id；改動寫你做了什麼。\n" +
 		"行為層（長期記憶、指引）的改動直接用 revise_memory、forget_memory 或 restore_memory 套用，證據帶上面的 id。\n" +
-		`要改程式碼時，用 open_card 在 soma 的 repo 開一張 obw 卡（正文寫明證據），再用 dispatch（repo=${reflection.repo}）派進 fleet。` +
+		"要改程式碼時，用 open_card 在 soma 的 repo 開一張 obw 卡（正文寫明證據），它會接著把卡派進 fleet。" +
 		"你不能合併任何東西，合併由人審查。上面開過的卡不要再開。沒有該改的就在改動寫「不改」。"
 	);
 }

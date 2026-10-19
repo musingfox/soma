@@ -1,5 +1,5 @@
 // Reflection smoke test on the real obsidian CLI and the real herdr fleet session: one recorded signal, a reflection
-// tick, and a scripted model that opens a code-change card and dispatches it. Checks that the card is in the vault, the
+// tick, and a scripted model that opens a code-change card, which open_card dispatches. Checks that the card is in the vault, the
 // agent is in the fleet and the human got the notices; then stops the agent and deletes the card, worktree and branch.
 // The agent never gets its first prompt: that is the event bridge's job, and no bridge runs here.
 //   node smoke/reflection-card.ts <repo>
@@ -39,9 +39,7 @@ faux.setResponses(
 	Array.from({ length: 10 }, () => (request: { messages: { role: string; content: unknown }[] }) => {
 		const last = JSON.stringify(request.messages.findLast((message) => message.role !== "system")?.content ?? "");
 		if (last.includes("已開卡"))
-			return fauxAssistantMessage([fauxToolCall("dispatch", { card, repo })], { stopReason: "toolUse" });
-		if (last.includes("sessionId"))
-			return fauxAssistantMessage(`觀察：card-x 失敗。\n證據 id：entry:1\n改動：開了 ${card} 並派進 fleet。`);
+			return fauxAssistantMessage(`觀察：card-x 失敗。\n證據 id：entry:1\n改動：開了 ${card}。`);
 		const open = fauxToolCall("open_card", {
 			card,
 			title: "反省冒煙測試卡（測完即刪）",
@@ -54,7 +52,7 @@ faux.setResponses(
 const models = createModels();
 models.setProvider(faux.provider);
 const agents = createHerdrAgentPort({ client: createHerdrClient({ socketPath }) });
-const reflections = reflection({ repo, createCard, readCard });
+const reflections = reflection({ repo, createCard, readCard, agents });
 const directory = await mkdtemp(join(tmpdir(), "soma-reflection-card-"));
 const harness: Harness = await openHarness(
 	join(directory, "soma.sqlite"),
@@ -91,7 +89,7 @@ try {
 	log("notices", notices);
 	check(listed !== undefined, `agent ${card} is not in the fleet`);
 	check(
-		notices.some((notice) => notice.includes(`開了一張改程式碼的卡 ${card}`)),
+		notices.some((notice) => notice.includes(`開了一張改程式碼的卡 ${card}`) && notice.includes("已派進 fleet")),
 		"the human got no notice of the card",
 	);
 } finally {

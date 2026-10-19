@@ -19,7 +19,8 @@ export const REBLOCK_WINDOW_MS = 10 * 60_000;
 /** An answered prompt shown again soon after: the answer did not get the agent past it. */
 export function reblockSignal(job: Job, status: AgentState, seq: number, now: number): Fact | undefined {
 	if (status.state !== "blocked" || status.fingerprint === undefined) return undefined;
-	const answered = job.decisions.findLast((decision) => decision.action === "answered");
+	const index = job.decisions.findLastIndex((decision) => decision.action === "answered");
+	const answered = job.decisions[index];
 	if (answered?.fingerprint !== status.fingerprint || now - Date.parse(answered.at) > REBLOCK_WINDOW_MS) {
 		return undefined;
 	}
@@ -28,7 +29,7 @@ export function reblockSignal(job: Job, status: AgentState, seq: number, now: nu
 		kind: SIGNAL.reblocked,
 		text: `agent ${job.agent}（卡片 ${job.card}）在 ${answered.at} 代答選項 ${answered.option} 之後，又卡在同一個提示（fingerprint=${status.fingerprint}）。`,
 		key: `reblock:${job.agent}:${seq}`,
-		refs: { card: job.card, agent: job.agent, seq },
+		refs: { card: job.card, agent: job.agent, seq, decision: index },
 	};
 }
 

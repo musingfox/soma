@@ -5,7 +5,9 @@ import { observe } from "../../domain/bridge.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
 import { reconcile } from "../../domain/reconcile.ts";
 import { outcomeOf } from "../../domain/report.ts";
+import { dispatchSignal, reblockSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
+import { recordFact } from "../memory/index.ts";
 import { Dispatches } from "./index.ts";
 
 /** Entry kind of a turn the bridge recorded as finished; it carries no model message. */
@@ -96,17 +98,25 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 					noticeEntry("question", `agent ${next.agent}（卡片 ${next.card}）在等登入或憑證，需要你處理。${msg}`),
 				);
 			}
+			// Signals commit with the seq, so a resent event records none twice.
+			if (action === "wake") {
+				const signal = reblockSignal(current, event.status, event.seq, Date.now());
+				if (signal !== undefined) await recordFact(tx, signal);
+			}
 			if (action === "complete") {
-				await tx.appendEntry(conversation.id, {
+				const outcome = next.outcome ?? "未知";
+				const done = await tx.appendEntry(conversation.id, {
 					kind: JOB_DONE,
 					data: {
 						agent: next.agent,
 						card: next.card,
 						state: next.status.state,
-						outcome: next.outcome ?? "未知",
+						outcome,
 						seq: event.seq,
 					},
 				});
+				const signal = dispatchSignal(next, outcome, event.seq, done.id, Date.now());
+				if (signal !== undefined) await recordFact(tx, signal);
 			}
 		}, context);
 	}

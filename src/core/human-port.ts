@@ -9,7 +9,9 @@ import {
 } from "@earendil-works/pi-durable";
 import type { AgentState } from "../ports/agent.ts";
 import type { HumanPort, NoticeKind, SomaEvent } from "../ports/human.ts";
+import { turnSignal } from "./domain/signal.ts";
 import { Dispatches } from "./extensions/dispatch/index.ts";
+import { recordFact } from "./extensions/memory/index.ts";
 import { NOTICE, noticeEntry } from "./notice.ts";
 
 const textOf = (entry: EntryRecord) =>
@@ -69,11 +71,19 @@ export async function openHumanPort(
 				emit({ type: "notice", kind, content });
 			} else if (event.type === "submission") {
 				const { record } = event;
-				if (record.type !== "input" || record.requestId === undefined) continue;
+				if (record.type !== "input") continue;
 				const { requestId } = record;
-				if (record.status === "done") emit({ type: "answer", requestId, content: answers.get(record.answer) ?? "" });
-				else if (record.status === "unanswered")
-					emit({ type: "failure", requestId, reason: failureReason(record.reason, record.detail) });
+				if (record.status === "unanswered") {
+					const reason = failureReason(record.reason, record.detail);
+					if (requestId !== undefined) emit({ type: "failure", requestId, reason });
+					const round = { submission: record.id, requestId, entry: record.entry, reason };
+					// A listener that throws ends the watch, and with it every later event to the human.
+					await root
+						.commit((tx) => recordFact(tx, turnSignal(round, Date.now())), context)
+						.catch((error: unknown) => console.error("[soma] outcome signal:", error));
+				} else if (record.status === "done" && requestId !== undefined) {
+					emit({ type: "answer", requestId, content: answers.get(record.answer) ?? "" });
+				}
 			}
 		}
 	});

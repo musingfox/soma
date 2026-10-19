@@ -28,6 +28,7 @@ import {
 	reviseLine,
 	type StoredLine,
 } from "../../domain/memory.ts";
+import { deniedSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
 
 const RECALL_LIMIT = 20;
@@ -55,8 +56,11 @@ export const Facts = defineDoc<{ rows: Fact[] }>({
 	initial: () => ({ rows: [] }),
 });
 
+/** A fact whose key is already recorded is not recorded again. */
 export async function recordFact(tx: Tx, fact: Fact): Promise<void> {
-	(await tx.doc(Facts)).rows.push(fact);
+	const facts = await tx.doc(Facts);
+	if (fact.key !== undefined && facts.rows.some((row) => row.key === fact.key)) return;
+	facts.rows.push(fact);
 }
 
 const text = (message: { content: string | readonly { type: string; text?: string }[] }) =>
@@ -219,9 +223,60 @@ const recall = defineTool({
 	},
 });
 
+const says = (entry: EntryRecord, role: "user" | "assistant") =>
+	(entry.model ?? []).some((message) => message.role === role && text(message).trim() !== "");
+
+/**
+ * Walks the transcript back from the newest input, the one that denies: the answer of the round `turnsAgo` rounds
+ * before it is the last assistant text before the next `turnsAgo - 1` inputs. Inputs are found by their user message,
+ * not their kind, since each client submits under its own kind.
+ */
+async function deniedAnswer(tx: Tx, conversationId: ConversationId, turnsAgo: number) {
+	let by: EntryRecord | undefined;
+	let passed = 0;
+	let cursor: Cursor | undefined;
+	do {
+		const page = await tx.scanEntries({ conversationId, order: "descending" }, 200, cursor);
+		for (const entry of page.items) {
+			if (says(entry, "user")) {
+				if (by === undefined) by = entry;
+				else passed += 1;
+			} else if (by !== undefined && passed === turnsAgo - 1 && says(entry, "assistant")) {
+				return { entry: entry.id, by: by.id };
+			}
+		}
+		cursor = page.next;
+	} while (cursor !== undefined);
+	return undefined;
+}
+
+const denied = defineTool({
+	name: "mark_denied",
+	description:
+		"使用者這一輪否定了你先前的回答（說你錯了、不是這樣、沒做到）時呼叫，記一筆結果訊號供日後反省。" +
+		"只記錄，不會改動任何回答。",
+	parameters: Type.Object({
+		turns_ago: Type.Optional(
+			Type.Integer({ minimum: 1, description: "被否定的是往回數第幾輪的回答；上一輪是 1，預設 1" }),
+		),
+	}),
+	// The row is keyed by the denied answer, so a rerun after a crash finds it instead of adding another.
+	replay: "safe",
+	execute: async (args, api, context) => {
+		const found = await api.commit(async (tx) => {
+			const answer = await deniedAnswer(tx, api.conversationId, args.turns_ago ?? 1);
+			if (answer !== undefined) await recordFact(tx, deniedSignal(answer.entry, answer.by, Date.now()));
+			return answer;
+		}, context);
+		return {
+			output: [{ type: "text", text: found === undefined ? "找不到那一輪的回答，沒有記錄。" : "記下了。" }],
+		};
+	},
+});
+
 export const memory = defineExtension({
 	name: "soma.memory",
-	tools: [remember, revise, forget, history, restore, recall],
+	tools: [remember, revise, forget, history, restore, recall, denied],
 	sections: [
 		section("memory", async (input, context) => {
 			const curated = await input.read.snapshot(Curated, context);

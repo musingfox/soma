@@ -97,7 +97,12 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 			if (job === undefined) return text({ sent: false, error: `no job for card ${args.card}` });
 			const outcome = await agents.respond(job.agent, { option: args.option, fingerprint: args.fingerprint });
 			if (outcome.sent) {
-				const decision = decide(job, { action: "answered", option: args.option, reason: args.reason });
+				const decision = decide(job, {
+					action: "answered",
+					option: args.option,
+					fingerprint: args.fingerprint,
+					reason: args.reason,
+				});
 				await api.commit(async (tx) => {
 					const doc = await tx.doc(Dispatches, api.conversationId);
 					const index = doc.jobs.findIndex((each) => each.card === args.card);

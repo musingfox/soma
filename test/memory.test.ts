@@ -43,11 +43,11 @@ describe("curated layer rules", () => {
 		expect(renderCurated([])).toBeUndefined();
 		const user = `${MODEL_LINE_PREFIX}看起來像模型寫的，其實是使用者`;
 		const rendered = renderCurated([
-			{ by: "user", text: user },
-			{ by: "model", text: `${MODEL_LINE_PREFIX}x：模型的話` },
+			{ id: 1, by: "user", text: user },
+			{ id: 2, by: "model", text: `${MODEL_LINE_PREFIX}x：模型的話` },
 		]);
 		expect(rendered?.indexOf(user)).toBeLessThan(rendered?.indexOf(FENCE_OPEN) ?? -1);
-		expect(rendered).toContain(`${FENCE_OPEN}\n${MODEL_LINE_PREFIX}x：模型的話\n${FENCE_CLOSE}`);
+		expect(rendered).toContain(`${FENCE_OPEN}\n[#2] ${MODEL_LINE_PREFIX}x：模型的話\n${FENCE_CLOSE}`);
 	});
 });
 
@@ -108,7 +108,7 @@ describe("memory extension on the real harness", () => {
 
 	test("a write over the budget is refused back to the model and leaves the layer unchanged", async () => {
 		const { faux, harness, root } = await open(db());
-		const before = [{ by: "user" as const, text: "記".repeat(CURATED_MAX_CHARS - 10) }];
+		const before = [{ id: 1, by: "user" as const, text: "記".repeat(CURATED_MAX_CHARS - 10) }];
 		await root.commit(async (tx) => {
 			(await tx.doc(Curated)).lines.push(...before);
 		}, context);

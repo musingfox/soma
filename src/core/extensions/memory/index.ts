@@ -1,6 +1,7 @@
 import { Type } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
+	type ConversationId,
 	type Cursor,
 	defineDoc,
 	defineExtension,
@@ -12,22 +13,38 @@ import {
 } from "@earendil-works/pi-durable";
 import {
 	appendModelLine,
+	type Change,
+	type Changed,
 	type CuratedLine,
 	type Fact,
 	type Recalled,
+	type Revision,
 	recallMatches,
 	renderCurated,
+	renderHistory,
 	renderRecall,
+	renderRevision,
+	restoreLine,
+	reviseLine,
+	type StoredLine,
 } from "../../domain/memory.ts";
+import { noticeEntry } from "../../notice.ts";
 
 const RECALL_LIMIT = 20;
 
-/** The curated layer: shared by every conversation, appended to, never rewritten. */
-export const Curated = defineDoc<{ lines: CuratedLine[] }>({
+/**
+ * The curated layer: shared by every conversation. Lines are appended, revised or forgotten; every revision keeps
+ * what it replaced in `history`, in the same document so a line and its history always commit together.
+ */
+export const Curated = defineDoc<{ next: number; lines: StoredLine[]; history: Revision[] }>({
 	kind: "soma.memory.curated",
-	version: 1,
+	version: 2,
 	scope: "session",
-	initial: () => ({ lines: [] }),
+	initial: () => ({ next: 1, lines: [], history: [] }),
+	migrate: (value) => {
+		const lines = (value as { lines: CuratedLine[] }).lines.map((line, index) => ({ id: index + 1, ...line }));
+		return { next: lines.length + 1, lines, history: [] };
+	},
 });
 
 /** The fact layer: host code appends rows with `recordFact`; no model writes here. */
@@ -72,17 +89,108 @@ async function scanAll<T>(scan: (cursor?: Cursor) => Promise<{ items: readonly T
 const remember = defineTool({
 	name: "remember",
 	description:
-		"把一件值得長期記住的事追加到長期記憶。只能追加，不能修改或刪除既有內容；超過容量上限時會被拒絕，原因會回報給你。",
+		"把一件值得長期記住的事追加到長期記憶。要改或刪既有的條目用 revise_memory、forget_memory；超過容量上限時會被拒絕，原因會回報給你。",
 	parameters: Type.Object({ text: Type.String({ description: "要記住的一句話" }) }),
 	execute: async (args, api, context) => {
 		const reason = await api.commit(async (tx) => {
 			const curated = await tx.doc(Curated);
 			const appended = appendModelLine(curated.lines, args.text, Date.now());
 			if (!appended.ok) return appended.reason;
-			curated.lines.push(appended.line);
+			curated.lines.push({ id: curated.next, ...appended.line });
+			curated.next += 1;
 			return undefined;
 		}, context);
 		return { output: [{ type: "text", text: reason ?? "記住了。" }] };
+	},
+});
+
+const line = Type.Number({ description: "條目編號，系統提示裡每一條前面的 [#編號]" });
+const reason = Type.String({ description: "為什麼要改：會寫進修訂紀錄並通知使用者" });
+const evidence = Type.Array(Type.String(), {
+	description: "至少一個證據 id，格式 entry:<id>、submission:<id>、task:<id> 或 document:<id>@<seq>",
+});
+
+// The revision, its history row and the human's notice share one commit: after a crash there is all of it or none.
+async function applyChange(
+	tx: Tx,
+	conversationId: ConversationId,
+	change: (lines: readonly StoredLine[], history: readonly Revision[]) => Changed,
+): Promise<string> {
+	const curated = await tx.doc(Curated);
+	const changed = change(curated.lines, curated.history);
+	if (!changed.ok) return changed.reason;
+	curated.lines = changed.lines;
+	curated.history.push(changed.revision);
+	const notice = renderRevision(changed.revision);
+	await tx.appendEntry(conversationId, noticeEntry("report", notice));
+	return `${notice}已通知使用者。`;
+}
+
+const answer = (output: string) => ({ output: [{ type: "text" as const, text: output }] });
+
+const revise = defineTool({
+	name: "revise_memory",
+	description:
+		"改寫長期記憶的一條。必須附理由和至少一個證據 id；沒有就會被拒絕，原因會回報給你。改過的條目算你寫的，修改前的原文會留在修訂紀錄，使用者會收到通知。",
+	parameters: Type.Object({ line, text: Type.String({ description: "這一條的新內容" }), reason, evidence }),
+	execute: async (args, api, context) => {
+		const change: Change = { line: args.line, reason: args.reason, evidence: args.evidence, at: Date.now() };
+		return answer(
+			await api.commit(
+				(tx) => applyChange(tx, api.conversationId, (lines) => reviseLine(lines, args.text, change)),
+				context,
+			),
+		);
+	},
+});
+
+const forget = defineTool({
+	name: "forget_memory",
+	description:
+		"刪除長期記憶的一條。必須附理由和至少一個證據 id；沒有就會被拒絕。刪掉的原文會留在修訂紀錄，可以用 restore_memory 還原，使用者會收到通知。",
+	parameters: Type.Object({ line, reason, evidence }),
+	execute: async (args, api, context) => {
+		const change: Change = { line: args.line, reason: args.reason, evidence: args.evidence, at: Date.now() };
+		return answer(
+			await api.commit(
+				(tx) => applyChange(tx, api.conversationId, (lines) => reviseLine(lines, null, change)),
+				context,
+			),
+		);
+	},
+});
+
+const history = defineTool({
+	name: "memory_history",
+	description: "列出長期記憶某一條的每一版，含修訂時間與理由，用來挑 restore_memory 要還原的版本。",
+	parameters: Type.Object({ line }),
+	replay: "safe",
+	execute: async (args, api, context) =>
+		// Rendered inside the commit: a doc is a live proxy only valid there.
+		answer(await api.commit(async (tx) => renderHistory((await tx.doc(Curated)).history, args.line), context)),
+});
+
+const restore = defineTool({
+	name: "restore_memory",
+	description:
+		"把長期記憶的一條還原成 memory_history 列出的某一版，也能找回刪掉的條目。必須附理由和至少一個證據 id；這次還原本身也會記進修訂紀錄，使用者會收到通知。",
+	parameters: Type.Object({
+		line,
+		version: Type.Number({ description: "memory_history 列出的版本號" }),
+		reason,
+		evidence,
+	}),
+	execute: async (args, api, context) => {
+		const change: Change = { line: args.line, reason: args.reason, evidence: args.evidence, at: Date.now() };
+		return answer(
+			await api.commit(
+				(tx) =>
+					applyChange(tx, api.conversationId, (lines, revisions) =>
+						restoreLine(lines, revisions, args.version, change),
+					),
+				context,
+			),
+		);
 	},
 });
 
@@ -112,7 +220,7 @@ const recall = defineTool({
 
 export const memory = defineExtension({
 	name: "soma.memory",
-	tools: [remember, recall],
+	tools: [remember, revise, forget, history, restore, recall],
 	sections: [
 		section("memory", async (input, context) => {
 			const curated = await input.read.snapshot(Curated, context);

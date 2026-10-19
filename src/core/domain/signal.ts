@@ -54,6 +54,25 @@ export function dispatchSignal(
 	};
 }
 
+const TURN_FAILED = " 那一輪沒有回答：";
+
+/**
+ * Why a round failed, as `turnSignal` wrote it, with what differs between two failures of one cause blanked out:
+ * ids (uuids and long runs that mix letters and digits) and long numbers such as timestamps. Short numbers stay, so a
+ * 401 and a 429 remain two causes.
+ */
+export function failureCause(fact: Fact): string {
+	const at = fact.text.indexOf(TURN_FAILED);
+	const reason = at === -1 ? fact.text : fact.text.slice(at + TURN_FAILED.length);
+	return reason
+		.toLowerCase()
+		.replace(/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/g, "<id>")
+		.replace(/\b(?=\w*\d)(?=\w*[a-z])\w{8,}\b/g, "<id>")
+		.replace(/\d{5,}/g, "<n>")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
 /** A round that ended unanswered; `entry` is its input's, absent when it was never placed. */
 export function turnSignal(
 	round: { readonly submission: number; readonly requestId?: string; readonly entry?: number; readonly reason: string },
@@ -63,7 +82,7 @@ export function turnSignal(
 	return {
 		at: now,
 		kind: SIGNAL.turnFailed,
-		text: `${requestId ?? `submission ${submission}`} 那一輪沒有回答：${reason}`,
+		text: `${requestId ?? `submission ${submission}`}${TURN_FAILED}${reason}`,
 		key: `turn:${submission}`,
 		refs: {
 			submission,

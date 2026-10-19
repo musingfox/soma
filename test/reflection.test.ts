@@ -8,7 +8,8 @@ import type { Harness, TaskId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
 import { runReflectionSmoke } from "../smoke/reflection.ts";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
-import { SIGNAL } from "../src/core/domain/signal.ts";
+import { subjectOf } from "../src/core/domain/reflection.ts";
+import { SIGNAL, turnSignal } from "../src/core/domain/signal.ts";
 import { eventBridge } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { Curated, Facts, memory } from "../src/core/extensions/memory/index.ts";
@@ -233,4 +234,20 @@ test("SIGKILL while waiting and again during the reflection's run keeps it on ti
 	timeout: 60_000,
 }, async () => {
 	await runReflectionSmoke(4_000);
+});
+
+test("failed rounds are one problem per cause, whatever ids or times they carry", () => {
+	const turn = (submission: number, reason: string) =>
+		turnSignal({ submission, requestId: `terminal:${submission}`, reason }, submission);
+	const subjects = [
+		turn(1, "模型出錯：401 invalid x-api-key (request req_011CVa1b2c3d4e5f)"),
+		turn(2, "模型出錯：401 invalid x-api-key (request req_011CVf9e8d7c6b5a)"),
+		turn(3, "模型出錯：429 rate limited, retry after 1792387555558"),
+		turn(4, "模型出錯：429 rate limited, retry after 1792387600000"),
+		turn(5, "找不到模型"),
+	].map(subjectOf);
+	expect(new Set(subjects).size).toBe(3);
+	expect(subjects[0]).toBe(subjects[1]);
+	expect(subjects[2]).toBe(subjects[3]);
+	expect(subjects[0]).not.toBe(subjects[2]);
 });

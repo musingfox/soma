@@ -71,19 +71,20 @@ export function appendModelLine(
 
 /**
  * Evidence ids, shared with the self-inspect tool (ARCHITECTURE.md「證據 id」): `entry:<id>`, `submission:<id>`,
- * `task:<id>` name Pi Durable records; `document:<id>@<seq>` names one committed revision of a document.
+ * `task:<id>` name Pi Durable records; `document:<id>@<seq>` names one committed revision of a document;
+ * `decision:<card>#<n>` names the n-th answer or escalation on a dispatched card's job.
  */
-export const EVIDENCE_ID = /^(?:(?:entry|submission|task):\d+|document:\d+@\d+)$/;
+export const EVIDENCE_ID = /^(?:(?:entry|submission|task):\d+|document:\d+@\d+|decision:[^#\s]+#\d+)$/;
 
 /** Only the format is checked: Pi Durable has no submission-by-id read, so existence can't be checked for every kind. */
 function refuseChange(reason: string, evidence: readonly string[]): string | undefined {
 	if (reason.trim() === "") return "沒有修訂：reason 是空的，每次修訂都要寫理由。";
 	if (evidence.length === 0) {
-		return "沒有修訂：evidence 是空的，每次修訂都要附至少一個證據 id（例如 entry:12、submission:3、task:7、document:2@41）。";
+		return "沒有修訂：evidence 是空的，每次修訂都要附至少一個證據 id（例如 entry:12、submission:3、task:7、document:2@41、decision:card-a#0）。";
 	}
 	const bad = evidence.filter((id) => !EVIDENCE_ID.test(id));
 	if (bad.length > 0) {
-		return `沒有修訂：這些證據 id 格式不對：${bad.join("、")}。格式是 entry:<id>、submission:<id>、task:<id> 或 document:<id>@<seq>。`;
+		return `沒有修訂：這些證據 id 格式不對：${bad.join("、")}。格式是 entry:<id>、submission:<id>、task:<id>、document:<id>@<seq> 或 decision:<卡片>#<序號>。`;
 	}
 	return undefined;
 }

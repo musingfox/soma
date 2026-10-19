@@ -5,11 +5,12 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { AssistantEntry, type Harness, type JsonObject } from "@earendil-works/pi-durable";
+import { AssistantEntry, type Harness, type JsonObject, ToolResultEntry } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { addTokens, NO_TOKENS, rounds, type Tokens } from "../src/core/domain/inspect.ts";
-import { eventBridge } from "../src/core/extensions/dispatch/bridge.ts";
+import { EVIDENCE_ID } from "../src/core/domain/memory.ts";
+import { eventBridge, JOB_DONE } from "../src/core/extensions/dispatch/bridge.ts";
 import { dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { inspectExtension } from "../src/core/extensions/inspect/index.ts";
 import { openHarness, openStorage } from "../src/core/harness.ts";
@@ -96,7 +97,10 @@ async function core() {
 		ask: async (args: JsonObject) => {
 			asked = args;
 			await say("自我檢視");
-			return results.at(-1) as Window;
+			const found = results.at(-1) as Window;
+			// Every row of every query can be cited as memory-revision evidence.
+			for (const row of found.items) expect(row.evidence).toMatch(EVIDENCE_ID);
+			return found;
 		},
 	};
 }
@@ -130,7 +134,10 @@ describe("inspect on the real harness", () => {
 
 		const found = await soma.ask({ what: "failures" });
 
-		expect(found).toMatchObject({ total: 1, items: [{ id: failed.id, reason: "model_error", detail: "faux 壞了" }] });
+		expect(found).toMatchObject({
+			total: 1,
+			items: [{ evidence: `submission:${failed.id}`, reason: "model_error", detail: "faux 壞了" }],
+		});
 		expect(found.truncated).toBeUndefined();
 	});
 
@@ -176,20 +183,31 @@ describe("inspect on the real harness", () => {
 		await new Promise((resolve) => setTimeout(resolve, 5));
 		soma.agents.emit("card-b", { ...prompt, fingerprint: "beef" });
 		await soma.settle();
+		soma.agents.finish("card-a", "結果：完成");
+		await soma.settle();
+		const entries = (await soma.root.entries({ order: "ascending" }, 1000, undefined, context)).items;
+		const done = entries.find((entry) => entry.kind === JOB_DONE);
+		const dispatched = entries.filter((entry) => {
+			const message = ToolResultEntry.is(entry) ? entry.model?.[0] : undefined;
+			if (message?.role !== "toolResult" || message.toolName !== "dispatch") return false;
+			const [block] = message.content;
+			return block?.type === "text" && JSON.parse(block.text).card === "card-b";
+		});
 
 		expect(await soma.ask({ what: "decisions" })).toMatchObject({
 			total: 2,
 			items: [
-				{ id: "card-b#0", card: "card-b", action: "escalated", reason: "會動到正式資料" },
-				{ id: "card-a#0", card: "card-a", action: "answered", option: "1", reason: "只是建立一個空檔" },
+				{ evidence: "decision:card-b#0", card: "card-b", action: "escalated", reason: "會動到正式資料" },
+				{ evidence: "decision:card-a#0", card: "card-a", action: "answered", option: "1", reason: "只是建立一個空檔" },
 			],
 		});
 		expect(await soma.ask({ what: "jobs" })).toMatchObject({
 			total: 2,
 			items: [
-				{ id: "card-b", status: "blocked", decisions: 1 },
-				// Answered, so working again.
-				{ id: "card-a", status: "working", decisions: 1 },
+				// Not finished: cited by the dispatch call that recorded its job.
+				{ card: "card-b", evidence: `entry:${dispatched[0]?.id}`, status: "blocked", decisions: 1 },
+				// Finished: cited by its result entry.
+				{ card: "card-a", evidence: `entry:${done?.id}`, status: "done", outcome: "完成", decisions: 1 },
 			],
 		});
 	});
@@ -202,7 +220,7 @@ describe("inspect on the real harness", () => {
 		const found = await soma.ask({ what: "failures", limit: 2 });
 
 		expect(found.total).toBe(3);
-		expect(found.items.map((row) => row.id)).toEqual([ids[2], ids[1]]);
+		expect(found.items.map((row) => row.evidence)).toEqual([`submission:${ids[2]}`, `submission:${ids[1]}`]);
 		expect(found.truncated).toContain("共 3 筆");
 	});
 });

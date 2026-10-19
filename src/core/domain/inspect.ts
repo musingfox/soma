@@ -90,8 +90,8 @@ export function window<T>(rows: readonly T[], limit: number): Window<T> {
 }
 
 export type DecisionRow = {
-	/** `<card>#<n>`: the n-th decision on the card's job, counted from 0; a job's decisions are only appended. */
-	readonly id: string;
+	/** `decision:<card>#<n>`, the n-th decision on the card's job from 0; a job's decisions are only appended. */
+	readonly evidence: string;
 	readonly card: string;
 	readonly at: string;
 	readonly kind: string;
@@ -102,14 +102,20 @@ export type DecisionRow = {
 
 export const decisionRows = (jobs: DispatchList, range: Range): DecisionRow[] =>
 	jobs
-		.flatMap((job) => job.decisions.map((decision, n) => ({ id: `${job.card}#${n}`, card: job.card, ...decision })))
+		.flatMap((job) =>
+			job.decisions.map((decision, n) => ({ evidence: `decision:${job.card}#${n}`, card: job.card, ...decision })),
+		)
 		.filter((row) => inRange(Date.parse(row.at), range))
 		.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
 
-// Newest dispatch first; the status's screen text is left out, it can be a whole terminal.
-export const jobRows = (jobs: DispatchList) =>
+/**
+ * Newest dispatch first; the status's screen text is left out, it can be a whole terminal. `evidence` maps a card to
+ * the record of its result, or of its dispatch while it has none.
+ */
+export const jobRows = (jobs: DispatchList, evidence: ReadonlyMap<string, string>) =>
 	[...jobs].reverse().map((job) => ({
-		id: job.card,
+		card: job.card,
+		...(evidence.has(job.card) && { evidence: evidence.get(job.card) }),
 		agent: job.agent,
 		status: job.status.state,
 		outcome: job.outcome ?? "未知",

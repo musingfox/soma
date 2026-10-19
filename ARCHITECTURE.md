@@ -143,6 +143,7 @@ soma 除了調派 agent，本身也要有助理的基本能力：讀 email、看
   - 每次修訂都在同一個 commit 寫一筆 `data.kind: "report"` 的 `notice` 給人，內容寫明改了哪一條、改前改後、理由和證據。不併進十分鐘彙報，因為改錯的記憶從下一輪起就會影響回答，人應該立刻看到。
 - **證據 id。** 自我檢視工具回傳的每一筆和記憶修訂引用的證據用同一種格式：`entry:<EntryId>`、`submission:<SubmissionId>`、`task:<TaskId>`，或 `document:<DocumentId>@<Seq>` 表示某份文件在某個 commit 的那一版（Pi Durable 沒有獨立的文件修訂紀錄，一版由文件 id 和 commit 序號決定），或 `decision:<卡片>#<序號>` 表示派工清單裡某張卡的第幾個代答或轉人決定（從 0 起算）。派工清單是 `history: "latest"`，舊版本讀不回來，所以決定不能用 `document:` 引用；決定只會追加，序號不會變。數字都是 Pi Durable 的 id（`durable/src/types.ts:27-36`）。檢查用的正規式是 `src/core/domain/memory.ts` 的 `EVIDENCE_ID`。
 - **事實層** 對應一份 document，由程式寫入，不經模型萃取。
+- **結果訊號** 存在事實層，種類以 `signal.` 開頭（`src/core/domain/signal.ts`），供自我檢視和反省判斷哪些行為該改。每筆帶一個 key，同一個 key 只記一次，所以崩潰後重跑的寫入不會重複。事件橋在提交 seq 的同一筆 commit 裡記兩種：代答後十分鐘內又卡在同一個 fingerprint 的提示，以及派工結果是失敗或讀不到結果行。HumanPort 看到一輪以 `unanswered` 結束時記一筆。使用者否定上一輪時，模型呼叫 `mark_denied` 標記，紀錄指向被否定那一輪的回答 entry；說明文字由程式產生，模型的話不進事實層。
 - **`recall`** 是一個搜尋舊對話紀錄的工具，不呼叫就不花成本。
 - **`inspect`** 讓模型唯讀查自己的執行軌跡：失敗的輪次、每輪 token 與成本、代答與轉人、每張派工卡的最後狀態，回傳的每一筆都帶一個 `evidence` 欄位，格式見上面的「證據 id」，超過筆數上限只回最新的幾筆並註明總數。
   - pi-durable 1.3.0 的 `Tx` 和 `Session` 都不能掃 submission，所以這個工具拿 Harness 自己的 `Storage` 來掃，而且只在 `api.commit` 的回呼裡掃：回呼占住 Session 的提交線，讀不到提交到一半的狀態，和 `Tx` 的讀取一樣。

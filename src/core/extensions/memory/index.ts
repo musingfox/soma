@@ -107,7 +107,8 @@ const remember = defineTool({
 const line = Type.Number({ description: "條目編號，系統提示裡每一條前面的 [#編號]" });
 const reason = Type.String({ description: "為什麼要改：會寫進修訂紀錄並通知使用者" });
 const evidence = Type.Array(Type.String(), {
-	description: "至少一個證據 id，格式 entry:<id>、submission:<id>、task:<id> 或 document:<id>@<seq>",
+	description:
+		"至少一個證據 id，格式 entry:<id>、submission:<id>、task:<id>、document:<id>@<seq> 或 decision:<卡片>#<序號>",
 });
 
 // The revision, its history row and the human's notice share one commit: after a crash there is all of it or none.

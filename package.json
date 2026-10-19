@@ -22,7 +22,8 @@
 		"smoke:memory": "node smoke/memory.ts",
 		"smoke:inspect": "node smoke/inspect.ts",
 		"smoke:signals": "node smoke/signals.ts",
-		"smoke:reflection": "node smoke/reflection.ts"
+		"smoke:reflection": "node smoke/reflection.ts",
+		"smoke:reflection-card": "node smoke/reflection-card.ts"
 	},
 	"dependencies": {
 		"@earendil-works/chord": "1.3.0",

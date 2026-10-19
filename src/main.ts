@@ -1,12 +1,13 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import type { Harness } from "@earendil-works/pi-durable";
 import { createHerdrAgentPort } from "./adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "./adapters/herdr/client.ts";
-import { readCard } from "./adapters/obsidian/card.ts";
+import { createCard, readCard } from "./adapters/obsidian/card.ts";
 import { runTelegram } from "./adapters/telegram/index.ts";
 import { runTerminal } from "./adapters/terminal/index.ts";
 import { anthropicAuthContext, type Config, ConfigError, loadConfig } from "./config.ts";
@@ -17,6 +18,7 @@ import { dispatchExtension } from "./core/extensions/dispatch/index.ts";
 import { inspectExtension } from "./core/extensions/inspect/index.ts";
 import { connectStdio, loadMcpConfig, mcpExtension } from "./core/extensions/mcp/index.ts";
 import { memory } from "./core/extensions/memory/index.ts";
+import { REFLECTION_PERIOD_MS, reflection } from "./core/extensions/reflection/index.ts";
 import { schedule } from "./core/extensions/schedule/index.ts";
 import { sleeper } from "./core/extensions/sleeper/index.ts";
 import { openHarness, openStorage } from "./core/harness.ts";
@@ -39,6 +41,13 @@ const agents = createHerdrAgentPort({
 	...(config.hangarCap !== undefined && { cap: config.hangarCap }),
 });
 const digests = digest(agents);
+// soma's own repository: the reflection's code-change cards go to the obw project its .obsidian.yaml names.
+const reflections = reflection({
+	repo: dirname(dirname(fileURLToPath(import.meta.url))),
+	createCard,
+	readCard,
+	agents,
+});
 const mcpServers = loadMcpConfig(config.mcpConfig);
 // One server that fails to start (say, an expired token) leaves soma running without its tools.
 const mcpClients = (
@@ -62,6 +71,7 @@ const extensions = [
 	schedule((id, c) => harness.abortTask(id, c)),
 	dispatchExtension(agents, readCard),
 	digests.extension,
+	reflections.extension,
 	inspectExtension(storage),
 	...(await Promise.all(mcpClients.map(({ name, client }) => mcpExtension(name, client)))),
 ];
@@ -71,6 +81,7 @@ const root = await harness.root(context, {
 });
 harness.resume();
 await digests.startDigest(root, DIGEST_PERIOD_MS, context);
+await reflections.startReflection(root, REFLECTION_PERIOD_MS, context);
 await reconcileDispatches(root, agents, context);
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 

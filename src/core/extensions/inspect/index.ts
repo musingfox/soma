@@ -2,6 +2,7 @@ import type { Context } from "@earendil-works/chord/context";
 import { Type } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
+	type ConversationId,
 	type Cursor,
 	defineExtension,
 	defineTool,
@@ -9,6 +10,7 @@ import {
 	type Storage,
 	type SubmissionQuery,
 	type SubmissionRecord,
+	ToolResultEntry,
 	type Tx,
 	UserEntry,
 } from "@earendil-works/pi-durable";
@@ -24,6 +26,7 @@ import {
 	type Step,
 	window,
 } from "../../domain/inspect.ts";
+import { JOB_DONE } from "../dispatch/bridge.ts";
 import { Dispatches } from "../dispatch/index.ts";
 
 async function scanAll<T>(scan: (cursor?: Cursor) => Promise<{ items: readonly T[]; next?: Cursor }>): Promise<T[]> {
@@ -56,7 +59,7 @@ export function inspectExtension(storage: Pick<Storage, "scanSubmissions">) {
 			if (!inRange(at, range)) continue;
 			const { detail } = record;
 			rows.push({
-				id: record.id,
+				evidence: `submission:${record.id}`,
 				conversationId: record.conversationId,
 				...(record.entry !== undefined && { entry: record.entry }),
 				...(at !== undefined && { at: iso(at) }),
@@ -83,10 +86,27 @@ export function inspectExtension(storage: Pick<Storage, "scanSubmissions">) {
 		return found
 			.sort((a, b) => b.at - a.at)
 			.map(({ submission, entry, at, ...round }) => ({
-				id: submission ?? entry ?? round.answers[0],
+				evidence: submission !== undefined ? `submission:${submission}` : `entry:${entry ?? round.answers[0]}`,
 				...round,
 				at: iso(at),
 			}));
+	}
+
+	/** Per card, its JOB_DONE entry, else the result entry of the dispatch call that recorded its job. */
+	async function jobEvidence(tx: Tx, conversationId: ConversationId) {
+		const found = new Map<string, string>();
+		const entries = await scanAll((cursor) => tx.scanEntries({ conversationId, order: "ascending" }, 200, cursor));
+		for (const entry of entries) {
+			if (entry.kind === JOB_DONE) {
+				found.set((entry.data as { card: string }).card, `entry:${entry.id}`);
+				continue;
+			}
+			const message = ToolResultEntry.is(entry) ? entry.model?.[0] : undefined;
+			if (message?.role !== "toolResult" || message.toolName !== "dispatch") continue;
+			const card = cardOf(message.content);
+			if (card !== undefined && !found.has(card)) found.set(card, `entry:${entry.id}`);
+		}
+		return found;
 	}
 
 	const inspect = defineTool({
@@ -94,7 +114,7 @@ export function inspectExtension(storage: Pick<Storage, "scanSubmissions">) {
 		description:
 			"唯讀查詢 soma 自己的執行紀錄，最新的在前。what=failures：沒有得到回答的輪次與原因；usage：每輪的 token 與成本；" +
 			"decisions：代答（answered）與轉人（escalated）的紀錄與理由；jobs：每張派工卡最後的狀態與結果，不受時間範圍篩選。" +
-			"每筆的 id 是穩定的 submission id、entry id 或「卡片#序號」，可以當證據引用。超過 limit 時只回傳最新的幾筆並註明總數。",
+			"每筆的 evidence 是穩定的證據 id（submission:<id>、entry:<id> 或 decision:<卡片>#<序號>），可以直接當記憶修訂的證據。超過 limit 時只回傳最新的幾筆並註明總數。",
 		parameters: Type.Object({
 			what: Type.Union([
 				Type.Literal("failures"),
@@ -125,7 +145,9 @@ export function inspectExtension(storage: Pick<Storage, "scanSubmissions">) {
 			const limit = args.limit ?? INSPECT_DEFAULT_LIMIT;
 			if (args.what === "decisions" || args.what === "jobs") {
 				const jobs = (await api.snapshot(Dispatches, api.conversationId, context))?.jobs ?? [];
-				return json(args.what === "jobs" ? window(jobRows(jobs), limit) : window(decisionRows(jobs, range), limit));
+				if (args.what === "decisions") return json(window(decisionRows(jobs, range), limit));
+				const evidence = await api.commit((tx) => jobEvidence(tx, api.conversationId), context);
+				return json(window(jobRows(jobs, evidence), limit));
 			}
 			if (args.what === "failures")
 				return json(window(await api.commit((tx) => failures(tx, range, context), context), limit));
@@ -134,6 +156,18 @@ export function inspectExtension(storage: Pick<Storage, "scanSubmissions">) {
 	});
 
 	return defineExtension({ name: "soma.inspect", tools: [inspect] });
+}
+
+// The dispatch tool's result is the job as JSON.
+function cardOf(content: readonly { type: string; text?: string }[]): string | undefined {
+	try {
+		const job: unknown = JSON.parse(content.map((block) => block.text ?? "").join(""));
+		return typeof job === "object" && job !== null && "card" in job && typeof job.card === "string"
+			? job.card
+			: undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /** An input entry starts a round; an answer spends tokens in it. */

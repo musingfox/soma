@@ -1,6 +1,6 @@
 import type { DispatchList } from "./dispatch.ts";
 import { EVIDENCE_ID, type Fact, FENCE_CLOSE, FENCE_OPEN } from "./memory.ts";
-import { SIGNAL } from "./signal.ts";
+import { failureCause, SIGNAL } from "./signal.ts";
 
 /** A card the reflection opened for a code change, with the evidence it was opened on. */
 export type OpenedCard = {
@@ -26,13 +26,13 @@ export function evidenceOf(fact: Fact): string[] {
 }
 
 /**
- * What problem a signal is about: the dispatched card, or the source of a round that failed. Two signals with one
- * subject are the same problem, so a subject already acted on is not reflected on again.
+ * What problem a signal is about: the dispatched card, or the cause of a round that failed. Two signals with one
+ * subject are the same problem.
  */
 export function subjectOf(fact: Fact): string {
-	const { card, requestId } = fact.refs ?? {};
+	const { card } = fact.refs ?? {};
 	if (card !== undefined) return `card:${card}`;
-	if (fact.kind === SIGNAL.turnFailed && requestId !== undefined) return `turn:${requestId.split(":", 1)[0]}`;
+	if (fact.kind === SIGNAL.turnFailed) return `turn:${failureCause(fact)}`;
 	return `${fact.kind}:${fact.key ?? fact.at}`;
 }
 

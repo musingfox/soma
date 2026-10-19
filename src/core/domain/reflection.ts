@@ -36,21 +36,67 @@ export function subjectOf(fact: Fact): string {
 	return `${fact.kind}:${fact.key ?? fact.at}`;
 }
 
-/** The subjects some revision or opened card cites evidence of. */
-export function actedOn(facts: readonly Fact[], cited: readonly string[]): Set<string> {
-	const subjects = new Set<string>();
-	for (const id of cited) {
-		const card = /^decision:([^#\s]+)#\d+$/.exec(id)?.[1];
-		if (card !== undefined) subjects.add(`card:${card}`);
-		for (const fact of facts) if (isSignal(fact) && evidenceOf(fact).includes(id)) subjects.add(subjectOf(fact));
-	}
-	return subjects;
+const describe = (subject: string) =>
+	subject.startsWith("card:")
+		? `卡片 ${subject.slice("card:".length)} 的問題`
+		: subject.startsWith("turn:")
+			? `輪次失敗「${subject.slice("turn:".length)}」`
+			: subject;
+
+/** A memory revision or an opened card, under an id that names it once and for all. */
+export type Action = { readonly id: string; readonly label: string; readonly evidence: readonly string[] };
+
+/** A problem acted on before that shows up again: the handling may not have worked. */
+export type Recurrence = { readonly subject: string; readonly actions: Action[]; readonly evidence: string[] };
+
+function subjectsOf(facts: readonly Fact[], id: string): string[] {
+	const card = /^decision:([^#\s]+)#\d+$/.exec(id)?.[1];
+	const found = facts.filter((fact) => isSignal(fact) && evidenceOf(fact).includes(id)).map(subjectOf);
+	return card === undefined ? found : [`card:${card}`, ...found];
 }
 
-/** Signals among `fresh` whose problem no revision or opened card has acted on yet. */
-export function unhandled(facts: readonly Fact[], fresh: readonly Fact[], cited: readonly string[]): Fact[] {
-	const acted = actedOn(facts, cited);
-	return fresh.filter((fact) => isSignal(fact) && !acted.has(subjectOf(fact)));
+/**
+ * Splits the signals among `fresh` into problems no action cites yet, for the model, and problems acted on that
+ * recur, for the human. A recurrence names only the actions not yet in `alerted`, so the human hears of each action
+ * failing once; a recurrence whose actions were all alerted is left out.
+ */
+export function triage(
+	facts: readonly Fact[],
+	fresh: readonly Fact[],
+	actions: readonly Action[],
+	alerted: readonly string[],
+): { unhandled: Fact[]; recurrences: Recurrence[] } {
+	const bySubject = new Map<string, Action[]>();
+	for (const action of actions)
+		for (const subject of new Set(action.evidence.flatMap((id) => subjectsOf(facts, id)))) {
+			bySubject.set(subject, [...(bySubject.get(subject) ?? []), action]);
+		}
+	const unhandled: Fact[] = [];
+	const recurring = new Map<string, Recurrence>();
+	for (const fact of fresh.filter(isSignal)) {
+		const subject = subjectOf(fact);
+		const acted = bySubject.get(subject);
+		if (acted === undefined) {
+			unhandled.push(fact);
+			continue;
+		}
+		const actions = acted.filter((action) => !alerted.includes(action.id));
+		if (actions.length === 0) continue;
+		const seen = recurring.get(subject) ?? { subject, actions, evidence: [] };
+		seen.evidence.push(...evidenceOf(fact));
+		recurring.set(subject, seen);
+	}
+	return { unhandled, recurrences: [...recurring.values()] };
+}
+
+/** The human's notice that a problem recurs after it was acted on; no model is woken for it. */
+export function renderRecurrence(recurrence: Recurrence): string {
+	const evidence = recurrence.evidence.length === 0 ? "（無）" : recurrence.evidence.join("、");
+	return (
+		`${describe(recurrence.subject)}處理過之後又出現新的訊號，處理可能沒有奏效。` +
+		`先前的處理：${recurrence.actions.map((action) => action.label).join("、")}。新訊號的證據：${evidence}。` +
+		"soma 不會自動再修訂或開卡，請你看看。"
+	);
 }
 
 export function refuseCard(evidence: readonly string[]): string | undefined {

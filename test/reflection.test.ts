@@ -207,27 +207,42 @@ test("a tick with no new signal calls no model and still moves its checkpoint on
 	expect(soma.notices).toEqual([]);
 });
 
-test("the same problem the next day opens no second card and revises nothing again", { timeout: 30_000 }, async () => {
+test("the same problem the next day wakes no model and tells the human once that its handling may not have worked", {
+	timeout: 30_000,
+}, async () => {
 	const soma = await core();
 	await soma.dispatched();
 	await soma.trajectory(["f001", "f002", "f003"]);
 	await soma.start();
 	await until(() => soma.notices.some((notice) => notice.startsWith("觀察：")));
 	expect(await soma.reflections()).toHaveLength(1);
+	const handled = soma.notices.length;
 
 	// The next day: the agent is answered again and blocks on that prompt again, a new reblock on the same card.
-	await soma.trajectory(["f004"]);
-	const facts = (await soma.harness.snapshot(Facts, context))?.rows ?? [];
-	expect(facts.filter((row) => row.kind === SIGNAL.reblocked)).toHaveLength(2);
-	const calls = soma.calls();
-	const next = (await soma.checkpoint()).next;
-	await until(async () => (await soma.checkpoint()).next > next);
+	const nextDay = async (fingerprint: string) => {
+		await soma.trajectory([fingerprint]);
+		const facts = (await soma.harness.snapshot(Facts, context))?.rows ?? [];
+		const calls = soma.calls();
+		const next = (await soma.checkpoint()).next;
+		await until(async () => (await soma.checkpoint()).next > next);
+		expect(soma.calls()).toBe(calls);
+		expect((await soma.checkpoint()).cursor).toBe(facts.length);
+	};
+	await nextDay("f004");
 
-	expect(soma.calls()).toBe(calls);
-	expect((await soma.checkpoint()).cursor).toBe(facts.length);
+	expect(soma.notices.slice(handled)).toEqual([
+		"卡片 card-a 的問題處理過之後又出現新的訊號，處理可能沒有奏效。" +
+			`先前的處理：長期記憶 #1 在 ${new Date((await soma.history())[0]?.at ?? 0).toISOString()} 的修改、卡片 fix-reblock。` +
+			"新訊號的證據：decision:card-a#3。soma 不會自動再修訂或開卡，請你看看。",
+	]);
 	expect(await soma.reflections()).toHaveLength(1);
 	expect(await soma.history()).toHaveLength(1);
 	expect([...soma.cards.keys()]).toEqual(["fix-reblock"]);
+
+	// The day after: the same handling has been reported already, so nothing is said again.
+	await nextDay("f005");
+	expect(soma.notices).toHaveLength(handled + 1);
+	expect(await soma.reflections()).toHaveLength(1);
 });
 
 test("SIGKILL while waiting and again during the reflection's run keeps it on time and runs it once", {

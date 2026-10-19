@@ -19,7 +19,8 @@
 		"smoke:digest": "node smoke/digest.ts",
 		"smoke:respond": "node smoke/respond.ts",
 		"smoke:telegram": "node smoke/telegram.ts",
-		"smoke:memory": "node smoke/memory.ts"
+		"smoke:memory": "node smoke/memory.ts",
+		"smoke:inspect": "node smoke/inspect.ts"
 	},
 	"dependencies": {
 		"@earendil-works/chord": "1.3.0",

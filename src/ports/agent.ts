@@ -1,6 +1,9 @@
 // State vocabulary is OSC 7501's: https://www.superlogical.com/rex/docs/build/program-status
 export type BlockedKind = "permission" | "question" | "auth";
 
+/** One option of a prompt on screen: `id` is what an answer names, `label` the terminal's own wording. */
+export type Choice = { readonly id: string; readonly label: string };
+
 export type AgentState =
 	| { readonly state: "idle" | "working" | "done" | "error"; readonly msg?: string }
 	| {
@@ -9,6 +12,8 @@ export type AgentState =
 			readonly msg?: string;
 			// Identifies the prompt on screen; an answer carries it back, so a changed screen refuses the answer.
 			readonly fingerprint?: string;
+			// A mutable array: a status is stored in the dispatch list as JSON, which takes no readonly array.
+			readonly options?: Choice[];
 	  };
 
 export interface StartRequest {

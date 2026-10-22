@@ -83,7 +83,7 @@ await root.commit(async (tx) => {
 	});
 }, context);
 await reconcileDispatches(root, agents, context);
-const human = await openHumanPort(harness, root, context);
+const human = await openHumanPort(harness, root, agents, context);
 emit({ event: "started", pid: process.pid });
 
 const report = async () =>

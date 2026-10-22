@@ -7,10 +7,10 @@ import {
 	type Harness,
 	watchEvents,
 } from "@earendil-works/pi-durable";
-import type { AgentState } from "../ports/agent.ts";
-import type { HumanPort, NoticeKind, SomaEvent } from "../ports/human.ts";
+import type { AgentPort, AgentState } from "../ports/agent.ts";
+import type { Choices, HumanPort, NoticeKind, SomaEvent } from "../ports/human.ts";
 import { turnSignal } from "./domain/signal.ts";
-import { Dispatches } from "./extensions/dispatch/index.ts";
+import { answerJob, Dispatches } from "./extensions/dispatch/index.ts";
 import { recordFact } from "./extensions/memory/index.ts";
 import { NOTICE, noticeEntry } from "./notice.ts";
 
@@ -42,6 +42,7 @@ const failureReason = (reason: string, detail: unknown) => {
 export async function openHumanPort(
 	harness: Harness,
 	root: Conversation,
+	agents: Pick<AgentPort, "respond">,
 	context: Context,
 ): Promise<HumanPort & { close(): Promise<void> }> {
 	const listeners = new Set<(event: SomaEvent) => void>();
@@ -67,8 +68,8 @@ export async function openHumanPort(
 			else if (event.type === "run_end") setRunning(false);
 			else if (event.type === "message_end") answers.set(event.entry.id, textOf(event.entry));
 			else if (event.type === "entry_appended" && event.entry.kind === NOTICE) {
-				const { kind, content } = event.entry.data as { kind: NoticeKind; content: string };
-				emit({ type: "notice", kind, content });
+				const { kind, content, choices } = event.entry.data as { kind: NoticeKind; content: string; choices?: Choices };
+				emit(choices === undefined ? { type: "notice", kind, content } : { type: "notice", kind, content, choices });
 			} else if (event.type === "submission") {
 				const { record } = event;
 				if (record.type !== "input") continue;
@@ -121,6 +122,13 @@ export async function openHumanPort(
 		},
 		async notify(content, kind) {
 			await root.submit({ type: "write", entry: noticeEntry(kind, content) }, context);
+		},
+		respond(card, answer) {
+			return answerJob(agents, (change) => root.commit(change, context), root.id, {
+				card,
+				answer,
+				reason: "人親自選的選項",
+			});
 		},
 		async close() {
 			await Promise.all([events.stop(), watch.stop()]);

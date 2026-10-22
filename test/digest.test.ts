@@ -44,7 +44,7 @@ test("two jobs finishing in one period make one report and one model call; a qui
 		}, context);
 		const errors: unknown[] = [];
 		eventBridge(root, agents, context).listen((error) => errors.push(error));
-		const human = await openHumanPort(harness, root, context);
+		const human = await openHumanPort(harness, root, agents, context);
 		const notices: string[] = [];
 		human.subscribe((event) => {
 			if (event.type === "notice" && event.kind === "report") notices.push(event.content);

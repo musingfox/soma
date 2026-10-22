@@ -110,7 +110,7 @@ try {
 
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
-	const human = await openHumanPort(harness, root, context);
+	const human = await openHumanPort(harness, root, agents, context);
 	const notices: SomaEvent[] = [];
 	human.subscribe((event) => {
 		if (event.type === "notice") notices.push(event);

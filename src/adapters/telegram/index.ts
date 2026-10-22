@@ -1,6 +1,13 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
-import { type HumanPort, type NoticeKind, PUSHED_FAILURES } from "../../ports/human.ts";
+import type { Answer } from "../../ports/agent.ts";
+import {
+	type Choices,
+	type HumanAnswerOutcome,
+	type HumanPort,
+	type NoticeKind,
+	PUSHED_FAILURES,
+} from "../../ports/human.ts";
 
 export interface TelegramConfig {
 	readonly token: string;
@@ -24,11 +31,35 @@ const PUSHED_SOURCES = ["schedule:"];
 // sendMessage takes 1-4096 characters; JavaScript string length counts the same UTF-16 units.
 export const MESSAGE_LIMIT = 4096;
 
+// callback_data takes 1-64 bytes: https://core.telegram.org/bots/api#inlinekeyboardbutton
+const CALLBACK_DATA_LIMIT = 64;
+// The data of the button that replaces a pressed keyboard: it names no answer, so a press on it only gets answered.
+const SETTLED = "-";
+
+const ButtonSchema = z.object({ text: z.string(), callback_data: z.string().optional() }).passthrough();
 const UpdateSchema = z
 	.object({
 		update_id: z.number(),
 		message: z
 			.object({ message_id: z.number(), chat: z.object({ id: z.number() }).passthrough(), text: z.string().optional() })
+			.passthrough()
+			.optional(),
+		callback_query: z
+			.object({
+				id: z.string(),
+				data: z.string().optional(),
+				message: z
+					.object({
+						message_id: z.number(),
+						chat: z.object({ id: z.number() }).passthrough(),
+						reply_markup: z
+							.object({ inline_keyboard: z.array(z.array(ButtonSchema)) })
+							.passthrough()
+							.optional(),
+					})
+					.passthrough()
+					.optional(),
+			})
 			.passthrough()
 			.optional(),
 	})
@@ -53,11 +84,39 @@ export function splitMessage(text: string, limit = MESSAGE_LIMIT): string[] {
 	return parts;
 }
 
+const REFUSALS: Record<Extract<HumanAnswerOutcome, { sent: false }>["refusal"], string> = {
+	not_blocked: "agent 已經不在等回答",
+	stale: "提示已經變了",
+	unknown_option: "沒有這個選項",
+	auth: "憑證要你親自處理",
+	unreadable: "畫面讀不出選項",
+	no_job: "派工清單裡沒有這張卡片",
+};
+
+// A card name is kebab-case and a fingerprint hex, so neither holds the separator.
+const callbackData = (card: string, { option, fingerprint }: Answer) => `${option}:${fingerprint}:${card}`;
+
+function parseCallbackData(data: string | undefined): { card: string; answer: Answer } | undefined {
+	const [option, fingerprint, card, ...rest] = data?.split(":") ?? [];
+	if (!option || !fingerprint || !card || rest.length > 0) return undefined;
+	return { card, answer: { option, fingerprint } };
+}
+
+/** One button per option, or none when a button's data would not fit: a cut card name would answer another job. */
+function keyboard({ card, fingerprint, options }: Choices) {
+	const rows = options.map(({ id, label }) => [
+		{ text: label, callback_data: callbackData(card, { option: id, fingerprint }) },
+	]);
+	const fits = rows.every(([button]) => Buffer.byteLength(button?.callback_data ?? "") <= CALLBACK_DATA_LIMIT);
+	return fits ? { inline_keyboard: rows } : undefined;
+}
+
 const label = (kind: NoticeKind, content: string) => `[${kind === "question" ? "問題" : "通知"}] ${content}`;
 
 /**
  * The Telegram client: each text message from the configured chat is an input, and answers and failures of this
- * client's inputs, failures of rounds the core started, and notices go back to that chat. A message Telegram delivers again keeps its requestId, so the core admits it
+ * client's inputs, failures of rounds the core started, and notices go back to that chat. A question that offers
+ * choices gets a button per option; a press from that chat goes to the agent as the human's own answer. A message Telegram delivers again keeps its requestId, so the core admits it
  * once; the update offset only lives in memory. Resolves when `signal` aborts.
  */
 export async function runTelegram(options: TelegramOptions): Promise<void> {
@@ -77,11 +136,13 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 
 	// One at a time, so a long answer's parts and the messages after it arrive in order.
 	let sending = Promise.resolve();
-	const send = (text: string) => {
+	const send = (text: string, markup?: object) => {
 		sending = sending.then(async () => {
-			for (const part of splitMessage(text)) {
+			const parts = splitMessage(text);
+			for (const [index, part] of parts.entries()) {
+				const last = index === parts.length - 1 && markup !== undefined;
 				try {
-					await call("sendMessage", { chat_id: chatId, text: part });
+					await call("sendMessage", { chat_id: chatId, text: part, ...(last ? { reply_markup: markup } : {}) });
 				} catch (error) {
 					if (!signal.aborted) onError(error);
 					return;
@@ -92,7 +153,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	// The prefix, not a set of ids sent from here, marks this client's rounds: a round the core finishes after a
 	// restart still reaches the chat that started it.
 	const unsubscribe = human.subscribe((event) => {
-		if (event.type === "notice") send(label(event.kind, event.content));
+		if (event.type === "notice") send(label(event.kind, event.content), event.choices && keyboard(event.choices));
 		else if (event.type === "answer") {
 			if (event.requestId.startsWith(REQUEST_PREFIX)) send(event.content);
 			else if (PUSHED_SOURCES.some((source) => event.requestId.startsWith(source)))
@@ -104,6 +165,32 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		}
 	});
 
+	// Telegram refuses to answer a query that is too old or to edit a deleted message; neither may stop the polling.
+	const quietly = (method: string, body: object) =>
+		call(method, body).catch((error: unknown) => {
+			if (!signal.aborted) onError(error);
+		});
+	type CallbackQuery = NonNullable<z.infer<typeof UpdateSchema>["callback_query"]>;
+	// A second tap arrives before the first press's edit hides the buttons; its refusal must not replace the result.
+	const settled = new Set<number>();
+	const answerPress = async (query: CallbackQuery, message: NonNullable<CallbackQuery["message"]>) => {
+		const pressed = parseCallbackData(query.data);
+		if (pressed === undefined || settled.has(message.message_id))
+			return quietly("answerCallbackQuery", { callback_query_id: query.id });
+		settled.add(message.message_id);
+		const outcome = await human.respond(pressed.card, pressed.answer);
+		const button = message.reply_markup?.inline_keyboard.flat().find((each) => each.callback_data === query.data);
+		const result = outcome.sent
+			? `已選：${button?.text ?? pressed.answer.option}`
+			: `未送出：${REFUSALS[outcome.refusal]}`;
+		await quietly("answerCallbackQuery", { callback_query_id: query.id, text: result });
+		await quietly("editMessageReplyMarkup", {
+			chat_id: chatId,
+			message_id: message.message_id,
+			reply_markup: { inline_keyboard: [[{ text: result, callback_data: SETTLED }]] },
+		});
+	};
+
 	const timeout = options.pollTimeoutSeconds ?? 30;
 	let offset: number | undefined;
 	try {
@@ -111,8 +198,8 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			try {
 				const updates = z
 					.array(UpdateSchema)
-					.parse(await call("getUpdates", { offset, timeout, allowed_updates: ["message"] }));
-				for (const { update_id, message } of updates) {
+					.parse(await call("getUpdates", { offset, timeout, allowed_updates: ["message", "callback_query"] }));
+				for (const { update_id, message, callback_query } of updates) {
 					if (message?.text !== undefined && message.chat.id === chatId) {
 						await human.submit({
 							content: message.text,
@@ -120,6 +207,8 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 							requestId: `${REQUEST_PREFIX}${message.message_id}`,
 						});
 					}
+					// A press delivered again after a restart is safe: once its answer went through, the fingerprint no longer matches.
+					if (callback_query?.message?.chat.id === chatId) await answerPress(callback_query, callback_query.message);
 					// Confirmed by the next getUpdates, so only once the core has admitted the input.
 					offset = update_id + 1;
 				}

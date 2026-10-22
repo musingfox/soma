@@ -95,7 +95,7 @@ await reflections.startReflection(root, REFLECTION_PERIOD_MS, context);
 await reconcileDispatches(root, agents, context);
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 
-const human = await openHumanPort(harness, root, context);
+const human = await openHumanPort(harness, root, agents, context);
 const { telegram } = config;
 const stopTelegram = new AbortController();
 const telegramDone = telegram && runTelegram({ ...telegram, human, signal: stopTelegram.signal });

@@ -73,7 +73,8 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 				screen = await readScreen(paneId);
 			}
 			const { kind, msg, prompt } = screen;
-			return { state: "blocked", kind, msg, ...(prompt ? { fingerprint: prompt.fingerprint } : {}) };
+			const options = prompt?.options.map(({ id, label }) => ({ id, label }));
+			return { state: "blocked", kind, msg, ...(prompt ? { fingerprint: prompt.fingerprint, options } : {}) };
 		} catch (error) {
 			return { state: "blocked", kind: "permission", msg: `pane.read failed: ${(error as Error).message}` };
 		}

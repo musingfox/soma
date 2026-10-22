@@ -45,7 +45,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 ```
 
 - **核心只依賴兩個 port 的型別**，不 import 任何介面卡；介面卡只依賴 port，不互相 import，也不碰 Pi Durable 的型別。Pi Durable 的 `Conversation`、`Entry`、`Harness` 只出現在核心內部。
-- **HumanPort** 就是「人類側契約」那三個動作：送出、訂閱、通知。核心暴露的是 soma 自己的事件型別（回答、失敗、通知、派工狀態、根對話這一輪是否在跑），不是 Pi 的 `watch()` 原始事件；程序內和程序外的介面卡拿到的是同一套型別，差別只在中間多一條 socket。
+- **HumanPort** 就是「人類側契約」那四個動作：送出、訂閱、通知、回答提示。核心暴露的是 soma 自己的事件型別（回答、失敗、通知、派工狀態、根對話這一輪是否在跑），不是 Pi 的 `watch()` 原始事件；程序內和程序外的介面卡拿到的是同一套型別，差別只在中間多一條 socket。
 - **AgentPort** 就是「agent 側契約」那六個動作，狀態用 OSC 7501 的詞彙。「呼叫 cc-mobile `/api/launch`」是其中一個實作，和未來直連 herdr 或 ACP 的實作可以互換。
 - **領域物件在核心**：派工清單、工作狀態機、報告。它們是純 TypeScript，不知道 Pi Durable 的存在；Pi Durable extension 是把它們掛進 harness 的那一層。
 - **測試縫**：M1 的 `kill -9` 驗收用真 herdr；其餘單元測試用記憶體內的假 AgentPort 和假 HumanPort，不碰 socket。
@@ -179,8 +179,9 @@ soma 每天讀一次自己的結果訊號，改進自己（`src/core/extensions/
 - **送出**：`submit({ type: "input", content, entry: { kind: "<來源>", data }, requestId })`。`requestId` 用該平台的訊息 id，重送也只會處理一次。終端機沒有訊息 id，用 `terminal:<毫秒時間戳>`：`requestId` 在整個對話內去重，重啟後從 1 重新計數會把新輸入當成重送吞掉。
 - **訂閱**：程序內的介面卡經 `src/core/human-port.ts` 的 HumanPort 訂閱，它把 `watchEvents()` 和派工清單的 `watchDoc()` 轉成 soma 的事件型別；派工狀態取自派工清單，所以誰寫進清單，介面卡就看得到。程序外的客戶端改經客戶端 socket 連入。
 - **通知**：核心要主動找人時（卡住或報告寫好），寫一筆帶 `kind: "notice"` 的紀錄，`data.kind` 是 `question`（卡住要人回答）或 `report`（報告寫好），各介面卡自己決定要不要推播。由 `schedule:` 開頭的 `requestId` 啟動的那一輪回答，介面卡也當成通知推給人。`digest:` 那一輪不推，因為彙報任務會把它的回答寫成 `data.kind: "report"` 的 `notice` 紀錄，再推一次就重複了。
+- **回答提示**：模型用 `escalate` 轉給人的提示，若 agent 側讀得出選項和指紋，`question` 通知會帶 `data.choices`（卡片、指紋、選項），介面卡可以讓人直接選。人選了之後，介面卡呼叫 HumanPort 的 `respond(card, { option, fingerprint })`，核心直接呼叫 AgentPort 的 `respond`，不跑模型（見「兩種互動不能混在一起」），送出後在派工清單記一筆 `answered`。指紋不符時不送鍵，回傳的拒絕原因由介面卡轉給人。Telegram 把每個選項畫成一顆 inline 按鈕，`callback_data` 是 `<選項>:<指紋>:<卡片>`，超過 64 bytes 就只送文字，因為截短的卡片名會答到別的工作。
 - **失敗**：一輪的 input 在 Pi Durable 裡結束成 `unanswered`（`model_error`、`no_model`、`aborted`、`faulted` 或孤兒化的原因，見 durable spec 8.3）時，HumanPort 發 `failure` 事件，帶 `requestId` 和人看得懂的原因，`model_error` 附上供應商的錯誤文字。介面卡把自己那一輪的失敗當回答送回；`schedule:` 和 `herdr:` 開頭（`src/ports/human.ts` 的 `PUSHED_FAILURES`）是核心自己發起的輪次，沒有人在等，所以每個介面卡都把它們的失敗當通知推給人。`digest:` 那一輪的失敗不推，因為彙報任務已經把失敗原因和原始工作清單寫成通知。終端機的 7501 根紀錄在失敗後報 `error`，直到人再輸入。事件快照不含 submission，所以重啟後不會再發一次已經發過的失敗。
-- **Telegram 只認一個聊天室。** bot token 和聊天室 id 都設了才啟動（見「設定」），其他聊天室的訊息一律丟掉，因為找到這個 bot 的任何人都能派 agent 在這台機器上跑。訊息 id 只在同一聊天室內唯一，所以只認一個聊天室也讓 `telegram:<message id>` 不會撞號。介面卡以 `telegram:` 前綴認自己的輪次，不記送過哪些 id，所以核心在重啟後才答完的那一輪仍會送回手機。
+- **Telegram 只認一個聊天室。** bot token 和聊天室 id 都設了才啟動（見「設定」），其他聊天室的訊息和按鈕一律丟掉，因為找到這個 bot 的任何人都能派 agent 在這台機器上跑。訊息 id 只在同一聊天室內唯一，所以只認一個聊天室也讓 `telegram:<message id>` 不會撞號。介面卡以 `telegram:` 前綴認自己的輪次，不記送過哪些 id，所以核心在重啟後才答完的那一輪仍會送回手機。
 
 客戶端 socket 的現況：
 
@@ -281,7 +282,7 @@ soma 啟動時讀一次 `~/.config/soma/config.json`。每個值先看環境變�
 順序如下，每一步一個可觀察的結果：
 
 1. **把人的回答轉給等待中的 agent。** 派工規則禁用 AskUserQuestion，agent 要問人時寫「結果：需要你」並結束這一輪；`reply` 工具把人的回答當成下一個 prompt 送給它，下一個結果照舊由彙報送回（2026-10-22 完成，人在終端機的驗收已跑過）。
-2. **Telegram 按鈕回答卡住的提示。** 依賴第 1 步。
+2. **Telegram 按鈕回答卡住的提示。** 模型轉給人的提示附上選項按鈕，人按下後由核心直接送給 agent，不跑模型（2026-10-22 完成，手機上的驗收已跑過）。
 3. **報告改用 rich message。** 先在手機上實測渲染。
 4. **收語音並轉成文字。** 語音轉文字跑在 GPU 工作站。
 5. **Mini App 雛型。** rich message 不夠用時才做，先驗證只靠 Tailscale 能否打開。

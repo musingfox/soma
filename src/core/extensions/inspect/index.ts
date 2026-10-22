@@ -113,7 +113,7 @@ export function inspectExtension(storage: Pick<Storage, "scanSubmissions">) {
 		name: "inspect",
 		description:
 			"唯讀查詢 soma 自己的執行紀錄，最新的在前。what=failures：沒有得到回答的輪次與原因；usage：每輪的 token 與成本；" +
-			"decisions：代答（answered）與轉人（escalated）的紀錄與理由；jobs：每張派工卡最後的狀態與結果，不受時間範圍篩選。" +
+			"decisions：代答（answered）、轉人（escalated）與轉達人的回答（replied）的紀錄與理由；jobs：每張派工卡最後的狀態與結果，不受時間範圍篩選。" +
 			"每筆的 evidence 是穩定的證據 id（submission:<id>、entry:<id> 或 decision:<卡片>#<序號>），可以直接當記憶修訂的證據。超過 limit 時只回傳最新的幾筆並註明總數。",
 		parameters: Type.Object({
 			what: Type.Union([

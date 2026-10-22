@@ -163,5 +163,42 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 		},
 	});
 
-	return defineExtension({ name: "soma.dispatch", tools: [dispatch, jobs, respond, escalate] });
+	const reply = defineTool({
+		name: "reply",
+		description:
+			"Send the human's answer to an agent whose result was 需要你, as its next prompt. " +
+			"Its next result comes back in the report like any other.",
+		parameters: Type.Object({
+			card: Type.String({ description: "The card of the job that asked" }),
+			text: Type.String({ description: "What to send the agent: the human's answer, in their words" }),
+			reason,
+		}),
+		// Not replayed: a crash mid-call reports it interrupted rather than sending the answer a second time.
+		replay: "unsafe",
+		execute: async (args, api, context) => {
+			// Copied out as JSON: a doc is a live proxy only valid inside its commit.
+			const job = await api.commit(async (tx) => {
+				const found = (await tx.doc(Dispatches, api.conversationId)).jobs.find((each) => each.card === args.card);
+				return found && (JSON.parse(JSON.stringify(found)) as Job);
+			}, context);
+			if (job === undefined) return text({ sent: false, error: `no job for card ${args.card}` });
+			await agents.prompt(job.agent, args.text);
+			const decision: Decision = {
+				at: new Date().toISOString(),
+				kind: "question",
+				action: "replied",
+				text: args.text,
+				reason: args.reason,
+			};
+			await api.commit(async (tx) => {
+				const doc = await tx.doc(Dispatches, api.conversationId);
+				const index = doc.jobs.findIndex((each) => each.card === args.card);
+				const current = doc.jobs[index];
+				if (current !== undefined) doc.jobs[index] = { ...current, decisions: [...current.decisions, decision] };
+			}, context);
+			return text({ sent: true });
+		},
+	});
+
+	return defineExtension({ name: "soma.dispatch", tools: [dispatch, jobs, respond, escalate, reply] });
 }

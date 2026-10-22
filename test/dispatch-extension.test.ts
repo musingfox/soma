@@ -4,7 +4,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
-import { reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
+import { eventBridge, JOB_DONE, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -41,7 +41,20 @@ async function setup() {
 		expect((await submission.wait(context)).status).toBe("done");
 	}
 	const jobs = async () => (await harness.snapshot(Dispatches, root.id, context))?.jobs ?? [];
-	return { agents, faux, root, dispatch, jobs };
+	async function call(tool: string, args: Record<string, string>, requestId: string) {
+		let result: unknown;
+		faux.setResponses([
+			fauxAssistantMessage([fauxToolCall(tool, args)], { stopReason: "toolUse" }),
+			(request) => {
+				result = JSON.parse(JSON.parse(JSON.stringify(request.messages.at(-1))).content[0].text);
+				return fauxAssistantMessage("ok");
+			},
+		]);
+		const submission = await root.submit({ type: "input", content: tool, requestId }, context);
+		expect((await submission.wait(context)).status).toBe("done");
+		return result;
+	}
+	return { agents, faux, root, dispatch, call, jobs };
 }
 
 test("dispatch starts an agent named after the card and records the job with its session id", async () => {
@@ -119,5 +132,45 @@ test("a card that cannot be read starts nothing", async () => {
 	await dispatch("missing", "r1");
 
 	expect(agents.started).toEqual([]);
+	expect(await jobs()).toEqual([]);
+});
+
+test("reply sends the human's answer to the agent that asked, and its next result is recorded", async () => {
+	const { agents, root, dispatch, call, jobs } = await setup();
+	const bridge = eventBridge(root, agents, context);
+	const handled: Promise<void>[] = [];
+	agents.onStatus((event) => handled.push(bridge.handle(event)));
+	const settle = async () => {
+		for (let seen = -1; seen !== handled.length; ) {
+			seen = handled.length;
+			await Promise.all(handled);
+		}
+	};
+	await dispatch("card-a", "r1");
+	agents.finish("card-a", "結果：需要你\nhello 還是 hi？");
+	await settle();
+
+	const result = await call("reply", { card: "card-a", text: "hi", reason: "人在終端機選了 hi" }, "r2");
+	agents.finish("card-a", "結果：完成");
+	await settle();
+
+	expect(result).toEqual({ sent: true });
+	expect(agents.prompts.at(-1)).toEqual({ agent: "card-a", text: "hi" });
+	expect((await jobs())[0]?.decisions).toMatchObject([
+		{ kind: "question", action: "replied", text: "hi", reason: "人在終端機選了 hi" },
+	]);
+	const done = (await root.entries({ order: "ascending" }, 1000, undefined, context)).items.filter(
+		(entry) => entry.kind === JOB_DONE,
+	);
+	expect(done.map((entry) => (entry.data as { outcome: string }).outcome)).toEqual(["需要你", "完成"]);
+});
+
+test("reply to a card with no job sends nothing and says why", async () => {
+	const { agents, call, jobs } = await setup();
+
+	const result = await call("reply", { card: "card-a", text: "hi", reason: "人回答了" }, "r1");
+
+	expect(result).toEqual({ sent: false, error: "no job for card card-a" });
+	expect(agents.prompts).toEqual([]);
 	expect(await jobs()).toEqual([]);
 });

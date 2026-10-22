@@ -4,12 +4,22 @@ import { type AuthContext, defaultProviderAuthContext } from "@earendil-works/pi
 import { z } from "zod";
 import type { TelegramConfig } from "./adapters/telegram/index.ts";
 
+/** The canonical form of a BCP 47 language tag, or undefined when it is not one. */
+function canonicalLanguage(tag: string): string | undefined {
+	try {
+		return Intl.getCanonicalLocales(tag)[0];
+	} catch {
+		return undefined;
+	}
+}
+
 const FileConfig = z
 	.object({
 		herdrSocket: z.string().min(1),
 		mcpConfig: z.string().min(1),
 		db: z.string().min(1),
 		model: z.string().min(1),
+		language: z.string().refine((tag) => canonicalLanguage(tag) !== undefined, "Expected a BCP 47 language tag"),
 		hangarCap: z.number().int().positive(),
 		programStatus: z.boolean(),
 		anthropic: z
@@ -30,6 +40,8 @@ export interface Config {
 	readonly mcpConfig: string;
 	readonly db: string;
 	readonly model: string;
+	/** The BCP 47 tag of the language soma answers the human in. */
+	readonly language: string;
 	/** Unset: performance cores minus two, see hangar-cap.ts. */
 	readonly hangarCap?: number;
 	/** Unset: ask the terminal whether it supports OSC 7501. */
@@ -100,6 +112,10 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		mcpConfig: fromEnv("SOMA_MCP_CONFIG") ?? file?.mcpConfig ?? join(home, ".config/soma/mcp.json"),
 		db: fromEnv("SOMA_DB") ?? file?.db ?? "soma.sqlite",
 		model: fromEnv("SOMA_MODEL") ?? file?.model ?? "claude-opus-5-5",
+		language:
+			parseEnv("SOMA_LANGUAGE", canonicalLanguage, "a BCP 47 language tag") ??
+			(file?.language === undefined ? undefined : canonicalLanguage(file.language)) ??
+			"en",
 		...(hangarCap !== undefined && { hangarCap }),
 		...(programStatus !== undefined && { programStatus }),
 		...(anthropicApiKey !== undefined && { anthropicApiKey }),

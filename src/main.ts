@@ -16,6 +16,7 @@ import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
 import { dispatchExtension } from "./core/extensions/dispatch/index.ts";
 import { inspectExtension } from "./core/extensions/inspect/index.ts";
+import { language } from "./core/extensions/language/index.ts";
 import { connectStdio, loadMcpConfig, mcpExtension } from "./core/extensions/mcp/index.ts";
 import { memory } from "./core/extensions/memory/index.ts";
 import { REFLECTION_PERIOD_MS, reflection } from "./core/extensions/reflection/index.ts";
@@ -74,6 +75,7 @@ const mcpClients = (
 const storage = await openStorage(config.db);
 const extensions = [
 	clock(),
+	language(config.language),
 	sleeper,
 	memory,
 	schedule((id, c) => harness.abortTask(id, c)),

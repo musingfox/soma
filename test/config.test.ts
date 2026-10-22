@@ -53,6 +53,13 @@ const fields = [
 		values: ["env-model", "file-model", "claude-opus-5-5"],
 	},
 	{
+		name: "language",
+		env: ["SOMA_LANGUAGE", "ja"],
+		file: { language: "zh-hant-tw" },
+		read: (c) => c.language,
+		values: ["ja", "zh-Hant-TW", "en"],
+	},
+	{
 		name: "hangarCap",
 		env: ["SOMA_HANGAR_CAP", "3"],
 		file: { hangarCap: 5 },
@@ -164,6 +171,7 @@ describe("invalid environment variables", () => {
 		["SOMA_HANGAR_CAP", "four"],
 		["SOMA_PROGRAM_STATUS", "yes"],
 		["TELEGRAM_CHAT_ID", "me"],
+		["SOMA_LANGUAGE", "繁體中文"],
 	])("%s=%s throws naming the variable", (name, value) => {
 		expect(() => resolveConfig(undefined, { [name]: value }, HOME)).toThrow(new ConfigError(`${name} must be`).message);
 	});
@@ -182,6 +190,10 @@ describe("the config file", () => {
 		const path = write(JSON.stringify({ hangarCap: "4", telegram: { chatId: "me" } }));
 		expect(() => loadConfig(path, {}, HOME)).toThrow(path);
 		expect(() => loadConfig(path, {}, HOME)).toThrow(/hangarCap: Expected number.*telegram\.chatId: Expected number/);
+	});
+	test("a language that is not a BCP 47 tag throws with the field", () => {
+		const path = write(JSON.stringify({ language: "繁體中文" }));
+		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: language: Expected a BCP 47 language tag`);
 	});
 	test("an unknown field throws with its name", () => {
 		const path = write(JSON.stringify({ telegram: { token: "t" } }));

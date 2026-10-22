@@ -91,6 +91,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 - **光靠 herdr 的事件流不可靠。** cc-mobile 另外用 `session.snapshot` 補洞，靠 `state_change_seq` 判斷狀態是否真的變過。計時器每秒一拍，但 snapshot 的頻率依聽眾分級，每 1、3、5 或 30 拍一次（`server/herdr/pane-events.ts:77, 94-98, 436-458`）。事件橋要照做。所以監控不花 token 是靠程式輪詢，而不是單靠事件推送。
 - **派工的第一則提示由事件橋送出，不在 `agent.start` 之後立刻送。** 2026-10-18 對 herdr 0.9.5 實測：`agent.start` 剛回應時 `agent.prompt` 回 `agent_not_ready`；把提示放進 claude 的啟動參數，herdr 以 `invalid_agent_argument` 拒絕；新 repo 的 claude 先停在資料夾信任對話框（herdr 回報 blocked）。所以派工工具只把提示（cc-mobile `server/launch-prompt.ts` 的規則加卡片內容）存進該筆工作，事件橋第一次看到 agent 進入 idle 時才送出。看到 working 或 done 就丟掉沒送的提示，因為那表示已經有人給了它工作，這也避免崩潰重啟後重送。
 - **每次觀察都先比對 `state_change_seq`。** 派工清單記下每筆工作最後處理過的 seq；同一個 seq 再來（重複的 snapshot、重啟後的對帳）就什麼都不做。叫醒模型的 input 在提交 seq 之前送出，崩潰在兩者之間時，重啟會以同一個 `requestId` 再送一次，被去重。
+- **agent 卡住的通知用 `whenBusy: "followUp"`，不用 `steer`。** soma 正在跑一輪時，通知要等整輪結束才處理（`src/core/extensions/dispatch/bridge.ts:69`）：pi-durable 1.3.0 只在一輪的最後邊界取出 followUp，steer 則在每個工具回合結束時就取出（`node_modules/@earendil-works/pi-durable/dist/harness/inbox.js:45`）。不用 steer 的理由是它會和原本那一輪共用回答：steer 的 input 被加進同一輪（`dist/harness/generation.js:538-539`），一輪結束時每個 input 都結算成同一個 `answer`（`dist/harness/live.js:27-30`）。後果有三個。併進使用者在 Telegram 問的那一輪，手機收到的回答會夾著代答內容，不再是「回答怎麼分送」一條要的一輪一份回答。併進彙報那一輪，彙報任務會把代答寫進報告通知（`src/core/extensions/digest/index.ts:142-147`）。合併的那一輪失敗時，HumanPort 對每個 input 各發一次失敗（`src/core/human-port.ts:78`），人會收到自己那一輪的失敗回覆，再加上 `herdr:` 經 `PUSHED_FAILURES`（`src/ports/human.ts:16`）推出的第二則。steer 只省下等一輪結束的時間，換不回這些代價。
 
 ### 派工的冪等
 

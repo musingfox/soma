@@ -136,6 +136,14 @@ test("list reads a blocked agent's screen for its kind, prompt and fingerprint",
 	expect(listed?.status?.msg).toContain("Do you want to use this API key?");
 });
 
+test("a blocked status carries the prompt's options as the parser read them", async () => {
+	const { port } = pane("blocked", BASH);
+	const [listed] = await port.list();
+	const parsed = readBlockedScreen(BASH).prompt?.options.map(({ id, label }) => ({ id, label }));
+	expect(parsed?.length).toBeGreaterThan(0);
+	expect(listed?.status).toMatchObject({ state: "blocked", fingerprint: fingerprintOf(BASH), options: parsed });
+});
+
 test("respond presses the chosen option's key after a fresh status and screen read", async () => {
 	const { port, calls, keys } = pane("blocked", BASH);
 	expect(await port.respond("card-a", { option: "1", fingerprint: fingerprintOf(BASH) })).toEqual({ sent: true });

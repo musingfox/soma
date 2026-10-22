@@ -3,6 +3,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
 import { afterEach, expect, test, vi } from "vitest";
+import { FakeAgentPort } from "../../../src/adapters/fake-agent/index.ts";
 import { FakeHumanPort } from "../../../src/adapters/fake-human/index.ts";
 import { FakeBotApi } from "../../../src/adapters/fake-telegram/index.ts";
 import { runTelegram, splitMessage } from "../../../src/adapters/telegram/index.ts";
@@ -43,7 +44,7 @@ async function core() {
 	cleanup.push(() => harness.close(context));
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
-	const human = await openHumanPort(harness, root, context);
+	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
 	cleanup.push(() => human.close());
 	return { faux, root, human };
 }
@@ -189,4 +190,121 @@ test("a failing Bot API is reported and polled again", async () => {
 	await vi.waitFor(() => expect(onError.mock.calls.length).toBeGreaterThanOrEqual(2));
 	controller.abort();
 	await running;
+});
+
+const choices = {
+	card: "card-a",
+	fingerprint: "f00d",
+	options: [
+		{ id: "1", label: "Yes" },
+		{ id: "2", label: "No" },
+	],
+};
+const chosen = (text: string) => ({ inline_keyboard: [[{ text, callback_data: "-" }]] });
+
+test("a question with choices arrives with a button per option; a press answers the agent and shows the choice", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	human.emit({ type: "notice", kind: "question", content: "要讓它執行嗎？", choices });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	expect(api.sent[0]).toEqual({
+		chat_id: CHAT,
+		text: "[問題] 要讓它執行嗎？",
+		reply_markup: {
+			inline_keyboard: [
+				[{ text: "Yes", callback_data: "1:f00d:card-a" }],
+				[{ text: "No", callback_data: "2:f00d:card-a" }],
+			],
+		},
+	});
+
+	const press = api.press("2:f00d:card-a", CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(2));
+	expect(human.answers).toEqual([{ card: "card-a", answer: { option: "2", fingerprint: "f00d" } }]);
+	expect(api.calls).toEqual([
+		{ method: "answerCallbackQuery", params: { callback_query_id: press.callback_query.id, text: "已選：No" } },
+		{
+			method: "editMessageReplyMarkup",
+			params: { chat_id: CHAT, message_id: press.callback_query.message.message_id, reply_markup: chosen("已選：No") },
+		},
+	]);
+});
+
+test("a press on a prompt that has since changed sends nothing and says so in the chat", async () => {
+	const human = new FakeHumanPort();
+	human.outcome = { sent: false, refusal: "stale" };
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	human.emit({ type: "notice", kind: "question", content: "要讓它執行嗎？", choices });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	api.press("1:f00d:card-a", CHAT);
+
+	await vi.waitFor(() => expect(api.calls).toHaveLength(2));
+	expect(api.calls.map(({ params }) => params.text ?? params.reply_markup)).toEqual([
+		"未送出：提示已經變了",
+		chosen("未送出：提示已經變了"),
+	]);
+});
+
+test("a press from another chat is ignored", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	human.emit({ type: "notice", kind: "question", content: "要讓它執行嗎？", choices });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	api.press("1:f00d:card-a", 7);
+	api.deliver("after", CHAT);
+
+	await vi.waitFor(() => expect(human.inputs).toHaveLength(1));
+	expect(human.answers).toEqual([]);
+	expect(api.calls).toEqual([]);
+});
+
+test("choices whose button data would pass 64 bytes arrive as plain text", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	human.emit({ type: "notice", kind: "question", content: "q", choices: { ...choices, card: "c".repeat(60) } });
+	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "[問題] q" }]));
+});
+
+test("a callback Telegram no longer accepts an answer for does not hold the polling back", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const { onError } = start(human, apiBase);
+
+	human.emit({ type: "notice", kind: "question", content: "q", choices });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	api.failing.add("answerCallbackQuery");
+	api.press("1:f00d:card-a", CHAT);
+	api.deliver("after", CHAT);
+
+	await vi.waitFor(() => expect(human.inputs).toHaveLength(1));
+	expect(human.answers).toHaveLength(1);
+	expect(onError).toHaveBeenCalled();
+});
+
+test("a second tap on the same question answers nothing and leaves the first result shown", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	human.emit({ type: "notice", kind: "question", content: "q", choices });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	api.press("2:f00d:card-a", CHAT);
+	const second = api.press("2:f00d:card-a", CHAT);
+	api.deliver("after", CHAT);
+
+	await vi.waitFor(() => expect(human.inputs).toHaveLength(1));
+	expect(human.answers).toHaveLength(1);
+	expect(api.calls.filter(({ method }) => method === "editMessageReplyMarkup")).toHaveLength(1);
+	expect(api.calls.at(-1)).toEqual({
+		method: "answerCallbackQuery",
+		params: { callback_query_id: second.callback_query.id },
+	});
 });

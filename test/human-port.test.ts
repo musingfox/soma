@@ -31,7 +31,7 @@ async function setup() {
 	cleanup.push(() => harness.close(context));
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
-	const human = await openHumanPort(harness, root, context);
+	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
 	cleanup.push(() => human.close());
 	const seen: SomaEvent[] = [];
 	human.subscribe((event) => seen.push(event));
@@ -125,7 +125,7 @@ test("a scheduled round that fails is shown to the human through the terminal", 
 	cleanup.push(() => harness.close(context));
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
-	const human = await openHumanPort(harness, root, context);
+	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
 	cleanup.push(() => human.close());
 	const input = new PassThrough();
 	const output = new PassThrough();
@@ -157,7 +157,7 @@ test("a failure settled before a restart is not delivered again", async () => {
 		const harness = await openHarness(join(directory, "soma.sqlite"), [], context, { models });
 		const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 		harness.resume();
-		const human = await openHumanPort(harness, root, context);
+		const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
 		const seen: SomaEvent[] = [];
 		human.subscribe((event) => seen.push(event));
 		const close = async () => {

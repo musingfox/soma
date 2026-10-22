@@ -65,7 +65,7 @@ async function core(agents: FakeAgentPort, plan: Plan) {
 	open.push({ close: () => harness.close(context) });
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
-	const human = await openHumanPort(harness, root, context);
+	const human = await openHumanPort(harness, root, agents, context);
 	open.push(human);
 	const notices: SomaEvent[] = [];
 	human.subscribe((event) => {
@@ -87,6 +87,7 @@ async function core(agents: FakeAgentPort, plan: Plan) {
 	await settle();
 	return {
 		calls: () => faux.state.callCount,
+		human,
 		results,
 		notices,
 		settle,
@@ -160,4 +161,62 @@ test("the model can hand a prompt to the human, with its reason recorded", async
 	expect((await soma.job())?.decisions).toMatchObject([
 		{ kind: "permission", action: "escalated", reason: "會動到正式資料" },
 	]);
+});
+
+const options = [
+	{ id: "1", label: "Yes" },
+	{ id: "2", label: "No" },
+];
+
+test("a prompt handed to the human carries its options and fingerprint, so a client can offer them", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await core(agents, { tool: "escalate" });
+
+	agents.emit("card-a", { ...prompt, fingerprint: "f00d", options });
+	await soma.settle();
+
+	expect(soma.notices).toEqual([
+		{
+			type: "notice",
+			kind: "question",
+			content: "agent card-a（卡片 card-a）：要讓它執行嗎？",
+			choices: { card: "card-a", fingerprint: "f00d", options },
+		},
+	]);
+});
+
+test("the human's own choice reaches the agent without a model round, and the decision is recorded", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await core(agents, { tool: "escalate" });
+	agents.emit("card-a", { ...prompt, fingerprint: "f00d", options });
+	await soma.settle();
+	const before = soma.calls();
+
+	expect(await soma.human.respond("card-a", { option: "2", fingerprint: "f00d" })).toEqual({ sent: true });
+	await soma.settle();
+
+	expect(soma.calls() - before).toBe(0);
+	expect(agents.responses).toEqual([{ agent: "card-a", answer: { option: "2", fingerprint: "f00d" } }]);
+	expect((await soma.job())?.decisions).toMatchObject([
+		{ kind: "permission", action: "escalated" },
+		{ kind: "permission", action: "answered", option: "2", fingerprint: "f00d", reason: "人親自選的選項" },
+	]);
+});
+
+test("the human's choice on a prompt that has since changed is refused, and nothing is recorded", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await core(agents, { tool: "escalate" });
+	agents.emit("card-a", { ...prompt, fingerprint: "f00d", options });
+	await soma.settle();
+
+	expect(await soma.human.respond("card-a", { option: "1", fingerprint: "0ld" })).toEqual({
+		sent: false,
+		refusal: "stale",
+	});
+	expect(await soma.human.respond("card-b", { option: "1", fingerprint: "f00d" })).toEqual({
+		sent: false,
+		refusal: "no_job",
+	});
+	expect(agents.responses).toEqual([]);
+	expect((await soma.job())?.decisions).toMatchObject([{ action: "escalated" }]);
 });

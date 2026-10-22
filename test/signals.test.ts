@@ -65,7 +65,7 @@ async function core(agents = new FakeAgentPort()) {
 	open.push({ close: () => harness.close(context) });
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
-	const human = await openHumanPort(harness, root, context);
+	const human = await openHumanPort(harness, root, agents, context);
 	open.push(human);
 	const bridge = eventBridge(root, agents, context);
 	const handled: Promise<void>[] = [];

@@ -63,7 +63,7 @@ await digests.startDigest(root, Number(period), context);
 await reconcileDispatches(root, agents, context);
 eventBridge(root, agents, context).listen((error) => emit({ event: "bridge_error", error: String(error) }));
 
-const human = await openHumanPort(harness, root, context);
+const human = await openHumanPort(harness, root, agents, context);
 void runTelegram({ ...telegram, human, signal: new AbortController().signal, retryMs: 500 });
 const screen = new PassThrough();
 screen.setEncoding("utf8").on("data", (chunk: string) => {

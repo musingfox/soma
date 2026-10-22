@@ -47,7 +47,7 @@ const root = await harness.root(context, { agent: { model: { provider: "faux", m
 harness.resume();
 await reconcileDispatches(root, agents, context);
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
-const human = await openHumanPort(harness, root, context);
+const human = await openHumanPort(harness, root, agents, context);
 const { programStatus } = resolveConfig(undefined, process.env, homedir());
 await runTerminal({ human, input: process.stdin, output: process.stdout, programStatus });
 unlisten();

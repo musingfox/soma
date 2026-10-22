@@ -63,7 +63,7 @@ const harness: Harness = await openHarness(
 const herdr = async (...args: string[]) => (await sh("herdr", ["--session", "fleet", ...args])).stdout;
 try {
 	const root = await harness.root(context, { agent: { model: { provider: faux.provider.id, modelId: "faux-1" } } });
-	const human = await openHumanPort(harness, root, context);
+	const human = await openHumanPort(harness, root, agents, context);
 	const notices: string[] = [];
 	human.subscribe((event) => {
 		if (event.type === "notice") notices.push(event.content);

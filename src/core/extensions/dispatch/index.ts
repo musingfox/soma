@@ -1,8 +1,16 @@
 import { randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord/context";
 import { Type } from "@earendil-works/pi-ai";
-import { defineDoc, defineExtension, defineTool, type ToolExecutionApi } from "@earendil-works/pi-durable";
-import type { AgentPort } from "../../../ports/agent.ts";
+import {
+	type Conversation,
+	defineDoc,
+	defineExtension,
+	defineTool,
+	type ToolExecutionApi,
+	type Tx,
+} from "@earendil-works/pi-durable";
+import type { AgentPort, Answer } from "../../../ports/agent.ts";
+import type { Choices, HumanAnswerOutcome } from "../../../ports/human.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
 import { composeLaunchPrompt } from "../../domain/launch-prompt.ts";
 import { noticeEntry } from "../../notice.ts";
@@ -56,6 +64,41 @@ export async function startJob(
 	return job;
 }
 
+const decide = (job: Job, decision: Omit<Decision, "at" | "kind">): Decision => ({
+	at: new Date().toISOString(),
+	kind: job.status.state === "blocked" ? job.status.kind : "permission",
+	...decision,
+});
+
+/**
+ * Sends `answer` to the card's blocked agent and, once sent, records the decision with `reason`. Shared by the respond
+ * tool and the human choosing an option themselves, which goes through no model round.
+ */
+export async function answerJob(
+	agents: Pick<AgentPort, "respond">,
+	commit: <T>(change: (tx: Tx) => Promise<T>) => Promise<T>,
+	conversationId: Conversation["id"],
+	{ card, answer, reason }: { card: string; answer: Answer; reason: string },
+): Promise<HumanAnswerOutcome> {
+	// Copied out as JSON: a doc is a live proxy only valid inside its commit.
+	const job = await commit(async (tx) => {
+		const found = (await tx.doc(Dispatches, conversationId)).jobs.find((each) => each.card === card);
+		return found && (JSON.parse(JSON.stringify(found)) as Job);
+	});
+	if (job === undefined) return { sent: false, refusal: "no_job" };
+	const outcome = await agents.respond(job.agent, answer);
+	if (outcome.sent) {
+		const decision = decide(job, { action: "answered", ...answer, reason });
+		await commit(async (tx) => {
+			const doc = await tx.doc(Dispatches, conversationId);
+			const index = doc.jobs.findIndex((each) => each.card === card);
+			const current = doc.jobs[index];
+			if (current !== undefined) doc.jobs[index] = { ...current, decisions: [...current.decisions, decision] };
+		});
+	}
+	return outcome;
+}
+
 /** `readCard` returns the card's markdown, read from wherever the repo's cards live. */
 export function dispatchExtension(agents: AgentPort, readCard: (repo: string, card: string) => Promise<string>) {
 	const dispatch = defineTool({
@@ -89,11 +132,6 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 
 	const card = Type.String({ description: "The blocked job's card" });
 	const reason = Type.String({ description: "Why: written into the dispatch list for the human to check later" });
-	const decide = (job: Job, decision: Omit<Decision, "at" | "kind">): Decision => ({
-		at: new Date().toISOString(),
-		kind: job.status.state === "blocked" ? job.status.kind : "permission",
-		...decision,
-	});
 	const respond = defineTool({
 		name: "respond",
 		description:
@@ -108,29 +146,15 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 		}),
 		// Not replayed: a crash mid-call reports it interrupted rather than pressing keys a second time.
 		replay: "unsafe",
-		execute: async (args, api, context) => {
-			// Copied out as JSON: a doc is a live proxy only valid inside its commit.
-			const job = await api.commit(async (tx) => {
-				const found = (await tx.doc(Dispatches, api.conversationId)).jobs.find((each) => each.card === args.card);
-				return found && (JSON.parse(JSON.stringify(found)) as Job);
-			}, context);
-			if (job === undefined) return text({ sent: false, error: `no job for card ${args.card}` });
-			const outcome = await agents.respond(job.agent, { option: args.option, fingerprint: args.fingerprint });
-			if (outcome.sent) {
-				const decision = decide(job, {
-					action: "answered",
-					option: args.option,
-					fingerprint: args.fingerprint,
-					reason: args.reason,
-				});
-				await api.commit(async (tx) => {
-					const doc = await tx.doc(Dispatches, api.conversationId);
-					const index = doc.jobs.findIndex((each) => each.card === args.card);
-					const current = doc.jobs[index];
-					if (current !== undefined) doc.jobs[index] = { ...current, decisions: [...current.decisions, decision] };
-				}, context);
-			}
-			return text(outcome);
+		execute: async ({ card, option, fingerprint, reason }, api, context) => {
+			const outcome = await answerJob(agents, (change) => api.commit(change, context), api.conversationId, {
+				card,
+				answer: { option, fingerprint },
+				reason,
+			});
+			return text(
+				!outcome.sent && outcome.refusal === "no_job" ? { sent: false, error: `no job for card ${card}` } : outcome,
+			);
 		},
 	});
 
@@ -153,9 +177,15 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 					...current,
 					decisions: [...current.decisions, decide(current, { action: "escalated", reason: args.reason })],
 				};
+				const { status } = current;
+				// Only a prompt the agent side could read into options can be answered by choosing one.
+				const choices: Choices | undefined =
+					status.state === "blocked" && status.fingerprint !== undefined && (status.options?.length ?? 0) > 0
+						? { card: current.card, fingerprint: status.fingerprint, options: status.options ?? [] }
+						: undefined;
 				await tx.appendEntry(
 					api.conversationId,
-					noticeEntry("question", `agent ${current.agent}（卡片 ${current.card}）：${args.question}`),
+					noticeEntry("question", `agent ${current.agent}（卡片 ${current.card}）：${args.question}`, choices),
 				);
 				return true;
 			}, context);

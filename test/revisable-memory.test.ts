@@ -7,6 +7,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { defineDoc, type Harness, type JsonObject } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, test } from "vitest";
+import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { type CuratedLine, EVIDENCE_ID, MODEL_LINE_PREFIX } from "../src/core/domain/memory.ts";
 import { Curated, memory } from "../src/core/extensions/memory/index.ts";
 import { openHarness } from "../src/core/harness.ts";
@@ -187,7 +188,7 @@ describe("revising the curated layer on the real harness", () => {
 
 	test("every revision reaches the human as a notice through HumanPort", async () => {
 		const { faux, harness, root } = await open();
-		const port = await openHumanPort(harness, root, context);
+		const port = await openHumanPort(harness, root, new FakeAgentPort(), context);
 		const events: SomaEvent[] = [];
 		port.subscribe((event) => events.push(event));
 		faux.setResponses([

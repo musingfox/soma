@@ -66,7 +66,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 | 派工清單 | document（對話層級） | 記錄每件工作的卡片、agent 名稱、session id 和狀態，和對話紀錄在同一筆提交裡更新 |
 | 派工工具 | tool，`replay: "safe"` | agent 名稱取卡片名，啟動前先查派工清單和同名 agent 是否存在，崩潰後重跑也不會重複啟動；詳見「派工的冪等」 |
 | 查詢與讀取工具 | tool，`replay: "safe"` | 列出 agent、讀對話紀錄 |
-| 回應工具 | tool，不可重跑 | `respond` 回答卡住的 agent，`escalate` 轉給人；兩者都把判斷和理由寫進派工清單。崩潰中斷時會告知模型，不會自動重送（spec:2944、3393-3397） |
+| 回應工具 | tool，不可重跑 | `respond` 回答卡住的 agent，`escalate` 轉給人，`reply` 把人的回答送給結果為「需要你」的 agent；三者都把判斷和理由寫進派工清單。崩潰中斷時會告知模型，不會自動重送（spec:2944、3393-3397） |
 | 事件橋 | 主機端程式碼，不是 LLM | 見下節 |
 | 排程 | tool + 背景任務 | `schedule(at, instruction)` 建一個睡到 `at` 的背景任務，時間到送一則 input（`requestId: schedule:<id>`）；定時彙報是它的一個固定實例。見「定時彙報」 |
 | 記憶 | section + document + tool | 移植 shikigami 的設計，見下節 |
@@ -280,7 +280,7 @@ soma 啟動時讀一次 `~/.config/soma/config.json`。每個值先看環境變�
 
 順序如下，每一步一個可觀察的結果：
 
-1. **把人的回答轉給等待中的 agent。** 派工規則禁用 AskUserQuestion，agent 要問人時寫「結果：需要你」並結束這一輪；目前沒有工具能把人的回答送回去，`agents.prompt` 只在派工時用（`src/core/extensions/dispatch/bridge.ts:76`）。
+1. **把人的回答轉給等待中的 agent。** 派工規則禁用 AskUserQuestion，agent 要問人時寫「結果：需要你」並結束這一輪；`reply` 工具把人的回答當成下一個 prompt 送給它，下一個結果照舊由彙報送回（2026-10-22 完成，人在終端機的驗收已跑過）。
 2. **Telegram 按鈕回答卡住的提示。** 依賴第 1 步。
 3. **報告改用 rich message。** 先在手機上實測渲染。
 4. **收語音並轉成文字。** 語音轉文字跑在 GPU 工作站。

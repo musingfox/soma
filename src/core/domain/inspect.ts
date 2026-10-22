@@ -95,8 +95,9 @@ export type DecisionRow = {
 	readonly card: string;
 	readonly at: string;
 	readonly kind: string;
-	readonly action: "answered" | "escalated";
+	readonly action: "answered" | "escalated" | "replied";
 	readonly option?: string;
+	readonly text?: string;
 	readonly reason: string;
 };
 

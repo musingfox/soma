@@ -5,10 +5,12 @@ import type { Outcome } from "./report.ts";
 export type Decision = {
 	readonly at: string;
 	readonly kind: BlockedKind;
-	readonly action: "answered" | "escalated";
+	readonly action: "answered" | "escalated" | "replied";
 	// The option pressed, and the prompt it was pressed on, when answered.
 	readonly option?: string;
 	readonly fingerprint?: string;
+	// The words sent to the agent, when replied.
+	readonly text?: string;
 	readonly reason: string;
 };
 

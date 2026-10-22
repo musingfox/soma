@@ -21,7 +21,7 @@ import { memory } from "./core/extensions/memory/index.ts";
 import { REFLECTION_PERIOD_MS, reflection } from "./core/extensions/reflection/index.ts";
 import { schedule } from "./core/extensions/schedule/index.ts";
 import { sleeper } from "./core/extensions/sleeper/index.ts";
-import { openHarness, openStorage } from "./core/harness.ts";
+import { acquireDbLock, DbLockedError, openHarness, openStorage } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
 
 const configPath = join(homedir(), ".config/soma/config.json");
@@ -30,6 +30,14 @@ try {
 	config = loadConfig(configPath, process.env, homedir());
 } catch (error) {
 	if (!(error instanceof ConfigError)) throw error;
+	console.error(`[soma] ${error.message}`);
+	process.exit(1);
+}
+let releaseDbLock: () => Promise<void>;
+try {
+	releaseDbLock = await acquireDbLock(config.db);
+} catch (error) {
+	if (!(error instanceof DbLockedError)) throw error;
 	console.error(`[soma] ${error.message}`);
 	process.exit(1);
 }
@@ -96,6 +104,7 @@ const shutdown = () => {
 		.then(() => human.close())
 		.then(() => harness.close(context))
 		.then(() => Promise.all(mcpClients.map(({ client }) => client.close())))
+		.then(releaseDbLock)
 		.then(() => process.exit(0));
 };
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, shutdown);

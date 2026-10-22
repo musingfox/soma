@@ -29,7 +29,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
   └──────────────────────┘
 ```
 
-- **核心是一個常駐程序。** 它以 [Pi Durable](https://earendil.com/posts/pi-durable/) 為 harness，用 SQLite 儲存。同一份儲存只能由一個程序擁有，這是約定而不是鎖（README:688）；chord 的 node 後端另有 `processLock`（`chord/src/manager.ts:82`）可以借用。
+- **核心是一個常駐程序。** 它以 [Pi Durable](https://earendil.com/posts/pi-durable/) 為 harness，用 SQLite 儲存。同一份儲存只能由一個程序擁有，儲存層本身不擋第二個程序（README:688）。soma 啟動時以 db 父目錄的 realpath 加檔名取得 chord 的 `processLock`（`chord/dist/manager.d.ts:66-72`、`src/core/harness.ts` 的 `acquireDbLock`），第二個程序印出 `[soma] ...` 並以狀態 1 結束。`kill -9` 後舊 socket 檔沒人接聽，下一個程序會接管（`chord/dist/manager.js:37-44`），但這是先檢查再刪檔，不防兩個程序在同一刻啟動。socket 檔放在 `os.tmpdir()` 底下，路徑太長時改放 `/tmp/chord2-<uid>/`（`chord/dist/manager.js:69-80`），所以 `TMPDIR` 不同的兩個程序拿到的是兩把鎖；之後寫 launchd 的 plist 時，要把 `TMPDIR` 設成和終端機相同的 `getconf DARWIN_USER_TEMP_DIR`。
 - **啟動順序。** 重啟後排程器不會自動恢復，要先呼叫 `harness.resume()`，否則背景任務和排隊中的輸入都不會動（`durable/src/harness/types.ts:716-720`）。接著事件橋做一次對帳：抓 herdr `agent.list` 和派工清單比對，補上核心停掉期間發生的狀態變化。M1 和 M2 的驗收都靠這一步。
 - **所有介面共用一個根對話（`harness.root()`）。** 在 Telegram 交代的事，回到桌面問也接得上。每則輸入用 `entry.kind` 標記來源，例如 `chat.telegram`、`voice.shikigami`。模型看不到 `entry.kind`，只看得到 `content`（spec:2318-2320、README:427），所以來源若要讓模型知道，得寫進內容。
 - **核心只產出一份回答，怎麼呈現由介面卡決定。** shikigami 念短版，Telegram 傳文字，cc-mobile 顯示完整報告。

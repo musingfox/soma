@@ -41,7 +41,7 @@ async function setup() {
 		expect((await submission.wait(context)).status).toBe("done");
 	}
 	const jobs = async () => (await harness.snapshot(Dispatches, root.id, context))?.jobs ?? [];
-	return { agents, root, dispatch, jobs };
+	return { agents, faux, root, dispatch, jobs };
 }
 
 test("dispatch starts an agent named after the card and records the job with its session id", async () => {
@@ -92,6 +92,25 @@ test("reconcile writes what changed while the core was down", async () => {
 	await reconcileDispatches(root, agents, context);
 
 	expect(await jobs()).toMatchObject([{ card: "card-a", status: { state: "done" } }]);
+});
+
+test("jobs lists the dispatched jobs", async () => {
+	const { faux, root, dispatch } = await setup();
+	await dispatch("card-a", "r1");
+	let result = "";
+	faux.setResponses([
+		fauxAssistantMessage([fauxToolCall("jobs", {})], { stopReason: "toolUse" }),
+		(request) => {
+			result = JSON.stringify(request.messages.at(-1));
+			return fauxAssistantMessage("ok");
+		},
+	]);
+
+	const submission = await root.submit({ type: "input", content: "列出派工清單", requestId: "r2" }, context);
+	expect((await submission.wait(context)).status).toBe("done");
+
+	expect(JSON.parse(result)).toMatchObject({ role: "toolResult", toolName: "jobs", isError: false });
+	expect(JSON.parse(JSON.parse(result).content[0].text)).toMatchObject([{ card: "card-a", agent: "card-a" }]);
 });
 
 test("a card that cannot be read starts nothing", async () => {

@@ -255,6 +255,7 @@ soma 啟動時讀一次 `~/.config/soma/config.json`。每個值先看環境變�
   "mcpConfig": "/Users/me/.config/soma/mcp.json",
   "db": "/Users/me/.local/share/soma/soma.sqlite",
   "model": "claude-opus-5-5",
+  "language": "zh-Hant-TW",
   "hangarCap": 4,
   "programStatus": true,
   "anthropic": { "apiKey": "sk-ant-..." },

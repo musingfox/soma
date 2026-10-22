@@ -268,6 +268,24 @@ soma 啟動時讀一次 `~/.config/soma/config.json`。每個值先看環境變�
 - **權限。** 設定檔裡有 key 或 token，而且群組或其他人可讀時，啟動會印出警告，請 `chmod 600`。
 - **`mcp.json` 仍是獨立的檔案**，格式見待決事項第 5 點。
 
+## 介面的下一步：互動與閱讀
+
+2026-10-22 決定：下一個介面不以通道（cc-mobile、shikigami）來選，而是分兩個方向評估——互動方式（按鈕、選項、語音）和閱讀方式（純文字以外的圖片、網頁、報表）。shikigami 的本質是桌面助理，它的語音屬於互動方式，呈現可以和 cc-mobile 共用同一套網頁。
+
+依 Bot API 10.3（2026-08-24）的文件，Telegram 本身就能承接大部分需求，所以客戶端 socket（M4）和獨立的網頁客戶端再往後延：
+
+- **互動**：inline 按鈕的 `callback_data` 上限 64 bytes，按下後可用 `editMessageReplyMarkup` 改寫原訊息（[Bot API](https://core.telegram.org/bots/api#inlinekeyboardbutton)）；語音以 `getFile` 下載，上限 20 MB，不附轉文字（[getFile](https://core.telegram.org/bots/api#getfile)）。
+- **閱讀**：`sendRichMessage`（10.1 新增）支援表格、標題、可收合段落和按鈕，上限 32,768 字（[sendRichMessage](https://core.telegram.org/bots/api#sendrichmessage)），哪些客戶端版本會渲染沒有文件；一般 `parse_mode` 沒有表格和清單，上限 4096 字。Mini App 只要求 HTTPS 網址，`initData` 在本機以 bot token 驗證（[Web Apps](https://core.telegram.org/bots/webapps)），只靠 Tailscale 連線是否可行未實證。
+- **核心不變**：核心照舊只產出一份有結構的文字回答，由介面卡轉成 rich message，「怎麼呈現由介面卡決定」不變。
+
+順序如下，每一步一個可觀察的結果：
+
+1. **把人的回答轉給等待中的 agent。** 派工規則禁用 AskUserQuestion，agent 要問人時寫「結果：需要你」並結束這一輪；目前沒有工具能把人的回答送回去，`agents.prompt` 只在派工時用（`src/core/extensions/dispatch/bridge.ts:76`）。
+2. **Telegram 按鈕回答卡住的提示。** 依賴第 1 步。
+3. **報告改用 rich message。** 先在手機上實測渲染。
+4. **收語音並轉成文字。** 語音轉文字跑在 GPU 工作站。
+5. **Mini App 雛型。** rich message 不夠用時才做，先驗證只靠 Tailscale 能否打開。
+
 ## 里程碑
 
 每個里程碑都只有一個可觀察的結果。

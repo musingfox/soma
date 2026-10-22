@@ -79,7 +79,12 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 		parameters: Type.Object({}),
 		replay: "safe",
 		execute: async (_args, api, context) =>
-			text(await api.commit(async (tx) => (await tx.doc(Dispatches, api.conversationId)).jobs, context)),
+			text(
+				await api.commit(
+					async (tx) => JSON.parse(JSON.stringify((await tx.doc(Dispatches, api.conversationId)).jobs)) as Job[],
+					context,
+				),
+			),
 	});
 
 	const card = Type.String({ description: "The blocked job's card" });

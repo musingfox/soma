@@ -72,6 +72,16 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 | 記憶 | section + document + tool | 移植 shikigami 的設計，見下節 |
 | 外部工具 | pi-mcp 轉接層 | email、行事曆等能力以 MCP server 接入，核心不為任何一種服務寫專用碼。見「助理基本能力」 |
 
+### 根對話的壓縮
+
+根對話所有介面共用、永不結束，所以遲早會長到觸發自動壓縮（未實測，見本節最後一點）。pi-durable 1.3.0 預設開啟自動壓縮，門檻是 `reserveTokens: 16384`、`keepRecentTokens: 20000`、`backgroundTokens: 32768`（`node_modules/@earendil-works/pi-durable/dist/harness/agent.js:10-15`）。`src/core/harness.ts` 沒傳 `settings`，所以用這組預設值。門檻依模型的上下文長度計算，soma 沒有需要不同門檻的情境。本節的 `pi-durable/README.md` 指 node_modules 裡 1.3.0 版的檔案，行號和 Pi repo 的 `durable/README.md` 不一定相同。
+
+- 壓縮把較舊的紀錄摘要成一筆 `pi.compaction` entry，舊紀錄仍留在儲存裡（`pi-durable/README.md:456`）。摘要在對話繼續運作時產生，不是一輪，所以不算進「定時彙報」一節的叫醒次數。
+- 讀舊紀錄的功能不受影響。`inspect`、`recall` 和 `mark_denied` 用 `tx.scanEntries` 掃儲存，反省讀事實層的文件（`src/core/extensions/reflection/index.ts:66`），都不經過模型看到的上下文。
+- 摘要的花費記在 `pi.usage` 文件（`pi-durable/README.md:482`、`dist/harness/compaction.js:139`），不在 assistant entry 裡。`inspect` 的 `usage` 只加總 assistant entry（`src/core/extensions/inspect/index.ts:174-196`），所以查不到壓縮的花費。
+- 一輪在阻擋門檻等的壓縮失敗時，這一輪也失敗，input 以 `model_error`、`Compaction failed: <error>` 結束成 `unanswered`（`pi-durable/README.md:484`）。這走一般的失敗路徑：HumanPort 發 `failure` 事件並記結果訊號，`inspect` 的 `failures` 查得到。
+- **未驗證：** 根對話長到觸發壓縮的情況沒有冒煙測試。本節是讀文件和程式碼得出的，沒有實際跑過。
+
 ### 事件橋：監控不花 token
 
 事件橋放在 harness 外面，訂閱 herdr 的事件，用規則決定怎麼處理，不呼叫模型：
@@ -114,7 +124,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 - **報告和下一個 checkpoint 同一個 commit。** 任務等這一輪答完，把回答寫成 `notice` 紀錄，和推進的 checkpoint 一起提交，所以崩潰在哪裡都只會有一份通知。模型這一輪失敗時（例如沒有 API key），通知改放原始的工作清單，這段時間的工作不會因此沒人看到。
 - **沒有內建的 cron。** `sleep(until)` 是唯一的計時原語（types.ts:240）。
 
-一天叫醒模型的次數約為「卡住次數 + 有新完成工作的十分鐘區間數 + 使用者主動詢問次數」，和工作跑多久無關。每次叫醒是一輪（run），一輪內會有多次模型請求，因為工具呼叫會多繞幾回（spec:2335-2338）。
+一天叫醒模型的次數約為「卡住次數 + 有新完成工作的十分鐘區間數 + 使用者主動詢問次數」，和工作跑多久無關。根對話的壓縮另有摘要呼叫，不算叫醒，見「根對話的壓縮」。每次叫醒是一輪（run），一輪內會有多次模型請求，因為工具呼叫會多繞幾回（spec:2335-2338）。
 
 ### 報告的資料來源
 

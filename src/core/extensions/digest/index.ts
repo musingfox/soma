@@ -30,7 +30,17 @@ export const Digests = defineDoc<{ taskId?: number }>({
 	initial: () => ({}),
 });
 
-type Done = { agent: string; card: string; outcome: Outcome | "未知" };
+type Done = { agent: string; card: string; outcome: Outcome | "未知"; notified?: boolean };
+
+/** Each agent's latest finished turn, unless the event bridge already told the human that one. */
+function unreported(entries: readonly EntryRecord[]): Done[] {
+	const latest = new Map<string, Done>();
+	for (const entry of entries) {
+		const done = entry.data as Done;
+		latest.set(done.agent, done);
+	}
+	return [...latest.values()].filter((done) => !done.notified);
+}
 
 type Checkpoint = {
 	phase: "tick";
@@ -99,9 +109,10 @@ export function digest(agents: Pick<AgentPort, "readResult">) {
 				if (upto === undefined) {
 					let last: number | undefined;
 					await runtime.commit(async (tx, current) => {
-						last = (await doneSince(tx, current.conversationId, cursor)).at(-1)?.id;
+						const found = await doneSince(tx, current.conversationId, cursor);
+						last = unreported(found).length === 0 ? undefined : found.at(-1)?.id;
 						return last === undefined
-							? advance(cursor)
+							? advance(found.at(-1)?.id ?? cursor)
 							: { status: "running", checkpoint: { ...checkpoint, upto: last } };
 					}, context);
 					if (last === undefined) return;
@@ -111,16 +122,12 @@ export function digest(agents: Pick<AgentPort, "readResult">) {
 				const pinnedUpto = upto;
 				let jobs: Omit<JobReport, "result">[] = [];
 				await runtime.commit(async (tx, current) => {
-					const latest = new Map<string, Done>();
-					for (const entry of await doneSince(tx, current.conversationId, cursor, pinnedUpto)) {
-						const done = entry.data as Done;
-						latest.set(done.agent, done);
-					}
+					const done = unreported(await doneSince(tx, current.conversationId, cursor, pinnedUpto));
 					const listed = (await tx.doc(Dispatches, current.conversationId)).jobs;
 					// A doc is a live proxy only valid inside its commit, so decisions are copied out as JSON.
-					jobs = [...latest.values()].map((done) => ({
-						...done,
-						decisions: JSON.parse(JSON.stringify(listed.find((job) => job.card === done.card)?.decisions ?? [])),
+					jobs = done.map(({ notified: _told, ...each }) => ({
+						...each,
+						decisions: JSON.parse(JSON.stringify(listed.find((job) => job.card === each.card)?.decisions ?? [])),
 					}));
 				}, context);
 				const reports: JobReport[] = await Promise.all(

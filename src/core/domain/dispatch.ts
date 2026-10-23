@@ -2,6 +2,9 @@ import type { AgentState, BlockedKind } from "../../ports/agent.ts";
 import type { Outcome } from "./report.ts";
 
 // Type aliases, not interfaces: a job is stored as JSON, and only aliases and mutable arrays fit its JsonValue type.
+/** The reason an answered decision carries when the human pressed the option themselves, not the model. */
+export const HUMAN_CHOSEN = "人親自選的選項";
+
 export type Decision = {
 	readonly at: string;
 	readonly kind: BlockedKind;

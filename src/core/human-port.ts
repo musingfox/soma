@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-durable";
 import type { AgentPort, AgentState } from "../ports/agent.ts";
 import type { Choices, HumanPort, NoticeKind, SomaEvent } from "../ports/human.ts";
+import { HUMAN_CHOSEN } from "./domain/dispatch.ts";
 import { turnSignal } from "./domain/signal.ts";
 import { answerJob, Dispatches } from "./extensions/dispatch/index.ts";
 import { recordFact } from "./extensions/memory/index.ts";
@@ -127,7 +128,7 @@ export async function openHumanPort(
 			return answerJob(agents, (change) => root.commit(change, context), root.id, {
 				card,
 				answer,
-				reason: "人親自選的選項",
+				reason: HUMAN_CHOSEN,
 			});
 		},
 		async close() {

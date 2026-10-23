@@ -1,12 +1,13 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
 import { afterEach, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../../../src/adapters/fake-agent/index.ts";
 import { FakeHumanPort } from "../../../src/adapters/fake-human/index.ts";
 import { FakeBotApi } from "../../../src/adapters/fake-telegram/index.ts";
 import { runTelegram, splitMessage } from "../../../src/adapters/telegram/index.ts";
+import { Dispatches, dispatchExtension } from "../../../src/core/extensions/dispatch/index.ts";
 import { openHumanPort } from "../../../src/core/human-port.ts";
 import type { HumanPort } from "../../../src/ports/human.ts";
 
@@ -36,11 +37,11 @@ function start(human: HumanPort, apiBase: string, onError = vi.fn()) {
 	return { stop, onError };
 }
 
-async function core() {
+async function core(registry = createRegistry()) {
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
-	const harness = await Harness.open(new MemoryStorage(), { models, registry: createRegistry() }, context);
+	const harness = await Harness.open(new MemoryStorage(), { models, registry }, context);
 	cleanup.push(() => harness.close(context));
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
@@ -81,6 +82,8 @@ test("a message is answered in its chat, and Telegram delivering it again after 
 	expect(items.find((entry) => entry.kind === "chat.telegram")?.data).toEqual({
 		messageId: update.message.message_id,
 	});
+	// Accepted: the core admits a redelivered message silently, so it is marked received again and stays so.
+	expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍", "👀"]);
 });
 
 test("this client's failed round goes back to its chat; another client's failure does not", async () => {
@@ -99,6 +102,78 @@ test("this client's failed round goes back to its chat; another client's failure
 	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
 	await new Promise((resolve) => setTimeout(resolve, 100));
 	expect(api.sent).toEqual([{ chat_id: CHAT, text: "[失敗] 模型出錯：401 invalid x-api-key" }]);
+	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👎"]));
+});
+
+test("a message is marked received, then answered", async () => {
+	const { faux, human } = await core();
+	faux.setResponses([fauxAssistantMessage("好。")]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	const { message } = api.deliver("你好", CHAT);
+
+	await vi.waitFor(() => expect(api.reactions).toHaveLength(2));
+	expect(api.reactions).toEqual([
+		{ message_id: message.message_id, emoji: "👀" },
+		{ message_id: message.message_id, emoji: "👍" },
+	]);
+});
+
+test("a message whose words went on to an agent is marked forwarded before it is answered", async () => {
+	const registry = createRegistry();
+	registry.install(dispatchExtension(new FakeAgentPort(), async (_repo, card) => `# ${card}`));
+	const { faux, root, human } = await core(registry);
+	await root.commit(async (tx) => {
+		(await tx.doc(Dispatches, root.id)).jobs = [
+			{ card: "a", agent: "a", sessionId: "s", status: { state: "idle" }, decisions: [] },
+		];
+	}, context);
+	faux.setResponses([
+		fauxAssistantMessage([fauxToolCall("reply", { card: "a", text: "hi", reason: "人說 hi" })], {
+			stopReason: "toolUse",
+		}),
+		fauxAssistantMessage("已轉給 a。"),
+	]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	api.deliver("跟 a 說 hi", CHAT);
+
+	await vi.waitFor(() => expect(api.reactions).toHaveLength(3));
+	expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👌", "👍"]);
+});
+
+test("only this client's inputs get reactions", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	human.emit({ type: "notice", kind: "forwarded", requestId: "terminal:1" });
+	human.emit({ type: "answer", requestId: "schedule:4", content: "提醒你：喝水" });
+	human.emit({ type: "notice", kind: "forwarded", requestId: "telegram:5" });
+
+	await vi.waitFor(() => expect(api.reactions).toHaveLength(1));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	expect(api.reactions).toEqual([{ message_id: 5, emoji: "👌" }]);
+	expect(api.sent.map((message) => message.text)).toEqual(["[通知] 提醒你：喝水"]);
+});
+
+test("a refused reaction is reported, and the answer and the next message still go through", async () => {
+	const { faux, human } = await core();
+	faux.setResponses([fauxAssistantMessage("一。"), fauxAssistantMessage("二。")]);
+	const { api, apiBase } = await bot();
+	api.failing.add("setMessageReaction");
+	const { onError } = start(human, apiBase);
+
+	api.deliver("一", CHAT);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	api.deliver("二", CHAT);
+
+	await vi.waitFor(() => expect(api.sent.map((message) => message.text)).toEqual(["一。", "二。"]));
+	expect(onError).toHaveBeenCalledWith(
+		expect.objectContaining({ message: expect.stringContaining("setMessageReaction") }),
+	);
 });
 
 test("failures of schedule and event-bridge rounds are pushed; digest and other clients' failures are not", async () => {

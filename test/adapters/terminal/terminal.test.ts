@@ -98,6 +98,7 @@ test("each line is an input with a fresh terminal requestId; only this client's 
 	human.emit({ type: "answer", requestId: "schedule:3", content: "提醒：喝水" });
 	human.emit({ type: "answer", requestId: "digest:1", content: "報告的那一輪" });
 	human.emit({ type: "notice", kind: "report", content: "報告" });
+	human.emit({ type: "notice", kind: "forwarded", requestId: first });
 
 	expect(take()).toBe("已派工。\n[通知] 提醒：喝水\n[通知] 報告\n");
 	await end();

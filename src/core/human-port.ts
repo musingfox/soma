@@ -5,6 +5,7 @@ import {
 	type EntryId,
 	type EntryRecord,
 	type Harness,
+	type SubmissionId,
 	watchEvents,
 } from "@earendil-works/pi-durable";
 import type { AgentPort, AgentState } from "../ports/agent.ts";
@@ -13,7 +14,7 @@ import { HUMAN_CHOSEN } from "./domain/dispatch.ts";
 import { turnSignal } from "./domain/signal.ts";
 import { answerJob, Dispatches } from "./extensions/dispatch/index.ts";
 import { recordFact } from "./extensions/memory/index.ts";
-import { NOTICE, noticeEntry } from "./notice.ts";
+import { isForwarded, NOTICE, noticeEntry } from "./notice.ts";
 
 const textOf = (entry: EntryRecord) =>
 	(entry.model ?? [])
@@ -58,6 +59,8 @@ export async function openHumanPort(
 		running = next;
 		emit({ type: "run", state: running ? "working" : "idle" });
 	};
+	// requestIds of inputs placed in the running round; a follow-up input joins a round already running.
+	const placed = new Map<SubmissionId, string>();
 	events.start(async (batch) => {
 		// An answer's entry and its submission settle in the same commit, so the same batch.
 		const answers = new Map<EntryId, string>();
@@ -68,13 +71,20 @@ export async function openHumanPort(
 			} else if (event.type === "run_start") setRunning(true);
 			else if (event.type === "run_end") setRunning(false);
 			else if (event.type === "message_end") answers.set(event.entry.id, textOf(event.entry));
-			else if (event.type === "entry_appended" && event.entry.kind === NOTICE) {
+			else if (event.type === "tool_execution_end") {
+				const forwarded = (event.entry?.model ?? []).some(
+					(message) => message.role === "toolResult" && isForwarded(message.details),
+				);
+				if (forwarded) for (const requestId of placed.values()) emit({ type: "notice", kind: "forwarded", requestId });
+			} else if (event.type === "entry_appended" && event.entry.kind === NOTICE) {
 				const { kind, content, choices } = event.entry.data as { kind: NoticeKind; content: string; choices?: Choices };
 				emit(choices === undefined ? { type: "notice", kind, content } : { type: "notice", kind, content, choices });
 			} else if (event.type === "submission") {
 				const { record } = event;
 				if (record.type !== "input") continue;
 				const { requestId } = record;
+				if (record.status === "placed" && requestId !== undefined) placed.set(record.id, requestId);
+				else placed.delete(record.id);
 				if (record.status === "unanswered") {
 					const reason = failureReason(record.reason, record.detail);
 					if (requestId !== undefined) emit({ type: "failure", requestId, reason });

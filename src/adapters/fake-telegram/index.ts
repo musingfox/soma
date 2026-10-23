@@ -33,7 +33,7 @@ export interface SentMessage {
 
 /**
  * A local stand-in for the Telegram Bot API (getUpdates long polling, sendMessage with inline buttons, and the
- * answerCallbackQuery and editMessageReplyMarkup calls a button press leads to) for one bot token, so the
+ * answerCallbackQuery and editMessageReplyMarkup calls a button press leads to, and setMessageReaction) for one bot token, so the
  * client runs over real HTTP without a bot. An update stays queued until a getUpdates offset above its id
  * confirms it, as Telegram does; `redeliver` puts one back, as Telegram does when a confirmation was lost.
  */
@@ -41,6 +41,8 @@ export class FakeBotApi {
 	readonly sent: SentMessage[] = [];
 	/** answerCallbackQuery and editMessageReplyMarkup, in the order they came. */
 	readonly calls: { readonly method: string; readonly params: Record<string, unknown> }[] = [];
+	/** Each setMessageReaction as the message and its one emoji, in the order they came. */
+	readonly reactions: { readonly message_id: number; readonly emoji: string }[] = [];
 	/** Methods answered with a 400, as Telegram answers a callback query that is too old. */
 	readonly failing = new Set<string>();
 	readonly #markups = new Map<number, InlineKeyboard>();
@@ -88,6 +90,11 @@ export class FakeBotApi {
 				this.calls.push({ method, params });
 				if (method === "editMessageReplyMarkup")
 					this.#markups.set(params.message_id as number, params.reply_markup as InlineKeyboard);
+				return reply(200, { ok: true, result: true });
+			}
+			if (method === "setMessageReaction") {
+				const [reaction] = params.reaction as { emoji: string }[];
+				this.reactions.push({ message_id: params.message_id as number, emoji: reaction?.emoji ?? "" });
 				return reply(200, { ok: true, result: true });
 			}
 			reply(404, { ok: false, error_code: 404, description: "Not Found" });

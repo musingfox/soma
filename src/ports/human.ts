@@ -25,6 +25,8 @@ export type SomaEvent =
 	// The round ended without an answer: a provider error, no model, an abort or a fault.
 	| { readonly type: "failure"; readonly requestId: string; readonly reason: string }
 	| { readonly type: "notice"; readonly kind: NoticeKind; readonly content: string; readonly choices?: Choices }
+	// A round's words went on to a worker agent: progress on the input with this requestId, nothing to show as text.
+	| { readonly type: "notice"; readonly kind: "forwarded"; readonly requestId: string }
 	| { readonly type: "job"; readonly card: string; readonly agent: string; readonly status: AgentState }
 	// soma's own run: working while a round of the root conversation runs, whoever started it.
 	| { readonly type: "run"; readonly state: "working" | "idle" };

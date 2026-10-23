@@ -13,7 +13,7 @@ import type { AgentPort, Answer } from "../../../ports/agent.ts";
 import type { Choices, HumanAnswerOutcome } from "../../../ports/human.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
 import { composeLaunchPrompt } from "../../domain/launch-prompt.ts";
-import { noticeEntry } from "../../notice.ts";
+import { FORWARDED, noticeEntry } from "../../notice.ts";
 
 /** Every job dispatched from this conversation; one per card. */
 export const Dispatches = defineDoc<{ jobs: Job[] }>({
@@ -226,7 +226,7 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 				const current = doc.jobs[index];
 				if (current !== undefined) doc.jobs[index] = { ...current, decisions: [...current.decisions, decision] };
 			}, context);
-			return text({ sent: true });
+			return { ...text({ sent: true }), details: FORWARDED };
 		},
 	});
 

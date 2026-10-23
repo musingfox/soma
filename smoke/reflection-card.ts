@@ -66,7 +66,7 @@ try {
 	const human = await openHumanPort(harness, root, agents, context);
 	const notices: string[] = [];
 	human.subscribe((event) => {
-		if (event.type === "notice") notices.push(event.content);
+		if (event.type === "notice" && event.kind !== "forwarded") notices.push(event.content);
 	});
 	await root.commit(async (tx) => {
 		await recordFact(tx, {

@@ -130,7 +130,7 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 	const mine = new Set<string>();
 	const onEvent = (event: SomaEvent) => {
 		if (event.type === "run") running = event.state === "working";
-		else if (event.type === "notice") notice(event.kind, event.content);
+		else if (event.type === "notice" && event.kind !== "forwarded") notice(event.kind, event.content);
 		else if (event.type === "answer") {
 			if (mine.delete(event.requestId)) print(event.content);
 			else if (PUSHED_SOURCES.some((source) => event.requestId.startsWith(source))) notice("report", event.content);

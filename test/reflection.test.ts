@@ -104,7 +104,7 @@ async function core({ failStart = false } = {}) {
 	open.push(human);
 	const notices: string[] = [];
 	human.subscribe((event) => {
-		if (event.type === "notice") notices.push(event.content);
+		if (event.type === "notice" && event.kind !== "forwarded") notices.push(event.content);
 	});
 	const bridge = eventBridge(root, agents, context);
 	const handled: Promise<void>[] = [];

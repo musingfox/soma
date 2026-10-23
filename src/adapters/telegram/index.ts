@@ -31,6 +31,10 @@ const PUSHED_SOURCES = ["schedule:"];
 // sendMessage takes 1-4096 characters; JavaScript string length counts the same UTF-16 units.
 export const MESSAGE_LIMIT = 4096;
 
+// The one reaction a message from the human carries, replaced as the round moves on; a bot without premium gets one.
+// Each is in ReactionTypeEmoji's list: https://core.telegram.org/bots/api#reactiontypeemoji
+const REACTIONS = { received: "👀", forwarded: "👌", answered: "👍", failed: "👎" } as const;
+
 // callback_data takes 1-64 bytes: https://core.telegram.org/bots/api#inlinekeyboardbutton
 const CALLBACK_DATA_LIMIT = 64;
 // The data of the button that replaces a pressed keyboard: it names no answer, so a press on it only gets answered.
@@ -150,26 +154,44 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			}
 		});
 	};
-	// The prefix, not a set of ids sent from here, marks this client's rounds: a round the core finishes after a
-	// restart still reaches the chat that started it.
-	const unsubscribe = human.subscribe((event) => {
-		if (event.type === "notice") send(label(event.kind, event.content), event.choices && keyboard(event.choices));
-		else if (event.type === "answer") {
-			if (event.requestId.startsWith(REQUEST_PREFIX)) send(event.content);
-			else if (PUSHED_SOURCES.some((source) => event.requestId.startsWith(source)))
-				send(label("report", event.content));
-		} else if (event.type === "failure") {
-			if (event.requestId.startsWith(REQUEST_PREFIX)) send(`[失敗] ${event.reason}`);
-			else if (PUSHED_FAILURES.some((source) => event.requestId.startsWith(source)))
-				send(`[失敗] ${event.requestId} 那一輪：${event.reason}`);
-		}
-	});
-
-	// Telegram refuses to answer a query that is too old or to edit a deleted message; neither may stop the polling.
+	// Telegram refuses to answer a query that is too old or to edit or react to a deleted message; none may stop the polling.
 	const quietly = (method: string, body: object) =>
 		call(method, body).catch((error: unknown) => {
 			if (!signal.aborted) onError(error);
 		});
+	// One at a time, so a later stage's reaction is the one that stays.
+	let reacting = Promise.resolve();
+	const react = (requestId: string, stage: keyof typeof REACTIONS) => {
+		const body = {
+			chat_id: chatId,
+			message_id: Number(requestId.slice(REQUEST_PREFIX.length)),
+			reaction: [{ type: "emoji", emoji: REACTIONS[stage] }],
+		};
+		reacting = reacting.then(() => quietly("setMessageReaction", body).then(() => {}));
+	};
+
+	// The prefix, not a set of ids sent from here, marks this client's rounds: a round the core finishes after a
+	// restart still reaches the chat that started it.
+	const unsubscribe = human.subscribe((event) => {
+		const mine = "requestId" in event && event.requestId.startsWith(REQUEST_PREFIX);
+		if (event.type === "notice") {
+			if (event.kind === "forwarded") {
+				if (mine) react(event.requestId, "forwarded");
+			} else send(label(event.kind, event.content), event.choices && keyboard(event.choices));
+		} else if (event.type === "answer") {
+			if (mine) {
+				react(event.requestId, "answered");
+				send(event.content);
+			} else if (PUSHED_SOURCES.some((source) => event.requestId.startsWith(source)))
+				send(label("report", event.content));
+		} else if (event.type === "failure") {
+			if (mine) {
+				react(event.requestId, "failed");
+				send(`[失敗] ${event.reason}`);
+			} else if (PUSHED_FAILURES.some((source) => event.requestId.startsWith(source)))
+				send(`[失敗] ${event.requestId} 那一輪：${event.reason}`);
+		}
+	});
 	type CallbackQuery = NonNullable<z.infer<typeof UpdateSchema>["callback_query"]>;
 	// A second tap arrives before the first press's edit hides the buttons; its refusal must not replace the result.
 	const settled = new Set<number>();
@@ -201,11 +223,13 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 					.parse(await call("getUpdates", { offset, timeout, allowed_updates: ["message", "callback_query"] }));
 				for (const { update_id, message, callback_query } of updates) {
 					if (message?.text !== undefined && message.chat.id === chatId) {
+						const requestId = `${REQUEST_PREFIX}${message.message_id}`;
 						await human.submit({
 							content: message.text,
 							entry: { kind: "chat.telegram", data: { messageId: message.message_id } },
-							requestId: `${REQUEST_PREFIX}${message.message_id}`,
+							requestId,
 						});
+						react(requestId, "received");
 					}
 					// A press delivered again after a restart is safe: once its answer went through, the fingerprint no longer matches.
 					if (callback_query?.message?.chat.id === chatId) await answerPress(callback_query, callback_query.message);
@@ -220,6 +244,6 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		}
 	} finally {
 		unsubscribe();
-		await sending;
+		await Promise.all([sending, reacting]);
 	}
 }

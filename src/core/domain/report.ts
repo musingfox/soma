@@ -1,4 +1,4 @@
-import type { Decision } from "./dispatch.ts";
+import { type Decision, HUMAN_CHOSEN } from "./dispatch.ts";
 
 // The first line of a worker's final reply: 結果：完成／需要你／失敗.
 export type Outcome = "完成" | "需要你" | "失敗";
@@ -9,6 +9,25 @@ const RESULT_LINE = /^結果：(完成|需要你|失敗)$/;
 export function outcomeOf(reply: string | undefined): Outcome | "未知" {
 	const first = reply?.trimStart().split("\n", 1)[0]?.trim() ?? "";
 	return (RESULT_LINE.exec(first)?.[1] as Outcome | undefined) ?? "未知";
+}
+
+// A human who answered or replied to a job this recently is likely still waiting on it.
+export const TOUCHED_MS = 10 * 60_000;
+
+/**
+ * Whether a finished turn goes to the human at once instead of waiting for the next report: someone has to act on
+ * 需要你 and 失敗, and a 完成 is awaited by a human who touched the job within TOUCHED_MS.
+ */
+export function urgent(outcome: Outcome | "未知", decisions: readonly Decision[], now: number): boolean {
+	if (outcome === "需要你" || outcome === "失敗") return true;
+	return (
+		outcome === "完成" &&
+		decisions.some(
+			(decision) =>
+				(decision.action === "replied" || (decision.action === "answered" && decision.reason === HUMAN_CHOSEN)) &&
+				now - Date.parse(decision.at) <= TOUCHED_MS,
+		)
+	);
 }
 
 export interface JobReport {
@@ -28,6 +47,16 @@ export interface Report {
 // Long enough for a result line and a few sentences of a worker's reply; the model writes a short report anyway.
 const RESULT_LIMIT = 600;
 
+const clip = (result: string) => (result.length > RESULT_LIMIT ? `${result.slice(0, RESULT_LIMIT)}…` : result);
+
+/**
+ * The notice of a turn told to the human at once. It carries the worker's own reply, result line first, so they can
+ * answer it directly; an urgent turn always has one, since its outcome was read off it.
+ */
+export function resultNotice(job: { card: string; agent: string }, reply: string): string {
+	return `agent ${job.agent}（卡片 ${job.card}）這一輪結束了：\n${clip(reply.trim())}`;
+}
+
 /**
  * The input that wakes the model for a report. The model never sees an entry's kind, so the source is stated in the
  * text itself.
@@ -40,7 +69,7 @@ export function digestPrompt(report: Report): string {
 		);
 		return (
 			`- 卡片 ${job.card}（agent ${job.agent}）結果：${job.outcome ?? "未知"}` +
-			(result ? `\n  回覆：${result.length > RESULT_LIMIT ? `${result.slice(0, RESULT_LIMIT)}…` : result}` : "") +
+			(result ? `\n  回覆：${clip(result)}` : "") +
 			decisions.join("")
 		);
 	});

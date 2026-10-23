@@ -7,6 +7,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import type { Conversation, Harness } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
+import { HUMAN_CHOSEN } from "../src/core/domain/dispatch.ts";
 import {
 	AGENT_BLOCKED,
 	blockedRequestId,
@@ -16,6 +17,7 @@ import {
 } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
+import { NOTICE } from "../src/core/notice.ts";
 
 const context = BACKGROUND_CONTEXT;
 const open: Harness[] = [];
@@ -180,4 +182,54 @@ test("an agent soma did not dispatch is ignored", async () => {
 
 	expect(soma.calls()).toBe(0);
 	expect(await entriesOf(soma.root, AGENT_BLOCKED)).toEqual([]);
+});
+
+test("需要你 is told to the human at once, without a model call, and once however often the event repeats", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await dispatched(await database(), agents, "card-a");
+	agents.emit("card-a", { state: "idle" });
+	await soma.settle();
+	const before = soma.calls();
+
+	agents.finish("card-a", "結果：需要你\n要用哪個 server？");
+	const seq = (await agents.list()).find((agent) => agent.name === "card-a")?.seq;
+	await soma.settle();
+	agents.emit("card-a", { state: "done" }, seq);
+	await soma.settle();
+
+	expect(soma.calls() - before).toBe(0);
+	expect(await entriesOf(soma.root, NOTICE)).toMatchObject([
+		{
+			data: { kind: "question", content: "agent card-a（卡片 card-a）這一輪結束了：\n結果：需要你\n要用哪個 server？" },
+		},
+	]);
+	expect(await entriesOf(soma.root, JOB_DONE)).toMatchObject([{ data: { outcome: "需要你", notified: true } }]);
+});
+
+test("完成 waits for the report, unless the human touched the job just before", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await dispatched(await database(), agents, "card-a");
+	agents.emit("card-a", { state: "idle" });
+	await soma.settle();
+
+	agents.finish("card-a", "結果：完成");
+	await soma.settle();
+	expect(await entriesOf(soma.root, NOTICE)).toEqual([]);
+
+	await soma.root.commit(async (tx) => {
+		const doc = await tx.doc(Dispatches, soma.root.id);
+		doc.jobs = doc.jobs.map((job) => ({
+			...job,
+			decisions: [{ at: new Date().toISOString(), kind: "permission", action: "answered", reason: HUMAN_CHOSEN }],
+		}));
+	}, context);
+	agents.emit("card-a", { state: "working" });
+	agents.finish("card-a", "結果：完成\n改好了。");
+	await soma.settle();
+
+	expect(await entriesOf(soma.root, NOTICE)).toMatchObject([{ data: { kind: "report" } }]);
+	const notified = (await entriesOf(soma.root, JOB_DONE)).map(
+		(entry) => (entry.data as { notified: boolean }).notified,
+	);
+	expect(notified.sort()).toEqual([false, true]);
 });

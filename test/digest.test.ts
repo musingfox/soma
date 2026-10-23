@@ -119,6 +119,58 @@ test("a report the model fails to write still reaches the human, as the raw job 
 	}
 });
 
+test("a turn already told at once is left out of the report, and a period of only those wakes no model", {
+	timeout: 30_000,
+}, async () => {
+	const directory = await mkdtemp(join(tmpdir(), "soma-digest-"));
+	const agents = new FakeAgentPort();
+	const { models, model, calls } = digestModels();
+	const { extension, startDigest } = digest(agents);
+	const harness: Harness = await openHarness(
+		join(directory, "soma.sqlite"),
+		[dispatchExtension(agents, async () => ""), extension],
+		context,
+		{ models },
+	);
+	try {
+		const root = await harness.root(context, { agent: { model } });
+		harness.resume();
+		await root.commit(async (tx) => {
+			(await tx.doc(Dispatches, root.id)).jobs = ["a", "b"].map((card) => ({
+				card,
+				agent: card,
+				sessionId: card,
+				status: { state: "working" },
+				decisions: [],
+			}));
+		}, context);
+		eventBridge(root, agents, context).listen(() => {});
+		await startDigest(root, PERIOD, context);
+		const reports = async () =>
+			(await root.entries({ order: "ascending" }, 1000, undefined, context)).items.flatMap((entry) =>
+				entry.kind === NOTICE ? [entry.data as { kind: string; content: string }] : [],
+			);
+
+		agents.finish("a", "結果：需要你\n要用哪個 server？");
+		agents.finish("b", "結果：完成");
+		for (const deadline = Date.now() + 5 * PERIOD; (await reports()).length < 2; await delay(100)) {
+			expect(Date.now()).toBeLessThan(deadline);
+		}
+		expect((await reports()).map(({ kind }) => kind)).toEqual(["question", "report"]);
+		expect((await reports())[1]?.content).toBe("報告：b 完成");
+		expect(calls()).toBe(1);
+
+		agents.emit("a", { state: "working" });
+		agents.finish("a", "結果：失敗");
+		await delay(2.5 * PERIOD);
+		expect((await reports()).map(({ kind }) => kind)).toEqual(["question", "report", "report"]);
+		expect(calls()).toBe(1);
+	} finally {
+		await harness.close(context);
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
 test("SIGKILL while waiting and again during the report's run neither drops nor repeats a report", {
 	timeout: 60_000,
 }, async () => {

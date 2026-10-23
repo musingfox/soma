@@ -89,7 +89,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 | 事件 | 處理方式 | 叫醒模型嗎 |
 |---|---|---|
 | agent 卡住（blocked） | 送一則 `input` 進根對話，`requestId` 為 `herdr:<agent>:<state_change_seq>` | 會。模型自行判斷要代答還是轉給人。`kind=auth` 例外：不叫醒模型，事件橋在提交 seq 的同一筆 commit 裡寫一筆 `notice`（question）給人，並記一筆 escalated 判斷。每次判斷連同理由寫進派工清單，彙報時一併列出，讓人事後能檢查它的判斷 |
-| agent 做完（進入 idle 或 done） | 用 `conversation.commit` 寫進派工清單並追加紀錄 | 不會 |
+| agent 做完（進入 idle 或 done） | 用 `conversation.commit` 寫進派工清單並追加紀錄。結果是「需要你」或「失敗」，或是「完成」而人十分鐘內親自選過選項或回覆過這件工作，就在同一筆 commit 寫一筆 `notice` 給人，內容是 agent 回覆原文；「需要你」用 question，其餘用 report（`src/core/domain/report.ts` 的 `urgent`） | 不會 |
 | 使用者主動詢問 | 由介面卡送出 `input` | 會 |
 
 事件橋和 harness 在同一個程序裡，只是不在 LLM 迴圈裡；它需要直接呼叫 `conversation.commit`。
@@ -114,7 +114,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 
 ### 定時彙報
 
-用一個背景任務實作，以 `tx.createTask(T, input, { ownership: { kind: "conversation" }, background: true })` 建立。它每十分鐘醒一次，先讀派工清單：自上次彙報以來沒有新完成的工作，就只推進 checkpoint、不叫醒模型；有，才送一則 input 請模型寫一份短報告。所以做完的工作最晚十分鐘內會被回報，而模型只在有東西可報時才被叫醒。
+用一個背景任務實作，以 `tx.createTask(T, input, { ownership: { kind: "conversation" }, background: true })` 建立。它每十分鐘醒一次，先讀派工清單：自上次彙報以來沒有新完成的工作，就只推進 checkpoint、不叫醒模型；有，才送一則 input 請模型寫一份短報告。所以做完的工作最晚十分鐘內會被回報，而模型只在有東西可報時才被叫醒。事件橋已經馬上通知過的工作不再列進彙報，只剩這類工作時也不叫醒模型。
 
 - **`sleep(until)` 本身不會被儲存。** 它只是記憶體裡的計時器。等待之所以能撐過重啟，是因為 `until` 寫在 checkpoint 裡：重開後任務回到 pending，phase 重跑，時間已過就立刻返回（types.ts:240、scheduler.ts:1816-1827、spec:1930）。
 - **每輪都必須推進 checkpoint，否則任務會被判定故障**（spec:1919-1921）。同一個 phase 內只要 checkpoint 內容有變就算推進，所以單一個 `tick` phase 每輪把 `next` 往後推、計數加一就夠了，不必拆成兩個 phase（`durable/test/examples/13-recovery.ts:21-47` 就是這樣寫）。
@@ -313,7 +313,7 @@ soma 啟動時讀一次 `~/.config/soma/config.json`。每個值先看環境變�
   - 重新評估的時機：M2 做完、harness 用到的 API 面積已知之後。
 - **模型認證用 Anthropic API key。** 理由見「外部依賴」。
 - **卡住時由模型判斷要不要轉給人**，`kind=auth` 除外；判斷和理由記進派工清單。
-- **完成回報走每十分鐘的定時檢查**，有新完成的工作才叫醒模型寫短報告。
+- **完成回報走每十分鐘的定時檢查**，有新完成的工作才叫醒模型寫短報告。例外（2026-10-23）：結果是「需要你」或「失敗」，或人十分鐘內碰過的「完成」，事件橋不叫醒模型就直接通知人，因為有人在等；2026-10-22 Telegram 驗收時，agent 做完後報告晚了九分鐘才到。
 
 ## 待決事項
 

@@ -4,7 +4,7 @@ import type { AgentPort, AgentState, AgentStatusEvent } from "../../../ports/age
 import { observe } from "../../domain/bridge.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
 import { reconcile } from "../../domain/reconcile.ts";
-import { outcomeOf } from "../../domain/report.ts";
+import { outcomeOf, resultNotice, urgent } from "../../domain/report.ts";
 import { dispatchSignal, reblockSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
 import { recordFact } from "../memory/index.ts";
@@ -32,7 +32,7 @@ function wakeContent(job: Job, status: Extract<AgentState, { state: "blocked" }>
 /**
  * Host-side rules over agent status, outside the model loop (ARCHITECTURE.md「事件橋」).
  * A finished turn is committed to the dispatch list and the transcript with the outcome its
- * reply's first line states, which starts no run; only a blocked agent submits an input, and a
+ * reply's first line states, which starts no run, and an urgent one with a notice to the human; only a blocked agent submits an input, and a
  * kind=auth block not even that: it is committed as a notice to the human together with the
  * decision, so the model never sees it to answer. The input's requestId is the agent's transition
  * counter, so a resent event, from a repeated snapshot or a restarted core, is admitted once.
@@ -53,10 +53,8 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 		const observed = observe(job, event.status, event.seq);
 		if (observed.job === job) return;
 		const { action } = observed;
-		const next: Job =
-			action === "complete"
-				? { ...observed.job, outcome: outcomeOf(await agents.readResult(job.agent)) }
-				: observed.job;
+		const reply = action === "complete" ? await agents.readResult(job.agent) : undefined;
+		const next: Job = action === "complete" ? { ...observed.job, outcome: outcomeOf(reply) } : observed.job;
 
 		// Each side effect precedes the commit of its seq, so a crash in between redoes it on restart:
 		// the requestId makes the second submit return the first.
@@ -105,6 +103,14 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			}
 			if (action === "complete") {
 				const outcome = next.outcome ?? "未知";
+				// Told now, in the commit of its seq, so a resent event or a restart tells it once; the report skips it.
+				const notified = reply !== undefined && urgent(outcome, current.decisions, Date.now());
+				if (notified) {
+					await tx.appendEntry(
+						conversation.id,
+						noticeEntry(outcome === "需要你" ? "question" : "report", resultNotice(next, reply)),
+					);
+				}
 				const done = await tx.appendEntry(conversation.id, {
 					kind: JOB_DONE,
 					data: {
@@ -113,6 +119,7 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 						state: next.status.state,
 						outcome,
 						seq: event.seq,
+						notified,
 					},
 				});
 				const signal = dispatchSignal(next, outcome, event.seq, done.id, Date.now());

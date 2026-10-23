@@ -56,6 +56,50 @@ test("a submitted input shows the run working, then idle with its answer", async
 	]);
 });
 
+const seedJob = (root: Awaited<ReturnType<typeof setup>>["root"]) =>
+	root.commit(async (tx) => {
+		(await tx.doc(Dispatches, root.id)).jobs = [
+			{ card: "a", agent: "a", sessionId: "s", status: { state: "idle" }, decisions: [] },
+		];
+	}, context);
+
+test("a reply that reaches the agent shows the round's input forwarded, before its answer", async () => {
+	const { faux, root, human, seen } = await setup();
+	await seedJob(root);
+	faux.setResponses([
+		fauxAssistantMessage([fauxToolCall("reply", { card: "a", text: "hi", reason: "人說 hi" })], {
+			stopReason: "toolUse",
+		}),
+		fauxAssistantMessage("已轉給 a。"),
+	]);
+
+	await human.submit({ content: "跟 a 說 hi", entry: { kind: "chat.terminal" }, requestId: "terminal:1" });
+	await root.waitForIdle(context);
+
+	await vi.waitFor(() => expect(seen.at(-1)).toMatchObject({ type: "answer", requestId: "terminal:1" }));
+	const progress = seen.filter((event) => event.type === "notice" || event.type === "answer");
+	expect(progress).toEqual([
+		{ type: "notice", kind: "forwarded", requestId: "terminal:1" },
+		{ type: "answer", requestId: "terminal:1", content: "已轉給 a。" },
+	]);
+});
+
+test("a reply to a card with no job forwards nothing", async () => {
+	const { faux, root, human, seen } = await setup();
+	faux.setResponses([
+		fauxAssistantMessage([fauxToolCall("reply", { card: "a", text: "hi", reason: "人說 hi" })], {
+			stopReason: "toolUse",
+		}),
+		fauxAssistantMessage("沒有這張卡片。"),
+	]);
+
+	await human.submit({ content: "跟 a 說 hi", entry: { kind: "chat.terminal" }, requestId: "terminal:1" });
+	await root.waitForIdle(context);
+
+	await vi.waitFor(() => expect(seen.at(-1)).toMatchObject({ type: "answer", requestId: "terminal:1" }));
+	expect(seen.filter((event) => event.type === "notice")).toEqual([]);
+});
+
 test("notify delivers a notice with its kind and starts no run", async () => {
 	const { human, seen } = await setup();
 

@@ -22,17 +22,17 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 ```
            人類側介面                         agent 側介面
   ┌──────────────────────┐            ┌──────────────────────┐
-  │ Telegram（程序內）     │            │ herdr（主力）          │
-  │ cc-mobile（客戶端）    │──▶ soma ──▶│ ACP（之後）            │
-  │ shikigami（客戶端）    │   核心      │ HTTP（之後）           │
-  │ 終端機（開發用）        │            └──────────────────────┘
-  └──────────────────────┘
+  │ Telegram（程序內）     │            │ rex                  │
+  │ shikigami（客戶端）    │──▶ soma ──▶│ herdr                │
+  │ 終端機（開發用）        │   核心      │ 原生 tty（M6）         │
+  └──────────────────────┘            │ ACP、HTTP（之後）       │
+                                      └──────────────────────┘
 ```
 
 - **核心是一個常駐程序。** 它以 [Pi Durable](https://earendil.com/posts/pi-durable/) 為 harness，用 SQLite 儲存。同一份儲存只能由一個程序擁有，儲存層本身不擋第二個程序（README:688）。soma 啟動時以 db 父目錄的 realpath 加檔名取得 chord 的 `processLock`（`chord/dist/manager.d.ts:66-72`、`src/core/harness.ts` 的 `acquireDbLock`），第二個程序印出 `[soma] ...` 並以狀態 1 結束。`kill -9` 後舊 socket 檔沒人接聽，下一個程序會接管（`chord/dist/manager.js:37-44`），但這是先檢查再刪檔，不防兩個程序在同一刻啟動。socket 檔放在 `os.tmpdir()` 底下，路徑太長時改放 `/tmp/chord2-<uid>/`（`chord/dist/manager.js:69-80`），所以 `TMPDIR` 不同的兩個程序拿到的是兩把鎖；之後寫 launchd 的 plist 時，要把 `TMPDIR` 設成和終端機相同的 `getconf DARWIN_USER_TEMP_DIR`。
 - **啟動順序。** 重啟後排程器不會自動恢復，要先呼叫 `harness.resume()`，否則背景任務和排隊中的輸入都不會動（`durable/src/harness/types.ts:716-720`）。接著事件橋做一次對帳：抓 herdr `agent.list` 和派工清單比對，補上核心停掉期間發生的狀態變化。M1 和 M2 的驗收都靠這一步。
 - **所有介面共用一個根對話（`harness.root()`）。** 在 Telegram 交代的事，回到桌面問也接得上。每則輸入用 `entry.kind` 標記來源，例如 `chat.telegram`、`voice.shikigami`。模型看不到 `entry.kind`，只看得到 `content`（spec:2318-2320、README:427），所以來源若要讓模型知道，得寫進內容。
-- **核心只產出一份回答，怎麼呈現由介面卡決定。** shikigami 念短版，Telegram 傳文字，cc-mobile 顯示完整報告。
+- **核心只產出一份回答，怎麼呈現由介面卡決定。** shikigami 念短版，Telegram 傳文字。
 - **回答怎麼分送。** 根對話共用，每個介面卡都看得到所有輪次。規則是：介面卡只送出由自己的 `requestId` 啟動的那一輪回答；報告經 `notice` 紀錄分送；其他輪次只當歷史。這條規則寫在介面卡裡，不寫在提示裡。
 
 ### 分層與依賴方向
@@ -41,12 +41,12 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 
 ```
   人類側介面卡 ──▶ HumanPort ──▶ 核心（領域 + Pi Durable extension）──▶ AgentPort ◀── agent 側介面卡
-  telegram/ cc-mobile-socket/ shikigami-socket/ terminal/          herdr/ cc-mobile-launch/ acp/ http/
+  telegram/ shikigami-socket/ terminal/                            herdr/ rex/ acp/ http/
 ```
 
 - **核心只依賴兩個 port 的型別**，不 import 任何介面卡；介面卡只依賴 port，不互相 import，也不碰 Pi Durable 的型別。Pi Durable 的 `Conversation`、`Entry`、`Harness` 只出現在核心內部。
 - **HumanPort** 就是「人類側契約」那四個動作：送出、訂閱、通知、回答提示。核心暴露的是 soma 自己的事件型別（回答、失敗、通知、派工狀態、根對話這一輪是否在跑），不是 Pi 的 `watch()` 原始事件；程序內和程序外的介面卡拿到的是同一套型別，差別只在中間多一條 socket。
-- **AgentPort** 就是「agent 側契約」那六個動作，狀態用 OSC 7501 的詞彙。「呼叫 cc-mobile `/api/launch`」是其中一個實作，和未來直連 herdr 或 ACP 的實作可以互換。
+- **AgentPort** 就是「agent 側契約」那六個動作，狀態用 OSC 7501 的詞彙。port 和核心不帶任何一種 agent 介面的名字，所以 herdr、rex、ACP 都只是可以互換的實作，別人也能為自己的終端寫一個。使用者在設定裡選要用哪一個，各實作的能力差異見「agent 側介面卡的能力差異」。
 - **領域物件在核心**：派工清單、工作狀態機、報告。它們是純 TypeScript，不知道 Pi Durable 的存在；Pi Durable extension 是把它們掛進 harness 的那一層。
 - **測試縫**：M1 的 `kill -9` 驗收用真 herdr；其餘單元測試用記憶體內的假 AgentPort 和假 HumanPort，不碰 socket。
 
@@ -55,7 +55,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 ### 兩種互動不能混在一起
 
 - **跟助理對話**：派工、問進度、看報告。這部分由 soma 負責。
-- **直接操作某個工作 agent**：鏡像 session、按權限提示。這部分不經過 soma 的 LLM，否則按一下核准也要先跑一輪模型推理。鏡像 session 維持 cc-mobile 現有的 herdr 直通；模型轉給人的權限提示，人可以在 Telegram 按按鈕回答，由核心直接送給 agent（見「回答提示」）。
+- **直接操作某個工作 agent**：鏡像 session、按權限提示。這部分不經過 soma 的 LLM，否則按一下核准也要先跑一輪模型推理。模型轉給人的權限提示，人可以在 Telegram 按按鈕回答，由核心直接送給 agent（見「回答提示」）。鏡像 session 和其他直接操作由終端自己的客戶端負責，不經過 soma；2026-10-18 時這部分由 cc-mobile 的 herdr 直通負責，2026-10-24 起不再需要 cc-mobile（見「已決事項」）。
 
 ## 核心的組成
 
@@ -201,11 +201,51 @@ soma 每天讀一次自己的結果訊號，改進自己（`src/core/extensions/
 | 狀態事件 | 原生狀態有 idle、working、blocked、done、unknown；前四種對應成 idle、running、requires_action，unknown 直接丟棄（`server/herdr/agent-state.ts:20-30`）。soma 內部改用 OSC 7501 的詞彙，見下節 |
 | 讀結果 | 讀對話紀錄（見上一節） |
 | 回應卡住 | `pane.read source:detection` 解析提示（`native-permission.ts:172`） → 比對指紋 → 送出前再讀一次畫面比對 → `pane.send_keys`（`server/herdr/permission/native-permission.ts:334-440`）。soma 在 blocked 時讀畫面補上 `kind` 和指紋，指紋隨叫醒模型的 input 交給模型，模型回答時帶回來比對 |
-| 停止 | `workspace.close`（`server/herdr/backend.ts:477`、`registry.ts:252`） |
+| 停止 | `workspace.close`（`server/herdr/backend.ts:477`、`registry.ts:252`）。soma 的 herdr 介面卡還沒實作（`src/adapters/herdr/agent-port.ts:185`） |
 
 soma 和 cc-mobile 都把工作派進同一個 herdr 機庫 session。機庫名稱來自 `ecosystem.config.cjs:48` 的環境變數，目前是 `fleet`，程式裡沒有預設值（`server/config.ts:131-138`）。並發上限的算法是效能核心數減 2、最少 1，讀不到核心數時預設 4，可用 `CC_MOBILE_HANGAR_CAP` 覆寫（`server/hangar-cap.ts:1, 52`）。cc-mobile 的佔用數取自機庫裡實際在跑的 agent 數（`server/sided-backend.ts:168-171`），所以 soma 直接派進機庫的 agent 也會被它算到；反過來 soma 若自己派工，也要用同樣的算法。
 
 herdr 的連線方式不是 JSON-RPC 2.0。每次呼叫開一條新的 unix socket 連線，送出 `{id,method,params}` 加換行；目前釘住的協定版本是 22（`server/herdr/transport.ts`、`client.ts:64`；herdr 0.9.5 的 `src/protocol/wire.rs:20` 也是 22）。
+
+### rex 的實作（2026-10-24 實測）
+
+rex 是終端多工器，也是終端機本身。查證時的版本是 rex `0.0.1792787366-g623b2d`（API revision 7）和 Claude Code 2.1.310。API 文件在 server 的 `GET /llms.txt`，每個方法的 JSON Schema 在 `GET /api/help`。2026-10-24 另有一份獨立審查重查過本節，標「未複驗」的是只有一次實測、審查沒有重跑的。
+
+rex 沒有 herdr 替 soma 擋下的四件事：轉換計數器（`state_change_seq`）、同名拒絕（`agent_name_taken`）、建立 worktree、信任對話框回報 `blocked`。rex 介面卡和核心要自己補上，做法寫在下面各點。
+
+- **連線。** server 在 unix socket `~/Library/Application Support/rex/server.sock` 上說 HTTP。控制連線是 `GET /api/control` 的 WebSocket，subprotocol 是 `rex.control.v1`，先送 `hello` 帶 `api_revision`，之後是 `{type:"request",id,method,payload}`。server 支援 revision 0 到 7 並向下協商，不像 herdr 要求協定號完全相等。
+- **狀態。** Claude Code 在 rex 裡自己送 OSC 7501，狀態回報不需要任何 integration。`rex skill setup` 另外會在 `~/.claude/settings.json` 裝一個 SessionStart hook，只告訴 agent 它在哪個 session 和 block，和狀態無關。block 方法 `program_status` 回傳記錄，帶 `state`、`kind`、`msg`、`app=claude-code`、`owner` 和 `updated_at`。實測依序看到 `idle`、`working`、`blocked`（`kind=question`，`msg` 是「answer: <問題> (<選項> · <選項>)」）、`blocked`（`kind=permission`，`msg` 是「approve Bash: touch probe.txt」）、`done`（未複驗）。
+- **只看根記錄。** subagent 會在同一個 block 留下帶 `id` 和 `title` 的子記錄。實測 subagent 要權限時，根記錄變成 `blocked`，子記錄一直是 `working`（未複驗），所以 agent 狀態取沒有 `id` 的那筆。
+- **辨識 claude 看 `argv0`。** 記錄的 `owner.name` 和 `process` 方法的 `foreground.name` 都是 `2.1.310`，因為執行檔在 `~/.local/share/claude/versions/2.1.310`；`foreground.argv0` 才是 `claude`。pid 也從 `process` 取，這樣沒有 7501 記錄時（例如信任對話框）也查得到。
+- **信任對話框沒有任何訊號。** 首次進入資料夾的信任對話框顯示時，`records` 是空的（未複驗）。herdr 在同一畫面回報 `blocked`，事件橋叫醒模型代答（見「事件橋」一節派工第一則提示那點）；rex 下沒有記錄也沒有事件，agent 會一直停在對話框，soma 不知道。解法是讓派工的 worktree 放在 repo 內的 `.claude/worktrees/<card>`：cc-mobile 觀察到 claude 在那裡不問信任（cc-mobile `CLAUDE.md:561-563`），要在 M5 前用一次真 claude 複驗。複驗不成立時，改由介面卡在「前景是 claude、沒有記錄、持續數秒」時讀畫面，解析出信任對話框就自己發一個 `blocked:kind=permission`。
+- **worktree 由介面卡自己建。** rex 沒有 worktree 相關的方法。介面卡用 `git worktree add` 建在上一點的位置，分支照舊是 `fleet/<card>`；重跑時分支已存在就開回同一個 worktree，對應 herdr 的 `worktree.open`。cc-mobile 的 `server/launch-worktree.ts` 有現成邏輯可以參考。
+- **同名不會被拒絕。** 審查實測用同一個 label 建兩個 session，兩個都成功；window 和 block 的 label 也沒有唯一性。所以派工冪等只剩 soma 自己的 list-before-start。機庫 session 要用設定檔裡的 `session_id` 找，不用 label；`list()` 看到同名的多筆時要報錯，不能取第一筆。
+- **選項仍要讀畫面。** `msg` 只有問題和選項的文字，沒有選項編號，所以回應卡住照舊要讀畫面（`com.superlogical.terminal.format`）解析選項和指紋。
+- **session 識別。** 記錄裡沒有 herdr 的 `agent_session`。Claude Code 會寫 `~/.claude/sessions/<pid>.json`，裡面有 `sessionId`、`cwd` 和 `status`，pid 和 `owner.pid` 對得上。派出去的 agent 本來就帶 `--session-id`，所以讀對話紀錄不需要這個檔；它的用處是偵測 `/clear`，實測 `/clear` 之後同一個 pid 的 `sessionId` 會換成新的（未複驗）。這是 Claude Code 沒有文件的內部檔案，讀取時要驗證格式，格式不符就當作讀不到。
+- **沒有轉換計數器，改核心的判斷而不是在介面卡合成一個。** rex 每收到一次回報就發一次 `program_status_changed`，即使只有 `updated_at` 變了（API 文件 `program_status_changed` 的說明）。核心今天的 `observe` 把「同一狀態、新的 seq」當成「中間去過別的狀態又回來」（`src/core/domain/bridge.ts:33-35`），所以拿 `updated_at` 當 seq，`blocked` 或 `idle` 一被重報，就會多叫醒一次模型或多記一筆完成。介面卡也沒有地方存一個能撐過 soma 重啟的計數器。所以改的是核心：seq 的語意改成「同一個值就是同一次觀察」，不再保證新值代表有轉換；`blocked` 只在指紋或 `msg` 變了才再叫醒；完成以 transcript 最後一則 assistant 訊息的 id 去重。herdr 和 rex 餵這套規則都正確。`blocked` 和 `idle` 實際會不會被重報還沒量過，M5 要量。
+- **事件串流，不輪詢。** 同一條連線內的事件 `seq` 從 1 起逐一遞增、沒有空號；斷線期間的事件會遺失，新連線的 `seq` 從 1 重新開始（API 文件「Reconnecting」一節）。所以介面卡只靠事件，重連後對每個 block 重讀一次 `program_status`，不照抄 herdr 介面卡 `status-watch.ts` 的每秒輪詢。
+- **機庫是一個 rex session。** 派出去的 agent 各是 `fleet` session 裡的一個 window，Rex.app 的 session 清單只多一筆，不會和人自己的 session 混在一起。機庫上限以這個 session 裡前景是 claude 的 block 數計算。同機也能用 `rex server run --listen unix://<路徑> --state-dir <目錄>` 跑第二個 server，但機庫只要求分隔、不要求故障隔離，所以不採用。
+- **claude 退出時 block 預設會關閉。** terminal flavor 的 `exit.on_completion` 預設是 true，claude 一退出 block 就從清單消失，對帳會把還沒結束的工作記成 agent 不見了。做法是開一個互動 shell 的 block，用 `initial_input` 打 `claude --session-id …` 的啟動指令，claude 退出後回到 shell，和 herdr 的 pane 一樣。`initial_input` 不能拿來送第一則提示，因為它會在 agent 就緒前就打字。建立時沒有 env 參數，環境變數寫在啟動指令裡。關閉用 `block.close`。
+- **送出提示要確認有動。** 實測 claude 剛啟動時，`rex send` 之後的 `rex send-key Enter` 沒有送出，改用 `write` 送 `\r` 才送出（未複驗）。soma 的 herdr 介面卡送提示時沒有確認步驟（`src/adapters/herdr/agent-port.ts:131-135`），rex 介面卡要加：送出後狀態沒有變成 `working`，就補送一次 `\r`。
+- **omp 不送 7501。** `~/workspace/oh-my-pi` 的原始碼裡沒有 OSC 7501，在 rex 裡 omp 的 pane 沒有狀態記錄。要到 omp repo 協助導入，優先順序低。
+- **成熟度。** rex 的 build 日期是 2026-10-23，Mac app 在封閉測試，Program Status 規格是 revision 0.4（2026-10-10）。Rex for iOS 已經存在但還不在公開測試；推播到手機寫在規格的「未來計畫」裡，目前沒有。
+
+### agent 側介面卡的能力差異
+
+兩端的介面卡都是可選的，使用者依自己的習慣在設定裡選，功能差異由使用者自己取捨。核心不假設任何一項能力一定存在：缺了某項能力時，核心照下表的「沒有時」一欄降級，不報錯。
+
+| 能力 | rex | herdr | 原生 tty（M6） | 沒有時 |
+|---|---|---|---|---|
+| soma 重啟後 agent 還在 | 是，由 rex server 託管 | 是，由 herdr daemon 託管 | 否，pty 隨 soma 結束 | 重啟後的對帳把還沒結束的工作記成 agent 不見了，通知人一次 |
+| 人能直接看畫面、親手接手 | Rex 的客戶端 | herdr attach | 否 | 只能經人類側介面卡回答提示 |
+| 狀態來源 | agent 自己送的 7501，經 rex 的 API | herdr 自己的偵測 | agent 自己送的 7501，由 soma 回應探測並解析 | agent 不送 7501 時沒有狀態，例如今天的 omp |
+| 讀畫面回答提示 | `com.superlogical.terminal.format` | `pane.read` | soma 自己的終端模擬器（未驗證要用哪一個） | 只能等人親手回答 |
+| 建 worktree | 介面卡自己跑 git | herdr 的 `worktree.create` | 介面卡自己跑 git | 不適用，三者都有 |
+| 同名拒絕 | 沒有，靠 list-before-start | 有 | soma 自己的 pty 表，同一程序內擋得住 | 只靠 list-before-start |
+
+人類側也一樣：Telegram 能推播和用按鈕回答提示，終端機只在前景時看得到，shikigami 之後補上。
+
+維護分優先級。maintainer 積極維護自己在用的介面卡，目前是 rex、Telegram 和終端機；其他介面卡在核心改動時會跟著過測試，但 agent 端或平台升版造成的問題不保證修。
 
 ### agent 狀態模型：採用 OSC 7501 的詞彙
 
@@ -215,7 +255,7 @@ soma 要支援它，分成兩邊：
 
 - **內部狀態模型直接用 7501 的詞彙。** herdr 的 idle／working／blocked／done 對應過來，`blocked` 的 `kind` 由權限解析補上，cc-mobile 的 idle／running／requires_action 不再沿用。這樣 herdr 對應和未來的 7501 來源餵進同一個形狀，事件橋的「`kind=auth` 一律轉人」規則也直接寫在 `kind` 上。
 - **發送：soma 的終端機客戶端回報自己的狀態。** 根紀錄是 soma 本身（有一輪在跑是 `working`，助理要問人是 `blocked:kind=question`，報告寫好是 `done`），每件派出去的工作一筆子紀錄 `id=job/<task>`。Pi 的 emitter 可以直接沿用（`tui/src/program-status.ts`，53 行，只支援根紀錄，要補 `id` 和 `title`），Pi 自己的狀態對應表在 `coding-agent/docs/terminal-setup.md:221-233`。這是 M1 的一部分，成本約一打行。
-- **接收：pty 是 herdr 的，soma 不自己讀。** 7501 要到 soma，得等 herdr 把它當成狀態來源。herdr 0.9.5 的文件和 release notes 都沒提 7501；對應的提案 [herdrdev/herdr#5069](https://github.com/herdrdev/herdr/issues/5069) 於 2026-10-08 被關掉並導向 discussions。Claude Code 2.1.295 起會送 7501，但只在終端機先回應探測時才送（[anthropics/claude-code#103022](https://github.com/anthropics/claude-code/issues/103022) 在要求一個不用探測的開關）。因此「在 herdr 裡的 Claude Code 目前不會送 7501」是推論，未實測。如果之後 soma 自己用 pty 跑 agent（ACP 路線），就要在那一層回應探測並解析 7501。
+- **接收：pty 是 herdr 的，soma 不自己讀。** 7501 要到 soma，得等 herdr 把它當成狀態來源。herdr 0.9.5 的文件和 release notes 都沒提 7501；對應的提案 [herdrdev/herdr#5069](https://github.com/herdrdev/herdr/issues/5069) 於 2026-10-08 被關掉並導向 discussions。Claude Code 2.1.295 起會送 7501，但只在終端機先回應探測時才送（[anthropics/claude-code#103022](https://github.com/anthropics/claude-code/issues/103022) 在要求一個不用探測的開關）。因此「在 herdr 裡的 Claude Code 目前不會送 7501」是推論，未實測。如果之後 soma 自己用 pty 跑 agent（ACP 路線），就要在那一層回應探測並解析 7501。這就是 M6 原生 tty 介面卡要做的事。走 rex 介面卡時，pty 是 rex 的，rex 會回應探測，Claude Code 的 7501 經 rex 的 API 交給 soma（見「rex 的實作」）。
 
 ACP 是第二種 agent 介面，等有具體需求才做。依據 [agentclientprotocol.com](https://agentclientprotocol.com) 的文件：
 
@@ -225,7 +265,7 @@ ACP 是第二種 agent 介面，等有具體需求才做。依據 [agentclientpr
 - **穩定版沒有 blocked 狀態**，要到 v2 草案的 `requires_action` 才有。
 - **Claude 要透過介面卡** `@agentclientprotocol/claude-agent-acp`（0.93.0），它包的是 Claude Agent SDK，不是 Claude Code CLI 本體（[agents 清單](https://agentclientprotocol.com/get-started/agents)）；Gemini CLI 以 `--acp` 原生支援。SDK 是 `@agentclientprotocol/sdk` 1.9.0。
 
-結論：herdr 是主力，因為核心重啟時 agent 仍由 herdr 託管，人也能隨時切進 pane 親手接手。ACP 適合核心自己開、跑完就收的短工作。
+結論：沒有唯一的主力，由使用者選。由終端託管 agent 的介面（rex、herdr）讓核心重啟時 agent 仍在，人也能隨時切進 pane 親手接手；原生 tty 少了這兩項，但不必另裝多工器。ACP 適合核心自己開、跑完就收的短工作。
 
 ## 可以沿用的現有程式碼
 
@@ -308,7 +348,9 @@ soma 啟動時讀一次 `~/.config/soma/config.json`。每個值先看環境變�
 - **M3 Telegram。** 這是最小的人類介面，在手機上驗證報告的品質。
 - **M3.5 email 與行事曆。** pi-mcp 轉接層加上選定的 MCP server。驗收：在 Telegram 問「今天有什麼會」得到正確答案。
 - **M4 客戶端 socket。** 給程序外的介面卡用。
-- **延後：cc-mobile 助理分頁、shikigami 改成客戶端。** 2026-10-18 決定先做 soma 本身的能力；這兩個專案的修改延後，或之後把它們的功能直接移植進 soma。
+- **延後：cc-mobile 助理分頁、shikigami 改成客戶端。** 2026-10-18 決定先做 soma 本身的能力；這兩個專案的修改延後，或之後把它們的功能直接移植進 soma。cc-mobile 助理分頁於 2026-10-24 取消，見「已決事項」。
+- **M5 rex 介面卡。** 先做四個前置改動，每個獨立驗收：讓 `src/main.ts` 依設定選 agent 側介面卡，今天它寫死 herdr（`src/main.ts:49`）；把 herdr 介面卡裡的 Claude 畫面解析、transcript 讀取和機庫上限搬到介面卡共用的模組，`test/layering.test.ts` 加一條允許的案例；把核心和 port 裡的 `herdr:` 前綴（`src/core/extensions/dispatch/bridge.ts:18`、`src/ports/human.ts` 的 `PUSHED_FAILURES`、叫醒模型的文字開頭）改成與介面無關的 `agent:`；照「rex 的實作」改核心 `observe` 的 seq 語意。接著新增 `src/adapters/rex/` 實作 AgentPort。驗收：用真 rex 重跑 `smoke/dispatch.ts` 和 `smoke/bridge.ts`，前者要保留「機庫裡只有一個該名 window」的斷言，後者要在不按鍵的情況下通過信任對話框；另外量一次讓權限提示停在畫面上 60 秒、再讓 agent 閒置 60 秒，各收到幾個 `program_status_changed`，寫進「rex 的實作」。herdr 介面卡保留，前置改動完成後它也要通過原本的兩支 smoke。
+- **M6 原生 tty 介面卡。** soma 自己開 pty 跑 agent，回應 7501 探測並解析回報，用終端模擬器讀畫面回答提示。驗收：派一件工作、讓它卡在權限提示、從 Telegram 回答、讀到結果；再派一件、`kill -9` soma、重開，這件工作被記成 agent 不見了並通知人一次，不重複通知。
 - **之後** 再視需要做 ACP 和 HTTP 兩種 agent 介面。
 
 先不做的事：一開始就把三種 agent 介面寫齊、做通用的外掛框架（port 要有，註冊表和動態載入不要）、上雲。
@@ -326,6 +368,17 @@ soma 啟動時讀一次 `~/.config/soma/config.json`。每個值先看環境變�
 - **卡住時由模型判斷要不要轉給人**，`kind=auth` 除外；判斷和理由記進派工清單。
 - **完成回報走每十分鐘的定時檢查**，有新完成的工作才叫醒模型寫短報告。例外（2026-10-23）：結果是「需要你」或「失敗」，或人十分鐘內碰過的「完成」，事件橋不叫醒模型就直接通知人，因為有人在等；2026-10-22 Telegram 驗收時，agent 做完後報告晚了九分鐘才到。
 
+2026-10-24 決定：
+
+- **兩端的介面卡都是可選的。** 使用者依自己的習慣選，連原生 tty 也要可行；不同介面卡的功能不同，由使用者自己取捨（見「agent 側介面卡的能力差異」）。新增 rex 介面卡（M5）和原生 tty 介面卡（M6），herdr 介面卡保留。AgentPort 本來就用 OSC 7501 的詞彙（`src/ports/agent.ts:1`），而 Claude Code 在 rex 裡原生回報 7501，不用 `herdr integration install claude`。rex 的實測事實與要補的缺口見「rex 的實作」。
+- **維護分優先級。** maintainer 積極維護自己在用的介面卡，其他的跟著核心改動過測試，但不保證修 agent 端或平台升版造成的問題。
+- **核心不綁定任何一種介面。** soma 之後可能開放給別人用，別人的習慣不一定和 maintainer 相同。所以 port 和核心不出現任何介面的名字（M5 的前置改動拿掉 `herdr:` 前綴就是為此），介面專屬的做法都留在介面卡裡，別人也可以為自己的終端寫一個介面卡。
+- **不再需要 cc-mobile。** 不改造它的理由是它的 `server/herdr/` 約 5.7k 行非測試程式，herdr 的詞彙已經滲進它的 wire protocol 和推播邏輯，改造的成本接近重寫。soma 原本規劃的 `cc-mobile-socket/` 和 `cc-mobile-launch/` 介面卡也取消。cc-mobile 面向使用者的功能分成三類：
+  - **soma 接手**：派工到機庫、卡住時推播、對派出去的 agent 按權限或問題的選項（Telegram 按鈕）。完成通知由十分鐘彙報加緊急即時通知取代 cc-mobile 的 45 秒合併推播。
+  - **終端客戶端接手**：鏡像 session、串流顯示、quick actions、自動完成、主題等純介面功能，由 Rex 的客戶端負責。
+  - **放棄**：對人自己開的 pane 按權限、對任何 agent 送自由文字、中斷、在手機上挑目錄開 session、傳圖片、寫入稽核檔、機庫離線推播、`GET /api/cards`。前三項在 Rex for iOS 可用後由它接手，其餘不再提供。
+- **手機上的空窗。** Rex for iOS 還不在公開測試，推播到手機也還沒有。在它們可用之前，手機上只能經 Telegram 回答 soma 派出去的 agent 的提示；人自己在終端開的 agent 卡住時，手機收不到通知，也沒辦法回答。
+
 ## 待決事項
 
 1. **（已決，2026-10-18）派工要怎麼接 herdr。** 有三條路：
@@ -335,10 +388,10 @@ soma 啟動時讀一次 `~/.config/soma/config.json`。每個值先看環境變�
 
    讀狀態和讀對話紀錄不經過派工路由，所以 M1 的事件橋仍然需要 herdr 的連線與訂閱程式碼。
 
-   2026-10-18 決定：M1 改由 herdr 介面卡直接派進 `fleet` 機庫 session，用 herdr 自己的 `worktree.create` 開 `fleet/<card>` 分支，再 `agent.start` 帶 `--session-id`。理由是 `/api/launch` 要 soma 持有 cc-mobile 的 launch token 並依賴 cc-mobile 在線，而 herdr 介面卡本來就要寫；並發上限照 cc-mobile 的算法計算機庫裡在跑的 agent 數，兩邊算到的是同一批。`/api/launch` 留作 AgentPort 的另一個實作。
+   2026-10-18 決定：M1 改由 herdr 介面卡直接派進 `fleet` 機庫 session，用 herdr 自己的 `worktree.create` 開 `fleet/<card>` 分支，再 `agent.start` 帶 `--session-id`。理由是 `/api/launch` 要 soma 持有 cc-mobile 的 launch token 並依賴 cc-mobile 在線，而 herdr 介面卡本來就要寫；並發上限照 cc-mobile 的算法計算機庫裡在跑的 agent 數，兩邊算到的是同一批。`/api/launch` 留作 AgentPort 的另一個實作（2026-10-24 取消，見「已決事項」）。
 2. **shikigami 跑在哪台機器。** 如果和核心同一台，就在本機直接連；如果在筆電上，就經 Tailscale 連，和 cc-mobile 被手機連的方式一樣。
 3. **報告存放位置，以及要不要另有一份每日總結。** 十分鐘短報告寫進 `notice` 紀錄由介面卡分送；是否再寫進 Obsidian vault 的日記或對應的 obw 卡片，待定。
-4. **沒有 obw 卡片的臨時工作怎麼派。** `POST /api/launch` 以卡片為單位；要嘛 soma 先替臨時工作建卡，要嘛走自己的派工路徑。
+4. **沒有 obw 卡片的臨時工作怎麼派。** `POST /api/launch` 以卡片為單位；要嘛 soma 先替臨時工作建卡，要嘛走自己的派工路徑。2026-10-24 取消 `/api/launch` 之後只剩後兩者，派工工具目前也以卡片為單位。
 5. **（已決，2026-10-18）email 與行事曆用哪個 MCP server，憑證放哪裡。**
 
    2026-10-18 決定：用 [workspace-mcp](https://github.com/taylorwilsdon/google_workspace_mcp)（MIT，未封存，v2.1.0 於 2026-10-09 發布），一個 stdio server 同時提供 Gmail 與 Calendar，以 Google OAuth 登入個人帳號。啟動指令是 `uvx workspace-mcp@2.1.0 --single-user --permissions gmail:readonly calendar:readonly`；2026-10-18 經 soma 的轉接層實際啟動，`tools/list` 只列出讀取類工具，其中有 `search_gmail_messages`（`query` 直接交給 Gmail，可用 `is:unread is:important`）和 `get_events`（`time_min`、`time_max`）。每個工具都有 `user_google_email` 參數。只加 `--single-user` 時這個參數仍是必填，而且帶了憑證目錄裡沒有的帳號就直接失敗、不會改用別的憑證（workspace-mcp 2.1.0 `auth/google_auth.py` 的 single-user 分支）；所以 `env` 還要設 `USER_GOOGLE_EMAIL`，server 會把參數改成選填並自動填入這個帳號（`core/server.py` 的 `USER_GOOGLE_EMAIL` 處理，2026-10-18 經轉接層實測 `tools/list` 的 `required` 已不含它）。

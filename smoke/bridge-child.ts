@@ -57,7 +57,7 @@ const watched: Conversation =
 					if (key !== "submit") return typeof value === "function" ? value.bind(target) : value;
 					return async (...args: Parameters<Conversation["submit"]>) => {
 						const submission = await target.submit(...args);
-						if (!args[0].requestId?.startsWith("herdr:")) return submission;
+						if (!args[0].requestId?.startsWith("agent:")) return submission;
 						await submission.wait(context);
 						emit({ event: "woke", requestId: args[0].requestId, calls: faux.state.callCount });
 						// A pending promise alone lets node exit; the timer keeps it alive until the kill.

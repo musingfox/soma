@@ -1,6 +1,7 @@
 import type {
 	AgentListing,
 	AgentPort,
+	AgentResult,
 	AgentState,
 	AgentStatusEvent,
 	Answer,
@@ -14,9 +15,10 @@ export class FakeAgentPort implements AgentPort {
 	readonly started: StartRequest[] = [];
 	readonly stopped = new Set<string>();
 	readonly #listeners = new Set<(event: AgentStatusEvent) => void>();
-	readonly #results = new Map<string, string>();
+	readonly #results = new Map<string, AgentResult>();
 	readonly #states = new Map<string, { status: AgentState; seq: number }>();
 	#seq = 0;
+	#turn = 0;
 
 	async start(request: StartRequest): Promise<void> {
 		this.started.push(request);
@@ -37,7 +39,7 @@ export class FakeAgentPort implements AgentPort {
 		return () => this.#listeners.delete(listener);
 	}
 
-	async readResult(agent: string): Promise<string | undefined> {
+	async readResult(agent: string): Promise<AgentResult | undefined> {
 		return this.#results.get(agent);
 	}
 
@@ -64,8 +66,9 @@ export class FakeAgentPort implements AgentPort {
 		for (const listener of this.#listeners) listener(event);
 	}
 
+	/** Each call is a new turn, with a message id of its own. */
 	finish(agent: string, result: string): void {
-		this.#results.set(agent, result);
+		this.#results.set(agent, { id: `msg_${++this.#turn}`, text: result });
 		this.emit(agent, { state: "done" });
 	}
 }

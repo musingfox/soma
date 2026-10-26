@@ -131,7 +131,7 @@ export function digest(agents: Pick<AgentPort, "readResult">) {
 					}));
 				}, context);
 				const reports: JobReport[] = await Promise.all(
-					jobs.map(async (job) => ({ ...job, result: await agents.readResult(job.agent) })),
+					jobs.map(async (job) => ({ ...job, result: (await agents.readResult(job.agent))?.text })),
 				);
 				const window = { since: new Date(since).toISOString(), until: new Date(next).toISOString() };
 				const root = await runtime.conversation(runtime.conversationId, context);

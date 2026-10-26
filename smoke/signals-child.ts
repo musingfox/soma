@@ -25,7 +25,7 @@ const agents: AgentPort = {
 	list: async () => [{ name: "card-x", status: { state: "done" }, seq: 5 }],
 	prompt: async () => {},
 	onStatus: () => () => {},
-	readResult: async () => "結果：失敗\n測試沒過。",
+	readResult: async () => ({ id: "msg_1", text: "結果：失敗\n測試沒過。" }),
 	respond: async () => ({ sent: false, refusal: "not_blocked" }),
 	stop: async () => {},
 };

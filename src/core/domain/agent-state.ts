@@ -9,7 +9,7 @@ export interface Transition {
 
 type State = AgentState["state"];
 
-// done → working is a follow-up prompt; done → idle is herdr settling after done.
+// done → working is a follow-up prompt; done → idle is the agent side settling after done.
 // error is terminal: a failed job is re-dispatched, not revived.
 const allowed: Readonly<Record<State, readonly State[]>> = {
 	idle: ["working", "blocked", "done", "error"],

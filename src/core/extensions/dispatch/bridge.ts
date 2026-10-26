@@ -1,10 +1,10 @@
 import type { Context } from "@earendil-works/chord/context";
 import type { Conversation } from "@earendil-works/pi-durable";
 import type { AgentPort, AgentState, AgentStatusEvent } from "../../../ports/agent.ts";
-import { observe } from "../../domain/bridge.ts";
+import { complete, observe } from "../../domain/bridge.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
 import { reconcile } from "../../domain/reconcile.ts";
-import { outcomeOf, resultNotice, urgent } from "../../domain/report.ts";
+import { resultNotice, urgent } from "../../domain/report.ts";
 import { dispatchSignal, reblockSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
 import { recordFact } from "../memory/index.ts";
@@ -34,8 +34,9 @@ function wakeContent(job: Job, status: Extract<AgentState, { state: "blocked" }>
  * A finished turn is committed to the dispatch list and the transcript with the outcome its
  * reply's first line states, which starts no run, and an urgent one with a notice to the human; only a blocked agent submits an input, and a
  * kind=auth block not even that: it is committed as a notice to the human together with the
- * decision, so the model never sees it to answer. The input's requestId is the agent's transition
- * counter, so a resent event, from a repeated snapshot or a restarted core, is admitted once.
+ * decision, so the model never sees it to answer. The input's requestId carries the observation's
+ * seq, so a resent event, from a repeated snapshot or a restarted core, is admitted once. A turn is
+ * recorded once per reply: the same reply under a new seq is the same turn.
  */
 export function eventBridge(conversation: Conversation, agents: AgentPort, context: Context) {
 	// One event at a time: each reads the job, acts, then commits what it saw.
@@ -52,9 +53,9 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 		if (job === undefined) return;
 		const observed = observe(job, event.status, event.seq);
 		if (observed.job === job) return;
-		const { action } = observed;
-		const reply = action === "complete" ? await agents.readResult(job.agent) : undefined;
-		const next: Job = action === "complete" ? { ...observed.job, outcome: outcomeOf(reply) } : observed.job;
+		const result = observed.action === "complete" ? await agents.readResult(job.agent) : undefined;
+		const { job: next, action } = complete(observed, result);
+		const reply = result?.text;
 
 		// Each side effect precedes the commit of its seq, so a crash in between redoes it on restart:
 		// the requestId makes the second submit return the first.
@@ -145,9 +146,9 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 
 /**
  * Startup step after `harness.resume()`: catch the dispatch list up with what changed while the
- * core was down. A listing with a transition counter goes through the bridge like any event, so a
- * turn that finished in the gap is recorded and a block that was already handed to the model is
- * not handed over again.
+ * core was down. A listing with a seq goes through the bridge like any event, so a turn that
+ * finished in the gap is recorded and a block that was already handed to the model is not handed
+ * over again.
  */
 export async function reconcileDispatches(conversation: Conversation, agents: AgentPort, context: Context) {
 	const listed = await agents.list();

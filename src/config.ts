@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type AuthContext, defaultProviderAuthContext } from "@earendil-works/pi-ai";
 import { z } from "zod";
+import { defaultRexSocket } from "./adapters/rex/client.ts";
 import type { TelegramConfig } from "./adapters/telegram/index.ts";
 
 /** The canonical form of a BCP 47 language tag, or undefined when it is not one. */
@@ -13,6 +14,22 @@ function canonicalLanguage(tag: string): string | undefined {
 		return undefined;
 	}
 }
+
+/** The agent-side adapters soma can dispatch through; the config picks one. */
+export const AGENT_ADAPTERS = ["herdr", "rex"] as const;
+export type AgentAdapter = (typeof AGENT_ADAPTERS)[number];
+
+/** The hangar is a rex session found by its id, never by its label, which rex does not keep unique. */
+export interface RexConfig {
+	readonly sessionId: string;
+	readonly socket: string;
+}
+
+// Checked only when rex is selected, so a herdr setup never trips over a rex block it does not use.
+const RexFileConfig = z
+	.object({ sessionId: z.string().min(1), socket: z.string().min(1) })
+	.partial()
+	.strict();
 
 const FileConfig = z
 	.object({
@@ -25,6 +42,8 @@ const FileConfig = z
 		programStatus: z.boolean(),
 		repo: z.string().min(1),
 		reflection: z.boolean(),
+		agentAdapter: z.enum(AGENT_ADAPTERS),
+		rex: z.unknown(),
 		anthropic: z
 			.object({ apiKey: z.string().min(1) })
 			.partial()
@@ -39,7 +58,10 @@ const FileConfig = z
 export type FileConfig = z.infer<typeof FileConfig>;
 
 export interface Config {
+	readonly agentAdapter: AgentAdapter;
 	readonly herdrSocket: string;
+	/** Set exactly when `agentAdapter` is rex. */
+	readonly rex?: RexConfig;
 	readonly mcpConfig: string;
 	readonly db: string;
 	readonly model: string;
@@ -66,6 +88,18 @@ export function configPath(env: Env, home: string): string {
 	return env.SOMA_CONFIG?.trim() || join(home, ".config/soma/config.json");
 }
 
+/** `value` parsed, else a ConfigError naming the config path and each field at fault, under `prefix`. */
+function parseOrThrow<T>(schema: z.ZodType<T>, value: unknown, path: string, prefix: readonly string[] = []): T {
+	const parsed = schema.safeParse(value);
+	if (parsed.success) return parsed.data;
+	const issues = parsed.error.issues.map((issue) => {
+		const at = [...prefix, ...issue.path];
+		const keys = issue.code === "unrecognized_keys" ? issue.keys.map((key) => [...at, key].join(".")) : [];
+		return `${keys.join(", ") || at.join(".") || "(top level)"}: ${issue.message}`;
+	});
+	throw new ConfigError(`${path}: ${issues.join("; ")}`);
+}
+
 /** A missing file is no file; a file soma cannot use throws rather than run with part of it. */
 export function readConfigFile(path: string, warn: (message: string) => void = console.warn): FileConfig | undefined {
 	if (!existsSync(path)) return undefined;
@@ -75,23 +109,18 @@ export function readConfigFile(path: string, warn: (message: string) => void = c
 	} catch (error) {
 		throw new ConfigError(`${path}: not valid JSON: ${(error as Error).message}`);
 	}
-	const parsed = FileConfig.safeParse(json);
-	if (!parsed.success) {
-		const issues = parsed.error.issues.map((issue) => {
-			const keys = issue.code === "unrecognized_keys" ? issue.keys.map((key) => [...issue.path, key].join(".")) : [];
-			return `${keys.join(", ") || issue.path.join(".") || "(top level)"}: ${issue.message}`;
-		});
-		throw new ConfigError(`${path}: ${issues.join("; ")}`);
-	}
-	const file = parsed.data;
+	const file = parseOrThrow(FileConfig, json, path);
 	if ((file.anthropic?.apiKey || file.telegram?.botToken) && statSync(path).mode & 0o044) {
 		warn(`[soma] ${path} holds a key or token and is readable by group or others; run chmod 600 ${path}`);
 	}
 	return file;
 }
 
-/** Each value comes from its environment variable, else the config file, else the default. */
-export function resolveConfig(file: FileConfig | undefined, env: Env, home: string): Config {
+/**
+ * Each value comes from its environment variable, else the config file, else the default. `path` names the config file
+ * in an error about a value that is missing rather than malformed.
+ */
+export function resolveConfig(file: FileConfig | undefined, env: Env, home: string, path = "config"): Config {
 	const fromEnv = (name: string) => env[name]?.trim() || undefined;
 	const parseEnv = <T>(name: string, parse: (value: string) => T | undefined, expected: string): T | undefined => {
 		const value = fromEnv(name);
@@ -116,7 +145,16 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 			"an integer",
 		) ?? file?.telegram?.chatId;
 	const apiBase = fromEnv("TELEGRAM_API_BASE") ?? file?.telegram?.apiBase ?? "https://api.telegram.org";
+	const agentAdapter =
+		parseEnv(
+			"SOMA_AGENT_ADAPTER",
+			(v) => AGENT_ADAPTERS.find((adapter) => adapter === v),
+			AGENT_ADAPTERS.map((adapter) => `"${adapter}"`).join(" or "),
+		) ??
+		file?.agentAdapter ??
+		"herdr";
 	return {
+		agentAdapter,
 		// The hangar session, never $HERDR_SOCKET_PATH: that names whichever session soma itself runs in.
 		herdrSocket:
 			fromEnv("SOMA_HERDR_SOCKET") ?? file?.herdrSocket ?? join(home, ".config/herdr/sessions/fleet/herdr.sock"),
@@ -131,6 +169,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		// Unset, the checkout this code runs from; a release directory is not a git repo, so prod sets it.
 		repo: fromEnv("SOMA_REPO") ?? file?.repo ?? dirname(dirname(fileURLToPath(import.meta.url))),
 		reflection: reflection ?? true,
+		...(agentAdapter === "rex" && { rex: resolveRex(file, fromEnv, home, path) }),
 		...(hangarCap !== undefined && { hangarCap }),
 		...(programStatus !== undefined && { programStatus }),
 		...(anthropicApiKey !== undefined && { anthropicApiKey }),
@@ -138,8 +177,33 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 	};
 }
 
+/** Read only when rex is selected, so a herdr setup never trips over them. */
+function resolveRex(
+	file: FileConfig | undefined,
+	fromEnv: (name: string) => string | undefined,
+	home: string,
+	path: string,
+): RexConfig {
+	const rex = file?.rex === undefined ? undefined : parseOrThrow(RexFileConfig, file.rex, path, ["rex"]);
+	const sessionId = fromEnv("SOMA_REX_SESSION_ID") ?? rex?.sessionId;
+	if (sessionId === undefined) {
+		throw new ConfigError(
+			`${path}: rex.sessionId: Required when agentAdapter is "rex" (or set SOMA_REX_SESSION_ID): the hangar session's id`,
+		);
+	}
+	if (!/^session:\S+$/.test(sessionId)) {
+		throw new ConfigError(
+			`${path}: rex.sessionId: Expected a rex session id such as "session:<uuid>", got "${sessionId}"`,
+		);
+	}
+	return {
+		sessionId,
+		socket: fromEnv("SOMA_REX_SOCKET") ?? rex?.socket ?? defaultRexSocket(home),
+	};
+}
+
 export function loadConfig(path: string, env: Env, home: string, warn?: (message: string) => void): Config {
-	return resolveConfig(readConfigFile(path, warn), env, home);
+	return resolveConfig(readConfigFile(path, warn), env, home, path);
 }
 
 /**

@@ -118,6 +118,22 @@ const fields = [
 		read: (c) => c.telegram?.apiBase,
 		values: ["http://env", "http://file", "https://api.telegram.org"],
 	},
+	{
+		name: "agentAdapter",
+		env: ["SOMA_AGENT_ADAPTER", "herdr"],
+		file: { agentAdapter: "rex" },
+		base: { env: { SOMA_REX_SESSION_ID: "session:hangar" } },
+		read: (c) => c.agentAdapter,
+		values: ["herdr", "rex", "herdr"],
+	},
+	{
+		name: "rex.socket",
+		env: ["SOMA_REX_SOCKET", "/env/rex.sock"],
+		file: { rex: { socket: "/file/rex.sock" } },
+		base: { env: { SOMA_AGENT_ADAPTER: "rex", SOMA_REX_SESSION_ID: "session:hangar" } },
+		read: (c) => c.rex?.socket,
+		values: ["/env/rex.sock", "/file/rex.sock", "/home/me/Library/Application Support/rex/server.sock"],
+	},
 ] satisfies {
 	name: string;
 	env: [string, string];
@@ -194,6 +210,7 @@ describe("invalid environment variables", () => {
 		["SOMA_REFLECTION", "off"],
 		["TELEGRAM_CHAT_ID", "me"],
 		["SOMA_LANGUAGE", "繁體中文"],
+		["SOMA_AGENT_ADAPTER", "tmux"],
 	])("%s=%s throws naming the variable", (name, value) => {
 		expect(() => resolveConfig(undefined, { [name]: value }, HOME)).toThrow(new ConfigError(`${name} must be`).message);
 	});
@@ -220,6 +237,49 @@ describe("the config file", () => {
 	test("an unknown field throws with its name", () => {
 		const path = write(JSON.stringify({ telegram: { token: "t" } }));
 		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: telegram.token: Unrecognized key`);
+	});
+});
+
+describe("the agent-side adapter", () => {
+	test("unset, it is herdr, and no rex setting is read", () => {
+		const config = resolveConfig(undefined, { SOMA_REX_SESSION_ID: "not an id" }, HOME);
+		expect(config.agentAdapter).toBe("herdr");
+		expect(config.rex).toBeUndefined();
+	});
+	test("an unknown one in the file throws with the path and the field", () => {
+		const path = write(JSON.stringify({ agentAdapter: "tmux" }));
+		expect(() => loadConfig(path, {}, HOME)).toThrow(ConfigError);
+		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: agentAdapter: Invalid enum value`);
+	});
+	test("rex without the hangar's session id throws with the path and the field", () => {
+		const path = write(JSON.stringify({ agentAdapter: "rex", rex: { socket: "/tmp/rex.sock" } }));
+		expect(() => loadConfig(path, {}, HOME)).toThrow(ConfigError);
+		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: rex.sessionId: Required`);
+	});
+	test("the hangar's session id comes from SOMA_REX_SESSION_ID, else the file", () => {
+		const file: FileConfig = { agentAdapter: "rex", rex: { sessionId: "session:file" } };
+		expect(resolveConfig(file, { SOMA_REX_SESSION_ID: "session:env" }, HOME).rex?.sessionId).toBe("session:env");
+		expect(resolveConfig(file, { SOMA_REX_SESSION_ID: " " }, HOME).rex?.sessionId).toBe("session:file");
+	});
+	test("rex selected by the environment without a session id throws too", () => {
+		expect(() => resolveConfig(undefined, { SOMA_AGENT_ADAPTER: "rex" }, HOME)).toThrow(ConfigError);
+	});
+	test.each([
+		["an empty session id", { sessionId: "" }, "rex.sessionId: String must contain at least 1 character(s)"],
+		["a socket that is not a string", { socket: 7 }, "rex.socket: Expected string, received number"],
+		["an unknown key", { session: "session:hangar" }, "rex.session: Unrecognized key"],
+		["a block that is not an object", "session:hangar", "rex: Expected object, received string"],
+	])("a rex block with %s is ignored under herdr and names the field under rex", (_, rex, field) => {
+		const herdr = write(JSON.stringify({ agentAdapter: "herdr", rex }));
+		expect(loadConfig(herdr, {}, HOME).agentAdapter).toBe("herdr");
+		expect(loadConfig(write(JSON.stringify({ rex })), {}, HOME).rex).toBeUndefined();
+		const path = write(JSON.stringify({ agentAdapter: "rex", rex }));
+		expect(() => loadConfig(path, { SOMA_REX_SESSION_ID: "session:env" }, HOME)).toThrow(ConfigError);
+		expect(() => loadConfig(path, { SOMA_REX_SESSION_ID: "session:env" }, HOME)).toThrow(`${path}: ${field}`);
+	});
+	test("a session label in place of the session id throws", () => {
+		const path = write(JSON.stringify({ agentAdapter: "rex", rex: { sessionId: "fleet" } }));
+		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: rex.sessionId: Expected a rex session id`);
 	});
 });
 

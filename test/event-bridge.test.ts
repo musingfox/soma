@@ -142,6 +142,65 @@ test("a blocked agent wakes the model once, however often the snapshot repeats i
 	expect(await soma.job("card-a")).toMatchObject({ seq: 41, status: { state: "blocked", kind: "permission" } });
 });
 
+test("the same blocked prompt re-reported under new seqs wakes the model once", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await dispatched(await database(), agents, "card-a");
+	const before = soma.calls();
+	const prompt = { state: "blocked", kind: "question", msg: "answer: which?", fingerprint: "fp-1" } as const;
+
+	agents.emit("card-a", prompt, 51);
+	agents.emit("card-a", prompt, 52);
+	await soma.settle();
+	agents.emit("card-a", prompt, 53);
+	await soma.settle();
+
+	expect(soma.calls() - before).toBe(1);
+	expect(await entriesOf(soma.root, AGENT_BLOCKED)).toMatchObject([{ data: { seq: 51 } }]);
+	expect(await soma.job("card-a")).toMatchObject({ seq: 53, status: prompt });
+});
+
+test("blocked → working → blocked on the same prompt wakes the model twice", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await dispatched(await database(), agents, "card-a");
+	const before = soma.calls();
+	const prompt = { state: "blocked", kind: "permission", msg: "approve Bash: ls", fingerprint: "fp-1" } as const;
+
+	agents.emit("card-a", prompt);
+	await soma.settle();
+	agents.emit("card-a", { state: "working" });
+	agents.emit("card-a", prompt);
+	await soma.settle();
+
+	expect(soma.calls() - before).toBe(2);
+	expect(await entriesOf(soma.root, AGENT_BLOCKED)).toHaveLength(2);
+});
+
+test("a finished turn re-reported under new seqs is recorded once, and a new reply once more", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await dispatched(await database(), agents, "card-a");
+	agents.emit("card-a", { state: "idle" });
+	await soma.settle();
+
+	agents.finish("card-a", "結果：完成");
+	agents.emit("card-a", { state: "idle" });
+	agents.emit("card-a", { state: "idle" });
+	await soma.settle();
+	agents.emit("card-a", { state: "idle" });
+	await soma.settle();
+	expect(await entriesOf(soma.root, JOB_DONE)).toHaveLength(1);
+	const first = (await soma.job("card-a"))?.resultId;
+	expect(first).toEqual(expect.any(String));
+
+	// A second turn between two samples: the reply changed, no working was seen.
+	agents.finish("card-a", "結果：需要你\n要用哪個 server？");
+	agents.emit("card-a", { state: "idle" });
+	await soma.settle();
+
+	const outcomes = (await entriesOf(soma.root, JOB_DONE)).map((entry) => (entry.data as { outcome: string }).outcome);
+	expect(outcomes.sort()).toEqual(["完成", "需要你"].sort());
+	expect((await soma.job("card-a"))?.resultId).not.toBe(first);
+});
+
 test("a block resent after a restart is handled once, by its requestId", async () => {
 	const db = await database();
 	const first = await dispatched(db, new FakeAgentPort(), "card-a");

@@ -29,14 +29,15 @@ export interface AgentListing {
 	// Absent when the agent side cannot tell, which is no claim either way.
 	readonly status?: AgentState;
 	readonly sessionId?: string;
-	// The agent side's transition counter, when it counts transitions.
+	// Names the observation, as on AgentStatusEvent; absent when the agent side has none to name it by.
 	readonly seq?: number;
 }
 
 export interface AgentStatusEvent {
 	readonly agent: string;
 	readonly status: AgentState;
-	// The agent side's transition counter; event-bridge requestIds are agent:<agent>:<seq>.
+	// Names the observation: the same value is the same observation, so a resent one is recognised, but a new
+	// value does not promise the agent went through a transition. Event-bridge requestIds are agent:<agent>:<seq>.
 	readonly seq: number;
 }
 
@@ -55,12 +56,15 @@ export type AnswerRefusal = "not_blocked" | "stale" | "unknown_option" | "auth" 
 
 export type AnswerOutcome = { readonly sent: true } | { readonly sent: false; readonly refusal: AnswerRefusal };
 
+/** The agent's last reply: `id` names the message, so a turn re-reported is told from a new one. */
+export type AgentResult = { readonly id: string; readonly text: string };
+
 export interface AgentPort {
 	start(request: StartRequest): Promise<void>;
 	list(): Promise<readonly AgentListing[]>;
 	prompt(agent: string, text: string): Promise<void>;
 	onStatus(listener: (event: AgentStatusEvent) => void): () => void;
-	readResult(agent: string): Promise<string | undefined>;
+	readResult(agent: string): Promise<AgentResult | undefined>;
 	// Re-reads the screen before sending: a stored status is never trusted to still be on it.
 	respond(agent: string, answer: Answer): Promise<AnswerOutcome>;
 	stop(agent: string): Promise<void>;

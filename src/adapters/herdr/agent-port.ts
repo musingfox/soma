@@ -3,10 +3,11 @@ import { copyFile } from "node:fs/promises";
 import { join } from "node:path";
 import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "../../agent-cli/hangar-cap.ts";
 import { answerKeys, readBlockedScreen } from "../../agent-cli/permission/blocked-screen.ts";
-import { readFinalAnswer, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
+import { readFinalMessage, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
 import type {
 	AgentListing,
 	AgentPort,
+	AgentResult,
 	AgentState,
 	AgentStatusEvent,
 	Answer,
@@ -158,12 +159,12 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 		},
 
 		/** The agent's last assistant message, read off its claude transcript; undefined while there is none. */
-		async readResult(agent: string): Promise<string | undefined> {
+		async readResult(agent: string): Promise<AgentResult | undefined> {
 			const info = await client.agentGet(agent);
 			const sessionId = info.agent_session?.value;
 			if (!sessionId) return undefined;
 			const path = await resolveTranscriptPath(sessionId, info.cwd, options.projectsDir);
-			return path === undefined ? undefined : readFinalAnswer(path);
+			return path === undefined ? undefined : readFinalMessage(path);
 		},
 
 		// cc-mobile native-permission.ts:334-440: fresh status, fresh screen, then the keys read off that screen.

@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
-import { readFinalAnswer, resolveTranscriptPath } from "../../src/agent-cli/transcript.ts";
+import { readFinalAnswer, readFinalMessage, resolveTranscriptPath } from "../../src/agent-cli/transcript.ts";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -109,4 +109,14 @@ test("a transcript with no assistant message, or whose last one has no text, has
 		assistant("msg_1", text("earlier")) + assistant("msg_2", { type: "tool_use", id: "t", name: "Bash", input: {} }),
 	);
 	expect(await readFinalAnswer(toolOnly)).toBeUndefined();
+});
+
+test("the final message carries the id of the last assistant message, and none without one", async () => {
+	const path = await transcript(
+		assistant("msg_1", text("earlier")) + assistant("msg_2", text("結果：完成")) + assistant("msg_2", text("done")),
+	);
+	expect(await readFinalMessage(path)).toEqual({ id: "msg_2", text: "結果：完成\ndone" });
+	const idless = await transcript(line({ type: "assistant", message: { role: "assistant", content: [text("x")] } }));
+	expect(await readFinalMessage(idless)).toBeUndefined();
+	expect(await readFinalAnswer(idless)).toBe("x");
 });

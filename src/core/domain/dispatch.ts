@@ -22,12 +22,14 @@ export type Job = {
 	readonly agent: string;
 	readonly sessionId: string;
 	readonly status: AgentState;
-	// The agent side's transition counter at `status`; an event carrying the same one was already handled.
+	// Names the observation that set `status`; an event carrying the same one was already handled.
 	readonly seq?: number;
 	// The first prompt, held until the agent can take it: claude refuses prompts until its trust dialog is answered.
 	readonly launch?: string;
 	// Read off the result line of the agent's last finished turn.
 	readonly outcome?: Outcome | "未知";
+	// The message id of the last reply recorded as a finished turn; the same reply observed again is no new turn.
+	readonly resultId?: string;
 	readonly decisions: Decision[];
 };
 

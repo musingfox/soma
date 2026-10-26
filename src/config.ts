@@ -55,6 +55,11 @@ type Env = Readonly<Record<string, string | undefined>>;
 
 export class ConfigError extends Error {}
 
+/** Unset, it is prod's file: launchd's soma and a plain `node src/main.ts` read the same one. */
+export function configPath(env: Env, home: string): string {
+	return env.SOMA_CONFIG?.trim() || join(home, ".config/soma/config.json");
+}
+
 /** A missing file is no file; a file soma cannot use throws rather than run with part of it. */
 export function readConfigFile(path: string, warn: (message: string) => void = console.warn): FileConfig | undefined {
 	if (!existsSync(path)) return undefined;

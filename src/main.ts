@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -10,7 +10,7 @@ import { createHerdrClient } from "./adapters/herdr/client.ts";
 import { createCard, readCard } from "./adapters/obsidian/card.ts";
 import { runTelegram } from "./adapters/telegram/index.ts";
 import { runTerminal } from "./adapters/terminal/index.ts";
-import { anthropicAuthContext, type Config, ConfigError, loadConfig } from "./config.ts";
+import { anthropicAuthContext, type Config, ConfigError, configPath, loadConfig } from "./config.ts";
 import { clock } from "./core/extensions/clock/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
@@ -25,10 +25,9 @@ import { sleeper } from "./core/extensions/sleeper/index.ts";
 import { acquireDbLock, DbLockedError, openHarness, openStorage } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
 
-const configPath = join(homedir(), ".config/soma/config.json");
 let config: Config;
 try {
-	config = loadConfig(configPath, process.env, homedir());
+	config = loadConfig(configPath(process.env, homedir()), process.env, homedir());
 } catch (error) {
 	if (!(error instanceof ConfigError)) throw error;
 	console.error(`[soma] ${error.message}`);

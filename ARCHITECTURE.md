@@ -289,7 +289,7 @@ cc-mobile `server/` 裡有 2,971 行（含註解與空行）只在清單內互�
 
 ## 設定
 
-soma 啟動時讀一次 `~/.config/soma/config.json`。每個值先看環境變數，再看設定檔，最後用預設值；欄位、對應的環境變數和預設值都在 `src/config.ts` 的 `resolveConfig`。檔案不存在就只用環境變數和預設值。JSON 壞掉、欄位型別不對或有不認得的欄位時，soma 印出檔案路徑和欄位名稱後以狀態 1 結束，不帶著部分設定跑。範例：
+soma 啟動時讀一次設定檔：環境變數 `SOMA_CONFIG` 指定的檔案，沒設時是 `~/.config/soma/config.json`（`src/config.ts` 的 `configPath`）。沒設時讀的是 prod 的設定，所以 dev 實例要設 `SOMA_CONFIG` 指向自己的設定檔，用不同的 `db`、不設 `telegram`（見里程碑「常駐服務」）。每個值先看環境變數，再看設定檔，最後用預設值；欄位、對應的環境變數和預設值都在 `src/config.ts` 的 `resolveConfig`。檔案不存在就只用環境變數和預設值。JSON 壞掉、欄位型別不對或有不認得的欄位時，soma 印出檔案路徑和欄位名稱後以狀態 1 結束，不帶著部分設定跑。範例：
 
 ```json
 {

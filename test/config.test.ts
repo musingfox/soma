@@ -5,7 +5,14 @@ import type { AuthContext } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { afterAll, describe, expect, test, vi } from "vitest";
-import { anthropicAuthContext, ConfigError, type FileConfig, loadConfig, resolveConfig } from "../src/config.ts";
+import {
+	anthropicAuthContext,
+	ConfigError,
+	configPath,
+	type FileConfig,
+	loadConfig,
+	resolveConfig,
+} from "../src/config.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "soma-config-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -213,5 +220,17 @@ describe("the permission warning", () => {
 		loadConfig(path, {}, HOME, warn);
 		if (warned) expect(warn).toHaveBeenCalledWith(expect.stringContaining(path));
 		else expect(warn).not.toHaveBeenCalled();
+	});
+});
+
+describe("configPath", () => {
+	test("SOMA_CONFIG names the file", () => {
+		expect(configPath({ SOMA_CONFIG: "/srv/soma/dev.json" }, "/home/me")).toBe("/srv/soma/dev.json");
+	});
+	test("unset, it is the one under ~/.config/soma", () => {
+		expect(configPath({}, "/home/me")).toBe("/home/me/.config/soma/config.json");
+	});
+	test("a blank SOMA_CONFIG counts as unset", () => {
+		expect(configPath({ SOMA_CONFIG: "  " }, "/home/me")).toBe("/home/me/.config/soma/config.json");
 	});
 });

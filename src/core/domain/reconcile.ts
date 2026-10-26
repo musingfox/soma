@@ -6,7 +6,9 @@ import type { DispatchList } from "./dispatch.ts";
  * truth, so a status is replaced outright rather than walked through `transition`:
  * a core that was down can miss every step in between. A job whose agent is no
  * longer listed failed unless it had already finished; jobs are never added here,
- * since the agent side also holds agents soma did not dispatch.
+ * since the agent side also holds agents soma did not dispatch. A listed status other
+ * than blocked forgets the block last handed over, as an observed one does, so the
+ * same prompt asked again is handed over again.
  */
 export function reconcile(jobs: DispatchList, listed: readonly AgentListing[]): DispatchList {
 	const byName = new Map(listed.map((agent) => [agent.name, agent]));
@@ -16,6 +18,9 @@ export function reconcile(jobs: DispatchList, listed: readonly AgentListing[]): 
 			if (job.status.state === "done" || job.status.state === "error") return job;
 			return { ...job, status: { state: "error", msg: "agent is gone" } };
 		}
-		return agent.status === undefined ? job : { ...job, status: agent.status };
+		if (agent.status === undefined) return job;
+		if (agent.status.state === "blocked") return { ...job, status: agent.status };
+		const { handedOver: _forgotten, ...rest } = job;
+		return { ...rest, status: agent.status };
 	});
 }

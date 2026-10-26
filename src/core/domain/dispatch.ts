@@ -17,6 +17,8 @@ export type Decision = {
 	readonly reason: string;
 };
 
+export type HandedOver = { readonly fingerprint?: string; readonly msg?: string };
+
 export type Job = {
 	readonly card: string;
 	readonly agent: string;
@@ -30,6 +32,9 @@ export type Job = {
 	readonly outcome?: Outcome | "未知";
 	// The message id of the last reply recorded as a finished turn; the same reply observed again is no new turn.
 	readonly resultId?: string;
+	// The prompt of the last block handed to the model or the human, until a status other than blocked is seen: the
+	// same prompt observed again is not handed over twice. `status` cannot tell, since reconcile writes it unobserved.
+	readonly handedOver?: HandedOver;
 	readonly decisions: Decision[];
 };
 

@@ -120,3 +120,12 @@ test("the final message carries the id of the last assistant message, and none w
 	expect(await readFinalMessage(idless)).toBeUndefined();
 	expect(await readFinalAnswer(idless)).toBe("x");
 });
+
+test("a last message without text still carries its id, with empty text", async () => {
+	const path = await transcript(
+		assistant("msg_1", text("earlier")) + assistant("msg_2", { type: "tool_use", id: "t", name: "Bash", input: {} }),
+	);
+	expect(await readFinalMessage(path)).toEqual({ id: "msg_2", text: "" });
+	expect(await readFinalAnswer(path)).toBeUndefined();
+	expect(await readFinalMessage(await transcript(user("開始")))).toBeUndefined();
+});

@@ -21,6 +21,22 @@ test("a listed agent's status replaces the job's, even across states the core ne
 	expect(next.map((j) => j.status)).toEqual([{ state: "blocked", kind: "question" }, { state: "done" }]);
 });
 
+test("a listed status other than blocked forgets the block last handed over; a blocked one keeps it", () => {
+	const prompt = { state: "blocked", kind: "question", fingerprint: "fp-1" } as const;
+	const jobs = [
+		{ ...job("a", prompt), handedOver: { fingerprint: "fp-1" } },
+		{ ...job("b", prompt), handedOver: { fingerprint: "fp-1" } },
+	];
+
+	const next = reconcile(jobs, [
+		{ name: "a", status: { state: "working" } },
+		{ name: "b", status: prompt },
+	]);
+
+	expect(next.map((j) => j.handedOver)).toEqual([undefined, { fingerprint: "fp-1" }]);
+	expect(next[0]).not.toHaveProperty("handedOver");
+});
+
 test("a listing without a status leaves the job alone", () => {
 	const jobs = [job("a", { state: "working" })];
 

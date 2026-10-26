@@ -55,7 +55,8 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 		if (observed.job === job) return;
 		const result = observed.action === "complete" ? await agents.readResult(job.agent) : undefined;
 		const { job: next, action } = complete(observed, result);
-		const reply = result?.text;
+		// A reply without text is told apart by its id but says nothing, as an unreadable one.
+		const reply = result?.text || undefined;
 
 		// Each side effect precedes the commit of its seq, so a crash in between redoes it on restart:
 		// the requestId makes the second submit return the first.
@@ -80,7 +81,7 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			const current = doc.jobs[index];
 			if (current === undefined || current.seq === event.seq) return;
 			// Decisions come from the current job, not the one read above: a respond tool may have added one since.
-			const { launch: _held, ...kept } = current;
+			const { launch: _held, handedOver: _handed, ...kept } = current;
 			const { decisions: _read, ...fields } = next;
 			doc.jobs[index] = { ...kept, ...fields };
 			if (action === "escalate") {

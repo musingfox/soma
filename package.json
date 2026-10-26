@@ -14,6 +14,7 @@
 		"smoke:herdr": "node smoke/herdr.ts",
 		"smoke:schedule": "node smoke/schedule.ts",
 		"smoke:dispatch": "node smoke/dispatch.ts",
+		"smoke:rex-dispatch": "node smoke/rex-dispatch.ts",
 		"smoke:terminal": "node smoke/terminal.ts",
 		"smoke:bridge": "node smoke/bridge.ts",
 		"smoke:digest": "node smoke/digest.ts",

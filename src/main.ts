@@ -6,6 +6,8 @@ import type { Harness } from "@earendil-works/pi-durable";
 import { createHerdrAgentPort } from "./adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "./adapters/herdr/client.ts";
 import { createCard, readCard } from "./adapters/obsidian/card.ts";
+import { createRexAgentPort } from "./adapters/rex/agent-port.ts";
+import { createRexClient } from "./adapters/rex/client.ts";
 import { runTelegram } from "./adapters/telegram/index.ts";
 import { runTerminal } from "./adapters/terminal/index.ts";
 import { anthropicAuthContext, type Config, ConfigError, configPath, loadConfig } from "./config.ts";
@@ -22,6 +24,7 @@ import { schedule } from "./core/extensions/schedule/index.ts";
 import { sleeper } from "./core/extensions/sleeper/index.ts";
 import { acquireDbLock, DbLockedError, openHarness, openStorage } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
+import type { AgentPort } from "./ports/agent.ts";
 
 let config: Config;
 try {
@@ -42,10 +45,19 @@ try {
 const context = BACKGROUND_CONTEXT;
 const models = createModels({ authContext: anthropicAuthContext(config.anthropicApiKey) });
 models.setProvider(anthropicProvider());
-const agents = createHerdrAgentPort({
-	client: createHerdrClient({ socketPath: config.herdrSocket }),
-	...(config.hangarCap !== undefined && { cap: config.hangarCap }),
-});
+/** The one place the agent-side adapter is chosen, by the config's `agentAdapter`. */
+function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap }: Config): AgentPort {
+	const cap = hangarCap === undefined ? {} : { cap: hangarCap };
+	if (agentAdapter === "rex") {
+		// resolveConfig sets rex exactly when it is selected.
+		if (rex === undefined) throw new Error("agentAdapter is rex but the config holds no rex settings");
+		const onError = (error: Error) => console.error("[soma] rex:", error.message);
+		const client = createRexClient({ socketPath: rex.socket, onError });
+		return createRexAgentPort({ client, sessionId: rex.sessionId, onError, ...cap });
+	}
+	return createHerdrAgentPort({ client: createHerdrClient({ socketPath: herdrSocket }), ...cap });
+}
+const agents = openAgentPort(config);
 const digests = digest(agents);
 const reflections = reflection({
 	repo: config.repo,

@@ -304,7 +304,9 @@ soma 啟動時讀一次設定檔：環境變數 `SOMA_CONFIG` 指定的檔案，
 
 ```json
 {
+  "agentAdapter": "herdr",
   "herdrSocket": "/Users/me/.config/herdr/sessions/fleet/herdr.sock",
+  "rex": { "sessionId": "session:01a1...", "socket": "/Users/me/Library/Application Support/rex/server.sock" },
   "mcpConfig": "/Users/me/.config/soma/mcp.json",
   "db": "/Users/me/.local/share/soma/soma.sqlite",
   "model": "claude-opus-5-5",
@@ -318,6 +320,7 @@ soma 啟動時讀一次設定檔：環境變數 `SOMA_CONFIG` 指定的檔案，
 }
 ```
 
+- **`agentAdapter`, `herdrSocket` and `rex`.** `agentAdapter` (`SOMA_AGENT_ADAPTER`) picks the agent-side adapter, `"herdr"` or `"rex"`; unset, it is herdr, so a config written before rex keeps working, and `src/main.ts`'s `openAgentPort` is the one place that builds it. herdr reads `herdrSocket` (`SOMA_HERDR_SOCKET`). The `rex` settings are read and checked only when rex is selected: `rex.sessionId` (`SOMA_REX_SESSION_ID`) is the hangar session's id, such as `session:<uuid>`, and is required, because the adapter finds the hangar by id, never by label (see「rex 的實作」); `rex.socket` (`SOMA_REX_SOCKET`) is the rex server's socket, by default `~/Library/Application Support/rex/server.sock`. `hangarCap` applies to either adapter, though the rex adapter does not count its blocks against it yet (M5-1).
 - **`repo` and `reflection`.** `repo` is soma's own git checkout, where the reflection reads `.obsidian.yaml` and sends its code-change cards; unset, it is the directory the code runs from, which prod must override once it runs from a release. `reflection: false` leaves out the daily reflection and its `open_card` tool, which dev sets so a dev db does not open cards. A reflection task a db already holds stays `pending` while it is off and the same task resumes when it is turned back on, without a second one being created (checked 2026-10-26 on a copy of a dev db).
 - **路徑不展開 `~`。** 請寫絕對路徑；`db` 寫相對路徑時以啟動時的目錄為準。
 - **模型 key 不寫進 `process.env`。** `anthropic.apiKey` 經 pi-ai 的 `createModels({ authContext })` 傳進去：soma 的 `env()` 先問 pi-ai 預設的環境變數查詢，`ANTHROPIC_API_KEY` 沒設時才回設定檔的 key。provider 依序找 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_OAUTH_TOKEN`、`ANTHROPIC_API_KEY`，所以任何一個環境變數都蓋過設定檔。沒有用 pi-ai 的 credential store，因為存進去的憑證會蓋過環境變數（pi-ai README 的 Credential Store 一節），優先順序就反了。

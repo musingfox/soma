@@ -1,4 +1,4 @@
-import type { BlockedKind } from "../../../ports/agent.ts";
+import type { BlockedKind } from "../../ports/agent.ts";
 import { parseClaudeDialog } from "./claude-dialog.ts";
 import { ompAnswerKeys } from "./omp-prompt.ts";
 import { type ParsedPrompt, parseBlockedPrompt } from "./prompt-parse.ts";

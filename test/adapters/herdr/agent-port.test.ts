@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { expect, test } from "vitest";
 import { createHerdrAgentPort } from "../../../src/adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "../../../src/adapters/herdr/client.ts";
-import { readBlockedScreen } from "../../../src/adapters/herdr/permission/blocked-screen.ts";
+import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
 
 const agent = (name: string | null, agent_status: string) => ({
 	terminal_id: "t",
@@ -89,7 +89,7 @@ test("start refuses when the hangar already runs cap agents, counting agents som
 });
 
 const screen = (name: string) =>
-	readFileSync(join(import.meta.dirname, "permission", "fixtures", `${name}.txt`), "utf8");
+	readFileSync(join(import.meta.dirname, "..", "..", "agent-cli", "permission", "fixtures", `${name}.txt`), "utf8");
 const BASH = screen("claude-bash-prompt-2.1.302");
 const TRUST = screen("claude-trust-dialog-2.1.302");
 const API_KEY = screen("claude-custom-api-key-2.1.302");

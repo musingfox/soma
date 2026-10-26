@@ -3,8 +3,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { answerKeys, readBlockedScreen } from "../../../../src/adapters/herdr/permission/blocked-screen.ts";
-import { parseBlockedPrompt } from "../../../../src/adapters/herdr/permission/prompt-parse.ts";
+import { answerKeys, readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
+import { parseBlockedPrompt } from "../../../src/agent-cli/permission/prompt-parse.ts";
 
 const fixture = (name: string) => readFileSync(join(import.meta.dirname, "fixtures", name), "utf8");
 

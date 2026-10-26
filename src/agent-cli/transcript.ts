@@ -81,12 +81,15 @@ function parseWindow(bytes: Buffer, startsAtRecord: boolean): unknown[] {
 	return records;
 }
 
-/** The text of the last assistant message. */
+/** The text of the last assistant message; undefined when it has none. */
 export async function readFinalAnswer(path: string, firstWindowBytes = 64 * 1024): Promise<string | undefined> {
-	return (await lastMessage(path, firstWindowBytes))?.text;
+	return (await lastMessage(path, firstWindowBytes))?.text || undefined;
 }
 
-/** The id and text of the last assistant message; undefined without text, or without an id to tell it from the next turn. */
+/**
+ * The id and text of the last assistant message. A message without text still has its id, with
+ * empty text, so the same turn is told from the next; one without an id is undefined.
+ */
 export async function readFinalMessage(
 	path: string,
 	firstWindowBytes = 64 * 1024,
@@ -98,7 +101,7 @@ export async function readFinalMessage(
 /**
  * claude writes one record per content block, all carrying the message's id, so the last
  * message is every trailing record with that id. The file is read from its end in growing
- * windows until one holds the message's first record. A message without text is none.
+ * windows until one holds the message's first record.
  */
 async function lastMessage(path: string, firstWindowBytes: number): Promise<{ id: unknown; text: string } | undefined> {
 	const file = await open(path, "r");
@@ -127,7 +130,7 @@ async function lastMessage(path: string, firstWindowBytes: number): Promise<{ id
 				.filter((block) => block?.type === "text" && typeof block.text === "string")
 				.map((block) => block.text as string)
 				.join("\n");
-			return text === "" ? undefined : { id, text };
+			return { id, text };
 		}
 	} finally {
 		await file.close();

@@ -4,10 +4,10 @@ import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { Conversation, Harness } from "@earendil-works/pi-durable";
+import type { Conversation, Harness, SubmissionId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
-import { HUMAN_CHOSEN } from "../src/core/domain/dispatch.ts";
+import { HUMAN_CHOSEN, type Job } from "../src/core/domain/dispatch.ts";
 import {
 	AGENT_BLOCKED,
 	blockedRequestId,
@@ -18,6 +18,7 @@ import {
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { NOTICE } from "../src/core/notice.ts";
+import type { AgentState, StartRequest } from "../src/ports/agent.ts";
 
 const context = BACKGROUND_CONTEXT;
 const open: Harness[] = [];
@@ -78,6 +79,29 @@ async function core(db: string, agents: FakeAgentPort) {
 async function entriesOf(root: Conversation, kind: string) {
 	const page = await root.entries({}, 1000, undefined, context);
 	return page.items.filter((entry) => entry.kind === kind);
+}
+
+/** Closes one core process, as a crash or a restart would. */
+async function stop(soma: { harness: Harness }) {
+	await soma.harness.close(context);
+	open.splice(open.indexOf(soma.harness), 1);
+}
+
+/** `conversation`, with the id of every submission its submit returns pushed to `ids`. */
+function watchSubmits(conversation: Conversation, ids: SubmissionId[]): Conversation {
+	return new Proxy(conversation, {
+		get(target, key) {
+			if (key === "submit") {
+				return async (...args: Parameters<Conversation["submit"]>) => {
+					const submission = await target.submit(...args);
+					ids.push(submission.id);
+					return submission;
+				};
+			}
+			const value = Reflect.get(target, key, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
 }
 
 async function dispatched(db: string, agents: FakeAgentPort, card: string) {
@@ -204,32 +228,121 @@ test("a finished turn re-reported under new seqs is recorded once, and a new rep
 test("a block resent after a restart is handled once, by its requestId", async () => {
 	const db = await database();
 	const first = await dispatched(db, new FakeAgentPort(), "card-a");
+	const beforeBlock = JSON.parse(JSON.stringify(await first.job("card-a"))) as Job;
 	const blocked = { state: "blocked", kind: "permission" } as const;
 	await eventBridge(first.root, new FakeAgentPort(), context).handle({ agent: "card-a", status: blocked, seq: 7 });
 	await first.root.waitForIdle(context);
-	expect(await entriesOf(first.root, AGENT_BLOCKED)).toHaveLength(1);
-	// The crash this stands in for: the wake was admitted, the job's seq never committed.
+	const wake = await first.root.commit(
+		async (tx) => (await tx.submissionByRequest(first.root.id, blockedRequestId("card-a", 7)))?.id,
+		context,
+	);
+	expect(wake).toBeDefined();
+	// The crash this stands in for: the wake was admitted, the commit of its seq never landed.
 	await first.root.commit(async (tx) => {
-		const doc = await tx.doc(Dispatches, first.root.id);
-		doc.jobs = doc.jobs.map(({ seq: _seq, ...job }) => job);
+		(await tx.doc(Dispatches, first.root.id)).jobs = [beforeBlock];
 	}, context);
-	await first.harness.close(context);
-	open.splice(open.indexOf(first.harness), 1);
+	await stop(first);
 
 	const agents = new FakeAgentPort();
 	agents.emit("card-a", blocked, 7);
 	const second = await core(db, agents);
-	await reconcileDispatches(second.root, agents, context);
+	const submitted: SubmissionId[] = [];
+	await reconcileDispatches(watchSubmits(second.root, submitted), agents, context);
 	await second.settle();
 
+	// The redo submitted again, and the requestId handed back the first submission instead of a new run.
+	expect(submitted).toEqual([wake]);
 	expect(second.calls()).toBe(0);
 	expect(await entriesOf(second.root, AGENT_BLOCKED)).toHaveLength(1);
-	const admitted = await second.root.commit(
-		async (tx) => (await tx.submissionByRequest(second.root.id, blockedRequestId("card-a", 7)))?.status,
-		context,
-	);
-	expect(admitted).toBe("done");
-	expect(await second.job("card-a")).toMatchObject({ seq: 7 });
+	expect(await second.job("card-a")).toMatchObject({ seq: 7, status: blocked, handedOver: {} });
+});
+
+/** An agent side whose listings carry no seq, as herdr's do. */
+class SeqlessAgentPort extends FakeAgentPort {
+	override async list() {
+		return (await super.list()).map(({ seq: _seq, ...listing }) => listing);
+	}
+}
+
+/** Blocked while soma was down: the restart's reconcile writes the status, the first snapshot then reports it. */
+async function blockedWhileDown(status: AgentState, agents: FakeAgentPort = new FakeAgentPort()) {
+	const db = await database();
+	await stop(await dispatched(db, agents, "card-a"));
+	const restarted = new SeqlessAgentPort();
+	restarted.emit("card-a", status, 11);
+	const soma = await core(db, restarted);
+	await reconcileDispatches(soma.root, restarted, context);
+	await soma.settle();
+	expect(await soma.job("card-a")).toMatchObject({ status });
+	return { soma, agents: restarted };
+}
+
+test("a block first seen at a restart's reconcile wakes the model once at the first snapshot", async () => {
+	const prompt = { state: "blocked", kind: "question", msg: "answer: which?", fingerprint: "fp-1" } as const;
+	const { soma, agents } = await blockedWhileDown(prompt);
+	expect(soma.calls()).toBe(0);
+
+	agents.emit("card-a", prompt, 11);
+	await soma.settle();
+	agents.emit("card-a", prompt, 12);
+	await soma.settle();
+
+	expect(soma.calls()).toBe(1);
+	expect(await entriesOf(soma.root, AGENT_BLOCKED)).toMatchObject([{ data: { seq: 11 } }]);
+});
+
+test("an auth block first seen at a restart's reconcile is told to the human once", async () => {
+	const auth = { state: "blocked", kind: "auth", msg: "login required" } as const;
+	const { soma, agents } = await blockedWhileDown(auth);
+
+	agents.emit("card-a", auth, 11);
+	await soma.settle();
+	agents.emit("card-a", auth, 12);
+	await soma.settle();
+
+	expect(soma.calls()).toBe(0);
+	expect(await entriesOf(soma.root, NOTICE)).toMatchObject([{ data: { kind: "question" } }]);
+	expect((await soma.job("card-a"))?.decisions).toMatchObject([{ kind: "auth", action: "escalated" }]);
+});
+
+test("a fresh dispatch whose agent sits on the trust dialog at a restart's reconcile is woken", async () => {
+	// The agent never reports idle, so the launch prompt is still held when soma goes down.
+	const quiet = new (class extends FakeAgentPort {
+		override async start(request: StartRequest) {
+			this.started.push(request);
+		}
+	})();
+	const trust = {
+		state: "blocked",
+		kind: "permission",
+		msg: "Do you trust this folder?",
+		fingerprint: "trust",
+	} as const;
+	const { soma, agents } = await blockedWhileDown(trust, quiet);
+	expect((await soma.job("card-a"))?.launch).toBeDefined();
+
+	agents.emit("card-a", trust, 11);
+	await soma.settle();
+
+	expect(soma.calls()).toBe(1);
+	expect(await entriesOf(soma.root, AGENT_BLOCKED)).toHaveLength(1);
+	expect((await soma.job("card-a"))?.launch).toBeDefined();
+});
+
+test("a turn whose last message has no text is recorded once, as unknown", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await dispatched(await database(), agents, "card-a");
+	agents.emit("card-a", { state: "idle" });
+	await soma.settle();
+
+	agents.finish("card-a", "");
+	agents.emit("card-a", { state: "idle" });
+	await soma.settle();
+	agents.emit("card-a", { state: "idle" });
+	await soma.settle();
+
+	expect(await entriesOf(soma.root, JOB_DONE)).toMatchObject([{ data: { outcome: "未知", notified: false } }]);
+	expect(await entriesOf(soma.root, NOTICE)).toEqual([]);
 });
 
 test("an agent soma did not dispatch is ignored", async () => {

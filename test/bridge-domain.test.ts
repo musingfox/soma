@@ -72,15 +72,30 @@ describe("observe", () => {
 	] as const)("%s", (_name, before, status, action, launch) => {
 		const result = observe(before, status, 9);
 		expect(result.action).toBe(action);
-		expect(result.job).toEqual({ ...before, status, seq: 9, launch });
+		const handedOver = status.state === "blocked" ? {} : undefined;
+		expect(result.job).toEqual({ ...before, status, seq: 9, launch, handedOver });
 	});
 });
 
 describe("observe a re-reported block", () => {
-	const prompt: AgentState = { state: "blocked", kind: "question", msg: "answer: which?", fingerprint: "fp-1" };
+	const prompt = { state: "blocked", kind: "question", msg: "answer: which?", fingerprint: "fp-1" } as const;
+	const handedOver = { fingerprint: "fp-1", msg: "answer: which?" };
+	const handed = (seq: number, launch?: string): Job => ({ ...job(prompt, seq, launch), handedOver });
 
-	test("the same prompt under a new seq records the seq and hands nothing over", () => {
-		const before = job(prompt, 4, "L");
+	test("a wake or an escalation remembers the prompt it handed over", () => {
+		expect(observe(job({ state: "working" }, 4), prompt, 5)).toEqual({
+			job: { ...job(prompt, 5), handedOver },
+			action: "wake",
+		});
+		const auth = { state: "blocked", kind: "auth" } as const;
+		expect(observe(job({ state: "working" }, 4), auth, 5)).toEqual({
+			job: { ...job(auth, 5), handedOver: {} },
+			action: "escalate",
+		});
+	});
+
+	test("the prompt last handed over, under a new seq, records the seq and hands nothing over", () => {
+		const before = handed(4, "L");
 		expect(observe(before, { ...prompt }, 5)).toEqual({ job: { ...before, seq: 5 }, action: "none" });
 	});
 
@@ -89,11 +104,20 @@ describe("observe a re-reported block", () => {
 		["another msg wakes", { ...prompt, msg: "answer: which one?" }, "wake"],
 		["another auth prompt escalates", { ...prompt, kind: "auth", fingerprint: "fp-2" }, "escalate"],
 	] as const)("%s", (_name, status, action) => {
-		expect(observe(job(prompt, 4), status, 5).action).toBe(action);
+		expect(observe(handed(4), status, 5).action).toBe(action);
 	});
 
-	test("the same prompt after an observed working wakes again", () => {
-		const working = observe(job(prompt, 4), { state: "working" }, 5).job;
+	test("a stored blocked status that was never handed over, as reconcile writes, is handed over", () => {
+		expect(observe(job(prompt, 4), prompt, 5).action).toBe("wake");
+		expect(observe(job(prompt), prompt, 5).action).toBe("wake");
+		expect(observe(job({ state: "blocked", kind: "auth" }), { state: "blocked", kind: "auth" }, 5).action).toBe(
+			"escalate",
+		);
+	});
+
+	test("an observed working forgets the prompt, so the same one wakes again", () => {
+		const working = observe(handed(4), { state: "working" }, 5).job;
+		expect(working.handedOver).toBeUndefined();
 		expect(observe(working, prompt, 6).action).toBe("wake");
 	});
 });
@@ -129,5 +153,20 @@ describe("complete", () => {
 	test("anything but a complete passes through", () => {
 		const observed = { job: job({ state: "working" }, 2), action: "none" as const };
 		expect(complete(observed, { id: "msg_1", text: "x" })).toBe(observed);
+	});
+});
+
+describe("complete a reply without text", () => {
+	const idle = { job: { ...job({ state: "idle" }, 9), resultId: "msg_1" }, action: "complete" as const };
+
+	test("is the same turn when its id was recorded", () => {
+		expect(complete(idle, { id: "msg_1", text: "" })).toEqual({ job: idle.job, action: "none" });
+	});
+
+	test("is a turn of unknown outcome under a new id, as an unreadable reply", () => {
+		expect(complete(idle, { id: "msg_2", text: "" })).toEqual({
+			job: { ...idle.job, outcome: "未知", resultId: "msg_2" },
+			action: "complete",
+		});
 	});
 });

@@ -1,6 +1,4 @@
 import { homedir } from "node:os";
-import { dirname } from "node:path";
-import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
@@ -49,9 +47,8 @@ const agents = createHerdrAgentPort({
 	...(config.hangarCap !== undefined && { cap: config.hangarCap }),
 });
 const digests = digest(agents);
-// soma's own repository: the reflection's code-change cards go to the obw project its .obsidian.yaml names.
 const reflections = reflection({
-	repo: dirname(dirname(fileURLToPath(import.meta.url))),
+	repo: config.repo,
 	createCard,
 	readCard,
 	agents,
@@ -80,7 +77,7 @@ const extensions = [
 	schedule((id, c) => harness.abortTask(id, c)),
 	dispatchExtension(agents, readCard),
 	digests.extension,
-	reflections.extension,
+	...(config.reflection ? [reflections.extension] : []),
 	inspectExtension(storage),
 	...(await Promise.all(mcpClients.map(({ name, client }) => mcpExtension(name, client)))),
 ];
@@ -90,7 +87,7 @@ const root = await harness.root(context, {
 });
 harness.resume();
 await digests.startDigest(root, DIGEST_PERIOD_MS, context);
-await reflections.startReflection(root, REFLECTION_PERIOD_MS, context);
+if (config.reflection) await reflections.startReflection(root, REFLECTION_PERIOD_MS, context);
 await reconcileDispatches(root, agents, context);
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 

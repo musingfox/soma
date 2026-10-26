@@ -1,6 +1,6 @@
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { AuthContext } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
@@ -79,6 +79,20 @@ const fields = [
 		file: { programStatus: true },
 		read: (c) => c.programStatus,
 		values: [false, true, undefined],
+	},
+	{
+		name: "repo",
+		env: ["SOMA_REPO", "/env/soma"],
+		file: { repo: "/file/soma" },
+		read: (c) => c.repo,
+		values: ["/env/soma", "/file/soma", resolve(import.meta.dirname, "..")],
+	},
+	{
+		name: "reflection",
+		env: ["SOMA_REFLECTION", "1"],
+		file: { reflection: false },
+		read: (c) => c.reflection,
+		values: [true, false, true],
 	},
 	{
 		name: "telegram.botToken",
@@ -177,6 +191,7 @@ describe("invalid environment variables", () => {
 		["SOMA_HANGAR_CAP", "0"],
 		["SOMA_HANGAR_CAP", "four"],
 		["SOMA_PROGRAM_STATUS", "yes"],
+		["SOMA_REFLECTION", "off"],
 		["TELEGRAM_CHAT_ID", "me"],
 		["SOMA_LANGUAGE", "繁體中文"],
 	])("%s=%s throws naming the variable", (name, value) => {
@@ -220,6 +235,12 @@ describe("the permission warning", () => {
 		loadConfig(path, {}, HOME, warn);
 		if (warned) expect(warn).toHaveBeenCalledWith(expect.stringContaining(path));
 		else expect(warn).not.toHaveBeenCalled();
+	});
+});
+
+describe("SOMA_REFLECTION", () => {
+	test("SOMA_REFLECTION=0 turns it off over a config file that turns it on", () => {
+		expect(resolveConfig({ reflection: true }, { SOMA_REFLECTION: "0" }, HOME).reflection).toBe(false);
 	});
 });
 

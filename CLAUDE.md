@@ -17,7 +17,7 @@
 SOMA_CONFIG=~/.config/soma/dev.json PATH=~/.local/share/fnm/node-versions/v24.13.0/installation/bin:$PATH node src/main.ts
 ```
 
-Without `SOMA_CONFIG`, soma reads prod's config; while prod is up that run fails on the db lock. `dev.json` has its own db and no Telegram, because one bot cannot be polled by two processes.
+Without `SOMA_CONFIG`, soma reads prod's config; while prod is up that run fails on the db lock. `dev.json` has its own db, no Telegram (one bot cannot be polled by two processes) and `reflection: false` (a dev db would open noise cards).
 
 ## Tests
 

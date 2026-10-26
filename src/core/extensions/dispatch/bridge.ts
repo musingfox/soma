@@ -15,11 +15,11 @@ export const JOB_DONE = "soma.dispatch.done";
 /** Entry kind of the input that wakes the model for a blocked agent. */
 export const AGENT_BLOCKED = "soma.dispatch.blocked";
 
-export const blockedRequestId = (agent: string, seq: number) => `herdr:${agent}:${seq}`;
+export const blockedRequestId = (agent: string, seq: number) => `agent:${agent}:${seq}`;
 
 function wakeContent(job: Job, status: Extract<AgentState, { state: "blocked" }>): string {
 	const { kind, msg, fingerprint } = status;
-	const head = `[herdr] agent ${job.agent}（卡片 ${job.card}）卡住了，kind=${kind}。`;
+	const head = `[bridge] agent ${job.agent}（卡片 ${job.card}）卡住了，kind=${kind}。`;
 	const screen = msg ? `\n畫面：\n${msg}\n` : "\n";
 	const how =
 		fingerprint === undefined

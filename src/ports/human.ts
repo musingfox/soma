@@ -18,7 +18,7 @@ export type HumanAnswerOutcome = AnswerOutcome | { readonly sent: false; readonl
  * requestId prefixes of rounds the core starts itself (schedule, event bridge) whose failure no client owns, so every
  * client pushes it. A digest round is not among them: on failure the digest task writes a notice with the reason.
  */
-export const PUSHED_FAILURES = ["schedule:", "herdr:"] as const;
+export const PUSHED_FAILURES = ["schedule:", "agent:"] as const;
 
 export type SomaEvent =
 	| { readonly type: "answer"; readonly requestId: string; readonly content: string }

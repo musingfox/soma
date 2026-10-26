@@ -88,7 +88,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 
 | 事件 | 處理方式 | 叫醒模型嗎 |
 |---|---|---|
-| agent 卡住（blocked） | 送一則 `input` 進根對話，`requestId` 為 `herdr:<agent>:<state_change_seq>` | 會。模型自行判斷要代答還是轉給人。`kind=auth` 例外：不叫醒模型，事件橋在提交 seq 的同一筆 commit 裡寫一筆 `notice`（question）給人，並記一筆 escalated 判斷。每次判斷連同理由寫進派工清單，彙報時一併列出，讓人事後能檢查它的判斷 |
+| agent 卡住（blocked） | 送一則 `input` 進根對話，`requestId` 為 `agent:<agent>:<state_change_seq>` | 會。模型自行判斷要代答還是轉給人。`kind=auth` 例外：不叫醒模型，事件橋在提交 seq 的同一筆 commit 裡寫一筆 `notice`（question）給人，並記一筆 escalated 判斷。每次判斷連同理由寫進派工清單，彙報時一併列出，讓人事後能檢查它的判斷 |
 | agent 做完（進入 idle 或 done） | 用 `conversation.commit` 寫進派工清單並追加紀錄。結果是「需要你」或「失敗」，或是「完成」而人十分鐘內親自選過選項或回覆過這件工作，就在同一筆 commit 寫一筆 `notice` 給人，內容是 agent 回覆原文；「需要你」用 question，其餘用 report（`src/core/domain/report.ts` 的 `urgent`） | 不會 |
 | 使用者主動詢問 | 由介面卡送出 `input` | 會 |
 
@@ -97,11 +97,11 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 已查證的依據：
 
 - **`write` 和 `commit` 都不會啟動一輪推理。** 出處是 pi `packages/durable` 的規格 spec:2343-2355 與 README:421。例外是對話閒置、收件匣卻還有排隊項目、而且這筆 write 不是純顯示用時，才會補跑一輪（spec:2363-2367）。
-- **`requestId` 在整個對話範圍內去重**（spec:2358）。根對話共用，所以每個來源要有自己的前綴：`herdr:<agent>:<seq>`、`telegram:<msgid>`、`digest:<until>`。
+- **`requestId` 在整個對話範圍內去重**（spec:2358）。根對話共用，所以每個來源要有自己的前綴：`agent:<agent>:<seq>`、`telegram:<msgid>`、`digest:<until>`。
 - **光靠 herdr 的事件流不可靠。** cc-mobile 另外用 `session.snapshot` 補洞，靠 `state_change_seq` 判斷狀態是否真的變過。計時器每秒一拍，但 snapshot 的頻率依聽眾分級，每 1、3、5 或 30 拍一次（`server/herdr/pane-events.ts:77, 94-98, 436-458`）。事件橋要照做。所以監控不花 token 是靠程式輪詢，而不是單靠事件推送。
 - **派工的第一則提示由事件橋送出，不在 `agent.start` 之後立刻送。** 2026-10-18 對 herdr 0.9.5 實測：`agent.start` 剛回應時 `agent.prompt` 回 `agent_not_ready`；把提示放進 claude 的啟動參數，herdr 以 `invalid_agent_argument` 拒絕；新 repo 的 claude 先停在資料夾信任對話框（herdr 回報 blocked）。所以派工工具只把提示（cc-mobile `server/launch-prompt.ts` 的規則加卡片內容）存進該筆工作，事件橋第一次看到 agent 進入 idle 時才送出。看到 working 或 done 就丟掉沒送的提示，因為那表示已經有人給了它工作，這也避免崩潰重啟後重送。
 - **每次觀察都先比對 `state_change_seq`。** 派工清單記下每筆工作最後處理過的 seq；同一個 seq 再來（重複的 snapshot、重啟後的對帳）就什麼都不做。叫醒模型的 input 在提交 seq 之前送出，崩潰在兩者之間時，重啟會以同一個 `requestId` 再送一次，被去重。
-- **agent 卡住的通知用 `whenBusy: "followUp"`，不用 `steer`。** soma 正在跑一輪時，通知要等整輪結束才處理（`src/core/extensions/dispatch/bridge.ts:69`）：pi-durable 1.3.0 只在一輪的最後邊界取出 followUp，steer 則在每個工具回合結束時就取出（`node_modules/@earendil-works/pi-durable/dist/harness/inbox.js:45`）。不用 steer 的理由是它會和原本那一輪共用回答：steer 的 input 被加進同一輪（`dist/harness/generation.js:538-539`），一輪結束時每個 input 都結算成同一個 `answer`（`dist/harness/live.js:27-30`）。後果有三個。併進使用者在 Telegram 問的那一輪，手機收到的回答會夾著代答內容，不再是「回答怎麼分送」一條要的一輪一份回答。併進彙報那一輪，彙報任務會把代答寫進報告通知（`src/core/extensions/digest/index.ts:142-147`）。合併的那一輪失敗時，HumanPort 對每個 input 各發一次失敗（`src/core/human-port.ts:78`），人會收到自己那一輪的失敗回覆，再加上 `herdr:` 經 `PUSHED_FAILURES`（`src/ports/human.ts:16`）推出的第二則。steer 只省下等一輪結束的時間，換不回這些代價。
+- **agent 卡住的通知用 `whenBusy: "followUp"`，不用 `steer`。** soma 正在跑一輪時，通知要等整輪結束才處理（`src/core/extensions/dispatch/bridge.ts:69`）：pi-durable 1.3.0 只在一輪的最後邊界取出 followUp，steer 則在每個工具回合結束時就取出（`node_modules/@earendil-works/pi-durable/dist/harness/inbox.js:45`）。不用 steer 的理由是它會和原本那一輪共用回答：steer 的 input 被加進同一輪（`dist/harness/generation.js:538-539`），一輪結束時每個 input 都結算成同一個 `answer`（`dist/harness/live.js:27-30`）。後果有三個。併進使用者在 Telegram 問的那一輪，手機收到的回答會夾著代答內容，不再是「回答怎麼分送」一條要的一輪一份回答。併進彙報那一輪，彙報任務會把代答寫進報告通知（`src/core/extensions/digest/index.ts:142-147`）。合併的那一輪失敗時，HumanPort 對每個 input 各發一次失敗（`src/core/human-port.ts:78`），人會收到自己那一輪的失敗回覆，再加上 `agent:` 經 `PUSHED_FAILURES`（`src/ports/human.ts:16`）推出的第二則。steer 只省下等一輪結束的時間，換不回這些代價。
 
 ### 派工的冪等
 
@@ -180,7 +180,7 @@ soma 每天讀一次自己的結果訊號，改進自己（`src/core/extensions/
 - **訂閱**：程序內的介面卡經 `src/core/human-port.ts` 的 HumanPort 訂閱，它把 `watchEvents()` 和派工清單的 `watchDoc()` 轉成 soma 的事件型別；派工狀態取自派工清單，所以誰寫進清單，介面卡就看得到。程序外的客戶端改經客戶端 socket 連入。
 - **通知**：核心要主動找人時（卡住或報告寫好），寫一筆帶 `kind: "notice"` 的紀錄，`data.kind` 是 `question`（卡住要人回答）或 `report`（報告寫好），各介面卡自己決定要不要推播。由 `schedule:` 開頭的 `requestId` 啟動的那一輪回答，介面卡也當成通知推給人。`digest:` 那一輪不推，因為彙報任務會把它的回答寫成 `data.kind: "report"` 的 `notice` 紀錄，再推一次就重複了。
 - **回答提示**：模型用 `escalate` 轉給人的提示，若 agent 側讀得出選項和指紋，`question` 通知會帶 `data.choices`（卡片、指紋、選項），介面卡可以讓人直接選。人選了之後，介面卡呼叫 HumanPort 的 `respond(card, { option, fingerprint })`，核心直接呼叫 AgentPort 的 `respond`，不跑模型（見「兩種互動不能混在一起」），送出後在派工清單記一筆 `answered`。指紋不符時不送鍵，回傳的拒絕原因由介面卡轉給人。Telegram 把每個選項畫成一顆 inline 按鈕，`callback_data` 是 `<選項>:<指紋>:<卡片>`，超過 64 bytes 就只送文字，因為截短的卡片名會答到別的工作。
-- **失敗**：一輪的 input 在 Pi Durable 裡結束成 `unanswered`（`model_error`、`no_model`、`aborted`、`faulted` 或孤兒化的原因，見 durable spec 8.3）時，HumanPort 發 `failure` 事件，帶 `requestId` 和人看得懂的原因，`model_error` 附上供應商的錯誤文字。介面卡把自己那一輪的失敗當回答送回；`schedule:` 和 `herdr:` 開頭（`src/ports/human.ts` 的 `PUSHED_FAILURES`）是核心自己發起的輪次，沒有人在等，所以每個介面卡都把它們的失敗當通知推給人。`digest:` 那一輪的失敗不推，因為彙報任務已經把失敗原因和原始工作清單寫成通知。終端機的 7501 根紀錄在失敗後報 `error`，直到人再輸入。事件快照不含 submission，所以重啟後不會再發一次已經發過的失敗。
+- **失敗**：一輪的 input 在 Pi Durable 裡結束成 `unanswered`（`model_error`、`no_model`、`aborted`、`faulted` 或孤兒化的原因，見 durable spec 8.3）時，HumanPort 發 `failure` 事件，帶 `requestId` 和人看得懂的原因，`model_error` 附上供應商的錯誤文字。介面卡把自己那一輪的失敗當回答送回；`schedule:` 和 `agent:` 開頭（`src/ports/human.ts` 的 `PUSHED_FAILURES`）是核心自己發起的輪次，沒有人在等，所以每個介面卡都把它們的失敗當通知推給人。`digest:` 那一輪的失敗不推，因為彙報任務已經把失敗原因和原始工作清單寫成通知。終端機的 7501 根紀錄在失敗後報 `error`，直到人再輸入。事件快照不含 submission，所以重啟後不會再發一次已經發過的失敗。
 - **進度**：工具結果的 `details` 帶 `forwarded: true`（`src/core/notice.ts` 的 `FORWARDED`，目前只有 `reply`）時，HumanPort 對這一輪每個已放進來的 input 發一次 `notice`，`kind` 是 `forwarded`，帶 `requestId`、不帶內容。它只是事件，不寫成紀錄，因為進度不必撐過重啟：重啟前已放進來的 input 不會再收到 submission 事件，它的 `forwarded` 會遺失。2026-10-23 決定先放進 `notice`，之後再評估要不要拆成獨立事件。Telegram 用 `setMessageReaction` 把進度標在人的訊息上：收下是 👀、`forwarded` 是 👌、回答是 👍、失敗是 👎。非 premium 的 bot 每則訊息只能有一個反應，所以後一個蓋掉前一個；對應表在 `src/adapters/telegram/index.ts` 的 `REACTIONS`。反應失敗只記錯誤，不擋輪詢。
 - **Telegram 只認一個聊天室。** bot token 和聊天室 id 都設了才啟動（見「設定」），其他聊天室的訊息和按鈕一律丟掉，因為找到這個 bot 的任何人都能派 agent 在這台機器上跑。訊息 id 只在同一聊天室內唯一，所以只認一個聊天室也讓 `telegram:<message id>` 不會撞號。介面卡以 `telegram:` 前綴認自己的輪次，不記送過哪些 id，所以核心在重啟後才答完的那一輪仍會送回手機。
 

@@ -145,9 +145,9 @@ test("a failed round of this client or of the core is printed and turns the root
 	expect(take()).toBe(
 		`[失敗] 模型出錯：Provider is not configured: anthropic\n${root({ state: "error", message: "模型出錯：Provider is not configured: anthropic" })}`,
 	);
-	human.emit({ type: "failure", requestId: "herdr:a:3", reason: "內部錯誤：boom" });
+	human.emit({ type: "failure", requestId: "agent:a:3", reason: "內部錯誤：boom" });
 	expect(take()).toBe(
-		`[失敗] herdr:a:3 那一輪：內部錯誤：boom\n${root({ state: "error", message: "herdr:a:3 那一輪：內部錯誤：boom" })}`,
+		`[失敗] agent:a:3 那一輪：內部錯誤：boom\n${root({ state: "error", message: "agent:a:3 那一輪：內部錯誤：boom" })}`,
 	);
 
 	await type("再試一次");

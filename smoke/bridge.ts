@@ -63,7 +63,7 @@ try {
 	children.push(first);
 	const woke = await first.next("woke");
 	check(
-		woke.requestId === `herdr:${card}:${(await herdr.agentGet(card)).state_change_seq}`,
+		woke.requestId === `agent:${card}:${(await herdr.agentGet(card)).state_change_seq}`,
 		"requestId is not herdr's seq",
 	);
 	// Dispatch is two requests (the tool call, then the answer); the wake is the third.

@@ -29,14 +29,14 @@ export interface AgentListing {
 	// Absent when the agent side cannot tell, which is no claim either way.
 	readonly status?: AgentState;
 	readonly sessionId?: string;
-	// herdr's state_change_seq, when the agent side counts transitions.
+	// The agent side's transition counter, when it counts transitions.
 	readonly seq?: number;
 }
 
 export interface AgentStatusEvent {
 	readonly agent: string;
 	readonly status: AgentState;
-	// herdr's state_change_seq; event-bridge requestIds are herdr:<agent>:<seq>.
+	// The agent side's transition counter; event-bridge requestIds are agent:<agent>:<seq>.
 	readonly seq: number;
 }
 

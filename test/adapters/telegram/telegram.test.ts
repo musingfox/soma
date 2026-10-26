@@ -185,13 +185,13 @@ test("failures of schedule and event-bridge rounds are pushed; digest and other 
 	human.emit({ type: "failure", requestId: "schedule:4", reason: "模型出錯：y" });
 	human.emit({ type: "failure", requestId: "digest:1", reason: "找不到模型" });
 
-	human.emit({ type: "failure", requestId: "herdr:a:3", reason: "內部錯誤：z" });
+	human.emit({ type: "failure", requestId: "agent:a:3", reason: "內部錯誤：z" });
 
 	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
 	await new Promise((resolve) => setTimeout(resolve, 100));
 	expect(api.sent.map((message) => message.text)).toEqual([
 		"[失敗] schedule:4 那一輪：模型出錯：y",
-		"[失敗] herdr:a:3 那一輪：內部錯誤：z",
+		"[失敗] agent:a:3 那一輪：內部錯誤：z",
 	]);
 });
 
@@ -216,7 +216,7 @@ test("only this client's answers, schedule rounds and notices reach the chat", a
 	start(human, apiBase);
 
 	human.emit({ type: "answer", requestId: "terminal:1", content: "terminal answer" });
-	human.emit({ type: "answer", requestId: "herdr:a:3", content: "herdr wake" });
+	human.emit({ type: "answer", requestId: "agent:a:3", content: "herdr wake" });
 	human.emit({ type: "answer", requestId: "digest:2026-10-18T00:10:00.000Z", content: "digest round" });
 	human.emit({ type: "run", state: "working" });
 	human.emit({ type: "job", card: "a", agent: "a", status: { state: "done" } });

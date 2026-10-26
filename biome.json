@@ -110,6 +110,34 @@
 			}
 		},
 		{
+			"includes": ["src/agent-cli/**"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"patterns": [
+									{
+										"group": ["**/adapters/**"],
+										"message": "Shared agent-cli code must not import adapters."
+									},
+									{
+										"group": ["**/core/**"],
+										"message": "This layer must not import core."
+									},
+									{
+										"group": ["@earendil-works/*", "@earendil-works/*/**"],
+										"message": "Pi types stay out of this layer."
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		},
+		{
 			"includes": ["src/adapters/**"],
 			"linter": {
 				"rules": {

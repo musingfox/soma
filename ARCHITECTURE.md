@@ -300,11 +300,14 @@ soma 啟動時讀一次設定檔：環境變數 `SOMA_CONFIG` 指定的檔案，
   "language": "zh-Hant-TW",
   "hangarCap": 4,
   "programStatus": true,
+  "repo": "/Users/me/workspace/soma",
+  "reflection": true,
   "anthropic": { "apiKey": "sk-ant-..." },
   "telegram": { "botToken": "123456:ABC...", "chatId": 123456789 }
 }
 ```
 
+- **`repo` and `reflection`.** `repo` is soma's own git checkout, where the reflection reads `.obsidian.yaml` and sends its code-change cards; unset, it is the directory the code runs from, which prod must override once it runs from a release. `reflection: false` leaves out the daily reflection and its `open_card` tool, which dev sets so a dev db does not open cards. A reflection task a db already holds stays `pending` while it is off and the same task resumes when it is turned back on, without a second one being created (checked 2026-10-26 on a copy of a dev db).
 - **路徑不展開 `~`。** 請寫絕對路徑；`db` 寫相對路徑時以啟動時的目錄為準。
 - **模型 key 不寫進 `process.env`。** `anthropic.apiKey` 經 pi-ai 的 `createModels({ authContext })` 傳進去：soma 的 `env()` 先問 pi-ai 預設的環境變數查詢，`ANTHROPIC_API_KEY` 沒設時才回設定檔的 key。provider 依序找 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_OAUTH_TOKEN`、`ANTHROPIC_API_KEY`，所以任何一個環境變數都蓋過設定檔。沒有用 pi-ai 的 credential store，因為存進去的憑證會蓋過環境變數（pi-ai README 的 Credential Store 一節），優先順序就反了。
 - **權限。** 設定檔裡有 key 或 token，而且群組或其他人可讀時，啟動會印出警告，請 `chmod 600`。
@@ -351,7 +354,7 @@ soma 啟動時讀一次設定檔：環境變數 `SOMA_CONFIG` 指定的檔案，
 - **延後：cc-mobile 助理分頁、shikigami 改成客戶端。** 2026-10-18 決定先做 soma 本身的能力；這兩個專案的修改延後，或之後把它們的功能直接移植進 soma。cc-mobile 助理分頁於 2026-10-24 取消，見「已決事項」。
 - **M5 rex 介面卡。** 先做四個前置改動，每個獨立驗收：讓 `src/main.ts` 依設定選 agent 側介面卡，今天它寫死 herdr（`src/main.ts:49`）；把 herdr 介面卡裡的 Claude 畫面解析、transcript 讀取和機庫上限搬到介面卡共用的模組，`test/layering.test.ts` 加一條允許的案例；把核心和 port 裡的 `herdr:` 前綴（`src/core/extensions/dispatch/bridge.ts:18`、`src/ports/human.ts` 的 `PUSHED_FAILURES`、叫醒模型的文字開頭）改成與介面無關的 `agent:`；照「rex 的實作」改核心 `observe` 的 seq 語意。接著新增 `src/adapters/rex/` 實作 AgentPort。驗收：用真 rex 重跑 `smoke/dispatch.ts` 和 `smoke/bridge.ts`，前者要保留「機庫裡只有一個該名 window」的斷言，後者要在不按鍵的情況下通過信任對話框；另外量一次讓權限提示停在畫面上 60 秒、再讓 agent 閒置 60 秒，各收到幾個 `program_status_changed`，寫進「rex 的實作」。herdr 介面卡保留，前置改動完成後它也要通過原本的兩支 smoke。
 - **M6 原生 tty 介面卡。** soma 自己開 pty 跑 agent，回應 7501 探測並解析回報，用終端模擬器讀畫面回答提示。驗收：派一件工作、讓它卡在權限提示、從 Telegram 回答、讀到結果；再派一件、`kill -9` soma、重開，這件工作被記成 agent 不見了並通知人一次，不重複通知。
-- **常駐服務。** 2026-10-26 決定：soma 由使用者層級的 launchd（LaunchAgent）啟動並在崩潰後重啟，人類側只用 Telegram，終端機介面等 M4。launchd 跑的是 release，不是 dev repo：用 `git archive` 把一個 commit 解開到 `~/.local/share/soma/releases/<sha>/`，在那裡執行 `npm ci --omit=dev`，再把 `current` symlink 指向它。這樣做不需要建置，因為 `tsconfig.json` 開了 `erasableSyntaxOnly`，正式依賴也沒有原生模組（SQLite 用 Node 內建的 `node:sqlite`）。dev 和 prod 分成兩條路徑：dev 跑 repo，prod 跑 release，每個環境一份設定檔。db 和 Telegram bot 不能共用，所以 dev 用自己的 db、預設不開 Telegram；herdr 的 fleet 機庫兩邊共用，因為事件橋會忽略不是自己派出的 agent（`src/core/extensions/dispatch/bridge.ts:52`），代價是並發上限合算，兩邊也不能派同一張卡。有兩個前置改動，各自驗收：一是新增 `SOMA_CONFIG` 環境變數選設定檔，今天這個路徑寫死在 `src/main.ts:29`，沒設時仍讀 `~/.config/soma/config.json`，也就是 prod 的設定；二是 reflection 的 repo 路徑可以設定、也可以關掉，今天 repo 取自程式碼的位置（`src/main.ts:55`），release 目錄不是 git repo，code-change 卡片無處可派，而 dev 實例的反省只會開出雜訊卡片。plist 的 `TMPDIR` 照「整體形狀」一節設定。驗收：所有終端機都關掉時，Telegram 仍得到回答；`kill -9` 後 launchd 把它拉回來，重啟前派出的工作照常回報；herdr 不在時 soma 不會卡死，herdr 回來後恢復服務。工作在 obw 卡 `resident-service`。
+- **常駐服務。** 2026-10-26 決定：soma 由使用者層級的 launchd（LaunchAgent）啟動並在崩潰後重啟，人類側只用 Telegram，終端機介面等 M4。launchd 跑的是 release，不是 dev repo：用 `git archive` 把一個 commit 解開到 `~/.local/share/soma/releases/<sha>/`，在那裡執行 `npm ci --omit=dev`，再把 `current` symlink 指向它。這樣做不需要建置，因為 `tsconfig.json` 開了 `erasableSyntaxOnly`，正式依賴也沒有原生模組（SQLite 用 Node 內建的 `node:sqlite`）。dev 和 prod 分成兩條路徑：dev 跑 repo，prod 跑 release，每個環境一份設定檔。db 和 Telegram bot 不能共用，所以 dev 用自己的 db、預設不開 Telegram；herdr 的 fleet 機庫兩邊共用，因為事件橋會忽略不是自己派出的 agent（`src/core/extensions/dispatch/bridge.ts:52`），代價是並發上限合算，兩邊也不能派同一張卡。有兩個前置改動，各自驗收：一是新增 `SOMA_CONFIG` 環境變數選設定檔，今天這個路徑寫死在 `src/main.ts:29`，沒設時仍讀 `~/.config/soma/config.json`，也就是 prod 的設定；二是 reflection 的 repo 路徑可以設定、也可以關掉（`src/config.ts` 的 `repo` 與 `reflection`），沒設 `repo` 時取程式碼的位置，release 目錄不是 git repo，code-change 卡片無處可派，而 dev 實例的反省只會開出雜訊卡片。plist 的 `TMPDIR` 照「整體形狀」一節設定。驗收：所有終端機都關掉時，Telegram 仍得到回答；`kill -9` 後 launchd 把它拉回來，重啟前派出的工作照常回報；herdr 不在時 soma 不會卡死，herdr 回來後恢復服務。工作在 obw 卡 `resident-service`。
 - **之後** 再視需要做 ACP 和 HTTP 兩種 agent 介面。
 
 先不做的事：一開始就把三種 agent 介面寫齊、做通用的外掛框架（port 要有，註冊表和動態載入不要）、上雲。

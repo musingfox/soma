@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { type AuthContext, defaultProviderAuthContext } from "@earendil-works/pi-ai";
 import { z } from "zod";
 import type { TelegramConfig } from "./adapters/telegram/index.ts";
@@ -22,6 +23,8 @@ const FileConfig = z
 		language: z.string().refine((tag) => canonicalLanguage(tag) !== undefined, "Expected a BCP 47 language tag"),
 		hangarCap: z.number().int().positive(),
 		programStatus: z.boolean(),
+		repo: z.string().min(1),
+		reflection: z.boolean(),
 		anthropic: z
 			.object({ apiKey: z.string().min(1) })
 			.partial()
@@ -46,6 +49,9 @@ export interface Config {
 	readonly hangarCap?: number;
 	/** Unset: ask the terminal whether it supports OSC 7501. */
 	readonly programStatus?: boolean;
+	/** soma's own repository: the reflection's code-change cards go to the vault project its `.obsidian.yaml` names. */
+	readonly repo: string;
+	readonly reflection: boolean;
 	readonly anthropicApiKey?: string;
 	/** Set only when both a bot token and a chat id are. */
 	readonly telegram?: TelegramConfig;
@@ -100,6 +106,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		file?.hangarCap;
 	const programStatus =
 		parseEnv("SOMA_PROGRAM_STATUS", (v) => ({ 1: true, 0: false })[v], "1 or 0") ?? file?.programStatus;
+	const reflection = parseEnv("SOMA_REFLECTION", (v) => ({ 1: true, 0: false })[v], "1 or 0") ?? file?.reflection;
 	const anthropicApiKey = file?.anthropic?.apiKey;
 	const token = fromEnv("TELEGRAM_BOT_TOKEN") ?? file?.telegram?.botToken;
 	const chatId =
@@ -121,6 +128,9 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 			parseEnv("SOMA_LANGUAGE", canonicalLanguage, "a BCP 47 language tag") ??
 			(file?.language === undefined ? undefined : canonicalLanguage(file.language)) ??
 			"en",
+		// Unset, the checkout this code runs from; a release directory is not a git repo, so prod sets it.
+		repo: fromEnv("SOMA_REPO") ?? file?.repo ?? dirname(dirname(fileURLToPath(import.meta.url))),
+		reflection: reflection ?? true,
 		...(hangarCap !== undefined && { hangarCap }),
 		...(programStatus !== undefined && { programStatus }),
 		...(anthropicApiKey !== undefined && { anthropicApiKey }),

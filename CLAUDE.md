@@ -5,10 +5,10 @@
 - Design, decisions and milestones: `ARCHITECTURE.md`. Task cards: the Obsidian vault and project named in `.obsidian.yaml`, under `pm/soma/tasks/`.
 - Everything is written in English: code, comments, commit messages, docs and task cards. `ARCHITECTURE.md` and the older cards are still in Traditional Chinese until they are translated; write new or changed text in English.
 
-## prod runs from this working tree
+## prod runs from a release
 
-- The launchd agent `dev.musingfox.soma` runs `bin/soma` from this repo, so an edit here takes effect at prod's next restart. This holds until the `resident-service` card moves prod to a release under `~/.local/share/soma/releases/current`.
-- Do not restart or unload prod (`launchctl kickstart` / `bootout`) and do not open prod's db `~/.local/share/soma/soma.sqlite` without asking. prod's log is `~/Library/Logs/soma.log`.
+- The launchd agent `dev.musingfox.soma` runs `~/.local/share/soma/releases/current/bin/soma`. `scripts/release.sh [ref]` unpacks a commit there and moves `current`; releasing an already unpacked commit is a rollback. Edits in this repo reach prod only through a release and a restart.
+- Do not run `release.sh`, restart or unload prod (`launchctl kickstart` / `bootout`), or open prod's db `~/.local/share/soma/soma.sqlite` without asking. prod's log is `~/Library/Logs/soma.log`; its config sets `repo` to this checkout.
 - Installing or reloading the LaunchAgent (`launchctl bootstrap`) is blocked by auto mode; ask the human to run it in their own terminal.
 
 ## Running dev

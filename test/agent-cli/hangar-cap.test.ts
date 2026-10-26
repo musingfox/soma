@@ -1,6 +1,6 @@
 // Ported from musingfox/cc-mobile server/__tests__/hangar-cap.test.ts @ d9f0690; describeHangarCap case dropped.
 import { describe, expect, test } from "vitest";
-import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "../../../src/adapters/herdr/hangar-cap.ts";
+import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "../../src/agent-cli/hangar-cap.ts";
 
 describe("readPerfCoresViaSysctl", () => {
 	test("reads the count via the absolute sysctl path", () => {

@@ -1,6 +1,9 @@
 import { constants } from "node:fs";
 import { copyFile } from "node:fs/promises";
 import { join } from "node:path";
+import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "../../agent-cli/hangar-cap.ts";
+import { answerKeys, readBlockedScreen } from "../../agent-cli/permission/blocked-screen.ts";
+import { readFinalAnswer, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
 import type {
 	AgentListing,
 	AgentPort,
@@ -12,8 +15,6 @@ import type {
 } from "../../ports/agent.ts";
 import { STATE_BY_AGENT_STATUS } from "./agent-state.ts";
 import type { HerdrClient } from "./client.ts";
-import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "./hangar-cap.ts";
-import { answerKeys, readBlockedScreen } from "./permission/blocked-screen.ts";
 import { waitForAvailableShell, waitForInteractiveReady } from "./readiness.ts";
 import {
 	AgentStartedResultSchema,
@@ -22,7 +23,6 @@ import {
 	WorktreeOpenedResultSchema,
 } from "./schema.ts";
 import { createStatusWatch, type StatusWatchOptions } from "./status-watch.ts";
-import { readFinalAnswer, resolveTranscriptPath } from "./transcript.ts";
 
 export interface HerdrAgentPortOptions {
 	/** A client on the hangar session's socket: every agent there counts against the cap. */

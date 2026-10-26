@@ -11,7 +11,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { parseBlockedPrompt } from "../../../../src/adapters/herdr/permission/prompt-parse.ts";
+import { parseBlockedPrompt } from "../../../src/agent-cli/permission/prompt-parse.ts";
 
 const FIXTURES = join(import.meta.dirname, "fixtures");
 const singleSelect = readFileSync(join(FIXTURES, "claude-ask-user-question.txt"), "utf8");

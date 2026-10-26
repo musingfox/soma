@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
-import { readFinalAnswer, resolveTranscriptPath } from "../../../src/adapters/herdr/transcript.ts";
+import { readFinalAnswer, resolveTranscriptPath } from "../../src/agent-cli/transcript.ts";
 
 const directories: string[] = [];
 afterEach(async () => {

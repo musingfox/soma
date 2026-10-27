@@ -253,6 +253,11 @@ describe("the agent-side adapter", () => {
 		expect(config.agentAdapter).toBe("herdr");
 		expect(config.rex).toBeUndefined();
 	});
+	test("tty needs no settings of its own", () => {
+		const config = resolveConfig({ agentAdapter: "tty" }, {}, HOME);
+		expect(config.agentAdapter).toBe("tty");
+		expect(config.rex).toBeUndefined();
+	});
 	test("an unknown one in the file throws with the path and the field", () => {
 		const path = write(JSON.stringify({ agentAdapter: "tmux" }));
 		expect(() => loadConfig(path, {}, HOME)).toThrow(ConfigError);

@@ -16,6 +16,7 @@
 		"smoke:dispatch": "node smoke/dispatch.ts",
 		"smoke:rex-dispatch": "node smoke/rex-dispatch.ts",
 		"smoke:rex-bridge": "node smoke/rex-bridge.ts",
+		"smoke:tty": "node smoke/tty.ts",
 		"smoke:terminal": "node smoke/terminal.ts",
 		"smoke:bridge": "node smoke/bridge.ts",
 		"smoke:digest": "node smoke/digest.ts",
@@ -32,6 +33,8 @@
 		"@earendil-works/pi-ai": "1.3.0",
 		"@earendil-works/pi-durable": "1.3.0",
 		"@earendil-works/pi-mcp": "1.3.0",
+		"@lydell/node-pty": "1.1.0",
+		"@xterm/headless": "6.0.0",
 		"defuddle": "0.19.6",
 		"linkedom": "0.18.14",
 		"zod": "3.25.76"

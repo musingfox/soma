@@ -16,7 +16,7 @@ function canonicalLanguage(tag: string): string | undefined {
 }
 
 /** The agent-side adapters soma can dispatch through; the config picks one. */
-export const AGENT_ADAPTERS = ["herdr", "rex"] as const;
+export const AGENT_ADAPTERS = ["herdr", "rex", "tty"] as const;
 export type AgentAdapter = (typeof AGENT_ADAPTERS)[number];
 
 /** The hangar is a rex session found by its id, never by its label, which rex does not keep unique. */

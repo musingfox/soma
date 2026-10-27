@@ -159,6 +159,19 @@ export async function reconcileDispatches(conversation: Conversation, agents: Ag
 	}
 	await conversation.commit(async (tx) => {
 		const doc = await tx.doc(Dispatches, conversation.id);
+		const before = doc.jobs.map((job) => job.status.state);
 		doc.jobs = [...reconcile(doc.jobs, listed)];
+		// Told in the commit that marks it, so a restart finds the job already failed and tells it no more.
+		for (const [index, job] of doc.jobs.entries()) {
+			if (job.status.state !== "error" || before[index] === "error" || before[index] === "done") continue;
+			await tx.appendEntry(
+				conversation.id,
+				noticeEntry("report", `agent ${job.agent}（卡片 ${job.card}）不見了，這件工作沒有做完。`),
+			);
+			await tx.appendEntry(conversation.id, {
+				kind: JOB_DONE,
+				data: { agent: job.agent, card: job.card, state: "error", outcome: "失敗", notified: true },
+			});
+		}
 	}, context);
 }

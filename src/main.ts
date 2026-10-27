@@ -22,6 +22,7 @@ import { memory } from "./core/extensions/memory/index.ts";
 import { REFLECTION_PERIOD_MS, reflection } from "./core/extensions/reflection/index.ts";
 import { schedule } from "./core/extensions/schedule/index.ts";
 import { sleeper } from "./core/extensions/sleeper/index.ts";
+import { web } from "./core/extensions/web/index.ts";
 import { acquireDbLock, DbLockedError, openHarness, openStorage } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
 import type { AgentPort } from "./ports/agent.ts";
@@ -91,6 +92,7 @@ const extensions = [
 	digests.extension,
 	...(config.reflection ? [reflections.extension] : []),
 	inspectExtension(storage),
+	web(),
 	...(await Promise.all(mcpClients.map(({ name, client }) => mcpExtension(name, client)))),
 ];
 const harness: Harness = await openHarness(storage, extensions, context, { models });

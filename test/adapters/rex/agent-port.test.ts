@@ -322,7 +322,9 @@ test("prompt pastes the text and presses \\r, and presses it once more when clau
 });
 
 test("prompt presses \\r only once when claude turns working", async () => {
-	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude" }]);
+	const fake = rex([
+		{ name: "card-a", block: "block:a", argv0: "claude", records: [{ state: "done", updated_at: AT }] },
+	]);
 	const original = fake.client.call.bind(fake.client);
 	fake.client.call = async (method, payload, schema) => {
 		const result = await original(method, payload, schema);
@@ -360,11 +362,37 @@ test("prompt does not press \\r again when claude goes from idle straight to blo
 });
 
 test("prompt does not press \\r again when the status cannot be read", async () => {
-	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude", records: [] }]);
+	const block: Block = {
+		name: "card-a",
+		block: "block:a",
+		argv0: "claude",
+		records: [{ state: "idle", updated_at: AT }],
+	};
+	const fake = rex([block]);
+	const original = fake.client.call.bind(fake.client);
+	fake.client.call = async (method, payload, schema) => {
+		const result = await original(method, payload, schema);
+		if (method === "com.superlogical.terminal.write") block.records = [];
+		return result;
+	};
 
 	await createRexAgentPort({ client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt("card-a", "go");
 
 	expect(fake.methods().filter((method) => method.endsWith(".write"))).toHaveLength(1);
+});
+
+test.each([
+	["blocked", [{ state: "blocked", kind: "permission", updated_at: AT }]],
+	["working", [{ state: "working", updated_at: AT }]],
+	["without a status record", []],
+])("prompt throws without typing anything when claude is %s", async (state, records) => {
+	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude", records }]);
+
+	await expect(
+		createRexAgentPort({ client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt("card-a", "go"),
+	).rejects.toThrow(`rex agent card-a is ${state}`);
+
+	expect(fake.methods().filter((method) => method === "block.event" || method.endsWith(".write"))).toEqual([]);
 });
 
 const projects = mkdtempSync(join(tmpdir(), "soma-rex-projects-"));

@@ -306,6 +306,14 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 
 		async prompt(agent: string, text: string): Promise<void> {
 			const { blockId } = only(await panes(), agent);
+			// Typed into a prompt, the text's `\r` would choose the highlighted option.
+			const { records } = await blockCall("program_status", blockId, ProgramStatusResultSchema);
+			const state = records.find(isRoot)?.state;
+			if (state !== "idle" && state !== "done") {
+				throw new Error(
+					`rex agent ${agent} is ${state ?? "without a status record"}: a prompt goes only to idle or done`,
+				);
+			}
 			const working = turnsWorking(blockId, confirmMs);
 			try {
 				// A paste keeps a multi-line prompt one message; claude takes `\r` as Enter where a typed key may not.

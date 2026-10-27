@@ -20,11 +20,22 @@ export type HumanAnswerOutcome = AnswerOutcome | { readonly sent: false; readonl
  */
 export const PUSHED_FAILURES = ["schedule:", "agent:"] as const;
 
+/**
+ * On a push the core starts itself, the entry kind of the one client that rings for it; every other client shows it
+ * silently. Absent when the core was given no push target, and then every client rings.
+ */
+type Target = { readonly target?: string };
+
 export type SomaEvent =
 	| { readonly type: "answer"; readonly requestId: string; readonly content: string }
 	// The round ended without an answer: a provider error, no model, an abort or a fault.
-	| { readonly type: "failure"; readonly requestId: string; readonly reason: string }
-	| { readonly type: "notice"; readonly kind: NoticeKind; readonly content: string; readonly choices?: Choices }
+	| ({ readonly type: "failure"; readonly requestId: string; readonly reason: string } & Target)
+	| ({
+			readonly type: "notice";
+			readonly kind: NoticeKind;
+			readonly content: string;
+			readonly choices?: Choices;
+	  } & Target)
 	// A round's words went on to a worker agent: progress on the input with this requestId, nothing to show as text.
 	| { readonly type: "notice"; readonly kind: "forwarded"; readonly requestId: string }
 	| { readonly type: "job"; readonly card: string; readonly agent: string; readonly status: AgentState }

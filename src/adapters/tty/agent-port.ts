@@ -134,7 +134,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Runs each card's claude in a pty soma holds itself, in its own `fleet/<card>` worktree, with no multiplexer. The
- * agents die with soma, and no human can look at their screens (ARCHITECTURE.md「agent 側介面卡的能力差異」).
+ * agents die with soma, and no human can look at their screens (ARCHITECTURE.md "How agent-side adapters differ").
  */
 export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 	const { spawn } = options;

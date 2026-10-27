@@ -16,7 +16,7 @@ export type OpenedCard = {
 export const isSignal = (fact: Fact) => fact.kind.startsWith("signal.");
 
 /**
- * The evidence ids (ARCHITECTURE.md「證據 id」) a signal points at. A reblock has no entry of its own, so it points at
+ * The evidence ids (ARCHITECTURE.md "Evidence ids") a signal points at. A reblock has no entry of its own, so it points at
  * the answer that did not take; a row written before refs carried that index points at nothing.
  */
 export function evidenceOf(fact: Fact): string[] {

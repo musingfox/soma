@@ -111,7 +111,14 @@ if (config.reflection) await reflections.startReflection(root, REFLECTION_PERIOD
 // Opened before the reconcile, which may tell the human of an agent gone while soma was down: the HumanPort passes
 // on only the notices appended after it began to watch. Telegram polls after it, so no message queued while soma was
 // down dispatches a job the reconcile's listing has not seen.
-const human = await openHumanPort(harness, root, agents, context);
+// Telegram is the default channel a push goes to when the human typed nowhere lately; without it, every client rings.
+const human = await openHumanPort(
+	harness,
+	root,
+	agents,
+	context,
+	config.telegram && { defaultTarget: "chat.telegram" },
+);
 await reconcileDispatches(root, agents, context);
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 

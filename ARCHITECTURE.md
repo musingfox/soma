@@ -326,7 +326,8 @@ soma reads a configuration file once at startup: the file named by the environme
   "reflection": true,
   "anthropic": { "apiKey": "sk-ant-..." },
   "exa": { "apiKey": "..." },
-  "telegram": { "botToken": "123456:ABC...", "chatId": 123456789 }
+  "telegram": { "botToken": "123456:ABC...", "chatId": 123456789 },
+  "web": { "host": "100.88.181.24", "port": 8790 }
 }
 ```
 
@@ -335,6 +336,7 @@ soma reads a configuration file once at startup: the file named by the environme
 - **Paths do not expand `~`.** Write absolute paths; a relative `db` path is taken from the directory at startup.
 - **The model key is not written into `process.env`.** `anthropic.apiKey` is passed in through pi-ai's `createModels({ authContext })`: soma's `env()` first asks pi-ai's default environment variable lookup, and returns the key from the configuration file only when `ANTHROPIC_API_KEY` is unset. The provider looks for `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` in that order, so any of these environment variables overrides the configuration file. pi-ai's credential store is not used, because credentials stored there override environment variables (the Credential Store section of the pi-ai README), which would reverse the precedence.
 - **Permissions.** When the configuration file holds a key or token and is readable by the group or others, startup prints a warning; please `chmod 600` it.
+- **`web`.** The web page (M7) is on only when both `web.host` (`SOMA_WEB_HOST`) and `web.port` (`SOMA_WEB_PORT`) are set. The host must be one tailnet IP address, in 100.64.0.0/10 or fd7a:115c:a1e0::/48 (`tailscale ip`), or soma exits 1 naming the field: the page has no login, so it never listens on a wildcard, on loopback or on the LAN. A page that cannot listen (the tailnet down at boot, the port taken) is logged and soma runs without it, with no retry until a restart.
 - **`mcp.json` is still a separate file**; for its format, see point 5 of the open questions.
 
 ## Next steps for interfaces: interaction and reading
@@ -390,6 +392,7 @@ Each milestone has only one observable outcome.
   - **Release.** `scripts/release.sh [ref]`, then `launchctl kickstart -k gui/$(id -u)/dev.musingfox.soma`. To roll back, release a commit that is already unpacked and restart again.
 - **M7 Web and desktop interfaces.** Decided on 2026-10-27; see "Decisions made". Each step has one observable outcome:
   1. **Web skeleton.** A human-side adapter in soma serves one mobile-first page and a WebSocket on the tailnet only. Acceptance: on the phone, over Tailscale, a message typed in the page gets the root conversation's answer back in the page; the character is a static image. The work is in the obw card `web-skeleton`.
+     - **Done 2026-10-27**, checked from this machine over its tailnet address; the human checks the phone. `src/adapters/web/` serves `GET /` (one page, inline script and style), a placeholder SVG and a WebSocket at `/socket` on the `ws` package (pure JS, so the release still needs no build; its optional native add-ons are not installed), upgraded by hand from `node:http` with `noServer` so the Host and Origin check comes first, with messages limited to 1 MiB. The server pings every page each 30 s and terminates the one that has not answered the last ping, which unsubscribes it; closing the server terminates every page socket at once rather than waiting for the peer's close frame, so soma exits promptly on SIGTERM with a page open. Each page message is an input with `entry.kind` `chat.web` and `requestId` `web:<32 hex>`, random in the page and kept on a resend after a reconnect, so the core admits it once. Every open page is a subscriber of its own and gets the answers and failures of `web:` turns, notices, pushed failures and the run state; a push named for another interface is shown without ringing, as the terminal shows it. The upgrade is refused unless `Host` is the configured address and `Origin`, when sent, is the page's own, so a site the phone visits cannot open the socket. A dev instance on `100.88.181.24:8790` served the page and answered a scripted client in 1.4 s, while `127.0.0.1:8790` refused the connection. Known limit, decided on 2026-10-27: a web input counts as presence, and until the page has Web Push a closed page cannot ring, so for 15 minutes after a web input a report rings nowhere (Telegram gets it silently, and reports do not escalate). Not built yet: the history on page load (a page sees only what happens while it is open), prompt buttons, and job status.
   2. **Character pick.** Two throwaway prototypes, Live2D and VRM, built side by side and compared against criteria set before they are built: performance on the phone, how state and lip-sync hook in, licence, and where the art comes from. It does not depend on step 1.
   3. **Character follows state.** The picked character reacts to whether a turn is running and to job status.
   4. **Reading pages.** Reports and the dispatch list as pages.

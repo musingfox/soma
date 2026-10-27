@@ -119,6 +119,13 @@ const fields = [
 		values: ["http://env", "http://file", "https://api.telegram.org"],
 	},
 	{
+		name: "exa.apiKey",
+		env: ["EXA_API_KEY", "env-key"],
+		file: { exa: { apiKey: "file-key" } },
+		read: (c) => c.exaApiKey,
+		values: ["env-key", "file-key", undefined],
+	},
+	{
 		name: "agentAdapter",
 		env: ["SOMA_AGENT_ADAPTER", "herdr"],
 		file: { agentAdapter: "rex" },
@@ -287,6 +294,7 @@ describe("the permission warning", () => {
 	test.each([
 		["a key, readable by others", { anthropic: { apiKey: "k" } }, 0o604, true],
 		["a token, readable by the group", { telegram: { botToken: "t" } }, 0o640, true],
+		["an Exa key, readable by others", { exa: { apiKey: "k" } }, 0o604, true],
 		["a key, owner only", { anthropic: { apiKey: "k" } }, 0o600, false],
 		["no secret, readable by all", { db: "x.sqlite" }, 0o644, false],
 	])("%s", (_, file, mode, warned) => {

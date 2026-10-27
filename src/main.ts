@@ -92,7 +92,7 @@ const extensions = [
 	digests.extension,
 	...(config.reflection ? [reflections.extension] : []),
 	inspectExtension(storage),
-	web(),
+	web({ exaApiKey: config.exaApiKey }),
 	...(await Promise.all(mcpClients.map(({ name, client }) => mcpExtension(name, client)))),
 ];
 const harness: Harness = await openHarness(storage, extensions, context, { models });

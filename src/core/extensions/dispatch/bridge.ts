@@ -30,7 +30,7 @@ function wakeContent(job: Job, status: Extract<AgentState, { state: "blocked" }>
 }
 
 /**
- * Host-side rules over agent status, outside the model loop (ARCHITECTURE.md「事件橋」).
+ * Host-side rules over agent status, outside the model loop (ARCHITECTURE.md "Event bridge").
  * A finished turn is committed to the dispatch list and the transcript with the outcome its
  * reply's first line states, which starts no run, and an urgent one with a notice to the human; only a blocked agent submits an input, and a
  * kind=auth block not even that: it is committed as a notice to the human together with the

@@ -140,7 +140,7 @@ function paneOf(window: RexWindow): Pane | undefined {
 
 /**
  * Dispatches each card's claude into a window of the hangar rex session, in its own `fleet/<card>` worktree.
- * ARCHITECTURE.md「rex 的實作」is the design.
+ * ARCHITECTURE.md "The rex implementation" is the design.
  */
 export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	const { client, sessionId } = options;

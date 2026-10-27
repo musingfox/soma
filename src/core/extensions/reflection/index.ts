@@ -120,7 +120,7 @@ export interface ReflectionOptions {
 }
 
 /**
- * A daily background reflection (ARCHITECTURE.md「反省」), run like the digest: each tick reads the outcome signals
+ * A daily background reflection (ARCHITECTURE.md "Reflection"), run like the digest: each tick reads the outcome signals
  * recorded since the last one. A problem a memory revision or an opened card already acted on that shows up again is
  * not the model's to handle twice: the program tells the human, once per action. With nothing else left the tick only
  * moves its checkpoint on, without the model. Otherwise it submits one input asking the model to reflect, and commits

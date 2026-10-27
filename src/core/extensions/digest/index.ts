@@ -79,7 +79,7 @@ const textOf = (entry: EntryRecord | undefined) =>
 		.join("");
 
 /**
- * A periodic background task (ARCHITECTURE.md「定時彙報」). Each tick reads the turns the event bridge recorded as
+ * A periodic background task (ARCHITECTURE.md "Scheduled digest"). Each tick reads the turns the event bridge recorded as
  * finished since the last report; with none it only moves its checkpoint on, without the model. With some it submits
  * one input asking the model for a short report, and commits the answer as a `notice` entry together with the next
  * checkpoint, so a crash anywhere before that commit redoes the tick and the requestId admits the input once.

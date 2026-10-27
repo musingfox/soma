@@ -85,7 +85,7 @@ export function appendModelLine(
 }
 
 /**
- * Evidence ids, shared with the self-inspect tool (ARCHITECTURE.md「證據 id」): `entry:<id>`, `submission:<id>`,
+ * Evidence ids, shared with the self-inspect tool (ARCHITECTURE.md "Evidence ids"): `entry:<id>`, `submission:<id>`,
  * `task:<id>` name Pi Durable records; `document:<id>@<seq>` names one committed revision of a document;
  * `decision:<card>#<n>` names the n-th answer or escalation on a dispatched card's job.
  */

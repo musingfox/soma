@@ -23,6 +23,12 @@ function worktreesByBranch(porcelain: string): Map<string, string> {
 	return byBranch;
 }
 
+/** The main checkout of the repo `path` is a worktree of, which git lists first; undefined for a bare repo. */
+export async function mainCheckout(git: Git, path: string): Promise<string | undefined> {
+	const [first = ""] = (await git(path, ["worktree", "list", "--porcelain"])).split("\n\n");
+	return /^bare$/m.test(first) ? undefined : /^worktree (.+)$/m.exec(first)?.[1];
+}
+
 /**
  * The card's worktree at `<repo>/.claude/worktrees/<card>` on branch `fleet/<card>`, where claude inherits the main
  * checkout's folder trust. A rerun after a crash finds the branch already there and reopens the same worktree.

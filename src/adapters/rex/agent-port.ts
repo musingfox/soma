@@ -17,6 +17,7 @@ import type {
 	StartRequest,
 } from "../../ports/agent.ts";
 import type { RexClient } from "./client.ts";
+import { type ProcessStart, readProcessStart } from "./process-start.ts";
 import {
 	BlobReadResultSchema,
 	BlockClosedResultSchema,
@@ -34,7 +35,7 @@ import {
 	ViewSchema,
 	WriteResultSchema,
 } from "./schema.ts";
-import { type Git, openWorktree, runGit } from "./worktree.ts";
+import { type Git, mainCheckout, openWorktree, runGit } from "./worktree.ts";
 
 export interface RexAgentPortOptions {
 	readonly client: RexClient;
@@ -48,10 +49,16 @@ export interface RexAgentPortOptions {
 	readonly confirmMs?: number;
 	/** Pause between the keys of one answer, so claude reads an arrow and the Enter after it as two keys. */
 	readonly keyGapMs?: number;
+	/** How long claude may be in the foreground without a record before its screen is read for the trust dialog. */
+	readonly trustMs?: number;
+	readonly processStart?: ProcessStart;
 	/** Pause between reads of a blocked screen that did not parse yet; claude may still be drawing it. */
 	readonly redrawMs?: number;
+	readonly now?: () => number;
 	readonly onError?: (error: Error) => void;
 }
+
+type Seen = { readonly status: AgentState; readonly seq: number };
 
 /** One agent: a window named after it, holding the block its claude runs in. */
 type Pane = { readonly name: string; readonly blockId: string; readonly label?: string };
@@ -129,14 +136,16 @@ function paneOf(window: RexWindow): Pane | undefined {
 
 /**
  * Dispatches each card's claude into a window of the hangar rex session, in its own `fleet/<card>` worktree.
- * ARCHITECTURE.md「rex 的實作」is the design. Stubbed in this slice: the folder-trust dialog check (it holds only for
- * repos the human trusts) and counting the hangar's claude blocks against the cap.
+ * ARCHITECTURE.md「rex 的實作」is the design. Stubbed in this slice: counting the hangar's claude blocks against the cap.
  */
 export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	const { client, sessionId } = options;
 	const git = options.git ?? runGit;
 	const confirmMs = options.confirmMs ?? 3_000;
 	const keyGapMs = options.keyGapMs ?? 200;
+	const trustMs = options.trustMs ?? 3_000;
+	const processStart = options.processStart ?? readProcessStart;
+	const now = options.now ?? Date.now;
 	const redrawMs = options.redrawMs ?? 500;
 	const onError = options.onError ?? ((error: Error) => console.warn(`[rex] ${error.message}`));
 	const cap = options.cap ?? resolveHangarCapWithSource(undefined, readPerfCoresViaSysctl).cap;
@@ -171,17 +180,27 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		return foreground?.argv0 === "claude";
 	}
 
-	/** The root record's status while claude is in the foreground: subagents leave child records with an id. */
-	async function observe(blockId: string): Promise<{ status: AgentState; seq: number } | undefined> {
-		const [{ records }, claude] = await Promise.all([
+	/**
+	 * What the block shows while claude is in the foreground: the root record's status (subagents leave child records
+	 * with an id), or, while claude has reported none, its folder-trust dialog. `recorded` says a root record is there,
+	 * which ends the dialog check for the block.
+	 */
+	async function observe(blockId: string): Promise<{ seen?: Seen; recorded: boolean }> {
+		const [{ records }, { foreground }] = await Promise.all([
 			blockCall("program_status", blockId, ProgramStatusResultSchema),
-			isClaude(blockId),
+			blockCall("process", blockId, ProcessResultSchema),
 		]);
 		const root = records.find(isRoot);
+		const recorded = root !== undefined;
+		if (foreground?.argv0 !== "claude") return { recorded };
 		const seq = root && seqOf(root);
-		return root === undefined || seq === undefined || !claude
-			? undefined
-			: { status: await statusOf(blockId, root), seq };
+		const seen =
+			root === undefined
+				? await trustDialog(blockId, foreground.pid, foreground.cwd)
+				: seq === undefined
+					? undefined
+					: { status: await statusOf(blockId, root), seq };
+		return seen === undefined ? { recorded } : { seen, recorded };
 	}
 
 	/**
@@ -204,6 +223,38 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			onError(error as Error);
 			return status;
 		}
+	}
+
+	/**
+	 * claude's folder-trust dialog, for which claude reports no record, read off the screen once claude has been in the
+	 * foreground for trustMs. Its seq is the time that first held, in microseconds: every read of one dialog, by any soma
+	 * process, names it alike, so a restarted core wakes the model under the requestId the first one did. Its msg ends
+	 * naming what a yes trusts: claude records the trust for the repo's main checkout, not the worktree it runs in.
+	 */
+	async function trustDialog(blockId: string, pid: number, cwd: string | undefined): Promise<Seen | undefined> {
+		const started = await processStart(pid);
+		if (started === undefined || now() - started < trustMs) return undefined;
+		const screen = await readScreen(blockId);
+		if (!isTrustDialog(screen)) return undefined;
+		const root = cwd === undefined ? "of the folder claude runs in" : await rootOf(cwd);
+		const msg = `${screen.msg}\nAnswering yes trusts the repository root ${root}, and with it every worktree of that repository.`;
+		return { status: blockedOf({ ...screen, msg }), seq: (started + trustMs) * 1000 };
+	}
+
+	// By cwd, so every report of one dialog names the same root, the fallback too: a msg that changed is a new prompt.
+	const roots = new Map<string, string>();
+	/** The main checkout of the repo `cwd` is in; `cwd` itself when git cannot tell, as claude trusts a plain folder. */
+	async function rootOf(cwd: string): Promise<string> {
+		const known = roots.get(cwd);
+		if (known !== undefined) return known;
+		let root = cwd;
+		try {
+			root = (await mainCheckout(git, cwd)) ?? cwd;
+		} catch (error) {
+			onError(error as Error);
+		}
+		roots.set(cwd, root);
+		return root;
 	}
 
 	/** The root record's state as rex reports it, undefined when there is none or it cannot be read. */
@@ -281,6 +332,10 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		// Which window each block is in, by name; null for a name more than one window has.
 		let names: Map<string, string | null> | undefined;
 		const lastSeq = new Map<string, number>();
+		// Blocks a root record was seen for, whose trust-dialog check is over.
+		const recorded = new Set<string>();
+		// Blocks whose last emitted status was read off the screen, under a seq of the adapter's clock.
+		const synthesized = new Set<string>();
 		async function refresh(): Promise<Map<string, string | null>> {
 			const fresh = new Map<string, string | null>();
 			for (const [name, list] of await panes()) {
@@ -289,18 +344,39 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			names = fresh;
 			return fresh;
 		}
-		function report(blockId: string, name: string | null | undefined, status: AgentState, seq: number): void {
+		function report(
+			blockId: string,
+			name: string | null | undefined,
+			status: AgentState,
+			seq: number,
+			synthetic = false,
+		): void {
 			if (name === undefined) return;
 			if (name === null) {
 				onError(new Error(`rex hangar ${sessionId}: two windows share block ${blockId}'s name`));
 				return;
 			}
 			// The same seq is the same observation, which a resync re-reads. A lower one is a report the resync already
-			// read past, whose event queued behind it.
+			// read past, whose event queued behind it; but a record rex stamped is never older than a dialog read off the
+			// screen under the adapter's clock.
 			const last = lastSeq.get(blockId);
-			if (last !== undefined && seq <= last) return;
+			if (last !== undefined && seq <= last && (synthetic || !synthesized.has(blockId))) return;
 			lastSeq.set(blockId, seq);
+			if (synthetic) synthesized.add(blockId);
+			else synthesized.delete(blockId);
 			emit({ agent: name, status, seq });
+		}
+
+		/** Reports what the block shows; a trust dialog seen again goes under a new seq, above the last one emitted. */
+		async function look(blockId: string, name: string | null): Promise<void> {
+			const { seen, recorded: has } = await observe(blockId);
+			if (has) recorded.add(blockId);
+			if (seen === undefined) return;
+			if (has) return report(blockId, name, seen.status, seen.seq);
+			// A record that arrived while the screen was read is newer than the dialog.
+			if (recorded.has(blockId)) return;
+			const last = lastSeq.get(blockId);
+			report(blockId, name, seen.status, last === undefined ? seen.seq : Math.max(now() * 1000, last + 1), true);
 		}
 
 		// One at a time, so a slow lookup is never overtaken by the block's next report.
@@ -311,13 +387,25 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		const resync = () =>
 			enqueue(async () => {
 				const fresh = await refresh();
-				await Promise.all(
-					[...fresh].map(async ([blockId, name]) => {
-						const seen = await observe(blockId);
-						if (seen !== undefined) report(blockId, name, seen.status, seen.seq);
-					}),
-				);
+				await Promise.all([...fresh].map(([blockId, name]) => look(blockId, name)));
 			});
+
+		// claude draws the trust dialog without reporting anything, so a block without a record is looked at again.
+		let checking = false;
+		const trustCheck = setInterval(() => {
+			if (checking) return;
+			checking = true;
+			enqueue(async () => {
+				try {
+					const known = names ?? (await refresh());
+					const unrecorded = [...known].filter(([blockId]) => !recorded.has(blockId));
+					await Promise.all(unrecorded.map(([blockId, name]) => look(blockId, name)));
+				} finally {
+					checking = false;
+				}
+			});
+		}, trustMs);
+		trustCheck.unref();
 
 		const offEvent = client.onSessionEvent((event) => {
 			if (event.session_id !== sessionId) return;
@@ -329,6 +417,8 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			if (!changed.success || changed.data.id !== "") return;
 			const { block_id: blockId } = block.data;
 			const { record } = changed.data;
+			// At once, so a dialog check whose screen read is in flight does not report past this record.
+			recorded.add(blockId);
 			const seq = seqOf(record);
 			if (seq === undefined) return;
 			enqueue(async () => {
@@ -340,6 +430,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		const offConnected = client.onConnected(resync);
 		void client.attach(sessionId).then(resync, (error: Error) => onError(error));
 		return () => {
+			clearInterval(trustCheck);
 			offEvent();
 			offConnected();
 		};
@@ -386,7 +477,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			return Promise.all(
 				[...byName.values()].map(async ([pane]) => {
 					const { name, blockId, label } = pane as Pane;
-					const seen = await observe(blockId);
+					const { seen } = await observe(blockId);
 					return {
 						name,
 						...(seen === undefined ? {} : seen),

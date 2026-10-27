@@ -116,6 +116,10 @@ test("a notice appended before anyone subscribed reaches the first subscriber on
 	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
 	cleanup.push(() => human.close());
 	await human.notify("agent a is gone", "report");
+	await root.commit(async (tx) => {
+		const status = { state: "idle" } as const;
+		(await tx.doc(Dispatches, root.id)).jobs = [{ card: "a", agent: "a", sessionId: "s", status, decisions: [] }];
+	}, context);
 	await root.waitForIdle(context);
 	await new Promise((resolve) => setTimeout(resolve, 50));
 
@@ -127,6 +131,8 @@ test("a notice appended before anyone subscribed reaches the first subscriber on
 	const gone = { type: "notice", kind: "report", content: "agent a is gone" };
 	expect(first).toContainEqual(gone);
 	expect(second).not.toContainEqual(gone);
+	// After the held notice, so a client retires the buttons of a prompt the job has moved past.
+	expect(first.findIndex((event) => event.type === "job")).toBeGreaterThan(first.findIndex((e) => e.type === "notice"));
 });
 
 test("a job state written to the dispatch list reaches subscribers once, and new subscribers get it at once", async () => {

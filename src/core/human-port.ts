@@ -245,8 +245,9 @@ export async function openHumanPort(
 		},
 		subscribe(listener) {
 			listener({ type: "run", state: running ? "working" : "idle" });
-			for (const [card, job] of jobs) listener({ type: "job", card, ...job });
+			// Held notices first, so a client that shows a prompt's buttons sees the job that may have moved past it.
 			for (const event of unheard ?? []) listener(event);
+			for (const [card, job] of jobs) listener({ type: "job", card, ...job });
 			unheard = undefined;
 			listeners.add(listener);
 			return () => listeners.delete(listener);

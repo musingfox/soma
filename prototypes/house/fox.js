@@ -504,7 +504,7 @@ export function spring(x, v, target, omega, dt) {
 	return [target + (d + k * dt) * e, (v - omega * k * dt) * e];
 }
 
-const POSE_OMEGA = 9;
+const POSE_OMEGA = 13;
 
 /**
  * The fox's meshes and the pose logic that moves them, for a scene owned by
@@ -538,8 +538,11 @@ export function createFoxRig({ isReduced = () => false } = {}) {
 		return !settled() || state === "talking" || state === "happy" || state === "working";
 	}
 
-	function update(dt) {
-		for (const key in target) [pose[key], vel[key]] = spring(pose[key], vel[key], target[key], POSE_OMEGA, dt);
+	// `tempo` speeds up how fast the pose follows a new state, not the
+	// ambient motion (breathing, blinks).
+	function update(dt, tempo = 1) {
+		const omega = POSE_OMEGA * tempo;
+		for (const key in target) [pose[key], vel[key]] = spring(pose[key], vel[key], target[key], omega, dt);
 		mouth += (mouthTarget - mouth) * (1 - Math.exp(-dt * 30));
 		if (!isReduced()) t += dt;
 		apply();

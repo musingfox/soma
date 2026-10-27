@@ -422,9 +422,23 @@ const BODY_POSES = {
 	worried: { hunch: 1, outL: -0.55, outR: -0.55, tail: 0.02, tailHz: 0.2 },
 	sleeping: { curl: 1, outL: 0, outR: 0, tail: 0, dim: 1 },
 };
-const BODY_OMEGA = { dim: 2.6 };
+const BODY_OMEGA = { dim: 5 };
+const BODY_OMEGA_DEFAULT = 12;
 
-const WALK = { speed: 1.15, pace: 0.5, accel: 2.4, decel: 1.4, stride: 0.55, arrive: 0.25 };
+// Speeds at tempo 1. The debug panel's speed slider scales time: speeds by
+// the tempo, accelerations by its square, spring rates by it.
+const WALK = {
+	speed: 2.3,
+	pace: 1.0,
+	accel: 5,
+	decel: 2.8,
+	stride: 0.55,
+	arrive: 0.25,
+	land: 10,
+	turn: 11,
+	legs: 14,
+	pause: 0.5,
+};
 // Turned toward its heading, but never edge-on: a card seen edge-on is a line.
 const HEADING_CAP = 0.7;
 // Only a walk almost straight away shows the fox's back; a turn past side-on
@@ -546,6 +560,7 @@ export function createHouse(container) {
 	let walkPhase = 0;
 	const walk = { x: 0, v: 0 };
 	let nextLook = 3;
+	let tempo = 1;
 	let tailPhase = 0;
 
 	function beginLeg() {
@@ -599,7 +614,7 @@ export function createHouse(container) {
 	function updateWalk(dt) {
 		if (!path.length && state === "thinking" && posed && !reduced) {
 			// Pacing: a short pause at each end, then off to the other one.
-			if (!pausedUntil) pausedUntil = time + 0.9;
+			if (!pausedUntil) pausedUntil = time + WALK.pause / tempo;
 			if (time >= pausedUntil) {
 				paceIdx = 1 - paceIdx;
 				path = [{ p: PLACES.thinking.pace[paceIdx] }];
@@ -615,20 +630,20 @@ export function createHouse(container) {
 		const dz = tz - pos.z;
 		const dist = Math.hypot(dx, dz);
 		const last = path.length === 1;
-		const top = !wp.tag && state === "thinking" ? WALK.pace : WALK.speed;
+		const top = (!wp.tag && state === "thinking" ? WALK.pace : WALK.speed) * tempo;
 
 		if (last && dist < WALK.arrive) landing = true;
 		if (landing) {
 			// The last stretch is a spring from the current velocity onto the
 			// spot, so the stop eases instead of snapping.
-			[pos.x, vel.x] = spring(pos.x, vel.x, tx, 6, dt);
-			[pos.z, vel.z] = spring(pos.z, vel.z, tz, 6, dt);
+			[pos.x, vel.x] = spring(pos.x, vel.x, tx, WALK.land * tempo, dt);
+			[pos.z, vel.z] = spring(pos.z, vel.z, tz, WALK.land * tempo, dt);
 		} else {
-			const want = last ? Math.min(top, Math.sqrt(2 * WALK.decel * dist)) : top;
+			const want = last ? Math.min(top, Math.sqrt(2 * WALK.decel * tempo * tempo * dist)) : top;
 			let ax = (dx / dist) * want - vel.x;
 			let az = (dz / dist) * want - vel.z;
 			const a = Math.hypot(ax, az);
-			const cap = WALK.accel * dt;
+			const cap = WALK.accel * tempo * tempo * dt;
 			if (a > cap) {
 				ax *= cap / a;
 				az *= cap / a;
@@ -662,7 +677,7 @@ export function createHouse(container) {
 
 	function updateFacing(dt) {
 		const speed = Math.hypot(vel.x, vel.z);
-		if (speed > 0.12 && !landing) {
+		if (speed > 0.12 * tempo && !landing) {
 			let h = Math.atan2(vel.x, vel.z);
 			const a = Math.abs(h);
 			if (a > HEADING_CAP && a < Math.PI - BACK_VIEW) h = Math.sign(h) * HEADING_CAP;
@@ -671,8 +686,8 @@ export function createHouse(container) {
 			yaw.target = PLACES[state].face;
 		}
 		const goal = yaw.x + wrap(yaw.target - yaw.x);
-		[yaw.x, yaw.v] = spring(yaw.x, yaw.v, goal, 7, dt);
-		[walk.x, walk.v] = spring(walk.x, walk.v, reduced ? 0 : Math.min(1, speed / 0.5), 10, dt);
+		[yaw.x, yaw.v] = spring(yaw.x, yaw.v, goal, WALK.turn * tempo, dt);
+		[walk.x, walk.v] = spring(walk.x, walk.v, reduced ? 0 : Math.min(1, speed / (0.5 * tempo)), WALK.legs * tempo, dt);
 		walkPhase += (speed / WALK.stride) * Math.PI * dt;
 	}
 
@@ -898,13 +913,13 @@ export function createHouse(container) {
 	function update(dt) {
 		time += dt;
 		if (!reduced) clock += dt;
-		rig.update(dt);
+		rig.update(dt, tempo);
 		updateWalk(dt);
 		updateFacing(dt);
 		updateLook();
 		for (const k in ch) {
 			const c = ch[k];
-			[c.x, c.v] = spring(c.x, c.v, c.target, BODY_OMEGA[k] ?? 8, dt);
+			[c.x, c.v] = spring(c.x, c.v, c.target, (BODY_OMEGA[k] ?? BODY_OMEGA_DEFAULT) * tempo, dt);
 		}
 		tailPhase += dt * Math.PI * 2 * ch.tailHz.x;
 		applyBody();
@@ -921,6 +936,14 @@ export function createHouse(container) {
 	return {
 		setState,
 		setView,
+		/** Scales how fast the fox moves and eases, 0.5 to 2. */
+		setTempo(v) {
+			tempo = Math.min(2, Math.max(0.5, Number(v) || 1));
+			wake();
+		},
+		get tempo() {
+			return tempo;
+		},
 		/** Sets how open the mouth is while talking, 0 to 1. */
 		setMouth(level) {
 			rig.setMouth(level);

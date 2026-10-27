@@ -44,6 +44,12 @@ mouth.addEventListener("input", () => {
 	$("mouth-out").textContent = Number(mouth.value).toFixed(2);
 });
 
+const tempo = $("tempo");
+tempo.addEventListener("input", () => {
+	house.setTempo(Number(tempo.value));
+	$("tempo-out").textContent = `${Number(tempo.value).toFixed(2)}×`;
+});
+
 function sync() {
 	for (const [v, b] of viewButtons) b.setAttribute("aria-pressed", String(house.view === v));
 	for (const [name, b] of stateButtons) b.setAttribute("aria-pressed", String(house.state === name));
@@ -70,6 +76,7 @@ window.house = {
 		sync();
 	},
 	setMouth: house.setMouth,
+	setTempo: house.setTempo,
 	setViewBlend: house.setViewBlend,
 	setOrbit: house.setOrbit,
 	stats: house.stats,

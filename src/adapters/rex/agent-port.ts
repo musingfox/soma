@@ -140,7 +140,7 @@ function paneOf(window: RexWindow): Pane | undefined {
 
 /**
  * Dispatches each card's claude into a window of the hangar rex session, in its own `fleet/<card>` worktree.
- * ARCHITECTURE.md「rex 的實作」is the design. Stubbed in this slice: counting the hangar's claude blocks against the cap.
+ * ARCHITECTURE.md「rex 的實作」is the design.
  */
 export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	const { client, sessionId } = options;
@@ -155,8 +155,6 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	const redrawMs = options.redrawMs ?? 500;
 	const onError = options.onError ?? ((error: Error) => console.warn(`[rex] ${error.message}`));
 	const cap = options.cap ?? resolveHangarCapWithSource(undefined, readPerfCoresViaSysctl).cap;
-	// Stub in this slice: the hangar's claude blocks are not counted yet, so the hangar never reads as full.
-	const occupied = async () => 0;
 
 	const blockCall = <T>(method: string, blockId: string, schema: ZodType<T>, args = {}) =>
 		client.call(`${TERMINAL}.${method}`, { session_id: sessionId, block_id: blockId, args }, schema);
@@ -207,6 +205,16 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	async function isClaude(blockId: string): Promise<boolean> {
 		const { foreground } = await blockCall("process", blockId, ProcessResultSchema);
 		return foreground?.argv0 === "claude";
+	}
+
+	/** The hangar's blocks running claude, on every window and layer, so a block a human split off counts too. */
+	async function occupied(): Promise<number> {
+		const view = await client.call("session.view", { session_id: sessionId }, ViewSchema);
+		const blockIds = (view.windows ?? []).flatMap((window) =>
+			(window.layers ?? []).flatMap((layer) => (layer.blocks ?? []).flatMap((block) => block.block_id ?? [])),
+		);
+		const claude = await Promise.all(blockIds.map(isClaude));
+		return claude.filter(Boolean).length;
 	}
 
 	/**
@@ -524,6 +532,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 
 	return {
 		async start(request: StartRequest): Promise<void> {
+			await client.attach(sessionId);
 			const running = await occupied();
 			if (running >= cap) throw new Error(`hangar is full: ${running} of ${cap} agents running`);
 			const path = await openWorktree(git, request.cwd, request.card);
@@ -533,7 +542,6 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 					if (error.code !== "ENOENT" && error.code !== "EEXIST") throw error;
 				},
 			);
-			await client.attach(sessionId);
 			// An interactive shell types claude's command, so the block outlives claude exiting, as a herdr pane does.
 			// The block's label keeps the session id, which nothing else in rex records.
 			await client.call(

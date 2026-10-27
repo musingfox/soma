@@ -27,6 +27,7 @@ test("start adds fleet/<card> under .claude/worktrees and types claude's command
 	]);
 	expect(fake.attached).toEqual([HANGAR]);
 	expect(fake.calls).toEqual([
+		{ method: "session.view", payload: { session_id: HANGAR } },
 		{
 			method: "session.new_window",
 			payload: {
@@ -48,6 +49,39 @@ test("start adds fleet/<card> under .claude/worktrees and types claude's command
 	]);
 });
 
+test("start refuses when the hangar's claude blocks already fill the cap, and leaves git and rex alone", async () => {
+	const fake = rex([
+		{ name: "card-b", block: "block:b", argv0: "claude" },
+		{ name: "card-c", block: "block:c", argv0: "claude" },
+	]);
+	const { git: run, runs } = git();
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		cap: 2,
+	});
+
+	await expect(port.start(request)).rejects.toThrow("hangar is full: 2 of 2 agents running");
+	expect(runs).toEqual([]);
+	expect(fake.methods()).not.toContain("session.new_window");
+});
+
+test("start does not count a hangar block whose foreground is not claude", async () => {
+	const fake = rex([
+		{ name: "card-b", block: "block:b", argv0: "claude" },
+		{ name: "card-c", block: "block:c", argv0: "-fish" },
+	]);
+	const { git: run } = git();
+
+	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, git: run, cap: 2 }).start(
+		request,
+	);
+
+	expect(fake.methods()).toContain("session.new_window");
+});
+
 test("start reopens the worktree an earlier attempt left on the branch", async () => {
 	const fake = rex([]);
 	const porcelain =
@@ -59,7 +93,9 @@ test("start reopens the worktree an earlier attempt left on the branch", async (
 	);
 
 	expect(runs).toHaveLength(1);
-	expect(fake.calls[0]?.payload).toMatchObject({ layout: { block: { options: { cwd: "/wt/card-a" } } } });
+	expect(fake.calls.find((call) => call.method === "session.new_window")?.payload).toMatchObject({
+		layout: { block: { options: { cwd: "/wt/card-a" } } },
+	});
 });
 
 test("start checks out a branch that exists without a worktree", async () => {

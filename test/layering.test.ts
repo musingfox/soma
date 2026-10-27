@@ -29,6 +29,8 @@ const cases: readonly (readonly [string, string, boolean])[] = [
 	["src/adapters/terminal/a.ts", "@earendil-works/pi-durable", true],
 	["src/adapters/terminal/b.ts", "../herdr/client.ts", true],
 	["src/adapters/rex/a.ts", "../herdr/client.ts", true],
+	["src/adapters/web/a.ts", "../rex/websocket.ts", true],
+	["src/adapters/web/b.ts", "../../core/human-port.ts", true],
 	["src/adapters/rex/b.ts", "../../core/domain/bridge.ts", true],
 	["src/adapters/x/g.ts", "../../agent-cli/a.ts", false],
 	["src/agent-cli/a.ts", "../adapters/herdr/client.ts", true],

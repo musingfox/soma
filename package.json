@@ -38,12 +38,14 @@
 		"@xterm/headless": "6.0.0",
 		"defuddle": "0.19.6",
 		"linkedom": "0.18.14",
+		"ws": "8.22.0",
 		"zod": "3.25.76"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.5.15",
 		"@modelcontextprotocol/server-everything": "1.0.0",
 		"@types/node": "22.20.5",
+		"@types/ws": "8.18.2",
 		"typescript": "7.0.2",
 		"vitest": "5.0.5"
 	}

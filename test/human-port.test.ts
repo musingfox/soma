@@ -111,6 +111,24 @@ test("notify delivers a notice with its kind and starts no run", async () => {
 	expect(seen.filter((event) => event.type === "run")).toEqual([{ type: "run", state: "idle" }]);
 });
 
+test("a notice appended before anyone subscribed reaches the first subscriber once", async () => {
+	const { harness, root } = await setup();
+	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
+	cleanup.push(() => human.close());
+	await human.notify("agent a is gone", "report");
+	await root.waitForIdle(context);
+	await new Promise((resolve) => setTimeout(resolve, 50));
+
+	const first: SomaEvent[] = [];
+	human.subscribe((event) => first.push(event));
+	const second: SomaEvent[] = [];
+	human.subscribe((event) => second.push(event));
+
+	const gone = { type: "notice", kind: "report", content: "agent a is gone" };
+	expect(first).toContainEqual(gone);
+	expect(second).not.toContainEqual(gone);
+});
+
 test("a job state written to the dispatch list reaches subscribers once, and new subscribers get it at once", async () => {
 	const { root, human, seen } = await setup();
 	const write = (state: "idle" | "blocked") =>

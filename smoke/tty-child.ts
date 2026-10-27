@@ -60,11 +60,11 @@ const agents = createTtyAgentPort({
 const harness = await openHarness(db, [dispatchExtension(agents, stubCard)], context, { models });
 const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 harness.resume();
-// In main.ts's order: Telegram subscribes before the reconcile, whose notices it must pass on.
+// In main.ts's order: the HumanPort opens before the reconcile, whose notices it must pass on.
 const human = await openHumanPort(harness, root, agents, context);
-void runTelegram({ ...telegram, human, signal: new AbortController().signal, retryMs: 500 });
 await reconcileDispatches(root, agents, context);
 eventBridge(root, agents, context).listen((error) => emit({ event: "bridge_error", error: String(error) }));
+void runTelegram({ ...telegram, human, signal: new AbortController().signal, retryMs: 500 });
 emit({ event: "started", pid: process.pid });
 
 for (;;) {

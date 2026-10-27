@@ -1,0 +1,94 @@
+:root {
+	color-scheme: dark;
+	--ink: #2a1d16;
+	--accent: #f47a2a;
+	--safe-t: env(safe-area-inset-top, 0px);
+	--safe-r: env(safe-area-inset-right, 0px);
+	--safe-b: env(safe-area-inset-bottom, 0px);
+	--safe-l: env(safe-area-inset-left, 0px);
+}
+* {
+	box-sizing: border-box;
+}
+html,
+body {
+	margin: 0;
+	height: 100%;
+	overflow: hidden;
+	overscroll-behavior: none;
+	background: #2b1e18;
+	font:
+		16px / 1.4 system-ui,
+		-apple-system,
+		sans-serif;
+	-webkit-tap-highlight-color: transparent;
+}
+#scene {
+	position: fixed;
+	inset: 0;
+}
+#debug-toggle {
+	position: fixed;
+	z-index: 20;
+	top: calc(var(--safe-t) + 10px);
+	right: calc(var(--safe-r) + 10px);
+	width: 40px;
+	height: 40px;
+	border-radius: 50%;
+	border: 1px solid rgba(255, 240, 220, 0.25);
+	background: rgba(30, 20, 15, 0.45);
+	color: rgba(255, 240, 220, 0.8);
+	font-size: 19px;
+	line-height: 1;
+}
+#debug {
+	position: fixed;
+	z-index: 20;
+	top: calc(var(--safe-t) + 58px);
+	right: calc(var(--safe-r) + 10px);
+	width: min(320px, calc(100vw - 20px - var(--safe-l) - var(--safe-r)));
+	max-height: calc(100% - var(--safe-t) - var(--safe-b) - 70px);
+	overflow: auto;
+	padding: 10px 12px;
+	border-radius: 12px;
+	background: rgba(24, 17, 13, 0.92);
+	color: #f3e7dc;
+	font-size: 13px;
+}
+#debug[hidden] {
+	display: none;
+}
+#debug button {
+	min-height: 36px;
+	font: inherit;
+	padding: 6px 4px;
+	border-radius: 7px;
+	border: 1px solid #4a3f37;
+	background: #2b2622;
+	color: #f3e7dc;
+}
+#debug button[aria-pressed="true"] {
+	background: var(--accent);
+	border-color: var(--accent);
+	color: var(--ink);
+}
+#debug .seg {
+	display: grid;
+	grid-template-columns: repeat(2, 1fr);
+	gap: 4px;
+}
+#debug .states {
+	display: grid;
+	grid-template-columns: repeat(2, 1fr);
+	gap: 4px;
+	margin: 8px 0;
+}
+#debug pre {
+	margin: 6px 0 0;
+	font:
+		11px / 1.4 ui-monospace,
+		Menlo,
+		monospace;
+	color: #c9b8a8;
+	white-space: pre-wrap;
+}

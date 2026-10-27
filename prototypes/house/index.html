@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<title>fox house · POC</title>
+<script type="importmap">
+{
+	"imports": {
+		"three": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.min.js",
+		"https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.core.js": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.core.min.js"
+	}
+}
+</script>
+<link rel="stylesheet" href="./house.css">
+</head>
+<body>
+<div id="scene"></div>
+
+<button id="debug-toggle" type="button" aria-expanded="false" aria-controls="debug" aria-label="Debug panel">⚙</button>
+<section id="debug" hidden>
+	<div class="row seg" id="views"></div>
+	<div class="states" id="states"></div>
+	<pre id="readout">frame time: waiting…</pre>
+</section>
+
+<script type="module" src="./house.js"></script>
+</body>
+</html>

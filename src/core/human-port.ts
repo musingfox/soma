@@ -48,7 +48,10 @@ export async function openHumanPort(
 	context: Context,
 ): Promise<HumanPort & { close(): Promise<void> }> {
 	const listeners = new Set<(event: SomaEvent) => void>();
+	// Notices from before the first subscriber, such as the startup reconcile's, which no snapshot replays.
+	let unheard: SomaEvent[] | undefined = [];
 	const emit = (event: SomaEvent) => {
+		if (unheard !== undefined && event.type === "notice") unheard.push(event);
 		for (const listener of listeners) listener(event);
 	};
 
@@ -128,6 +131,8 @@ export async function openHumanPort(
 		subscribe(listener) {
 			listener({ type: "run", state: running ? "working" : "idle" });
 			for (const [card, job] of jobs) listener({ type: "job", card, ...job });
+			for (const event of unheard ?? []) listener(event);
+			unheard = undefined;
 			listeners.add(listener);
 			return () => listeners.delete(listener);
 		},

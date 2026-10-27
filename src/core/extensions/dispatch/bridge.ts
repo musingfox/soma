@@ -36,7 +36,7 @@ function wakeContent(job: Job, status: Extract<AgentState, { state: "blocked" }>
  * kind=auth block not even that: it is committed as a notice to the human together with the
  * decision, so the model never sees it to answer. The input's requestId carries the observation's
  * seq, so a resent event, from a repeated snapshot or a restarted core, is admitted once. A turn is
- * recorded once per reply: the same reply under a new seq is the same turn.
+ * recorded once per last transcript record: the same record under a new seq is the same turn.
  */
 export function eventBridge(conversation: Conversation, agents: AgentPort, context: Context) {
 	// One event at a time: each reads the job, acts, then commits what it saw.
@@ -55,7 +55,7 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 		if (observed.job === job) return;
 		const result = observed.action === "complete" ? await agents.readResult(job.agent) : undefined;
 		const { job: next, action } = complete(observed, result);
-		// A reply without text is told apart by its id but says nothing, as an unreadable one.
+		// A turn that ends without a reply is told apart by its id but says nothing, as an unreadable one.
 		const reply = result?.text || undefined;
 
 		// Each side effect precedes the commit of its seq, so a crash in between redoes it on restart:

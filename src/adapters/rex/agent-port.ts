@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { ZodType } from "zod";
 import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "../../agent-cli/hangar-cap.ts";
 import { answerKeys, type BlockedScreen, readBlockedScreen } from "../../agent-cli/permission/blocked-screen.ts";
-import { readFinalMessage, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
+import { readLastRecord, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
 import type {
 	AgentListing,
 	AgentPort,
@@ -524,13 +524,13 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			};
 		},
 
-		/** The agent's last assistant message, read off its claude transcript; undefined while there is none. */
+		/** What the agent's claude transcript ends on (`readLastRecord`); undefined while there is no transcript. */
 		async readResult(agent: string): Promise<AgentResult | undefined> {
 			const { blockId, label } = only(await panes(), agent);
 			if (label === undefined || !SESSION_ID.test(label)) return undefined;
 			const { foreground, child } = await blockCall("process", blockId, ProcessResultSchema);
 			const path = await resolveTranscriptPath(label, foreground?.cwd ?? child?.cwd, options.projectsDir);
-			return path === undefined ? undefined : readFinalMessage(path);
+			return path === undefined ? undefined : readLastRecord(path);
 		},
 
 		// As herdr's: fresh status, fresh screen, then the keys read off that screen.

@@ -1,9 +1,12 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "vitest";
+import { afterAll, expect, test } from "vitest";
 import { createHerdrAgentPort } from "../../../src/adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "../../../src/adapters/herdr/client.ts";
 import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
+import { complete, observe } from "../../../src/core/domain/bridge.ts";
+import type { Job } from "../../../src/core/domain/dispatch.ts";
 
 const agent = (name: string | null, agent_status: string) => ({
 	terminal_id: "t",
@@ -183,4 +186,49 @@ test("respond refuses an auth dialog, an agent no longer blocked, and an option 
 		refusal: "unknown_option",
 	});
 	expect([...auth.keys(), ...moved.keys(), ...unknown.keys()]).toEqual([]);
+});
+
+const projects = mkdtempSync(join(tmpdir(), "soma-herdr-projects-"));
+afterAll(() => rmSync(projects, { recursive: true, force: true }));
+
+test("an idle re-reported under a new seq, with the transcript's last record unchanged, records no second turn", async () => {
+	const session = "0b6f6c1e-8a1c-4d5e-9f00-1234567890ab";
+	const cwd = "/nonexistent/worktree";
+	const dir = join(projects, cwd.replace(/[^a-zA-Z0-9]/g, "-"));
+	mkdirSync(dir, { recursive: true });
+	// The human interrupted the first turn before claude replied: the transcript ends on the user.
+	writeFileSync(
+		join(dir, `${session}.jsonl`),
+		[
+			{ type: "user", uuid: "u-1", message: { role: "user", content: "go" } },
+			{
+				type: "user",
+				uuid: "u-stop",
+				message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user]" }] },
+			},
+		]
+			.map((record) => `${JSON.stringify(record)}\n`)
+			.join(""),
+	);
+	const client = createHerdrClient({
+		transport: {
+			async request(method) {
+				if (method !== "agent.get") throw new Error(`unexpected ${method}`);
+				return { type: "agent_info", agent: { ...agent("card-a", "idle"), agent_session: { value: session }, cwd } };
+			},
+		},
+	});
+	const port = createHerdrAgentPort({ client, cap: 1, projectsDir: projects });
+	const fold = async (job: Job, seq: number) =>
+		complete(observe(job, { state: "idle" }, seq), await port.readResult("card-a"));
+	const working = observe(
+		{ card: "card-a", agent: "card-a", sessionId: session, status: { state: "idle" }, seq: 1, decisions: [] },
+		{ state: "working" },
+		2,
+	).job;
+
+	const ended = await fold(working, 3);
+	expect(ended).toMatchObject({ action: "complete", job: { outcome: "未知", resultId: "u-stop" } });
+	const again = await fold(ended.job, 4);
+	expect(again).toEqual({ action: "none", job: { ...ended.job, seq: 4 } });
 });

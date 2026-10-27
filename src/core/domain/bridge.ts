@@ -17,7 +17,7 @@ export type Observed = { readonly job: Job; readonly action: BridgeAction };
  * through a transition, so a status re-reported under a new seq acts only on what changed. A
  * blocked agent is handed over unless its prompt is the one last handed over and no other status
  * was observed since; the same status after a turn may be a new turn between two samples, which
- * `complete` tells by the reply. The returned job no longer holds a launch prompt once the agent
+ * `complete` tells by the transcript's last record. The returned job no longer holds a launch prompt once the agent
  * has been seen to take work, from this prompt or anyone else's.
  */
 export function observe(job: Job, status: AgentState, seq: number): Observed {
@@ -59,9 +59,10 @@ export function observe(job: Job, status: AgentState, seq: number): Observed {
 }
 
 /**
- * Settles a `complete` against the reply read for it. The reply already recorded is the same turn
- * observed again, so only the observation is kept; a new reply, or none that could be read, is a
- * finished turn with the outcome its first line states.
+ * Settles a `complete` against what the agent's transcript ends on. The last record already recorded
+ * is the same turn observed again, so only the observation is kept. A new one is a finished turn with
+ * the outcome its reply's first line states, 未知 when it ends without one; so is a transcript that
+ * could not be read at all, which leaves the recorded id alone.
  */
 export function complete(observed: Observed, result: AgentResult | undefined): Observed {
 	if (observed.action !== "complete") return observed;

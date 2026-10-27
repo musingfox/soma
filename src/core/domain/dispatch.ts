@@ -30,7 +30,8 @@ export type Job = {
 	readonly launch?: string;
 	// Read off the result line of the agent's last finished turn.
 	readonly outcome?: Outcome | "未知";
-	// The message id of the last reply recorded as a finished turn; the same reply observed again is no new turn.
+	// The id of the transcript's last record when a finished turn was last recorded; the same record observed again is
+	// no new turn (src/ports/agent.ts, AgentResult).
 	readonly resultId?: string;
 	// The prompt of the last block handed to the model or the human, until a status other than blocked is seen: the
 	// same prompt observed again is not handed over twice. `status` cannot tell, since reconcile writes it unobserved.

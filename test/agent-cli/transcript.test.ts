@@ -2,7 +2,12 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
-import { readFinalAnswer, readFinalMessage, resolveTranscriptPath } from "../../src/agent-cli/transcript.ts";
+import {
+	awaitingReply,
+	readFinalAnswer,
+	readLastRecord,
+	resolveTranscriptPath,
+} from "../../src/agent-cli/transcript.ts";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -111,21 +116,101 @@ test("a transcript with no assistant message, or whose last one has no text, has
 	expect(await readFinalAnswer(toolOnly)).toBeUndefined();
 });
 
-test("the final message carries the id of the last assistant message, and none without one", async () => {
-	const path = await transcript(
-		assistant("msg_1", text("earlier")) + assistant("msg_2", text("結果：完成")) + assistant("msg_2", text("done")),
-	);
-	expect(await readFinalMessage(path)).toEqual({ id: "msg_2", text: "結果：完成\ndone" });
+test("an assistant message without an id still has an answer", async () => {
 	const idless = await transcript(line({ type: "assistant", message: { role: "assistant", content: [text("x")] } }));
-	expect(await readFinalMessage(idless)).toBeUndefined();
 	expect(await readFinalAnswer(idless)).toBe("x");
 });
 
-test("a last message without text still carries its id, with empty text", async () => {
+const toolResult = (uuid: string) =>
+	line({ type: "user", uuid, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t" }] } });
+
+test("a transcript that ends on the assistant names the last record, with the whole message's text", async () => {
 	const path = await transcript(
-		assistant("msg_1", text("earlier")) + assistant("msg_2", { type: "tool_use", id: "t", name: "Bash", input: {} }),
+		user("開始") +
+			assistant("msg_1", text("earlier")) +
+			assistant("msg_2", { type: "thinking", thinking: "…" }) +
+			assistant("msg_2", text("結果：完成")) +
+			assistant("msg_2", text("done"), { uuid: "a-last" }),
 	);
-	expect(await readFinalMessage(path)).toEqual({ id: "msg_2", text: "" });
-	expect(await readFinalAnswer(path)).toBeUndefined();
-	expect(await readFinalMessage(await transcript(user("開始")))).toBeUndefined();
+	expect(await readLastRecord(path)).toEqual({ id: "a-last", text: "結果：完成\ndone" });
+	expect(await readLastRecord(path, 64)).toEqual({ id: "a-last", text: "結果：完成\ndone" });
+});
+
+test("a transcript that ends on the user, as an interrupted turn does, names the user's record and has no text", async () => {
+	const path = await transcript(
+		user("一") +
+			assistant("msg_1", text("結果：需要你")) +
+			user("二") +
+			line({
+				type: "user",
+				uuid: "u-stop",
+				message: { role: "user", content: [text("[Request interrupted by user]")] },
+			}),
+	);
+	expect(await readLastRecord(path)).toEqual({ id: "u-stop" });
+	expect(await readLastRecord(await transcript(user("開始")))).toEqual({ id: "u-開始" });
+});
+
+test("a transcript that ends on a tool result, as a denied permission does, names it and has no text", async () => {
+	const path = await transcript(
+		user("開始") +
+			assistant("msg_1", text("結果：完成")) +
+			assistant("msg_2", { type: "tool_use", id: "t", name: "Bash", input: {} }) +
+			toolResult("u-denied"),
+	);
+	expect(await readLastRecord(path)).toEqual({ id: "u-denied" });
+});
+
+test("records claude writes around a turn, and records that are not the conversation, name no turn", async () => {
+	const path = await transcript(
+		user("開始") +
+			assistant("msg_1", text("結果：完成"), { uuid: "a-reply" }) +
+			assistant("msg_side", text("sub-agent"), { isSidechain: true }) +
+			line({ type: "user", uuid: "u-meta", isMeta: true, message: { role: "user", content: "caveat" } }) +
+			line({ type: "system", uuid: "s-1", subtype: "turn_duration" }) +
+			line({ type: "system", uuid: "s-2", subtype: "stop_hook_summary" }) +
+			line({ type: "attachment", uuid: "at-1", attachment: { type: "date" } }) +
+			line({ type: "last-prompt" }),
+	);
+	expect(await readLastRecord(path)).toEqual({ id: "a-reply", text: "結果：完成" });
+});
+
+test("a last message without text names its record without text; no record with an id names nothing", async () => {
+	const toolUse = await transcript(
+		assistant("msg_1", text("earlier")) +
+			assistant("msg_2", { type: "tool_use", id: "t", name: "Bash", input: {} }, { uuid: "a-tool" }),
+	);
+	expect(await readLastRecord(toolUse)).toEqual({ id: "a-tool" });
+	expect(await readFinalAnswer(toolUse)).toBeUndefined();
+	const idless = await transcript(line({ type: "assistant", message: { role: "assistant", content: [text("x")] } }));
+	expect(await readLastRecord(idless)).toBeUndefined();
+	expect(await readLastRecord(await transcript(""))).toBeUndefined();
+	expect(await readLastRecord(await transcript(line({ type: "system", uuid: "s-1" })))).toBeUndefined();
+});
+
+test("a reply is awaited while the assistant's last record holds only thinking", async () => {
+	const thinking = assistant("msg_2", { type: "thinking", thinking: "…" });
+	expect(await awaitingReply(await transcript(user("一") + thinking))).toBe(true);
+	expect(await awaitingReply(await transcript(user("一") + thinking + assistant("msg_2", text("結果：完成"))))).toBe(
+		false,
+	);
+});
+
+test("a reply is awaited while the conversation's last record is the user's, or there is none", async () => {
+	const meta = line({ type: "user", isMeta: true, message: { role: "user", content: "caveat" } });
+	const system = line({ type: "system", content: "turn duration" });
+	expect(await awaitingReply(await transcript(user("開始")))).toBe(true);
+	expect(await awaitingReply(await transcript(user("一") + assistant("msg_1", text("ok")) + user("二") + system))).toBe(
+		true,
+	);
+	expect(await awaitingReply(await transcript(user("開始") + assistant("msg_1", text("ok")) + system + meta))).toBe(
+		false,
+	);
+	expect(await awaitingReply(await transcript(""))).toBe(true);
+	expect(await awaitingReply(await transcript(line({ type: "mode", mode: "default" })))).toBe(true);
+	// An attachment larger than the first window, written after the reply.
+	const attachment = line({ type: "attachment", attachment: { content: "x".repeat(200) } });
+	expect(await awaitingReply(await transcript(user("一") + assistant("msg_1", text("ok")) + attachment), 64)).toBe(
+		false,
+	);
 });

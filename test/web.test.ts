@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 import {
+	FETCH_MAX_BYTES,
 	FETCH_MAX_CHARS,
 	fetchPage,
 	SEARCH_DEFAULT_RESULTS,
@@ -57,6 +58,76 @@ test("a long page is cut at the cap and says how long it was", async () => {
 		`[Cut at ${FETCH_MAX_CHARS} of ${long.length + "https://example.com/long\n\n".length} characters.]`,
 	);
 	expect(result.text.length).toBeLessThan(FETCH_MAX_CHARS + 100);
+});
+
+test("no more than the byte cap is read, so an endless page cannot stall parsing", async () => {
+	const chunk = new TextEncoder().encode("<p>filler text.</p>".repeat(1024));
+	let pulled = 0;
+	const endless = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(
+				new TextEncoder().encode("<html><head><title>Huge</title></head><body><article><p>The first paragraph.</p>"),
+			);
+		},
+		pull(controller) {
+			pulled += chunk.byteLength;
+			controller.enqueue(chunk);
+		},
+	});
+	const result = await fetchPage(
+		"https://example.com/huge",
+		async () => new Response(endless, { headers: { "content-type": "text/html" } }),
+		signal,
+	);
+	expect(result.isError).toBe(false);
+	expect(result.text).toContain("The first paragraph.");
+	expect(result.text).toMatch(/\[Read only the first 512 KB of the page\.\]$/);
+	expect(pulled).toBeLessThan(FETCH_MAX_BYTES + 3 * chunk.byteLength);
+});
+
+test("a page of exactly the byte cap is not reported as cut, one byte more is", async () => {
+	const chunked = (total: number) => {
+		let sent = 0;
+		return new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (sent >= total) return controller.close();
+				const size = Math.min(16 * 1024, total - sent);
+				sent += size;
+				controller.enqueue(new Uint8Array(size).fill(0x61));
+			},
+		});
+	};
+	const read = (total: number) =>
+		fetchPage(
+			"https://example.com/a.txt",
+			async () => new Response(chunked(total), { headers: { "content-type": "text/plain" } }),
+			signal,
+		);
+	expect((await read(FETCH_MAX_BYTES)).text).not.toContain("Read only");
+	expect((await read(FETCH_MAX_BYTES + 1)).text).toContain("Read only the first 512 KB");
+});
+
+test("a page is decoded in the charset its response names", async () => {
+	const big5 = new Uint8Array([0xa4, 0xa4, 0xa4, 0xe5]);
+	const result = await fetchPage(
+		"https://example.com/tw.txt",
+		async () => new Response(big5, { headers: { "content-type": "text/plain; charset=big5" } }),
+		signal,
+	);
+	expect(result.text).toBe("https://example.com/tw.txt\n\n中文");
+});
+
+test("an empty page or one of no stated type is an error result", async () => {
+	expect(await fetchPage("https://example.com/empty", serve(""), signal)).toEqual({
+		isError: true,
+		text: "https://example.com/empty answered with an empty page.",
+	});
+	expect(await fetchPage("https://example.com/blob", async () => new Response(new Uint8Array([0, 1])), signal)).toEqual(
+		{
+			isError: true,
+			text: "https://example.com/blob is of no stated type, not a text page.",
+		},
+	);
 });
 
 test("only http and https URLs are fetched", async () => {
@@ -146,6 +217,8 @@ test("a search asks Exa for highlights with the key in a header, five results un
 		contents: { highlights: true },
 	});
 	expect(JSON.parse(String(second?.request?.body)).numResults).toBe(SEARCH_MAX_RESULTS);
+	await search("node release", 0, KEY, exa(exaResults), signal);
+	expect(JSON.parse(String(exa.calls[2]?.request?.body)).numResults).toBe(1);
 });
 
 test("each result comes back as title, URL, date and highlights, in no provider's vocabulary", async () => {

@@ -25,6 +25,8 @@ export interface TelegramOptions extends TelegramConfig {
 }
 
 const REQUEST_PREFIX = "telegram:";
+/** The entry kind of this client's inputs, which the core names as a push's target when it means this chat. */
+const ENTRY_KIND = "chat.telegram";
 // Rounds started by these sources produce something the human did not ask for here: push them as notices.
 // A digest round is not among them: its report arrives as a notice entry of its own.
 const PUSHED_SOURCES = ["schedule:"];
@@ -39,6 +41,8 @@ const REACTIONS = { received: "👀", forwarded: "👌", answered: "👍", faile
 const CALLBACK_DATA_LIMIT = 64;
 // The data of the button that replaces a pressed keyboard: it names no answer, so a press on it only gets answered.
 const SETTLED = "-";
+// What replaces the buttons of a prompt answered on another interface, or by the model.
+const ELSEWHERE = "已在別處處理";
 
 const ButtonSchema = z.object({ text: z.string(), callback_data: z.string().optional() }).passthrough();
 const UpdateSchema = z
@@ -138,15 +142,36 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		return parsed.result;
 	};
 
+	// A second tap arrives before the first press's edit hides the buttons; its refusal must not replace the result.
+	// A message whose buttons were taken away as answered elsewhere is settled too.
+	const settled = new Set<number>();
+	// By card and fingerprint, the messages here showing that prompt's buttons; lost on a restart.
+	const shown = new Map<string, { card: string; fingerprint: string; messageIds: number[] }>();
 	// One at a time, so a long answer's parts and the messages after it arrive in order.
 	let sending = Promise.resolve();
-	const send = (text: string, markup?: object) => {
+	const send = (
+		text: string,
+		markup?: object,
+		{ silent = false, prompt }: { silent?: boolean; prompt?: Choices } = {},
+	) => {
 		sending = sending.then(async () => {
 			const parts = splitMessage(text);
 			for (const [index, part] of parts.entries()) {
 				const last = index === parts.length - 1 && markup !== undefined;
 				try {
-					await call("sendMessage", { chat_id: chatId, text: part, ...(last ? { reply_markup: markup } : {}) });
+					const sent = await call("sendMessage", {
+						chat_id: chatId,
+						text: part,
+						...(last ? { reply_markup: markup } : {}),
+						...(silent ? { disable_notification: true } : {}),
+					});
+					const messageId = (sent as { message_id?: unknown }).message_id;
+					if (last && prompt !== undefined && typeof messageId === "number") {
+						const key = `${prompt.card}\n${prompt.fingerprint}`;
+						const entry = shown.get(key) ?? { card: prompt.card, fingerprint: prompt.fingerprint, messageIds: [] };
+						entry.messageIds.push(messageId);
+						shown.set(key, entry);
+					}
 				} catch (error) {
 					if (!signal.aborted) onError(error);
 					return;
@@ -174,10 +199,33 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	// restart still reaches the chat that started it.
 	const unsubscribe = human.subscribe((event) => {
 		const mine = "requestId" in event && event.requestId.startsWith(REQUEST_PREFIX);
+		// A push meant for another interface still arrives here, without a sound.
+		const silent = "target" in event && event.target !== undefined && event.target !== ENTRY_KIND;
 		if (event.type === "notice") {
 			if (event.kind === "forwarded") {
 				if (mine) react(event.requestId, "forwarded");
-			} else send(label(event.kind, event.content), event.choices && keyboard(event.choices));
+			} else {
+				const markup = event.choices && keyboard(event.choices);
+				send(label(event.kind, event.content), markup, { silent, ...(markup && { prompt: event.choices }) });
+			}
+		} else if (event.type === "job") {
+			// Answered elsewhere: the prompt is no longer on the job's screen. Queued behind the sends, so it sees them.
+			const { card, status } = event;
+			sending = sending.then(async () => {
+				for (const [key, prompt] of shown) {
+					if (prompt.card !== card) continue;
+					if (status.state === "blocked" && status.fingerprint === prompt.fingerprint) continue;
+					shown.delete(key);
+					for (const messageId of prompt.messageIds.filter((id) => !settled.has(id))) {
+						settled.add(messageId);
+						await quietly("editMessageReplyMarkup", {
+							chat_id: chatId,
+							message_id: messageId,
+							reply_markup: { inline_keyboard: [[{ text: ELSEWHERE, callback_data: SETTLED }]] },
+						});
+					}
+				}
+			});
 		} else if (event.type === "answer") {
 			if (mine) {
 				react(event.requestId, "answered");
@@ -189,12 +237,10 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 				react(event.requestId, "failed");
 				send(`[失敗] ${event.reason}`);
 			} else if (PUSHED_FAILURES.some((source) => event.requestId.startsWith(source)))
-				send(`[失敗] ${event.requestId} 那一輪：${event.reason}`);
+				send(`[失敗] ${event.requestId} 那一輪：${event.reason}`, undefined, { silent });
 		}
 	});
 	type CallbackQuery = NonNullable<z.infer<typeof UpdateSchema>["callback_query"]>;
-	// A second tap arrives before the first press's edit hides the buttons; its refusal must not replace the result.
-	const settled = new Set<number>();
 	const answerPress = async (query: CallbackQuery, message: NonNullable<CallbackQuery["message"]>) => {
 		const pressed = parseCallbackData(query.data);
 		if (pressed === undefined || settled.has(message.message_id))
@@ -226,7 +272,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 						const requestId = `${REQUEST_PREFIX}${message.message_id}`;
 						await human.submit({
 							content: message.text,
-							entry: { kind: "chat.telegram", data: { messageId: message.message_id } },
+							entry: { kind: ENTRY_KIND, data: { messageId: message.message_id } },
 							requestId,
 						});
 						react(requestId, "received");

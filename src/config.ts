@@ -48,6 +48,10 @@ const FileConfig = z
 			.object({ apiKey: z.string().min(1) })
 			.partial()
 			.strict(),
+		exa: z
+			.object({ apiKey: z.string().min(1) })
+			.partial()
+			.strict(),
 		telegram: z
 			.object({ botToken: z.string().min(1), chatId: z.number().int().safe(), apiBase: z.string().url() })
 			.partial()
@@ -75,6 +79,7 @@ export interface Config {
 	readonly repo: string;
 	readonly reflection: boolean;
 	readonly anthropicApiKey?: string;
+	readonly exaApiKey?: string;
 	/** Set only when both a bot token and a chat id are. */
 	readonly telegram?: TelegramConfig;
 }
@@ -110,7 +115,7 @@ export function readConfigFile(path: string, warn: (message: string) => void = c
 		throw new ConfigError(`${path}: not valid JSON: ${(error as Error).message}`);
 	}
 	const file = parseOrThrow(FileConfig, json, path);
-	if ((file.anthropic?.apiKey || file.telegram?.botToken) && statSync(path).mode & 0o044) {
+	if ((file.anthropic?.apiKey || file.exa?.apiKey || file.telegram?.botToken) && statSync(path).mode & 0o044) {
 		warn(`[soma] ${path} holds a key or token and is readable by group or others; run chmod 600 ${path}`);
 	}
 	return file;
@@ -137,6 +142,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		parseEnv("SOMA_PROGRAM_STATUS", (v) => ({ 1: true, 0: false })[v], "1 or 0") ?? file?.programStatus;
 	const reflection = parseEnv("SOMA_REFLECTION", (v) => ({ 1: true, 0: false })[v], "1 or 0") ?? file?.reflection;
 	const anthropicApiKey = file?.anthropic?.apiKey;
+	const exaApiKey = fromEnv("EXA_API_KEY") ?? file?.exa?.apiKey;
 	const token = fromEnv("TELEGRAM_BOT_TOKEN") ?? file?.telegram?.botToken;
 	const chatId =
 		parseEnv(
@@ -173,6 +179,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		...(hangarCap !== undefined && { hangarCap }),
 		...(programStatus !== undefined && { programStatus }),
 		...(anthropicApiKey !== undefined && { anthropicApiKey }),
+		...(exaApiKey !== undefined && { exaApiKey }),
 		...(token !== undefined && chatId !== undefined && { telegram: { token, chatId, apiBase } }),
 	};
 }

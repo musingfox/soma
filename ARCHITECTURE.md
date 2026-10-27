@@ -357,13 +357,14 @@ The order is as follows, each step with one observable outcome:
 
 ### Whom to push to when there are several interfaces
 
-Decided on 2026-10-23, to be built only when a second human-side interface is connected; for now each adapter still pushes "Notify" itself. Pushing on every interface is noisy, and adapters do not import each other, so they cannot see that the human is on another interface right now. So the core decides whom to push to, based on the `entry.kind` of the human's latest input.
+Decided on 2026-10-23. Pushing on every interface is noisy, and adapters do not import each other, so they cannot see that the human is on another interface right now. So the core decides whom to push to, based on the `entry.kind` of the human's latest input.
 
 - **Only pushes the core starts are covered**: `notice`, and the failures of the `PUSHED_FAILURES` turns. A turn the human started still goes back only to the adapter that started it.
 - **Push target**: the interface with input in the last 15 minutes; if none, the default channel, Telegram. The other interfaces still get the content but do not ring; Telegram uses `disable_notification`.
 - **Escalation**: if within 15 minutes after a `question` or a failure is pushed the human has neither answered that prompt nor typed on any interface, push once more to Telegram; when the target was already Telegram, there is no escalation. Reports do not escalate; if nobody reads them, they stay in the history.
 - **Put away once answered**: when a prompt is answered on one interface, the same one on the other interfaces loses its buttons (Telegram uses `editMessageReplyMarkup`).
 - No guessing of user preferences: there are too few signals, and the cost of a wrong guess is a missed notice that needs the human. The work is in the obw card `multi-interface-push-target`.
+- **Done 2026-10-27**, with the Telegram adapter and the dev terminal as the two interfaces. `openHumanPort` takes the default target from `src/main.ts` (Telegram when it is configured; without it every client rings as before), names the target on each `notice` and pushed `failure` event, and keeps presence and the pending escalations in the `soma.push` doc (`src/core/human-port.ts`, rules in `src/core/domain/push.ts`). An escalation is a new notice entry naming the default target, appended in the commit that drops it from the pending list, so a restart neither loses nor repeats it. `node smoke/push.ts` passed with the windows cut to 3 s: a report rang only on the terminal after it was typed on, then rang on Telegram once the window passed; a question escalated once, and lost its buttons on Telegram after it was answered on the terminal; a question the human typed after did not escalate; a core killed while an escalation waited, reopened twice, pushed it once. Known limits: pressing a Telegram button is not an input, so it does not count as presence; and the Telegram adapter keeps the prompts it showed in memory, so after a restart it cannot take away the buttons of a prompt shown before.
 
 ## Milestones
 

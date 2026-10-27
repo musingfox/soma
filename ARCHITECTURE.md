@@ -23,7 +23,7 @@ Source abbreviations:
            human-side interfaces              agent-side interfaces
   ┌──────────────────────┐            ┌──────────────────────┐
   │ Telegram (in-process)│            │ rex                  │
-  │ shikigami (client)   │──▶ soma ──▶│ herdr                │
+  │ web + desktop (M7)   │──▶ soma ──▶│ herdr                │
   │ terminal (dev)       │   core     │ native tty (M6)      │
   └──────────────────────┘            │ ACP, HTTP (later)    │
                                       └──────────────────────┘
@@ -355,6 +355,8 @@ The order is as follows, each step with one observable outcome:
 4. **Receive voice and turn it into text.** Speech-to-text runs on the GPU workstation.
 5. **Mini App prototype.** Build it only when rich messages are not enough; first check whether it opens over Tailscale alone.
 
+On 2026-10-27 the human chose a web interface of soma's own over steps 3 to 5; see "Decisions made" and M7.
+
 ### Whom to push to when there are several interfaces
 
 Decided on 2026-10-23. Pushing on every interface is noisy, and adapters do not import each other, so they cannot see that the human is on another interface right now. So the core decides whom to push to, based on the `entry.kind` of the human's latest input.
@@ -376,7 +378,7 @@ Each milestone has only one observable outcome.
 - **M3 Telegram.** This is the smallest human interface, to verify the quality of reports on the phone.
 - **M3.5 Email and calendar.** The pi-mcp bridge plus the chosen MCP servers. Acceptance: asking `今天有什麼會` in Telegram gets the right answer.
 - **M4 Client socket.** For out-of-process adapters.
-- **Deferred: the cc-mobile assistant tab, and shikigami as a client.** Decided on 2026-10-18 to build soma's own abilities first; changes to these two projects are deferred, or their features are later ported straight into soma. The cc-mobile assistant tab was cancelled on 2026-10-24; see "Decisions made".
+- **Deferred: the cc-mobile assistant tab, and shikigami as a client.** Decided on 2026-10-18 to build soma's own abilities first; changes to these two projects are deferred, or their features are later ported straight into soma. The cc-mobile assistant tab was cancelled on 2026-10-24; see "Decisions made". shikigami as a client was replaced on 2026-10-27 by M7's desktop shell.
 - **M5 rex adapter.** First make four preparatory changes, each accepted on its own: let `src/main.ts` pick the agent-side adapter from the configuration (today it hard-codes herdr, `src/main.ts:49`); move the Claude screen parsing, transcript reading and hangar cap out of the herdr adapter into modules the adapters share, adding one allowed case to `test/layering.test.ts`; change the `herdr:` prefix in the core and the ports (`src/core/extensions/dispatch/bridge.ts:18`, `PUSHED_FAILURES` in `src/ports/human.ts`, the opening of the text that wakes the model) to the interface-neutral `agent:`; and change the seq meaning in the core's `observe` as "The rex implementation" says. Then add `src/adapters/rex/` implementing AgentPort. Acceptance: rerun `smoke/dispatch.ts` and `smoke/bridge.ts` with a real rex. The former must keep the assertion "the hangar has only one window with that name", and the latter must get past the trust dialog without a key press. Also measure once how many `program_status_changed` arrive while a permission prompt stays on screen for 60 seconds and then while the agent sits idle for 60 seconds, and write it into "The rex implementation". The herdr adapter stays, and after the preparatory changes it must also pass the two original smokes.
   - **Done 2026-10-27**, checked against rex 0.0.1792787366-g623b2d and Claude Code 2.1.311. `node smoke/rex-dispatch.ts` passed with the one-window-per-name assertion, and `node smoke/rex-bridge.ts` passed in a fresh untrusted repo with no key pressed; the rex runs of these replace the two original smokes on rex, since `smoke/dispatch.ts` and `smoke/bridge.ts` drive herdr. The measurement is in "No transition counter". On herdr, `node smoke/bridge.ts` passed on a throwaway herdr session; `smoke/dispatch.ts` on herdr was not fixed, by the human's decision on 2026-10-27: it fails on main 884aa16 at its own step 3, where it answers the trust dialog with Down and Enter and then times out waiting for idle, and dispatch goes through rex instead.
 - **M6 native tty adapter.** soma opens a pty itself to run the agent, answers the 7501 probe and parses the reports, and reads the screen with a terminal emulator to answer prompts. Acceptance: dispatch a job, let it stop at a permission prompt, answer from Telegram, and read the result; then dispatch another, `kill -9` soma and reopen, and this job is recorded as the agent having gone missing, with the human told once and not again.
@@ -386,6 +388,13 @@ Each milestone has only one observable outcome.
   - **Done 2026-10-26.** All three checks passed. The herdr one ran on a throwaway herdr session with a dev instance, so fleet's agents kept running: with herdr down soma exits 1 within about a second rather than hanging, and answers once herdr is back. Two things were not observed: launchd restarting that exit 1 every 10 s (inferred from `KeepAlive.SuccessfulExit=false`), and herdr going away while soma is already running.
   - **Install.** The plist is not in this repo; it is `~/Library/LaunchAgents/dev.musingfox.soma.plist`, modelled on `dev.musingfox.herdr-fleet.plist`. Its keys: `ProgramArguments` is only `~/.local/share/soma/releases/current/bin/soma` (pointing at node would make macOS list the background item as "Node.js Foundation"); `PATH` starts with the fnm node that `package.json` accepts and includes the directory of `uvx`, without which the Google MCP server does not start; `TMPDIR` is `getconf DARWIN_USER_TEMP_DIR`; `WorkingDirectory` is `~/.local/share/soma`; `RunAtLoad`, `KeepAlive.SuccessfulExit=false`, `ThrottleInterval` 10; `ExitTimeOut` 40, longer than Telegram's 30 s long poll; both log paths `~/Library/Logs/soma.log`. Before loading it, prod's config `~/.config/soma/config.json` (chmod 600) sets `repo` to the checkout and `scripts/release.sh` has made `current`. Then the human runs `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.musingfox.soma.plist`; auto mode blocks it.
   - **Release.** `scripts/release.sh [ref]`, then `launchctl kickstart -k gui/$(id -u)/dev.musingfox.soma`. To roll back, release a commit that is already unpacked and restart again.
+- **M7 Web and desktop interfaces.** Decided on 2026-10-27; see "Decisions made". Each step has one observable outcome:
+  1. **Web skeleton.** A human-side adapter in soma serves one mobile-first page and a WebSocket on the tailnet only. Acceptance: on the phone, over Tailscale, a message typed in the page gets the root conversation's answer back in the page; the character is a static image. The work is in the obw card `web-skeleton`.
+  2. **Character pick.** Two throwaway prototypes, Live2D and VRM, built side by side and compared against criteria set before they are built: performance on the phone, how state and lip-sync hook in, licence, and where the art comes from. It does not depend on step 1.
+  3. **Character follows state.** The picked character reacts to whether a turn is running and to job status.
+  4. **Reading pages.** Reports and the dispatch list as pages.
+  5. **Desktop shell.** A frameless window in `desktop/` that loads the same page.
+  6. **Voice.** Speech-to-text on the GPU workstation; text-to-speech not yet chosen.
 - **Later**, build the ACP and HTTP agent interfaces as needed.
 
 Not done for now: writing all three agent interfaces from the start, a general plugin framework (ports yes; no registry and no dynamic loading), and the cloud.
@@ -425,6 +434,11 @@ Decided 2026-10-27:
   - **Local addresses are not blocked.** `web_fetch` can read localhost and LAN addresses; the human does not count this as a risk for a single-user soma.
   - **Replay is `safe` for both.** pi-durable reruns a call after a crash only when it is declared safe (`node_modules/@earendil-works/pi-durable/README.md:181`), and a read has nothing to repeat.
   - **No deferred tools yet.** soma defines 18 tools of its own; two more do not change the plan in "External dependencies" (MCP) to defer tools and install `createToolSearchExtension()` once shikigami-bridge's tools arrive.
+- **soma gets a web interface and a desktop assistant, both with a visible character.** This reverses the 2026-10-22 order (rich messages, then a Mini App), because the human wants three things Telegram cannot give: a character that keeps them company and reacts to the agents, reading that is not bound by a message format, and voice. Telegram stays, and the push target rules of 2026-10-23 cover the web as one more interface.
+  - **One frontend.** The phone opens the page soma serves; the desktop assistant is a shell that loads the same page, so the character and the pages are written once.
+  - **The desktop shell lives in this repo, in `desktop/`, and is not part of the release.** A release needs no build step ("Resident service"), and any desktop shell needs one, so the shell is packaged on its own. shikigami is not reworked into a client; its brain is the third brain "The problems to solve" names.
+  - **Tailscale only.** The page is not public, so the first step needs no login of its own.
+  - **A new character**, not shikigami's avatar. Live2D and VRM compete, so both get a throwaway prototype (M7 step 2).
 
 ## Open questions
 

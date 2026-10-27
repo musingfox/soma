@@ -43,6 +43,11 @@ export function readBlockedScreen(text: string): BlockedScreen {
 	return { kind: AUTH_WORDING.test(tail) ? "auth" : "permission", msg: tail };
 }
 
+/** claude's folder-trust dialog, which it draws before it reports any status (ARCHITECTURE.md「rex 的實作」). */
+export const isTrustDialog = (screen: BlockedScreen) =>
+	screen.kind === "permission" &&
+	screen.prompt?.options.some((option) => /trust this folder/i.test(option.label)) === true;
+
 /**
  * The keys that choose `optionId` on the screen as `prompt` read it, or `undefined` when that prompt
  * offers no such option or the cursor it must travel from was not read.

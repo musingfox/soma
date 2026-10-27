@@ -3,7 +3,7 @@
 ## Where things are
 
 - Design, decisions and milestones: `ARCHITECTURE.md`. Task cards: the Obsidian vault and project named in `.obsidian.yaml`, under `pm/soma/tasks/`.
-- Everything is written in English: code, comments, commit messages, docs and task cards.
+- Everything is written in English: code, comments, commit messages, docs and task cards. The older cards are still in Traditional Chinese until they are translated; write new or changed text in English.
 
 ## prod runs from a release
 

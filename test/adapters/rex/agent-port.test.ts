@@ -123,13 +123,17 @@ function git(porcelain = "", branches = "") {
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+// A claude whose start ps cannot tell: no unit test runs ps.
+const unstarted = async () => undefined;
 const request = { name: "card-a", card: "card-a", cwd: "/nonexistent/repo", sessionId: SESSION };
 
 test("start adds fleet/<card> under .claude/worktrees and types claude's command into an interactive shell", async () => {
 	const fake = rex([]);
 	const { git: run, runs } = git();
 
-	await createRexAgentPort({ client: fake.client, sessionId: HANGAR, git: run }).start(request);
+	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, git: run }).start(
+		request,
+	);
 
 	expect(runs).toEqual([
 		["/nonexistent/repo", "worktree", "list", "--porcelain"],
@@ -165,7 +169,9 @@ test("start reopens the worktree an earlier attempt left on the branch", async (
 		"worktree /nonexistent/repo\nHEAD abc\nbranch refs/heads/main\n\nworktree /wt/card-a\nHEAD def\nbranch refs/heads/fleet/card-a\n";
 	const { git: run, runs } = git(porcelain, "  fleet/card-a\n");
 
-	await createRexAgentPort({ client: fake.client, sessionId: HANGAR, git: run }).start(request);
+	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, git: run }).start(
+		request,
+	);
 
 	expect(runs).toHaveLength(1);
 	expect(fake.calls[0]?.payload).toMatchObject({ layout: { block: { options: { cwd: "/wt/card-a" } } } });
@@ -174,7 +180,9 @@ test("start reopens the worktree an earlier attempt left on the branch", async (
 test("start checks out a branch that exists without a worktree", async () => {
 	const { git: run, runs } = git("", "  fleet/card-a\n");
 
-	await createRexAgentPort({ client: rex([]).client, sessionId: HANGAR, git: run }).start(request);
+	await createRexAgentPort({ processStart: unstarted, client: rex([]).client, sessionId: HANGAR, git: run }).start(
+		request,
+	);
 
 	expect(runs.at(-1)).toEqual([
 		"/nonexistent/repo",
@@ -201,7 +209,12 @@ test("list names each window, with the root record's status and seq while claude
 		{ name: "card-c", block: "block:c", argv0: "claude" },
 	]);
 
-	const listed = await createRexAgentPort({ client: fake.client, sessionId: HANGAR, redrawMs: 0 }).list();
+	const listed = await createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		redrawMs: 0,
+	}).list();
 
 	expect(listed).toEqual([
 		{
@@ -221,15 +234,15 @@ test("list refuses two windows of one name rather than take the first", async ()
 		{ name: "card-a", block: "block:b" },
 	]);
 
-	await expect(createRexAgentPort({ client: fake.client, sessionId: HANGAR }).list()).rejects.toThrow(
-		"more than one window named card-a",
-	);
+	await expect(
+		createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR }).list(),
+	).rejects.toThrow("more than one window named card-a");
 });
 
 test("onStatus reports root records off the event stream, one per observation", async () => {
 	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", records: [] };
 	const fake = rex([block, { name: "shell", block: "block:s", argv0: "-fish" }]);
-	const port = createRexAgentPort({ client: fake.client, sessionId: HANGAR });
+	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
 	const seen: AgentStatusEvent[] = [];
 	const off = port.onStatus((event) => seen.push(event));
 	await settle();
@@ -260,7 +273,9 @@ test("onStatus re-reads each block's program_status once after a reconnect", asy
 	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", records: [] };
 	const fake = rex([block]);
 	const seen: AgentStatusEvent[] = [];
-	createRexAgentPort({ client: fake.client, sessionId: HANGAR }).onStatus((event) => seen.push(event));
+	createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR }).onStatus((event) =>
+		seen.push(event),
+	);
 	await settle();
 	const reads = () => fake.methods().filter((method) => method.endsWith(".program_status")).length;
 	const before = reads();
@@ -277,7 +292,9 @@ test("onStatus drops a report older than one a resync already emitted", async ()
 	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", records: [] };
 	const fake = rex([block]);
 	const seen: AgentStatusEvent[] = [];
-	createRexAgentPort({ client: fake.client, sessionId: HANGAR }).onStatus((event) => seen.push(event));
+	createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR }).onStatus((event) =>
+		seen.push(event),
+	);
 	await settle();
 	let release = () => {};
 	const held = new Promise<void>((resolve) => {
@@ -308,7 +325,7 @@ test("prompt pastes the text and presses \\r, and presses it once more when clau
 		{ name: "card-a", block: "block:a", argv0: "claude", records: [{ state: "idle", updated_at: AT }] },
 	]);
 
-	await createRexAgentPort({ client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt(
+	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt(
 		"card-a",
 		"line 1\nline 2",
 	);
@@ -346,7 +363,12 @@ test("prompt presses \\r only once when claude turns working", async () => {
 		return result;
 	};
 
-	await createRexAgentPort({ client: fake.client, sessionId: HANGAR, confirmMs: 1_000 }).prompt("card-a", "go");
+	await createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		confirmMs: 1_000,
+	}).prompt("card-a", "go");
 
 	expect(fake.methods().filter((method) => method.endsWith(".write"))).toHaveLength(1);
 });
@@ -369,7 +391,10 @@ test("prompt does not press \\r again when claude goes from idle straight to blo
 		return result;
 	};
 
-	await createRexAgentPort({ client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt("card-a", "go");
+	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt(
+		"card-a",
+		"go",
+	);
 
 	expect(fake.methods().filter((method) => method.endsWith(".write"))).toHaveLength(1);
 });
@@ -389,7 +414,10 @@ test("prompt does not press \\r again when the status cannot be read", async () 
 		return result;
 	};
 
-	await createRexAgentPort({ client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt("card-a", "go");
+	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt(
+		"card-a",
+		"go",
+	);
 
 	expect(fake.methods().filter((method) => method.endsWith(".write"))).toHaveLength(1);
 });
@@ -402,7 +430,10 @@ test.each([
 	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude", records }]);
 
 	await expect(
-		createRexAgentPort({ client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt("card-a", "go"),
+		createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt(
+			"card-a",
+			"go",
+		),
 	).rejects.toThrow(`rex agent card-a is ${state}`);
 
 	expect(fake.methods().filter((method) => method === "block.event" || method.endsWith(".write"))).toEqual([]);
@@ -430,7 +461,7 @@ test("readResult reads the last reply off the transcript of the session id the b
 test("stop closes the agent's block", async () => {
 	const fake = rex([{ name: "card-a", block: "block:a" }]);
 
-	await createRexAgentPort({ client: fake.client, sessionId: HANGAR }).stop("card-a");
+	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR }).stop("card-a");
 
 	expect(fake.calls.at(-1)).toEqual({ method: "block.close", payload: { session_id: HANGAR, block_id: "block:a" } });
 });
@@ -450,7 +481,7 @@ const keys = (fake: ReturnType<typeof rex>) =>
 
 async function respond(block: Omit<Block, "name" | "block">, option: string, fingerprint: string) {
 	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude", ...block }]);
-	const port = createRexAgentPort({ client: fake.client, sessionId: HANGAR, keyGapMs: 0 });
+	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, keyGapMs: 0 });
 	return { outcome: await port.respond("card-a", { option, fingerprint }), fake };
 }
 
@@ -529,7 +560,12 @@ test("respond reads only the tail of a scrollback too long for one reply", async
 		return original(method, payload, schema);
 	};
 
-	const outcome = await createRexAgentPort({ client: fake.client, sessionId: HANGAR, keyGapMs: 0 }).respond("card-a", {
+	const outcome = await createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		keyGapMs: 0,
+	}).respond("card-a", {
 		option: "1",
 		fingerprint: fingerprintOf(BASH),
 	});
@@ -544,7 +580,7 @@ test("respond reads only the tail of a scrollback too long for one reply", async
 test("a blocked record carries the prompt read off the screen, whose fingerprint respond then answers", async () => {
 	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", records: [], screen: BASH };
 	const fake = rex([block]);
-	const port = createRexAgentPort({ client: fake.client, sessionId: HANGAR, keyGapMs: 0 });
+	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, keyGapMs: 0 });
 	const seen: AgentStatusEvent[] = [];
 	const off = port.onStatus((event) => seen.push(event));
 	await settle();
@@ -582,7 +618,12 @@ test("a blocked record whose screen does not parse keeps the record's status, wi
 		},
 	]);
 
-	const listed = await createRexAgentPort({ client: fake.client, sessionId: HANGAR, redrawMs: 0 }).list();
+	const listed = await createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		redrawMs: 0,
+	}).list();
 
 	expect(listed).toEqual([
 		{ name: "card-a", status: { state: "blocked", kind: "question", msg: "answer: which?" }, seq: AT_US },
@@ -606,9 +647,12 @@ test("a blocked record's screen that parses only once claude has drawn it carrie
 		return result;
 	};
 	const seen: AgentStatusEvent[] = [];
-	const off = createRexAgentPort({ client: fake.client, sessionId: HANGAR, redrawMs: 50 }).onStatus((event) =>
-		seen.push(event),
-	);
+	const off = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		redrawMs: 50,
+	}).onStatus((event) => seen.push(event));
 	await settle();
 
 	block.records = [{ state: "blocked", kind: "permission", msg: "approve Bash: ls", updated_at: AT }];
@@ -627,7 +671,7 @@ test("a second prompt under the same record text, with no other status between, 
 	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", records: [], screen: BASH };
 	const fake = rex([block]);
 	const seen: AgentStatusEvent[] = [];
-	const port = createRexAgentPort({ client: fake.client, sessionId: HANGAR });
+	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
 	const off = port.onStatus((event) => seen.push(event));
 	await settle();
 	const blocked = (updated_at: string) => ({ state: "blocked", kind: "permission", msg: "approve Bash", updated_at });
@@ -657,6 +701,239 @@ async function until(ok: () => boolean, ms = 2_000): Promise<void> {
 	}
 }
 
+// claude in a card's worktree of a repo whose main checkout is /nonexistent/repo.
+const WORKTREE = "/nonexistent/repo/.claude/worktrees/card-a";
+const mainGit = git(
+	`worktree /nonexistent/repo\nHEAD abc\nbranch refs/heads/main\n\nworktree ${WORKTREE}\nHEAD def\nbranch refs/heads/fleet/card-a\n`,
+);
+const ROOT_LINE =
+	"Answering yes trusts the repository root /nonexistent/repo, and with it every worktree of that repository.";
+
+const TRUSTED = {
+	state: "blocked",
+	kind: "permission",
+	msg: `${readBlockedScreen(TRUST).msg}\n${ROOT_LINE}`,
+	fingerprint: fingerprintOf(TRUST),
+	options: [
+		{ id: "1", label: "No, exit" },
+		{ id: "2", label: "Yes, I trust this folder" },
+	],
+};
+
+test("onStatus reports the trust dialog once claude ran trustMs without a record, again while it stays, until a record", async () => {
+	const started = Date.now();
+	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", cwd: WORKTREE, records: [], screen: TRUST };
+	const fake = rex([block]);
+	const seen: AgentStatusEvent[] = [];
+	const port = createRexAgentPort({
+		client: fake.client,
+		sessionId: HANGAR,
+		git: mainGit.git,
+		trustMs: 100,
+		processStart: async (pid) => (pid === 9 ? started : undefined),
+	});
+	const off = port.onStatus((event) => seen.push(event));
+	const reads = () => fake.methods().filter((method) => method.endsWith(".format")).length;
+	await settle();
+	// Read at once on listening, but claude has not been up for trustMs yet.
+	expect(seen).toEqual([]);
+	expect(reads()).toBe(0);
+
+	await until(() => seen.length >= 2);
+	expect(seen[0]).toEqual({ agent: "card-a", status: TRUSTED, seq: (started + 100) * 1000 });
+	expect(seen[1]?.status).toEqual(TRUSTED);
+	expect(seen[1]?.seq).toBeGreaterThan(seen[0]?.seq as number);
+
+	// claude's first record once the dialog is answered: rex stamped it before the adapter's last dialog seq.
+	// The dialog's text is left on screen, so a check that went on would report it again.
+	block.records = [{ state: "idle", updated_at: AT }];
+	fake.emit(fake.status("block:a", { state: "idle", updated_at: AT }));
+	await until(() => seen.at(-1)?.status.state === "idle");
+	const readsAtRecord = reads();
+	const count = seen.length;
+	await new Promise((resolve) => setTimeout(resolve, 350));
+
+	expect(seen.at(-1)).toEqual({ agent: "card-a", status: { state: "idle" }, seq: AT_US });
+	expect(seen).toHaveLength(count);
+	expect(reads()).toBe(readsAtRecord);
+	off();
+});
+
+/** A rex whose screen reads wait, while `hold` is on, until `release`; `held` counts the reads that waited. */
+function heldScreen(fake: ReturnType<typeof rex>) {
+	const gate = { hold: false, held: 0, release: () => {} };
+	let opened = Promise.resolve();
+	const original = fake.client.call.bind(fake.client);
+	fake.client.call = async (method, payload, schema) => {
+		if (gate.hold && method.endsWith(".format")) {
+			gate.held++;
+			await opened;
+		}
+		return original(method, payload, schema);
+	};
+	return {
+		gate,
+		hold() {
+			gate.hold = true;
+			opened = new Promise((resolve) => {
+				gate.release = () => {
+					gate.hold = false;
+					resolve();
+				};
+			});
+		},
+	};
+}
+
+test("a record arriving while the first dialog check reads the screen wins: the dialog is never reported", async () => {
+	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", cwd: WORKTREE, records: [], screen: TRUST };
+	const fake = rex([block]);
+	const screen = heldScreen(fake);
+	screen.hold();
+	const seen: AgentStatusEvent[] = [];
+	const off = createRexAgentPort({
+		client: fake.client,
+		sessionId: HANGAR,
+		git: mainGit.git,
+		trustMs: 60_000,
+		processStart: async () => Date.now() - 120_000,
+	}).onStatus((event) => seen.push(event));
+	// The read on listening finds claude up past trustMs, no record, and reads the screen.
+	await until(() => screen.gate.held === 1);
+
+	block.records = [{ state: "idle", updated_at: AT }];
+	fake.emit(fake.status("block:a", { state: "idle", updated_at: AT }));
+	screen.gate.release();
+	await until(() => seen.length > 0);
+	await settle();
+
+	expect(seen).toEqual([{ agent: "card-a", status: { state: "idle" }, seq: AT_US }]);
+	off();
+});
+
+test("a record arriving while a re-check reads the screen ends the dialog's reports at that record", async () => {
+	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", cwd: WORKTREE, records: [], screen: TRUST };
+	const fake = rex([block]);
+	const screen = heldScreen(fake);
+	const seen: AgentStatusEvent[] = [];
+	const off = createRexAgentPort({
+		client: fake.client,
+		sessionId: HANGAR,
+		git: mainGit.git,
+		trustMs: 30,
+		processStart: async () => Date.now() - 120_000,
+	}).onStatus((event) => seen.push(event));
+	await until(() => seen.length > 0);
+	expect(seen[0]?.status).toEqual(TRUSTED);
+
+	screen.hold();
+	await until(() => screen.gate.held === 1);
+	const before = seen.length;
+	// rex stamped claude's first record below the dialog's seq, so only the guards keep the stale dialog out.
+	block.records = [{ state: "idle", updated_at: AT }];
+	fake.emit(fake.status("block:a", { state: "idle", updated_at: AT }));
+	screen.gate.release();
+	await until(() => seen.at(-1)?.status.state === "idle");
+	await new Promise((resolve) => setTimeout(resolve, 100));
+
+	expect(seen.slice(before)).toEqual([{ agent: "card-a", status: { state: "idle" }, seq: AT_US }]);
+	off();
+});
+
+test("onStatus never reads the screen of a claude that reports records", async () => {
+	const fake = rex([
+		{ name: "card-a", block: "block:a", argv0: "claude", records: [{ state: "idle", updated_at: AT }], screen: TRUST },
+	]);
+	const seen: AgentStatusEvent[] = [];
+	const off = createRexAgentPort({
+		client: fake.client,
+		sessionId: HANGAR,
+		trustMs: 20,
+		processStart: async () => Date.now() - 60_000,
+	}).onStatus((event) => seen.push(event));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+
+	expect(seen).toEqual([{ agent: "card-a", status: { state: "idle" }, seq: AT_US }]);
+	expect(fake.methods().filter((method) => method.endsWith(".format"))).toEqual([]);
+	off();
+});
+
+test("list reports the trust dialog under the seq of the time it first held, whichever port reads it", async () => {
+	const started = Date.parse("2026-10-27T01:00:00Z");
+	const block: Block = {
+		name: "card-a",
+		block: "block:a",
+		label: SESSION,
+		argv0: "claude",
+		cwd: WORKTREE,
+		records: [],
+		screen: TRUST,
+	};
+	const at = (ms: number) =>
+		createRexAgentPort({
+			client: rex([block]).client,
+			sessionId: HANGAR,
+			git: mainGit.git,
+			processStart: async () => started,
+			now: () => started + ms,
+		}).list();
+
+	expect(await at(2_999)).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	const first = await at(3_000);
+	expect(first).toEqual([{ name: "card-a", status: TRUSTED, seq: (started + 3_000) * 1000, sessionId: SESSION }]);
+	expect(await at(600_000)).toEqual(first);
+});
+
+test("the trust dialog's msg ends naming the repository root a yes trusts, not the worktree claude runs in", async () => {
+	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", cwd: WORKTREE, records: [], screen: TRUST };
+	const { git: run, runs } = git(`worktree /nonexistent/repo\nHEAD abc\nbranch refs/heads/main\n`);
+	const list = (gitFor: typeof run) =>
+		createRexAgentPort({
+			client: rex([block]).client,
+			sessionId: HANGAR,
+			git: gitFor,
+			processStart: async () => Date.now() - 60_000,
+			onError: () => {},
+		}).list();
+
+	const msgOf = async (gitFor: typeof run) => (await list(gitFor))[0]?.status?.msg ?? "";
+
+	const msg = await msgOf(run);
+	expect(msg.split("\n").at(-1)).toBe(ROOT_LINE);
+	expect(msg.startsWith(readBlockedScreen(TRUST).msg)).toBe(true);
+	expect(runs).toEqual([[WORKTREE, "worktree", "list", "--porcelain"]]);
+
+	// Where git cannot name a main checkout, claude trusts the folder itself.
+	const plain = await msgOf(async () => {
+		throw new Error("not a git repository");
+	});
+	expect(plain.split("\n").at(-1)).toBe(
+		`Answering yes trusts the repository root ${WORKTREE}, and with it every worktree of that repository.`,
+	);
+});
+
+test("a git failure's fallback stays the trust dialog's msg, so a git that recovers does not make it a new prompt", async () => {
+	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", cwd: WORKTREE, records: [], screen: TRUST };
+	let fails = true;
+	const port = createRexAgentPort({
+		client: rex([block]).client,
+		sessionId: HANGAR,
+		git: async (repo, args) => {
+			if (fails) throw new Error("index.lock exists");
+			return mainGit.git(repo, args);
+		},
+		processStart: async () => Date.now() - 60_000,
+		onError: () => {},
+	});
+	const msgOf = async () => (await port.list())[0]?.status?.msg ?? "";
+
+	const first = await msgOf();
+	fails = false;
+
+	expect(first.split("\n").at(-1)).toContain(`root ${WORKTREE},`);
+	expect(await msgOf()).toBe(first);
+});
+
 test("records map onto OSC 7501's vocabulary, and a blocked kind left out reads as permission", () => {
 	expect(stateOf({ state: "blocked", updated_at: AT })).toEqual({ state: "blocked", kind: "permission" });
 	expect(stateOf({ state: "blocked", kind: "auth", msg: "log in", updated_at: AT })).toEqual({
@@ -682,7 +959,9 @@ test("seq is updated_at in microseconds, so reports 800 µs apart are two observ
 
 	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude", records: [] }]);
 	const seen: AgentStatusEvent[] = [];
-	createRexAgentPort({ client: fake.client, sessionId: HANGAR, redrawMs: 0 }).onStatus((event) => seen.push(event));
+	createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, redrawMs: 0 }).onStatus(
+		(event) => seen.push(event),
+	);
 	await settle();
 	fake.emit(fake.status("block:a", { state: "working", updated_at: "2026-10-27T01:02:03.456100Z" }));
 	fake.emit(

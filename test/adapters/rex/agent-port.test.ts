@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, expect, test } from "vitest";
@@ -6,6 +6,7 @@ import type { ZodType } from "zod";
 import { createRexAgentPort, seqOf, stateOf } from "../../../src/adapters/rex/agent-port.ts";
 import type { RexClient } from "../../../src/adapters/rex/client.ts";
 import type { SessionEvent } from "../../../src/adapters/rex/schema.ts";
+import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
 import type { AgentStatusEvent } from "../../../src/ports/agent.ts";
 
 const HANGAR = "session:hangar";
@@ -14,7 +15,18 @@ const AT = "2026-10-27T01:02:03.456789+08:00";
 /** AT in microseconds since the epoch. */
 const AT_US = Date.parse("2026-10-27T01:02:03+08:00") * 1000 + 456_789;
 
-type Block = { name: string; block: string; label?: string; argv0?: string; cwd?: string; records?: object[] };
+type Block = {
+	name: string;
+	block: string;
+	label?: string;
+	argv0?: string;
+	cwd?: string;
+	records?: object[];
+	screen?: string;
+};
+
+const fixture = (name: string) =>
+	readFileSync(join(import.meta.dirname, "../../agent-cli/permission/fixtures", name), "utf8");
 
 /** An in-memory rex: the hangar's windows, each with one block, and every call made on it. */
 function rex(blocks: Block[]) {
@@ -40,6 +52,7 @@ function rex(blocks: Block[]) {
 			bytes_written: String((payload.args as { data: string }).data).length,
 		}),
 		"com.superlogical.terminal.program_status": (payload) => ({ records: byId(payload)?.records ?? [] }),
+		"com.superlogical.terminal.format": (payload) => ({ content: byId(payload)?.screen ?? "" }),
 		"com.superlogical.terminal.process": (payload) => {
 			const found = byId(payload);
 			return {
@@ -188,7 +201,7 @@ test("list names each window, with the root record's status and seq while claude
 		{ name: "card-c", block: "block:c", argv0: "claude" },
 	]);
 
-	const listed = await createRexAgentPort({ client: fake.client, sessionId: HANGAR }).list();
+	const listed = await createRexAgentPort({ client: fake.client, sessionId: HANGAR, redrawMs: 0 }).list();
 
 	expect(listed).toEqual([
 		{
@@ -422,17 +435,227 @@ test("stop closes the agent's block", async () => {
 	expect(fake.calls.at(-1)).toEqual({ method: "block.close", payload: { session_id: HANGAR, block_id: "block:a" } });
 });
 
-test("respond is a stub that sends nothing", async () => {
-	const fake = rex([{ name: "card-a", block: "block:a" }]);
+const BASH = fixture("claude-bash-prompt-2.1.302.txt");
+const TRUST = fixture("claude-trust-dialog-2.1.302.txt");
+const fingerprintOf = (screen: string) => readBlockedScreen(screen).prompt?.fingerprint as string;
+const blocked = [{ state: "blocked", kind: "permission", updated_at: AT }];
+const keys = (fake: ReturnType<typeof rex>) =>
+	fake.calls
+		.filter((call) => call.method === "block.event")
+		.map((call) => {
+			const { block_id, event } = call.payload as { block_id: string; event: { type: string; payload: object } };
+			const { key, text, action } = event.payload as { key: string; text: string; action: string };
+			return { block_id, type: event.type, key, text, action };
+		});
 
-	const outcome = await createRexAgentPort({ client: fake.client, sessionId: HANGAR }).respond("card-a", {
+async function respond(block: Omit<Block, "name" | "block">, option: string, fingerprint: string) {
+	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude", ...block }]);
+	const port = createRexAgentPort({ client: fake.client, sessionId: HANGAR, keyGapMs: 0 });
+	return { outcome: await port.respond("card-a", { option, fingerprint }), fake };
+}
+
+test("respond refuses not_blocked off a fresh read, before reading the screen", async () => {
+	for (const block of [
+		{ records: [{ state: "idle", updated_at: AT }], screen: BASH },
+		{ records: [{ state: "working", updated_at: AT }], screen: BASH },
+		// No record and no trust dialog on screen: claude is starting up, or a prompt it never reported.
+		{ records: [], screen: BASH },
+		// No record and no claude: a shell, whatever its screen shows.
+		{ argv0: "-fish", records: [], screen: TRUST },
+	]) {
+		const { outcome, fake } = await respond(block, "1", fingerprintOf(BASH));
+		expect(outcome).toEqual({ sent: false, refusal: "not_blocked" });
+		expect(keys(fake)).toEqual([]);
+	}
+});
+
+test("respond refuses auth, unreadable, stale and unknown_option off the screen read through rex", async () => {
+	const cases = [
+		[{ screen: fixture("claude-custom-api-key-2.1.302.txt") }, "1", "f", "auth"],
+		[{ screen: "nothing anyone can answer" }, "1", "f", "unreadable"],
+		[{ screen: BASH }, "1", "0123456789abcdef", "stale"],
+		[{ screen: BASH }, "9", fingerprintOf(BASH), "unknown_option"],
+	] as const;
+	for (const [block, option, fingerprint, refusal] of cases) {
+		const { outcome, fake } = await respond({ records: blocked, ...block }, option, fingerprint);
+		expect(outcome).toEqual({ sent: false, refusal });
+		expect(fake.methods()).toContain("com.superlogical.terminal.format");
+		expect(keys(fake)).toEqual([]);
+	}
+});
+
+test("respond presses the option's digit on a numbered prompt", async () => {
+	const { outcome, fake } = await respond({ records: blocked, screen: BASH }, "1", fingerprintOf(BASH));
+
+	expect(outcome).toEqual({ sent: true });
+	expect(keys(fake)).toEqual([
+		{ block_id: "block:a", type: "key", key: "digit_1", text: "1", action: "press" },
+		{ block_id: "block:a", type: "key", key: "digit_1", text: "1", action: "release" },
+	]);
+	expect(fake.calls.find((call) => call.method.endsWith(".format"))?.payload).toEqual({
+		session_id: HANGAR,
+		block_id: "block:a",
+		args: { format: "text", trim: true, max_bytes: 65_536 },
+	});
+});
+
+test("respond answers the trust dialog that has no record, travelling from the cursor", async () => {
+	const { outcome, fake } = await respond({ records: [], screen: TRUST }, "2", fingerprintOf(TRUST));
+
+	expect(outcome).toEqual({ sent: true });
+	expect(keys(fake).map(({ key, action }) => `${key}:${action}`)).toEqual([
+		"arrow_down:press",
+		"arrow_down:release",
+		"enter:press",
+		"enter:release",
+	]);
+});
+
+test("respond reads only the tail of a scrollback too long for one reply", async () => {
+	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude", records: blocked }]);
+	const original = fake.client.call.bind(fake.client);
+	const reads: unknown[] = [];
+	fake.client.call = async (method, payload, schema) => {
+		if (method.endsWith(".format")) return schema.parse({ content: "old output", id: 7, total: 200_000, eof: false });
+		if (method.endsWith(".blob_read")) {
+			reads.push((payload as { args: unknown }).args);
+			const offset = (payload as { args: { offset: number } }).args.offset;
+			return schema.parse(
+				offset < 200_000 - 1_000
+					? { id: 7, data: "x".repeat(65_536 - 1_000), total: 200_000, eof: false }
+					: { id: 7, data: BASH, total: 200_000, eof: true },
+			);
+		}
+		return original(method, payload, schema);
+	};
+
+	const outcome = await createRexAgentPort({ client: fake.client, sessionId: HANGAR, keyGapMs: 0 }).respond("card-a", {
 		option: "1",
-		fingerprint: "f",
+		fingerprint: fingerprintOf(BASH),
 	});
 
-	expect(outcome).toEqual({ sent: false, refusal: "unreadable" });
-	expect(fake.calls).toEqual([]);
+	expect(outcome).toEqual({ sent: true });
+	expect(reads).toEqual([
+		{ id: 7, offset: 200_000 - 65_536 },
+		{ id: 7, offset: 200_000 - 1_000 },
+	]);
 });
+
+test("a blocked record carries the prompt read off the screen, whose fingerprint respond then answers", async () => {
+	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", records: [], screen: BASH };
+	const fake = rex([block]);
+	const port = createRexAgentPort({ client: fake.client, sessionId: HANGAR, keyGapMs: 0 });
+	const seen: AgentStatusEvent[] = [];
+	const off = port.onStatus((event) => seen.push(event));
+	await settle();
+
+	block.records = [{ state: "blocked", kind: "permission", msg: "approve Bash: ls", updated_at: AT }];
+	fake.emit(fake.status("block:a", block.records[0] as object));
+	await until(() => seen.length > 0);
+	off();
+	const { kind, msg, prompt } = readBlockedScreen(BASH);
+	const status = {
+		state: "blocked",
+		kind,
+		msg,
+		fingerprint: prompt?.fingerprint,
+		options: prompt?.options.map(({ id, label }) => ({ id, label })),
+	};
+	expect(status.fingerprint).toBeDefined();
+	expect(status.options?.length).toBeGreaterThan(1);
+	expect(seen).toEqual([{ agent: "card-a", status, seq: AT_US }]);
+	expect(await port.list()).toEqual([{ name: "card-a", status, seq: AT_US }]);
+
+	const [{ status: emitted }] = seen as [AgentStatusEvent];
+	const { fingerprint } = emitted as { fingerprint: string };
+	expect(await port.respond("card-a", { option: "1", fingerprint })).toEqual({ sent: true });
+});
+
+test("a blocked record whose screen does not parse keeps the record's status, without a fingerprint", async () => {
+	const fake = rex([
+		{
+			name: "card-a",
+			block: "block:a",
+			argv0: "claude",
+			records: [{ state: "blocked", kind: "question", msg: "answer: which?", updated_at: AT }],
+			screen: "nothing anyone can answer",
+		},
+	]);
+
+	const listed = await createRexAgentPort({ client: fake.client, sessionId: HANGAR, redrawMs: 0 }).list();
+
+	expect(listed).toEqual([
+		{ name: "card-a", status: { state: "blocked", kind: "question", msg: "answer: which?" }, seq: AT_US },
+	]);
+	// Read three times, in case claude was still drawing it.
+	expect(fake.methods().filter((method) => method.endsWith(".format"))).toHaveLength(3);
+});
+
+test("a blocked record's screen that parses only once claude has drawn it carries the prompt", async () => {
+	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", records: [], screen: "Bash command" };
+	const fake = rex([block]);
+	const original = fake.client.call.bind(fake.client);
+	const reads: number[] = [];
+	fake.client.call = async (method, payload, schema) => {
+		const result = await original(method, payload, schema);
+		// The first read catches the prompt half drawn; claude has finished it by the next.
+		if (method.endsWith(".format")) {
+			reads.push(Date.now());
+			block.screen = BASH;
+		}
+		return result;
+	};
+	const seen: AgentStatusEvent[] = [];
+	const off = createRexAgentPort({ client: fake.client, sessionId: HANGAR, redrawMs: 50 }).onStatus((event) =>
+		seen.push(event),
+	);
+	await settle();
+
+	block.records = [{ state: "blocked", kind: "permission", msg: "approve Bash: ls", updated_at: AT }];
+	fake.emit(fake.status("block:a", block.records[0] as object));
+	await until(() => seen.length > 0);
+	off();
+
+	expect(reads).toHaveLength(2);
+	expect((reads[1] as number) - (reads[0] as number)).toBeGreaterThanOrEqual(45);
+	expect(seen).toEqual([
+		{ agent: "card-a", status: expect.objectContaining({ fingerprint: fingerprintOf(BASH) }), seq: AT_US },
+	]);
+});
+
+test("a second prompt under the same record text, with no other status between, carries its own fingerprint", async () => {
+	const block: Block = { name: "card-a", block: "block:a", argv0: "claude", records: [], screen: BASH };
+	const fake = rex([block]);
+	const seen: AgentStatusEvent[] = [];
+	const port = createRexAgentPort({ client: fake.client, sessionId: HANGAR });
+	const off = port.onStatus((event) => seen.push(event));
+	await settle();
+	const blocked = (updated_at: string) => ({ state: "blocked", kind: "permission", msg: "approve Bash", updated_at });
+
+	block.records = [blocked("2026-10-27T01:02:04Z")];
+	fake.emit(fake.status("block:a", block.records[0] as object));
+	await until(() => seen.length === 1);
+	// rex's record reads the same; the screen shows another command.
+	const other = BASH.replaceAll("canary.txt", "other.txt");
+	block.screen = other;
+	block.records = [blocked("2026-10-27T01:02:09Z")];
+	fake.emit(fake.status("block:a", block.records[0] as object));
+	await until(() => seen.length === 2);
+	off();
+
+	expect(fingerprintOf(other)).not.toBe(fingerprintOf(BASH));
+	expect(seen.map((event) => event.status)).toEqual([
+		expect.objectContaining({ fingerprint: fingerprintOf(BASH) }),
+		expect.objectContaining({ fingerprint: fingerprintOf(other) }),
+	]);
+	expect((await port.list())[0]?.status).toMatchObject({ fingerprint: fingerprintOf(other) });
+});
+
+async function until(ok: () => boolean, ms = 2_000): Promise<void> {
+	for (const deadline = Date.now() + ms; !ok(); await new Promise((resolve) => setTimeout(resolve, 5))) {
+		if (Date.now() > deadline) throw new Error("timed out");
+	}
+}
 
 test("records map onto OSC 7501's vocabulary, and a blocked kind left out reads as permission", () => {
 	expect(stateOf({ state: "blocked", updated_at: AT })).toEqual({ state: "blocked", kind: "permission" });
@@ -459,13 +682,13 @@ test("seq is updated_at in microseconds, so reports 800 µs apart are two observ
 
 	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude", records: [] }]);
 	const seen: AgentStatusEvent[] = [];
-	createRexAgentPort({ client: fake.client, sessionId: HANGAR }).onStatus((event) => seen.push(event));
+	createRexAgentPort({ client: fake.client, sessionId: HANGAR, redrawMs: 0 }).onStatus((event) => seen.push(event));
 	await settle();
 	fake.emit(fake.status("block:a", { state: "working", updated_at: "2026-10-27T01:02:03.456100Z" }));
 	fake.emit(
 		fake.status("block:a", { state: "blocked", kind: "permission", updated_at: "2026-10-27T01:02:03.456900Z" }),
 	);
-	await settle();
+	await until(() => seen.length === 2);
 
 	expect(seen.map((event) => event.status.state)).toEqual(["working", "blocked"]);
 	expect(new Set(seen.map((event) => event.seq)).size).toBe(2);

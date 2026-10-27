@@ -3,6 +3,7 @@ import { copyFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ZodType } from "zod";
 import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "../../agent-cli/hangar-cap.ts";
+import { answerKeys, type BlockedScreen, readBlockedScreen } from "../../agent-cli/permission/blocked-screen.ts";
 import { readFinalMessage, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
 import type {
 	AgentListing,
@@ -17,9 +18,11 @@ import type {
 } from "../../ports/agent.ts";
 import type { RexClient } from "./client.ts";
 import {
+	BlobReadResultSchema,
 	BlockClosedResultSchema,
 	BlockEventSchema,
 	EmptyResultSchema,
+	FormatResultSchema,
 	NewWindowResultSchema,
 	ProcessResultSchema,
 	ProgramStatusChangedSchema,
@@ -43,6 +46,10 @@ export interface RexAgentPortOptions {
 	readonly git?: Git;
 	/** How long a sent prompt may take to turn the agent working before `\r` is sent once more. */
 	readonly confirmMs?: number;
+	/** Pause between the keys of one answer, so claude reads an arrow and the Enter after it as two keys. */
+	readonly keyGapMs?: number;
+	/** Pause between reads of a blocked screen that did not parse yet; claude may still be drawing it. */
+	readonly redrawMs?: number;
 	readonly onError?: (error: Error) => void;
 }
 
@@ -55,6 +62,34 @@ const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const VIEW_EVENTS = new Set(["session_view_changed", "window_created", "window_closed", "window_label_changed"]);
 
 const isRoot = (record: StatusRecord) => record.id === undefined || record.id === "";
+
+// The tail of the screen and scrollback that is read: a prompt is drawn at the bottom.
+const SCREEN_BYTES = 65_536;
+// Reads of a blocked record's screen, redrawMs apart, before it is taken not to parse.
+const BLOCKED_READS = 3;
+
+/** claude's folder-trust dialog, which it draws before it reports any status (ARCHITECTURE.md「rex 的實作」). */
+export const isTrustDialog = (screen: BlockedScreen) =>
+	screen.kind === "permission" &&
+	screen.prompt?.options.some((option) => /trust this folder/i.test(option.label)) === true;
+
+// rex's key event is client.key's `key` object, as a keyboard reports it; block.event takes it under type `key`.
+const NAMED_KEYS: Record<string, { key: string; text: string }> = {
+	Up: { key: "arrow_up", text: "" },
+	Down: { key: "arrow_down", text: "" },
+	Enter: { key: "enter", text: "\r" },
+};
+
+/** The key `answerKeys` names, as rex spells it; undefined for any other, such as a two-digit option. */
+function keyOf(name: string): { key: string; text: string; unshifted_codepoint: number } | undefined {
+	const key = /^\d$/.test(name) ? { key: `digit_${name}`, text: name } : NAMED_KEYS[name];
+	return key && { ...key, unshifted_codepoint: key.text.codePointAt(0) ?? 0 };
+}
+
+function blockedOf({ kind, msg, prompt }: BlockedScreen): AgentState {
+	const options = prompt?.options.map(({ id, label }) => ({ id, label }));
+	return { state: "blocked", kind, msg, ...(prompt ? { fingerprint: prompt.fingerprint, options } : {}) };
+}
 
 /** OSC 7501's own vocabulary, which the port shares; a state rex does not know reads as idle, as its API says. */
 export function stateOf(record: StatusRecord): AgentState {
@@ -94,13 +129,15 @@ function paneOf(window: RexWindow): Pane | undefined {
 
 /**
  * Dispatches each card's claude into a window of the hangar rex session, in its own `fleet/<card>` worktree.
- * ARCHITECTURE.md「rex 的實作」is the design. Stubbed in this slice: `respond`, the folder-trust dialog check (it
- * holds only for repos the human trusts) and counting the hangar's claude blocks against the cap.
+ * ARCHITECTURE.md「rex 的實作」is the design. Stubbed in this slice: the folder-trust dialog check (it holds only for
+ * repos the human trusts) and counting the hangar's claude blocks against the cap.
  */
 export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	const { client, sessionId } = options;
 	const git = options.git ?? runGit;
 	const confirmMs = options.confirmMs ?? 3_000;
+	const keyGapMs = options.keyGapMs ?? 200;
+	const redrawMs = options.redrawMs ?? 500;
 	const onError = options.onError ?? ((error: Error) => console.warn(`[rex] ${error.message}`));
 	const cap = options.cap ?? resolveHangarCapWithSource(undefined, readPerfCoresViaSysctl).cap;
 	// Stub in this slice: the hangar's claude blocks are not counted yet, so the hangar never reads as full.
@@ -142,7 +179,31 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		]);
 		const root = records.find(isRoot);
 		const seq = root && seqOf(root);
-		return root === undefined || seq === undefined || !claude ? undefined : { status: stateOf(root), seq };
+		return root === undefined || seq === undefined || !claude
+			? undefined
+			: { status: await statusOf(blockId, root), seq };
+	}
+
+	/**
+	 * A root record's status. A blocked one carries the prompt read off the screen, its options and fingerprint, as
+	 * herdr's does, since rex's record names neither and respond needs the fingerprint. claude may report the block
+	 * before it has drawn the prompt, so a screen that does not parse is read again, as herdr's is; one that still does
+	 * not, or cannot be read, leaves the record's own status, a block nobody can answer.
+	 */
+	async function statusOf(blockId: string, record: StatusRecord): Promise<AgentState> {
+		const status = stateOf(record);
+		if (status.state !== "blocked") return status;
+		try {
+			let screen = await readScreen(blockId);
+			for (let read = 1; read < BLOCKED_READS && screen.prompt === undefined; read++) {
+				await new Promise((resolve) => setTimeout(resolve, redrawMs));
+				screen = await readScreen(blockId);
+			}
+			return screen.prompt === undefined ? status : blockedOf(screen);
+		} catch (error) {
+			onError(error as Error);
+			return status;
+		}
 	}
 
 	/** The root record's state as rex reports it, undefined when there is none or it cannot be read. */
@@ -157,6 +218,37 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	}
 
 	const write = (blockId: string, data: string) => blockCall("write", blockId, WriteResultSchema, { data });
+
+	/** The block's screen as plain text, cut to its last SCREEN_BYTES: the whole scrollback can outgrow one reply. */
+	async function readScreen(blockId: string): Promise<BlockedScreen> {
+		const args = { format: "text", trim: true, max_bytes: SCREEN_BYTES };
+		const first = await blockCall("format", blockId, FormatResultSchema, args);
+		if (first.id === undefined || first.total === undefined || first.eof === true) {
+			return readBlockedScreen(first.content);
+		}
+		let text = "";
+		for (let offset = Math.max(0, first.total - SCREEN_BYTES); ; ) {
+			const part = await blockCall("blob_read", blockId, BlobReadResultSchema, { id: first.id, offset });
+			text += part.data;
+			offset += Buffer.byteLength(part.data);
+			if (part.eof || part.data === "") return readBlockedScreen(text);
+		}
+	}
+
+	/** A press and a release, as `rex send-key` sends them, straight to the block so no key binding takes it. */
+	async function press(blockId: string, key: NonNullable<ReturnType<typeof keyOf>>): Promise<void> {
+		for (const action of ["press", "release"]) {
+			await client.call(
+				"block.event",
+				{
+					session_id: sessionId,
+					block_id: blockId,
+					event: { type: "key", payload: { ...key, mods: "", composing: false, action } },
+				},
+				EmptyResultSchema,
+			);
+		}
+	}
 
 	/** Resolves true once the block's root record turns working, false when `ms` passes first. */
 	function turnsWorking(blockId: string, ms: number) {
@@ -242,7 +334,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			enqueue(async () => {
 				const known = names?.has(blockId) ? names : await refresh();
 				if (!known.has(blockId) || !(await isClaude(blockId))) return;
-				report(blockId, known.get(blockId), stateOf(record), seq);
+				report(blockId, known.get(blockId), await statusOf(blockId, record), seq);
 			});
 		});
 		const offConnected = client.onConnected(resync);
@@ -350,9 +442,32 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			return path === undefined ? undefined : readFinalMessage(path);
 		},
 
-		// Stub in this slice: the screen is not read, so no answer can be checked against it.
-		async respond(_agent: string, _answer: Answer): Promise<AnswerOutcome> {
-			return { sent: false, refusal: "unreadable" };
+		// As herdr's: fresh status, fresh screen, then the keys read off that screen.
+		async respond(agent: string, answer: Answer): Promise<AnswerOutcome> {
+			const { blockId } = only(await panes(), agent);
+			const [{ records }, claude] = await Promise.all([
+				blockCall("program_status", blockId, ProgramStatusResultSchema),
+				isClaude(blockId),
+			]);
+			const root = records.find(isRoot);
+			// Without a record, the trust dialog is the one block claude can be in.
+			if (root === undefined ? !claude : root.state !== "blocked") return { sent: false, refusal: "not_blocked" };
+			const screen = await readScreen(blockId);
+			if (root === undefined && !isTrustDialog(screen)) return { sent: false, refusal: "not_blocked" };
+			const { kind, prompt } = screen;
+			if (kind === "auth") return { sent: false, refusal: "auth" };
+			if (prompt === undefined) return { sent: false, refusal: "unreadable" };
+			if (prompt.fingerprint !== answer.fingerprint) return { sent: false, refusal: "stale" };
+			if (!prompt.options.some((option) => option.id === answer.option)) {
+				return { sent: false, refusal: "unknown_option" };
+			}
+			const keys = answerKeys(prompt, answer.option)?.map(keyOf);
+			if (keys === undefined || keys.some((key) => key === undefined)) return { sent: false, refusal: "unreadable" };
+			for (const [index, key] of keys.entries()) {
+				if (index > 0) await new Promise((resolve) => setTimeout(resolve, keyGapMs));
+				await press(blockId, key as NonNullable<typeof key>);
+			}
+			return { sent: true };
 		},
 
 		async stop(agent: string): Promise<void> {

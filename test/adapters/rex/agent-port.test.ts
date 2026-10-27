@@ -1,126 +1,11 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, expect, test } from "vitest";
-import type { ZodType } from "zod";
 import { createRexAgentPort, seqOf, stateOf } from "../../../src/adapters/rex/agent-port.ts";
-import type { RexClient } from "../../../src/adapters/rex/client.ts";
-import type { SessionEvent } from "../../../src/adapters/rex/schema.ts";
 import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
-import type { AgentStatusEvent } from "../../../src/ports/agent.ts";
-
-const HANGAR = "session:hangar";
-const SESSION = "0e9d6c1f-4a3b-4a52-9c85-2f6d3f6f2f10";
-const AT = "2026-10-27T01:02:03.456789+08:00";
-/** AT in microseconds since the epoch. */
-const AT_US = Date.parse("2026-10-27T01:02:03+08:00") * 1000 + 456_789;
-
-type Block = {
-	name: string;
-	block: string;
-	label?: string;
-	argv0?: string;
-	cwd?: string;
-	records?: object[];
-	screen?: string;
-};
-
-const fixture = (name: string) =>
-	readFileSync(join(import.meta.dirname, "../../agent-cli/permission/fixtures", name), "utf8");
-
-/** An in-memory rex: the hangar's windows, each with one block, and every call made on it. */
-function rex(blocks: Block[]) {
-	const calls: { method: string; payload: Record<string, unknown> }[] = [];
-	const events = new Set<(event: SessionEvent) => void>();
-	const connected = new Set<() => void>();
-	const attached: string[] = [];
-	const byId = (payload: Record<string, unknown>) => blocks.find((each) => each.block === payload.block_id);
-	const replies: Record<string, (payload: Record<string, unknown>) => unknown> = {
-		"session.view": () => ({
-			revision: 1,
-			session_id: HANGAR,
-			windows: blocks.map(({ name, block, label }) => ({
-				window_id: `window:${block}`,
-				label: name,
-				layers: [{ kind: "tiled", blocks: [{ block_id: block, ...(label === undefined ? {} : { label }) }] }],
-			})),
-		}),
-		"session.new_window": () => ({ window_id: "window:new", block_ids: ["block:new"], revision: 2 }),
-		"block.close": (payload) => ({ block_id: payload.block_id, revision: 3 }),
-		"block.event": () => ({}),
-		"com.superlogical.terminal.write": (payload) => ({
-			bytes_written: String((payload.args as { data: string }).data).length,
-		}),
-		"com.superlogical.terminal.program_status": (payload) => ({ records: byId(payload)?.records ?? [] }),
-		"com.superlogical.terminal.format": (payload) => ({ content: byId(payload)?.screen ?? "" }),
-		"com.superlogical.terminal.process": (payload) => {
-			const found = byId(payload);
-			return {
-				last_exit: null,
-				foreground: { pid: 9, user_id: 501, name: "2.1.310", argv0: found?.argv0 ?? "-fish", cwd: found?.cwd },
-			};
-		},
-	};
-	const client: RexClient = {
-		async call<T>(method: string, payload: unknown, schema: ZodType<T>): Promise<T> {
-			calls.push({ method, payload: payload as Record<string, unknown> });
-			const reply = replies[method];
-			if (reply === undefined) throw new Error(`unexpected ${method}`);
-			return schema.parse(reply(payload as Record<string, unknown>));
-		},
-		async attach(sessionId) {
-			attached.push(sessionId);
-		},
-		onSessionEvent(listener) {
-			events.add(listener);
-			return () => events.delete(listener);
-		},
-		onConnected(listener) {
-			connected.add(listener);
-			return () => connected.delete(listener);
-		},
-		close() {},
-	};
-	const status = (block: string, record: object, id = "") =>
-		({
-			session_id: HANGAR,
-			event: {
-				type: "block_event",
-				payload: {
-					block_id: block,
-					creator_name: "com.superlogical.terminal",
-					name: "program_status_changed",
-					payload: { id, record, reason: "report" },
-				},
-			},
-		}) satisfies SessionEvent;
-	return {
-		client,
-		calls,
-		attached,
-		emit: (event: SessionEvent) => {
-			for (const listener of events) listener(event);
-		},
-		status,
-		reconnect: () => {
-			for (const listener of connected) listener();
-		},
-		methods: () => calls.map((call) => call.method),
-	};
-}
-
-function git(porcelain = "", branches = "") {
-	const runs: string[][] = [];
-	return {
-		runs,
-		git: async (repo: string, args: readonly string[]) => {
-			runs.push([repo, ...args]);
-			if (args[0] === "worktree" && args[1] === "list") return porcelain;
-			if (args[0] === "branch") return branches;
-			return "";
-		},
-	};
-}
+import type { AgentPort, AgentResult, AgentStatusEvent } from "../../../src/ports/agent.ts";
+import { AT, AT_US, type Block, fixture, git, HANGAR, rex, SESSION } from "./fake.ts";
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 // A claude whose start ps cannot tell: no unit test runs ps.
@@ -459,6 +344,336 @@ test("readResult reads the last reply off the transcript of the session id the b
 	}).readResult("card-a");
 
 	expect(result).toEqual({ id: "a-1", text: "結果：完成" });
+});
+
+/**
+ * Feeds the watch a turn of `block` that ended at `at`: a working, then the done rex has on record from then on.
+ * Returns the watch's unsubscribe.
+ */
+async function turnOver(fake: ReturnType<typeof rex>, port: AgentPort, block: Block, at: string): Promise<() => void> {
+	const seen: AgentStatusEvent[] = [];
+	const off = port.onStatus((event) => seen.push(event));
+	await settle();
+	fake.emit(fake.status(block.block, { state: "working", updated_at: new Date(Date.parse(at) - 1_000).toISOString() }));
+	block.records = [{ state: "done", updated_at: at }];
+	fake.emit(fake.status(block.block, { state: "done", updated_at: at }));
+	await until(() => seen.at(-1)?.status.state === "done");
+	return off;
+}
+
+/** A transcript for a fresh worktree of `projects`, holding `records`, and the cwd claude runs in to write it. */
+function transcript(records: object[]) {
+	const cwd = `/nonexistent/repo/.claude/worktrees/card-${Math.random().toString(36).slice(2)}`;
+	const path = join(projects, cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${SESSION}.jsonl`);
+	mkdirSync(join(path, ".."), { recursive: true });
+	writeFileSync(path, records.map(line).join(""));
+	return { cwd, path };
+}
+const line = (value: object) => `${JSON.stringify(value)}\n`;
+const reply = (id: string, text: string) => ({
+	type: "assistant",
+	uuid: `a-${id}`,
+	message: { id, content: [{ type: "text", text }] },
+});
+const user = (content: string) => ({ type: "user", uuid: `u-${content}`, message: { role: "user", content } });
+
+test.each([
+	["a later turn", [user("go")]],
+	["the first turn, before any of it is written", [{ type: "mode", mode: "default" }]],
+	["a later turn, before any of it is written", [user("earlier"), reply("msg_1", "earlier")]],
+])("readResult waits for a reply claude reported done before writing it: %s", async (_turn, before) => {
+	const { cwd, path } = transcript(before);
+	const block: Block = { name: "card-b", block: "block:b", label: SESSION, argv0: "claude", cwd, records: [] };
+	const fake = rex([block]);
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+	});
+	// claude reports done a moment after the file was last written, and writes the turn only after that.
+	const off = await turnOver(fake, port, block, new Date(Date.now() + 20).toISOString());
+	setTimeout(() => writeFileSync(path, line(user("go")) + line(reply("msg_2", "結果：完成")), { flag: "a" }), 150);
+
+	expect(await port.readResult("card-b")).toEqual({ id: "a-msg_2", text: "結果：完成" });
+	off();
+});
+
+test("readResult is the transcript's last record after replyMs when nothing was written since the turn ended", async () => {
+	const { cwd } = transcript([user("go"), reply("msg_1", "earlier")]);
+	const block: Block = { name: "card-c", block: "block:c", label: SESSION, argv0: "claude", cwd, records: [] };
+	const fake = rex([block]);
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+		replyMs: 150,
+	});
+	// claude reported the turn a minute after it last wrote the transcript.
+	const off = await turnOver(fake, port, block, new Date(Date.now() + 60_000).toISOString());
+
+	// The core holds this id already, so the turn it could not read is not recorded under the turn before's.
+	const asked = Date.now();
+	expect(await port.readResult("card-c")).toEqual({ id: "a-msg_1", text: "earlier" });
+	expect(Date.now() - asked).toBeGreaterThanOrEqual(140);
+	expect(Date.now() - asked).toBeLessThan(400);
+	off();
+});
+
+test("readResult names a turn that ended on the user by its last record after replyMs, without text", async () => {
+	const { cwd, path } = transcript([user("go"), reply("msg_1", "earlier")]);
+	const block: Block = { name: "card-g", block: "block:g", label: SESSION, argv0: "claude", cwd, records: [] };
+	const fake = rex([block]);
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+		replyMs: 150,
+	});
+	const off = await turnOver(fake, port, block, new Date(Date.now() + 20).toISOString());
+	// The human interrupts the turn: claude writes the prompt and the interruption, and no reply ever.
+	setTimeout(
+		() => writeFileSync(path, line(user("go2")) + line(user("[Request interrupted by user]")), { flag: "a" }),
+		50,
+	);
+
+	const asked = Date.now();
+	expect(await port.readResult("card-g")).toEqual({ id: "u-[Request interrupted by user]" });
+	expect(Date.now() - asked).toBeGreaterThanOrEqual(140);
+	expect(Date.now() - asked).toBeLessThan(400);
+	off();
+});
+
+test("readResult answers a re-stamp of the record that ended the turn with its reply at once", async () => {
+	// The turn ended a second ago, and claude wrote its reply since.
+	const ended = new Date(Date.now() - 1_000).toISOString();
+	const { cwd } = transcript([user("go"), reply("msg_1", "結果：需要你")]);
+	const block: Block = { name: "card-e", block: "block:e", label: SESSION, argv0: "claude", cwd, records: [] };
+	const fake = rex([block]);
+	const seen: AgentStatusEvent[] = [];
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+	});
+	const offTurn = await turnOver(fake, port, block, ended);
+	const off = port.onStatus((event) => seen.push(event));
+	expect(await port.readResult("card-e")).toEqual({ id: "a-msg_1", text: "結果：需要你" });
+
+	// rex re-stamps the done a minute on, with no working in between: no new turn, so nothing is waited for.
+	const restamp = { state: "done", updated_at: new Date(Date.now() + 59_000).toISOString() };
+	block.records = [restamp];
+	fake.emit(fake.status("block:e", restamp));
+	await until(() => seen.length > 0);
+	const asked = Date.now();
+	expect(await port.readResult("card-e")).toEqual({ id: "a-msg_1", text: "結果：需要你" });
+	expect(Date.now() - asked).toBeLessThan(500);
+	off();
+	offTurn();
+});
+
+test("readResult reads at once a turn whose start the watch never saw, as at the startup reconcile", async () => {
+	const { cwd } = transcript([reply("msg_1", "結果：完成")]);
+	// rex's record is a minute newer than the transcript, as after a re-stamp while soma was down.
+	const records = [{ state: "done", updated_at: new Date(Date.now() + 60_000).toISOString() }];
+	const fake = rex([{ name: "card-f", block: "block:f", label: SESSION, argv0: "claude", cwd, records }]);
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+	});
+	const ask = async () => {
+		const asked = Date.now();
+		expect(await port.readResult("card-f")).toEqual({ id: "a-msg_1", text: "結果：完成" });
+		expect(Date.now() - asked).toBeLessThan(500);
+	};
+
+	await ask();
+	// A watch that opened on the done saw no working before it.
+	const seen: AgentStatusEvent[] = [];
+	const off = port.onStatus((event) => seen.push(event));
+	await until(() => seen.length > 0);
+	await ask();
+	off();
+});
+
+test("readResult waits for the turn a resync read the end of, though the working came after it, not the turn before", async () => {
+	const { cwd, path } = transcript([user("go"), reply("msg_1", "one")]);
+	const block: Block = { name: "card-h", block: "block:h", label: SESSION, argv0: "claude", cwd, records: [] };
+	const fake = rex([block]);
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+	});
+	const seen: AgentStatusEvent[] = [];
+	const off = port.onStatus((event) => seen.push(event));
+	await settle();
+	const at = (ms: number) => new Date(Date.now() + ms).toISOString();
+	fake.emit(fake.status("block:h", { state: "working", updated_at: at(-3_000) }));
+	block.records = [{ state: "done", updated_at: at(-2_000) }];
+	fake.emit(fake.status("block:h", { state: "done", updated_at: at(-2_000) }));
+	await until(() => seen.at(-1)?.status.state === "done");
+
+	// Turn 2 starts and ends while the connection is down: the resync reads its done, and its working queues behind.
+	block.records = [{ state: "done", updated_at: at(20) }];
+	fake.reconnect();
+	fake.emit(fake.status("block:h", { state: "working", updated_at: at(-500) }));
+	await until(() => seen.length === 3);
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	expect(seen.map((event) => event.status.state)).toEqual(["working", "done", "done"]);
+	// claude writes turn 2 a moment after it reported it over.
+	setTimeout(() => writeFileSync(path, line(user("go2")) + line(reply("msg_2", "two")), { flag: "a" }), 150);
+
+	expect(await port.readResult("card-h")).toEqual({ id: "a-msg_2", text: "two" });
+	off();
+});
+
+test("readResult asked at a resync's done waits for the working queued behind a slow resync of another block", async () => {
+	const { cwd, path } = transcript([user("go"), reply("msg_1", "one")]);
+	const block: Block = { name: "card-y", block: "block:y", label: SESSION, argv0: "claude", cwd, records: [] };
+	// A block whose prompt never parses, so the resync reads its screen again and again.
+	const other: Block = { name: "card-x", block: "block:x", argv0: "claude", records: [], screen: "nothing" };
+	const fake = rex([block, other]);
+	const call = fake.client.call.bind(fake.client);
+	fake.client.call = async (method, payload, schema) => {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		return call(method, payload, schema);
+	};
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+		redrawMs: 200,
+	});
+	const seen: AgentStatusEvent[] = [];
+	let read: Promise<AgentResult | undefined> | undefined;
+	// As the bridge does: the read is asked for as the event arrives.
+	const off = port.onStatus((event) => {
+		if (event.agent !== "card-y") return;
+		seen.push(event);
+		if (seen.length === 3) read = port.readResult("card-y");
+	});
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	const at = (ms: number) => new Date(Date.now() + ms).toISOString();
+	fake.emit(fake.status("block:y", { state: "working", updated_at: at(-3_000) }));
+	block.records = [{ state: "done", updated_at: at(-2_000) }];
+	fake.emit(fake.status("block:y", { state: "done", updated_at: at(-2_000) }));
+	await until(() => seen.length === 2);
+
+	// Turn 2 starts and ends while the connection is down; the other block is blocked by then.
+	other.records = [{ state: "blocked", kind: "permission", msg: "approve", updated_at: at(-100) }];
+	block.records = [{ state: "done", updated_at: at(20) }];
+	fake.reconnect();
+	fake.emit(fake.status("block:y", { state: "working", updated_at: at(-500) }));
+	setTimeout(() => writeFileSync(path, line(user("go2")) + line(reply("msg_2", "two")), { flag: "a" }), 150);
+	await until(() => read !== undefined);
+
+	expect(await read).toEqual({ id: "a-msg_2", text: "two" });
+	off();
+});
+
+test("readResult does not wait for watch work queued after it was asked", async () => {
+	const { cwd } = transcript([user("go"), reply("msg_1", "one")]);
+	const block: Block = { name: "card-y", block: "block:y", label: SESSION, argv0: "claude", cwd, records: [] };
+	const other: Block = { name: "card-x", block: "block:x", argv0: "claude", records: [], screen: "nothing" };
+	const fake = rex([block, other]);
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+		redrawMs: 200,
+		replyMs: 300,
+	});
+	const seen: AgentStatusEvent[] = [];
+	const off = port.onStatus((event) => {
+		if (event.agent === "card-y") seen.push(event);
+	});
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	const at = (ms: number) => new Date(Date.now() + ms).toISOString();
+	fake.emit(fake.status("block:y", { state: "working", updated_at: at(-3_000) }));
+	block.records = [{ state: "done", updated_at: at(-2_000) }];
+	fake.emit(fake.status("block:y", { state: "done", updated_at: at(-2_000) }));
+	await until(() => seen.length === 2);
+
+	// The other block's prompt never parses, and rex re-sends its record faster than its screen is read three times.
+	let n = 0;
+	const report = () => {
+		const record = { state: "blocked", kind: "permission", msg: `approve ${n++}`, updated_at: at(0) };
+		other.records = [record];
+		fake.emit(fake.status("block:x", record));
+	};
+	report();
+	const busy = setInterval(report, 300);
+	try {
+		const asked = Date.now();
+		expect(await port.readResult("card-y")).toEqual({ id: "a-msg_1", text: "one" });
+		expect(Date.now() - asked).toBeLessThan(1_500);
+	} finally {
+		clearInterval(busy);
+		off();
+	}
+});
+
+test.each([
+	["a resync read across a gap that swallowed its working", "resync"],
+	["a done whose working the watch missed", "event"],
+] as const)("readResult reads at once, not against the turn before's end, %s", async (_case, how) => {
+	// The turn before ended on the user, so a read against its end would wait out replyMs.
+	const { cwd } = transcript([user("go"), user("[Request interrupted by user]")]);
+	const block: Block = { name: "card-i", block: "block:i", label: SESSION, argv0: "claude", cwd, records: [] };
+	const fake = rex([block]);
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+		replyMs: 300,
+	});
+	const off = await turnOver(fake, port, block, new Date(Date.now() - 1_000).toISOString());
+	const seen: AgentStatusEvent[] = [];
+	const offSeen = port.onStatus((event) => seen.push(event));
+	const done = { state: "done", updated_at: new Date(Date.now() + 60_000).toISOString() };
+	block.records = [done];
+	if (how === "resync") fake.reconnect();
+	else fake.emit(fake.status("block:i", done));
+	await until(() => seen.length > 0);
+
+	const asked = Date.now();
+	expect(await port.readResult("card-i")).toEqual({ id: "u-[Request interrupted by user]" });
+	expect(Date.now() - asked).toBeLessThan(150);
+	offSeen();
+	off();
+});
+
+test("readResult waits at most 2 s by default", async () => {
+	let clock = 0;
+	// A session no transcript was written for.
+	const label = "7a1d2c3b-0000-4000-8000-000000000000";
+	const block: Block = { name: "card-d", block: "block:d", label, argv0: "claude", cwd: "/nonexistent/none" };
+	const fake = rex([block]);
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+		// Each look at the clock is 400 ms on: no transcript is ever found, so the wait runs to its end.
+		now: () => (clock += 400),
+	});
+	const off = await turnOver(fake, port, block, AT);
+	clock = 0;
+
+	expect(await port.readResult("card-d")).toBeUndefined();
+	expect(clock).toBeGreaterThanOrEqual(2_000);
+	expect(clock).toBeLessThanOrEqual(400 + 2_000 + 400);
+	off();
 });
 
 test("stop closes the agent's block", async () => {

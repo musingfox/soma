@@ -6,6 +6,11 @@ import { z } from "zod";
 
 export const FETCH_MAX_CHARS = 20_000;
 export const WEB_TIMEOUT_MS = 15_000;
+/**
+ * Parsing is synchronous and outside the timeout, and its time grows faster than the page: dense 1 MB took 4.8 s, 512 KB
+ * 1.7 s. A 416 KB GitHub page lost its README when cut at 256 KB.
+ */
+export const FETCH_MAX_BYTES = 512 * 1024;
 export const SEARCH_DEFAULT_RESULTS = 5;
 export const SEARCH_MAX_RESULTS = 10;
 
@@ -24,6 +29,39 @@ const reasonOf = (error: unknown, timeoutMs: number) =>
 			? error.message
 			: String(error);
 
+/** At most `FETCH_MAX_BYTES` of the body, decoded in the charset the response names; `cut` when there was more. */
+async function readBody(response: Response): Promise<{ body: string; cut: boolean }> {
+	const chunks: Uint8Array[] = [];
+	let size = 0;
+	let ended = true;
+	const reader = response.body?.getReader();
+	while (reader) {
+		if (size >= FETCH_MAX_BYTES) {
+			ended = (await reader.read()).done;
+			break;
+		}
+		const { done, value } = await reader.read();
+		if (done) break;
+		chunks.push(value);
+		size += value.byteLength;
+	}
+	await reader?.cancel();
+	const bytes = new Uint8Array(size);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	const charset = /charset=([^;]+)/i.exec(response.headers.get("content-type") ?? "")?.[1]?.trim();
+	let decoder: TextDecoder;
+	try {
+		decoder = new TextDecoder(charset ?? "utf-8");
+	} catch {
+		decoder = new TextDecoder();
+	}
+	return { body: decoder.decode(bytes.subarray(0, FETCH_MAX_BYTES)), cut: !ended };
+}
+
 function cap(text: string): string {
 	if (text.length <= FETCH_MAX_CHARS) return text;
 	return `${text.slice(0, FETCH_MAX_CHARS)}\n\n[Cut at ${FETCH_MAX_CHARS} of ${text.length} characters.]`;
@@ -40,24 +78,32 @@ export async function fetchPage(
 	if (protocol !== "http:" && protocol !== "https:") return failure(`Only http and https URLs can be fetched: ${url}`);
 	let response: Response;
 	let body: string;
+	let cut: boolean;
 	try {
 		response = await fetchImpl(url, { signal: withTimeout(signal, timeoutMs) });
-		body = await response.text();
+		({ body, cut } = await readBody(response));
 	} catch (error) {
 		return failure(`Could not fetch ${url}: ${reasonOf(error, timeoutMs)}`);
 	}
 	if (!response.ok)
 		return failure(`${url} answered ${[response.status, response.statusText].filter(Boolean).join(" ")}.`);
 	const type = response.headers.get("content-type")?.split(";")[0]?.trim() ?? "";
+	if (body.trim() === "") return failure(`${url} answered with an empty page.`);
+	const note = cut ? `\n\n[Read only the first ${FETCH_MAX_BYTES / 1024} KB of the page.]` : "";
 	if (type.includes("html")) {
-		const { document } = parseHTML(body);
-		// Async extractors call third-party APIs that the timeout above does not cover.
-		const page = await Defuddle(document, url, { markdown: true, useAsync: false });
-		return { text: cap(`${page.title ? `# ${page.title}\n\n` : ""}${url}\n\n${page.content}`), isError: false };
+		try {
+			const { document } = parseHTML(body);
+			// Async extractors call third-party APIs that the timeout above does not cover.
+			const page = await Defuddle(document, url, { markdown: true, useAsync: false });
+			const text = `${page.title ? `# ${page.title}\n\n` : ""}${url}\n\n${page.content}`;
+			return { text: cap(text) + note, isError: false };
+		} catch {
+			return failure(`${url} could not be parsed as HTML.`);
+		}
 	}
-	if (type.startsWith("text/") || type.includes("json") || type.includes("xml") || type === "")
-		return { text: cap(`${url}\n\n${body}`), isError: false };
-	return failure(`${url} is ${type}, not a text page.`);
+	if (type.startsWith("text/") || type.includes("json") || type.includes("xml"))
+		return { text: cap(`${url}\n\n${body}`) + note, isError: false };
+	return failure(`${url} is ${type || "of no stated type"}, not a text page.`);
 }
 
 const ExaAnswer = z.object({
@@ -89,12 +135,12 @@ export async function search(
 			headers: { "content-type": "application/json", "x-api-key": key },
 			body: JSON.stringify({
 				query,
-				numResults: Math.min(limit ?? SEARCH_DEFAULT_RESULTS, SEARCH_MAX_RESULTS),
+				numResults: Math.min(Math.max(Math.trunc(limit ?? SEARCH_DEFAULT_RESULTS), 1), SEARCH_MAX_RESULTS),
 				contents: { highlights: true },
 			}),
 			signal: withTimeout(signal, timeoutMs),
 		});
-		body = await response.text();
+		({ body } = await readBody(response));
 	} catch (error) {
 		return failed(reasonOf(error, timeoutMs));
 	}

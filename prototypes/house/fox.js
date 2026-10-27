@@ -504,7 +504,7 @@ export function spring(x, v, target, omega, dt) {
 	return [target + (d + k * dt) * e, (v - omega * k * dt) * e];
 }
 
-const POSE_OMEGA = 13;
+const POSE_OMEGA = 26;
 
 /**
  * The fox's meshes and the pose logic that moves them, for a scene owned by

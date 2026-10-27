@@ -422,22 +422,22 @@ const BODY_POSES = {
 	worried: { hunch: 1, outL: -0.55, outR: -0.55, tail: 0.02, tailHz: 0.2 },
 	sleeping: { curl: 1, outL: 0, outR: 0, tail: 0, dim: 1 },
 };
-const BODY_OMEGA = { dim: 5 };
-const BODY_OMEGA_DEFAULT = 12;
+const BODY_OMEGA = { dim: 10 };
+const BODY_OMEGA_DEFAULT = 24;
 
 // Speeds at tempo 1. The debug panel's speed slider scales time: speeds by
 // the tempo, accelerations by its square, spring rates by it.
 const WALK = {
-	speed: 2.3,
-	pace: 1.0,
-	accel: 5,
-	decel: 2.8,
+	speed: 4.6,
+	pace: 2.0,
+	accel: 20,
+	decel: 11.2,
 	stride: 0.55,
 	arrive: 0.25,
-	land: 10,
-	turn: 11,
-	legs: 14,
-	pause: 0.5,
+	land: 20,
+	turn: 22,
+	legs: 28,
+	pause: 0.25,
 };
 // Turned toward its heading, but never edge-on: a card seen edge-on is a line.
 const HEADING_CAP = 0.7;
@@ -677,7 +677,7 @@ export function createHouse(container) {
 
 	function updateFacing(dt) {
 		const speed = Math.hypot(vel.x, vel.z);
-		if (speed > 0.12 * tempo && !landing) {
+		if (speed > 0.24 * tempo && !landing) {
 			let h = Math.atan2(vel.x, vel.z);
 			const a = Math.abs(h);
 			if (a > HEADING_CAP && a < Math.PI - BACK_VIEW) h = Math.sign(h) * HEADING_CAP;
@@ -687,7 +687,7 @@ export function createHouse(container) {
 		}
 		const goal = yaw.x + wrap(yaw.target - yaw.x);
 		[yaw.x, yaw.v] = spring(yaw.x, yaw.v, goal, WALK.turn * tempo, dt);
-		[walk.x, walk.v] = spring(walk.x, walk.v, reduced ? 0 : Math.min(1, speed / (0.5 * tempo)), WALK.legs * tempo, dt);
+		[walk.x, walk.v] = spring(walk.x, walk.v, reduced ? 0 : Math.min(1, speed / tempo), WALK.legs * tempo, dt);
 		walkPhase += (speed / WALK.stride) * Math.PI * dt;
 	}
 

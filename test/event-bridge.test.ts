@@ -257,6 +257,25 @@ test("a block resent after a restart is handled once, by its requestId", async (
 	expect(await second.job("card-a")).toMatchObject({ seq: 7, status: blocked, handedOver: {} });
 });
 
+test("an agent gone at a restart is told to the human once, however often soma restarts", async () => {
+	const db = await database();
+	await stop(await dispatched(db, new FakeAgentPort(), "card-a"));
+
+	for (let restart = 0; restart < 2; restart++) {
+		const soma = await core(db, new FakeAgentPort());
+		await reconcileDispatches(soma.root, new FakeAgentPort(), context);
+		await soma.settle();
+		expect(await soma.job("card-a")).toMatchObject({ status: { state: "error", msg: "agent is gone" } });
+		expect(await entriesOf(soma.root, NOTICE)).toMatchObject([{ data: { kind: "report" } }]);
+		// notified, so the digest does not report it a second time.
+		expect(await entriesOf(soma.root, JOB_DONE)).toMatchObject([
+			{ data: { agent: "card-a", state: "error", outcome: "失敗", notified: true } },
+		]);
+		expect(soma.calls()).toBe(0);
+		await stop(soma);
+	}
+});
+
 /** An agent side whose listings carry no seq, as herdr's do. */
 class SeqlessAgentPort extends FakeAgentPort {
 	override async list() {

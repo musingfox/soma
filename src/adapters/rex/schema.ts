@@ -88,4 +88,13 @@ export const BlockClosedResultSchema = z.object({ block_id: z.string() }).passth
 
 export const WriteResultSchema = z.object({ bytes_written: z.number() }).passthrough();
 
+/** `id` and `total` are set when the output was cut at `max_bytes`; `blob_read` reads the rest. */
+export const FormatResultSchema = z
+	.object({ content: z.string(), id: z.number().optional(), total: z.number().optional(), eof: z.boolean().optional() })
+	.passthrough();
+
+export const BlobReadResultSchema = z
+	.object({ id: z.number(), data: z.string(), total: z.number(), eof: z.boolean() })
+	.passthrough();
+
 export const EmptyResultSchema = z.object({}).passthrough();

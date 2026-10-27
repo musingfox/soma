@@ -447,15 +447,18 @@ test("readResult reads the last reply off the transcript of the session id the b
 	mkdirSync(join(projects, cwd.replace(/[^a-zA-Z0-9]/g, "-")), { recursive: true });
 	writeFileSync(
 		join(projects, cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${SESSION}.jsonl`),
-		`${JSON.stringify({ type: "assistant", message: { id: "msg_1", content: [{ type: "text", text: "結果：完成" }] } })}\n`,
+		`${JSON.stringify({ type: "assistant", uuid: "a-1", message: { id: "msg_1", content: [{ type: "text", text: "結果：完成" }] } })}\n`,
 	);
 	const fake = rex([{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude", cwd }]);
 
-	const result = await createRexAgentPort({ client: fake.client, sessionId: HANGAR, projectsDir: projects }).readResult(
-		"card-a",
-	);
+	const result = await createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+	}).readResult("card-a");
 
-	expect(result).toEqual({ id: "msg_1", text: "結果：完成" });
+	expect(result).toEqual({ id: "a-1", text: "結果：完成" });
 });
 
 test("stop closes the agent's block", async () => {

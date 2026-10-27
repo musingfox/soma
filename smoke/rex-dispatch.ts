@@ -26,7 +26,7 @@ import {
 	TERMINAL,
 	ViewSchema,
 } from "../src/adapters/rex/schema.ts";
-import { readFinalMessage, resolveTranscriptPath } from "../src/agent-cli/transcript.ts";
+import { readLastRecord, resolveTranscriptPath } from "../src/agent-cli/transcript.ts";
 import type { Job } from "../src/core/domain/dispatch.ts";
 import { outcomeOf } from "../src/core/domain/report.ts";
 import { delay, run } from "./driver.ts";
@@ -160,7 +160,7 @@ try {
 	);
 	const transcript = await resolveTranscriptPath(started.sessionId as string, foreground?.cwd);
 	check(transcript !== undefined, "no transcript for the session");
-	const reply = await readFinalMessage(transcript as string);
+	const reply = await readLastRecord(transcript as string);
 	check(reply !== undefined, "the transcript holds no reply");
 	check(reconciled.done.length === 1, `${reconciled.done.length} finished turns recorded`);
 	check(

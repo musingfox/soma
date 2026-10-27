@@ -156,17 +156,25 @@ describe("complete", () => {
 	});
 });
 
-describe("complete a reply without text", () => {
-	const idle = { job: { ...job({ state: "idle" }, 9), resultId: "msg_1" }, action: "complete" as const };
+describe("complete a transcript that ends without a reply", () => {
+	const idle = { job: { ...job({ state: "idle" }, 9), resultId: "u-1" }, action: "complete" as const };
 
-	test("is the same turn when its id was recorded", () => {
-		expect(complete(idle, { id: "msg_1", text: "" })).toEqual({ job: idle.job, action: "none" });
+	test("is the same turn when its last record was recorded", () => {
+		expect(complete(idle, { id: "u-1" })).toEqual({ job: idle.job, action: "none" });
 	});
 
-	test("is a turn of unknown outcome under a new id, as an unreadable reply", () => {
-		expect(complete(idle, { id: "msg_2", text: "" })).toEqual({
-			job: { ...idle.job, outcome: "未知", resultId: "msg_2" },
+	test("is a turn of unknown outcome under a new last record, which it stores", () => {
+		expect(complete(idle, { id: "u-2" })).toEqual({
+			job: { ...idle.job, outcome: "未知", resultId: "u-2" },
 			action: "complete",
 		});
+	});
+
+	test("after a turn with a reply is a new turn of unknown outcome", () => {
+		const replied = complete({ ...idle, job: job({ state: "done" }, 3) }, { id: "a-1", text: "結果：需要你" }).job;
+		expect(replied).toMatchObject({ outcome: "需要你", resultId: "a-1" });
+		const interrupted = complete({ job: { ...replied, seq: 4 }, action: "complete" }, { id: "u-2" });
+		expect(interrupted).toEqual({ job: { ...replied, seq: 4, outcome: "未知", resultId: "u-2" }, action: "complete" });
+		expect(complete({ job: { ...interrupted.job, seq: 5 }, action: "complete" }, { id: "u-2" }).action).toBe("none");
 	});
 });

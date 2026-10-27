@@ -65,6 +65,13 @@ function asAssistant(record: unknown): AssistantRecord | undefined {
 	return record as AssistantRecord;
 }
 
+function isConversation(record: unknown): boolean {
+	if (typeof record !== "object" || record === null) return false;
+	const fields = record as Record<string, unknown>;
+	if (SUPPRESSING_FLAGS.some((flag) => fields[flag] === true)) return false;
+	return fields.type === "user" || fields.type === "assistant";
+}
+
 /** Complete records in the window; a partial first line (the window began mid-record) is dropped. */
 function parseWindow(bytes: Buffer, startsAtRecord: boolean): unknown[] {
 	// 0x0A never occurs inside a multi-byte UTF-8 sequence, so cutting at it keeps characters whole.
@@ -81,29 +88,17 @@ function parseWindow(bytes: Buffer, startsAtRecord: boolean): unknown[] {
 	return records;
 }
 
-/** The text of the last assistant message; undefined when it has none. */
-export async function readFinalAnswer(path: string, firstWindowBytes = 64 * 1024): Promise<string | undefined> {
-	return (await lastMessage(path, firstWindowBytes))?.text || undefined;
-}
+const uuidOf = (record: unknown) => (record as { uuid?: unknown }).uuid;
 
-/**
- * The id and text of the last assistant message. A message without text still has its id, with
- * empty text, so the same turn is told from the next; one without an id is undefined.
- */
-export async function readFinalMessage(
+// What a window's reader returns when the window may have cut short what it looks for.
+const GROW = Symbol("grow");
+
+/** Reads `path` from its end in growing windows until `read` has what it looks for; `whole` says the window is the file. */
+async function windowed<T>(
 	path: string,
-	firstWindowBytes = 64 * 1024,
-): Promise<{ id: string; text: string } | undefined> {
-	const message = await lastMessage(path, firstWindowBytes);
-	return typeof message?.id === "string" ? { id: message.id, text: message.text } : undefined;
-}
-
-/**
- * claude writes one record per content block, all carrying the message's id, so the last
- * message is every trailing record with that id. The file is read from its end in growing
- * windows until one holds the message's first record.
- */
-async function lastMessage(path: string, firstWindowBytes: number): Promise<{ id: unknown; text: string } | undefined> {
+	firstWindowBytes: number,
+	read: (records: unknown[], whole: boolean) => T | typeof GROW,
+): Promise<T> {
 	const file = await open(path, "r");
 	try {
 		const { size } = await file.stat();
@@ -111,28 +106,84 @@ async function lastMessage(path: string, firstWindowBytes: number): Promise<{ id
 			const start = Math.max(0, size - window);
 			const bytes = Buffer.alloc(size - start);
 			await file.read(bytes, 0, bytes.length, start);
-			const assistants = parseWindow(bytes, start === 0).flatMap((record) => asAssistant(record) ?? []);
-			const last = assistants.at(-1);
-			if (last === undefined) {
-				if (start === 0) return undefined;
-				continue;
-			}
-			const id = last.message.id;
-			let first = assistants.length - 1;
-			while (typeof id === "string" && first > 0 && assistants[first - 1]?.message.id === id) first--;
-			// The window may have cut the message short unless an earlier message, or the file's start, bounds it.
-			if (first === 0 && start > 0) continue;
-			const blocks = assistants.slice(first).flatMap((record) => {
-				const content = record.message.content;
-				return Array.isArray(content) ? content : [];
-			});
-			const text = blocks
-				.filter((block) => block?.type === "text" && typeof block.text === "string")
-				.map((block) => block.text as string)
-				.join("\n");
-			return { id, text };
+			const result = read(parseWindow(bytes, start === 0), start === 0);
+			if (result !== GROW) return result;
 		}
 	} finally {
 		await file.close();
 	}
+}
+
+/**
+ * Whether the reply to the last turn is still unwritten: the conversation's last record is the user's, or the
+ * assistant's holding only thinking, or there is none yet. claude writes a turn's records in batches, the prompt's own
+ * included, one record per content block, and can report the turn over before the last batch is out, so a reply's
+ * thinking can be on disk before its text. The file is read from its end in growing windows, as an attachment can
+ * outgrow the first.
+ */
+export async function awaitingReply(path: string, firstWindowBytes = 64 * 1024): Promise<boolean> {
+	return windowed(path, firstWindowBytes, (records, whole) => {
+		const last = records.findLast(isConversation) as { type?: unknown; message?: { content?: unknown } } | undefined;
+		if (last !== undefined) return last.type === "user" || thinkingOnly(last.message?.content);
+		return whole ? true : GROW;
+	});
+}
+
+function thinkingOnly(content: unknown): boolean {
+	return (
+		Array.isArray(content) &&
+		content.length > 0 &&
+		content.every((block) => block?.type === "thinking" || block?.type === "redacted_thinking")
+	);
+}
+
+/** The text of the last assistant message; undefined when it has none. */
+export async function readFinalAnswer(path: string, firstWindowBytes = 64 * 1024): Promise<string | undefined> {
+	return (await windowed(path, firstWindowBytes, lastMessage))?.text || undefined;
+}
+
+/**
+ * What names a finished turn: `id` is the `uuid` of the conversation's last record that carries one, whoever wrote
+ * it, the user's prompt, a tool result or the assistant; `text` is the last assistant message's text, present only
+ * when that record is the assistant's and the message has text. claude also stamps a `uuid` on the `system` and
+ * `attachment` records it writes around a turn (turn_duration, stop_hook_summary), which are not the conversation:
+ * one written after the turn was read must not read as a new turn. Undefined when no record carries a `uuid`.
+ */
+export async function readLastRecord(
+	path: string,
+	firstWindowBytes = 64 * 1024,
+): Promise<{ id: string; text?: string } | undefined> {
+	return windowed(path, firstWindowBytes, (records, whole) => {
+		const last = records.filter(isConversation).findLast((record) => typeof uuidOf(record) === "string");
+		if (last === undefined) return whole ? undefined : GROW;
+		const id = uuidOf(last) as string;
+		if ((last as { type?: unknown }).type === "user") return { id };
+		const message = lastMessage(records, whole);
+		if (message === GROW) return GROW;
+		return message?.text ? { id, text: message.text } : { id };
+	});
+}
+
+/**
+ * claude writes one record per content block, all carrying the message's id, so the last
+ * message is every trailing record with that id. Unless an earlier message, or the file's
+ * start, bounds it, the window may have cut it short.
+ */
+function lastMessage(records: unknown[], whole: boolean): { id: unknown; text: string } | undefined | typeof GROW {
+	const assistants = records.flatMap((record) => asAssistant(record) ?? []);
+	const last = assistants.at(-1);
+	if (last === undefined) return whole ? undefined : GROW;
+	const id = last.message.id;
+	let first = assistants.length - 1;
+	while (typeof id === "string" && first > 0 && assistants[first - 1]?.message.id === id) first--;
+	if (first === 0 && !whole) return GROW;
+	const blocks = assistants.slice(first).flatMap((record) => {
+		const content = record.message.content;
+		return Array.isArray(content) ? content : [];
+	});
+	const text = blocks
+		.filter((block) => block?.type === "text" && typeof block.text === "string")
+		.map((block) => block.text as string)
+		.join("\n");
+	return { id, text };
 }

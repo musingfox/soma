@@ -56,14 +56,20 @@ export type AnswerRefusal = "not_blocked" | "stale" | "unknown_option" | "auth" 
 
 export type AnswerOutcome = { readonly sent: true } | { readonly sent: false; readonly refusal: AnswerRefusal };
 
-/** The agent's last reply: `id` names the message, so a turn re-reported is told from a new one. */
-export type AgentResult = { readonly id: string; readonly text: string };
+/**
+ * What the agent's transcript ends on. `id` names its last record that carries one, whoever wrote it: the user's
+ * prompt, a tool result or the assistant's reply. A finished turn re-reported reads the same id, so it is told from a
+ * new turn whether that turn ended on a reply or on the user, as an interrupted turn or a denied permission does.
+ * `text` is the final reply, present only when the transcript does not end awaiting one.
+ */
+export type AgentResult = { readonly id: string; readonly text?: string };
 
 export interface AgentPort {
 	start(request: StartRequest): Promise<void>;
 	list(): Promise<readonly AgentListing[]>;
 	prompt(agent: string, text: string): Promise<void>;
 	onStatus(listener: (event: AgentStatusEvent) => void): () => void;
+	// Undefined only when no transcript, or no record in it with an id, can be read.
 	readResult(agent: string): Promise<AgentResult | undefined>;
 	// Re-reads the screen before sending: a stored status is never trusted to still be on it.
 	respond(agent: string, answer: Answer): Promise<AnswerOutcome>;

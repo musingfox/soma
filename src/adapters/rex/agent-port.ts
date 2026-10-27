@@ -1,10 +1,10 @@
 import { constants } from "node:fs";
-import { copyFile } from "node:fs/promises";
+import { copyFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ZodType } from "zod";
 import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "../../agent-cli/hangar-cap.ts";
 import { answerKeys, type BlockedScreen, readBlockedScreen } from "../../agent-cli/permission/blocked-screen.ts";
-import { readLastRecord, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
+import { awaitingReply, readLastRecord, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
 import type {
 	AgentListing,
 	AgentPort,
@@ -52,6 +52,10 @@ export interface RexAgentPortOptions {
 	/** How long claude may be in the foreground without a record before its screen is read for the trust dialog. */
 	readonly trustMs?: number;
 	readonly processStart?: ProcessStart;
+	/** How long readResult waits for claude to write the reply to a turn it reported over. */
+	readonly replyMs?: number;
+	/** How long after a read that replyMs cut short the block's end is reported again, so the core reads it once more. */
+	readonly recheckMs?: number;
 	/** Pause between reads of a blocked screen that did not parse yet; claude may still be drawing it. */
 	readonly redrawMs?: number;
 	readonly now?: () => number;
@@ -146,6 +150,8 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	const trustMs = options.trustMs ?? 3_000;
 	const processStart = options.processStart ?? readProcessStart;
 	const now = options.now ?? Date.now;
+	const replyMs = options.replyMs ?? 2_000;
+	const recheckMs = options.recheckMs ?? 10_000;
 	const redrawMs = options.redrawMs ?? 500;
 	const onError = options.onError ?? ((error: Error) => console.warn(`[rex] ${error.message}`));
 	const cap = options.cap ?? resolveHangarCapWithSource(undefined, readPerfCoresViaSysctl).cap;
@@ -154,6 +160,29 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 
 	const blockCall = <T>(method: string, blockId: string, schema: ZodType<T>, args = {}) =>
 		client.call(`${TERMINAL}.${method}`, { session_id: sessionId, block_id: blockId, args }, schema);
+
+	// By block, the seq of the done, idle or error the watch last reported, when it saw a working before it: when the
+	// turn readResult waits for ended. Absent when the watch cannot tell that report ended a turn: a re-stamp of an end,
+	// a report after a working the watch missed, or one a resync read across a gap. `turning`: a working seen, not ended.
+	const turnEnded = new Map<string, number>();
+	const turning = new Set<string>();
+	function track(blockId: string, status: AgentState, seq: number): void {
+		if (status.state === "working") turning.add(blockId);
+		else if (status.state === "blocked") return;
+		else if (turning.delete(blockId)) turnEnded.set(blockId, seq);
+		else turnEnded.delete(blockId);
+	}
+	/** A working that arrived after the watch reported `last`, a later record a resync read, which it came before. */
+	function overtaken(blockId: string, last: { readonly state: AgentState["state"]; readonly seq: number }): void {
+		if (last.state === "working" || last.state === "blocked") turning.add(blockId);
+		else turnEnded.set(blockId, last.seq);
+	}
+	// The watch's work, one at a time, so a slow lookup is never overtaken by the block's next report. readResult awaits
+	// the tail it finds, so a working queued behind the report it was asked at is tracked before turnEnded is read;
+	// work queued after that is not waited for, so a block reporting without pause cannot hold the read.
+	let queue = Promise.resolve();
+	// Set while the watch runs: schedules the re-check of a block whose read replyMs cut short.
+	let recheck: ((blockId: string) => void) | undefined;
 
 	/** Every pane of the hangar, by window name; a name can be on more than one window. */
 	async function panes(): Promise<Map<string, Pane[]>> {
@@ -336,6 +365,14 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		const recorded = new Set<string>();
 		// Blocks whose last emitted status was read off the screen, under a seq of the adapter's clock.
 		const synthesized = new Set<string>();
+		// By block, the state and seq of the last record emitted, and the seq emitted before it.
+		const reported = new Map<
+			string,
+			{ readonly state: AgentState["state"]; readonly seq: number; readonly before: number }
+		>();
+		// By block, the token of the re-check pending since a read was cut short, while no working or blocked was reported
+		// since; a newer read cut short replaces it.
+		const quiet = new Map<string, object>();
 		async function refresh(): Promise<Map<string, string | null>> {
 			const fresh = new Map<string, string | null>();
 			for (const [name, list] of await panes()) {
@@ -360,10 +397,21 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			// read past, whose event queued behind it; but a record rex stamped is never older than a dialog read off the
 			// screen under the adapter's clock.
 			const last = lastSeq.get(blockId);
-			if (last !== undefined && seq <= last && (synthetic || !synthesized.has(blockId))) return;
+			if (last !== undefined && seq <= last && (synthetic || !synthesized.has(blockId))) {
+				// Such a working still says a turn began after the report before the one the resync read.
+				const read = reported.get(blockId);
+				if (status.state === "working" && read !== undefined && seq > read.before) overtaken(blockId, read);
+				return;
+			}
 			lastSeq.set(blockId, seq);
 			if (synthetic) synthesized.add(blockId);
-			else synthesized.delete(blockId);
+			else {
+				synthesized.delete(blockId);
+				track(blockId, status, seq);
+				reported.set(blockId, { state: status.state, seq, before: last ?? Number.NEGATIVE_INFINITY });
+			}
+			// The block went on to work or to a prompt: the turn the re-check was for is over, and was reported.
+			if (status.state === "working" || status.state === "blocked") quiet.delete(blockId);
 			emit({ agent: name, status, seq });
 		}
 
@@ -379,8 +427,6 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			report(blockId, name, seen.status, last === undefined ? seen.seq : Math.max(now() * 1000, last + 1), true);
 		}
 
-		// One at a time, so a slow lookup is never overtaken by the block's next report.
-		let queue = Promise.resolve();
 		const enqueue = (work: () => Promise<void>) => {
 			queue = queue.then(work).catch((error: Error) => onError(error));
 		};
@@ -389,6 +435,43 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 				const fresh = await refresh();
 				await Promise.all([...fresh].map(([blockId, name]) => look(blockId, name)));
 			});
+
+		// By block, the timer of the one re-check pending.
+		const rechecks = new Map<string, NodeJS.Timeout>();
+		let closed = false;
+		/**
+		 * Reports the block's root record again, above the last seq emitted for it, when the watch reported no working and
+		 * no blocked for it since the read that was cut short (`token`), and the block is still in the hangar with claude
+		 * in the foreground and a done, idle or error on record, whatever its updated_at: a done that settled into idle
+		 * is the usual end of a turn. It goes through track with no working seen, so the core reads the transcript at
+		 * once. A block that went on to work or to a prompt gets nothing: the watch reported that turn's end already.
+		 */
+		async function again(blockId: string, token: object): Promise<void> {
+			if (closed || quiet.get(blockId) !== token) return;
+			quiet.delete(blockId);
+			const last = lastSeq.get(blockId);
+			const known = names?.has(blockId) ? names : await refresh();
+			if (last === undefined || !known.has(blockId)) return;
+			const [{ records }, claude] = await Promise.all([
+				blockCall("program_status", blockId, ProgramStatusResultSchema),
+				isClaude(blockId),
+			]);
+			const root = records.find(isRoot);
+			const status = root && stateOf(root);
+			if (!claude || status === undefined || status.state === "working" || status.state === "blocked") return;
+			report(blockId, known.get(blockId), status, last + 1);
+		}
+		recheck = (blockId) => {
+			clearTimeout(rechecks.get(blockId));
+			const token = {};
+			quiet.set(blockId, token);
+			const timer = setTimeout(() => {
+				rechecks.delete(blockId);
+				enqueue(() => again(blockId, token));
+			}, recheckMs);
+			timer.unref();
+			rechecks.set(blockId, timer);
+		};
 
 		// claude draws the trust dialog without reporting anything, so a block without a record is looked at again.
 		let checking = false;
@@ -430,6 +513,9 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		const offConnected = client.onConnected(resync);
 		void client.attach(sessionId).then(resync, (error: Error) => onError(error));
 		return () => {
+			closed = true;
+			for (const timer of rechecks.values()) clearTimeout(timer);
+			recheck = undefined;
 			clearInterval(trustCheck);
 			offEvent();
 			offConnected();
@@ -524,13 +610,40 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			};
 		},
 
-		/** What the agent's claude transcript ends on (`readLastRecord`); undefined while there is no transcript. */
+		/**
+		 * What the agent's claude transcript ends on (`readLastRecord`); undefined while there is none. rex passes
+		 * claude's report on at once, and claude writes the turn's records only after it reported the turn over, so the
+		 * transcript is read once it was written at or after the time the watch saw the block's last turn end and does
+		 * not end awaiting the reply (`awaitingReply`). When replyMs passes first, it is read as it then is: a turn that
+		 * ended on the user, as an interrupted one does, never gets a reply, and its last record names it as well; a turn
+		 * claude wrote just before rex stamped its end is read whole; a turn not yet written, or only part written, reads
+		 * as the turn before or as its prompt. Such a read schedules a re-check of the block recheckMs later (`again`),
+		 * which reports its end once more, so the turn written since is read and recorded. Without a turn end the watch
+		 * saw (`track`), as at the startup reconcile, for a re-stamp of an end, or after a working the watch missed, it
+		 * is read at once, so a re-stamp reads the last record the core already holds.
+		 */
 		async readResult(agent: string): Promise<AgentResult | undefined> {
 			const { blockId, label } = only(await panes(), agent);
 			if (label === undefined || !SESSION_ID.test(label)) return undefined;
 			const { foreground, child } = await blockCall("process", blockId, ProcessResultSchema);
-			const path = await resolveTranscriptPath(label, foreground?.cwd ?? child?.cwd, options.projectsDir);
-			return path === undefined ? undefined : readLastRecord(path);
+			const cwd = foreground?.cwd ?? child?.cwd;
+			// Taken after the watch's work queued so far, so a working queued behind the resync that reported this turn's end
+			// is tracked; the client's one connection queued it before rex answered the calls above.
+			await queue;
+			const ended = turnEnded.get(blockId);
+			for (const deadline = now() + replyMs; ; ) {
+				const path = await resolveTranscriptPath(label, cwd, options.projectsDir);
+				if (ended === undefined) return path === undefined ? undefined : readLastRecord(path);
+				const written = path !== undefined && (await stat(path)).mtimeMs >= ended / 1000;
+				if (written && !(await awaitingReply(path))) return readLastRecord(path);
+				const left = deadline - now();
+				if (left <= 0) {
+					// The turn may be written yet: the watch reports its end again later, and the core reads it then.
+					recheck?.(blockId);
+					return path === undefined ? undefined : readLastRecord(path);
+				}
+				await new Promise((resolve) => setTimeout(resolve, Math.min(100, left)));
+			}
 		},
 
 		// As herdr's: fresh status, fresh screen, then the keys read off that screen.

@@ -102,13 +102,14 @@ const root = await harness.root(context, {
 harness.resume();
 await digests.startDigest(root, DIGEST_PERIOD_MS, context);
 if (config.reflection) await reflections.startReflection(root, REFLECTION_PERIOD_MS, context);
-await reconcileDispatches(root, agents, context);
-const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
-
+// Telegram subscribes before the reconcile, which may tell the human of an agent gone while soma was down: the
+// HumanPort passes on only the notices appended after it began to watch.
 const human = await openHumanPort(harness, root, agents, context);
 const { telegram } = config;
 const stopTelegram = new AbortController();
 const telegramDone = telegram && runTelegram({ ...telegram, human, signal: stopTelegram.signal });
+await reconcileDispatches(root, agents, context);
+const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 const shutdown = () => {
 	unlisten();
 	stopTelegram.abort();

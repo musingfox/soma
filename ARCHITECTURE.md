@@ -70,7 +70,7 @@ soma 是一個個人助理核心：它接收各種介面傳來的話，調派本
 | 事件橋 | 主機端程式碼，不是 LLM | 見下節 |
 | 排程 | tool + 背景任務 | `schedule(at, instruction)` 建一個睡到 `at` 的背景任務，時間到送一則 input（`requestId: schedule:<id>`）；定時彙報是它的一個固定實例。見「定時彙報」 |
 | 記憶 | section + document + tool | 移植 shikigami 的設計，見下節 |
-| 外部工具 | pi-mcp 轉接層 | email、行事曆等能力以 MCP server 接入，核心不為任何一種服務寫專用碼。見「助理基本能力」 |
+| 外部工具 | pi-mcp 轉接層 | email、行事曆等能力以 MCP server 接入，核心不為任何一種服務寫專用碼。Exception (2026-10-27): read-only tools whose output soma must shape, such as web search, may be core extensions; see「已決事項」. 見「助理基本能力」 |
 
 ### 根對話的壓縮
 
@@ -145,6 +145,7 @@ soma 除了調派 agent，本身也要有助理的基本能力：讀 email、看
 
 - **排程。** 「指定時間處理工作」和定時彙報用同一個機制：模型呼叫 `schedule` 工具，核心建一個背景任務睡到指定時間，到時把指令當成一則 input 送回根對話。等待期間不佔 session、不花 token；週期任務靠每輪推進 checkpoint。排程清單存在 document 裡，模型可以列出和取消。
 - **email 與行事曆。** 經 pi-mcp 轉接層接 MCP server，soma 只負責把 MCP 工具掛進 harness。Gmail 與 Google Calendar 用 workspace-mcp，憑證放在 repo 外的 `~/.config/soma/`（待決事項 5 的決定）。對模型來說，這些和派工工具一樣都是工具，差別只在它們不可重跑（寄信不能 replay）。
+- **Web search and page fetch.** Two core extension tools, `web_search` (Exa) and `web_fetch` (Defuddle), under the read-only exception decided on 2026-10-27 (see「已決事項」).
 - **記憶。** 見下節。因為報告和排程都會用到，記憶要提前到 M2。
 
 ### 記憶：移植 shikigami 的設計
@@ -412,6 +413,13 @@ soma 啟動時讀一次設定檔：環境變數 `SOMA_CONFIG` 指定的檔案，
 Decided 2026-10-27:
 
 - **A completion is identified by the transcript's last record, not by timing.** A turn whose transcript ends on a user record recorded a new 未知 turn at every re-stamp, and two adapter-level fixes that told a re-stamp from a new turn by timing both left holes. So the contract changed instead: `AgentResult` is `{ id, text? }`, `id` the `uuid` of the transcript's last record, whoever wrote it (see「事件橋」, M5-2d).
+- **Web search and page fetch are two read-only core extension tools, not MCP servers.** Decided with the human for the `web-search` card. The rule that external capabilities come in through pi-mcp (「核心的組成」, 外部工具) gets one exception: a tool that only reads, has no side effects, and whose output soma must shape may be a core extension, with the provider's details kept inside that extension.
+  - **Search** is `web_search`, which POSTs to Exa's `/search` with `contents.highlights` and returns title, URL, date and highlights per result ([Exa highlights](https://exa.ai/docs/search/highlights), [Exa search quickstart](https://exa.ai/docs/search/quickstart)). The tool name and output carry no Exa vocabulary, so another provider can sit behind it later. Rejected: Exa's MCP server over stdio with `ENABLED_TOOLS=web_search_exa` ([exa-mcp-server README](https://github.com/exa-labs/exa-mcp-server/blob/main/README.md)); it needs no code, but Exa names and shapes the tool, the MCP adapter forces `replay: "unsafe"`, and prod gains an `npx` child process.
+  - **Fetch** is `web_fetch`: Node's `fetch` gets the HTML, linkedom parses it, and `Defuddle(document, url, { markdown: true })` from `defuddle/node` returns the main content as markdown ([Defuddle README](https://github.com/kepano/defuddle/blob/main/README.md), Node.js section). Only `http` and `https` URLs. Rejected: the `defuddle` CLI as a child process, which starts a process per call and must be on prod's PATH.
+  - **Credentials.** The Exa key is `exa.apiKey` in soma's config file, as `anthropic.apiKey` is, and the chmod 600 warning (`src/config.ts:113`) extends to it; `EXA_API_KEY` overrides it. Without a key, `web_search` is not registered and soma starts normally. The key never appears in tool output or logs.
+  - **Limits.** `web_search` returns 5 results by default and at most 10. `web_fetch` cuts the markdown at 20,000 characters and says it did. Both time out after 15 s. Every failure is an `isError` result the model can read, as the MCP adapter's are.
+  - **Replay is `safe` for both.** pi-durable reruns a call after a crash only when it is declared safe (`node_modules/@earendil-works/pi-durable/README.md:181`), and a read has nothing to repeat.
+  - **No deferred tools yet.** soma defines 18 tools of its own; two more do not change the plan in「外部依賴」(MCP) to defer tools and install `createToolSearchExtension()` once shikigami-bridge's tools arrive.
 
 ## 待決事項
 

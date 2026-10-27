@@ -1,10 +1,12 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { BlockList, isIP } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type AuthContext, defaultProviderAuthContext } from "@earendil-works/pi-ai";
 import { z } from "zod";
 import { defaultRexSocket } from "./adapters/rex/client.ts";
 import type { TelegramConfig } from "./adapters/telegram/index.ts";
+import type { WebConfig } from "./adapters/web/index.ts";
 
 /** The canonical form of a BCP 47 language tag, or undefined when it is not one. */
 function canonicalLanguage(tag: string): string | undefined {
@@ -56,6 +58,10 @@ const FileConfig = z
 			.object({ botToken: z.string().min(1), chatId: z.number().int().safe(), apiBase: z.string().url() })
 			.partial()
 			.strict(),
+		web: z
+			.object({ host: z.string().min(1), port: z.number().int().min(1).max(65535) })
+			.partial()
+			.strict(),
 	})
 	.partial()
 	.strict();
@@ -82,6 +88,8 @@ export interface Config {
 	readonly exaApiKey?: string;
 	/** Set only when both a bot token and a chat id are. */
 	readonly telegram?: TelegramConfig;
+	/** Set only when both a host and a port are; the host is a tailnet address. */
+	readonly web?: WebConfig;
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -91,6 +99,18 @@ export class ConfigError extends Error {}
 /** Unset, it is prod's file: launchd's soma and a plain `node src/main.ts` read the same one. */
 export function configPath(env: Env, home: string): string {
 	return env.SOMA_CONFIG?.trim() || join(home, ".config/soma/config.json");
+}
+
+// Tailscale gives each node an address in 100.64.0.0/10 and one in fd7a:115c:a1e0::/48:
+// https://tailscale.com/kb/1015/100.x-addresses and https://tailscale.com/kb/1033/ip-and-dns-addresses
+const tailnet = new BlockList();
+tailnet.addSubnet("100.64.0.0", 10, "ipv4");
+tailnet.addSubnet("fd7a:115c:a1e0::", 48, "ipv6");
+
+/** Whether `host` is a single tailnet address: the page has no login, so it is never served anywhere else. */
+export function isTailnetAddress(host: string): boolean {
+	const family = isIP(host);
+	return family !== 0 && tailnet.check(host, family === 4 ? "ipv4" : "ipv6");
 }
 
 /** `value` parsed, else a ConfigError naming the config path and each field at fault, under `prefix`. */
@@ -151,6 +171,18 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 			"an integer",
 		) ?? file?.telegram?.chatId;
 	const apiBase = fromEnv("TELEGRAM_API_BASE") ?? file?.telegram?.apiBase ?? "https://api.telegram.org";
+	const webHost = fromEnv("SOMA_WEB_HOST") ?? file?.web?.host;
+	const webPort =
+		parseEnv(
+			"SOMA_WEB_PORT",
+			(v) => (/^[1-9][0-9]*$/.test(v) && Number(v) <= 65535 ? Number(v) : undefined),
+			"a port from 1 to 65535",
+		) ?? file?.web?.port;
+	if (webHost !== undefined && !isTailnetAddress(webHost)) {
+		throw new ConfigError(
+			`${path}: web.host: Expected one tailnet IP address (100.64.0.0/10 or fd7a:115c:a1e0::/48, see tailscale ip), got "${webHost}"`,
+		);
+	}
 	const agentAdapter =
 		parseEnv(
 			"SOMA_AGENT_ADAPTER",
@@ -181,6 +213,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		...(anthropicApiKey !== undefined && { anthropicApiKey }),
 		...(exaApiKey !== undefined && { exaApiKey }),
 		...(token !== undefined && chatId !== undefined && { telegram: { token, chatId, apiBase } }),
+		...(webHost !== undefined && webPort !== undefined && { web: { host: webHost, port: webPort } }),
 	};
 }
 

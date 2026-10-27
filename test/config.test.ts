@@ -119,6 +119,22 @@ const fields = [
 		values: ["http://env", "http://file", "https://api.telegram.org"],
 	},
 	{
+		name: "web.host",
+		env: ["SOMA_WEB_HOST", "100.88.181.24"],
+		file: { web: { host: "fd7a:115c:a1e0::1" } },
+		base: { env: { SOMA_WEB_PORT: "8790" } },
+		read: (c) => c.web?.host,
+		values: ["100.88.181.24", "fd7a:115c:a1e0::1", undefined],
+	},
+	{
+		name: "web.port",
+		env: ["SOMA_WEB_PORT", "8791"],
+		file: { web: { port: 8790 } },
+		base: { env: { SOMA_WEB_HOST: "100.88.181.24" } },
+		read: (c) => c.web?.port,
+		values: [8791, 8790, undefined],
+	},
+	{
 		name: "exa.apiKey",
 		env: ["EXA_API_KEY", "env-key"],
 		file: { exa: { apiKey: "file-key" } },
@@ -209,6 +225,37 @@ describe("Telegram", () => {
 	});
 });
 
+describe("the web page", () => {
+	test("is on only with both a host and a port, from either source", () => {
+		expect(resolveConfig(undefined, { SOMA_WEB_HOST: "100.88.181.24" }, HOME).web).toBeUndefined();
+		expect(resolveConfig({ web: { port: 8790 } }, {}, HOME).web).toBeUndefined();
+		expect(resolveConfig({ web: { port: 8790 } }, { SOMA_WEB_HOST: "100.88.181.24" }, HOME).web).toEqual({
+			host: "100.88.181.24",
+			port: 8790,
+		});
+	});
+	test.each([
+		"0.0.0.0",
+		"::",
+		"127.0.0.1",
+		"192.168.1.10",
+		"100.63.255.255",
+		"100.128.0.1",
+		"fd7a:115c:a1e1::1",
+		"localhost",
+		"my-mac.tail1234.ts.net",
+	])("refuses %s, which is not one tailnet address", (host) => {
+		expect(() => resolveConfig({ web: { host, port: 8790 } }, {}, HOME, "/c.json")).toThrow(
+			new ConfigError(`/c.json: web.host: Expected one tailnet IP address`).message,
+		);
+		expect(() => resolveConfig(undefined, { SOMA_WEB_HOST: host }, HOME)).toThrow(ConfigError);
+	});
+	test("a port out of range in the file throws with the field", () => {
+		const path = write(JSON.stringify({ web: { host: "100.88.181.24", port: 70000 } }));
+		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: web.port:`);
+	});
+});
+
 describe("invalid environment variables", () => {
 	test.each([
 		["SOMA_HANGAR_CAP", "0"],
@@ -218,6 +265,8 @@ describe("invalid environment variables", () => {
 		["TELEGRAM_CHAT_ID", "me"],
 		["SOMA_LANGUAGE", "繁體中文"],
 		["SOMA_AGENT_ADAPTER", "tmux"],
+		["SOMA_WEB_PORT", "0"],
+		["SOMA_WEB_PORT", "65536"],
 	])("%s=%s throws naming the variable", (name, value) => {
 		expect(() => resolveConfig(undefined, { [name]: value }, HOME)).toThrow(new ConfigError(`${name} must be`).message);
 	});

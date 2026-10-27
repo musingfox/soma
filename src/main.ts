@@ -12,6 +12,7 @@ import { runTelegram } from "./adapters/telegram/index.ts";
 import { runTerminal } from "./adapters/terminal/index.ts";
 import { createTtyAgentPort } from "./adapters/tty/agent-port.ts";
 import { spawnPty } from "./adapters/tty/pty.ts";
+import { startWeb } from "./adapters/web/index.ts";
 import { anthropicAuthContext, type Config, ConfigError, configPath, loadConfig } from "./config.ts";
 import { clock } from "./core/extensions/clock/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
@@ -125,10 +126,24 @@ const unlisten = eventBridge(root, agents, context).listen((error) => console.er
 const { telegram } = config;
 const stopTelegram = new AbortController();
 const telegramDone = telegram && runTelegram({ ...telegram, human, signal: stopTelegram.signal });
+// Each open page subscribes on its own, so the web takes none of the notices held for the first subscriber. A page
+// that cannot listen (the tailnet address is down, the port taken) leaves soma running without it, as Telegram stays.
+const webPage =
+	config.web &&
+	(await startWeb({ ...config.web, human }).then(
+		(server) => {
+			console.error(`[soma] web page on http://${config.web?.host}:${server.port}/`);
+			return server;
+		},
+		(error: unknown) => {
+			console.error("[soma] web page not served:", error);
+			return undefined;
+		},
+	));
 const shutdown = () => {
 	unlisten();
 	stopTelegram.abort();
-	void Promise.resolve(telegramDone)
+	void Promise.all([telegramDone, webPage?.close()])
 		.then(() => human.close())
 		.then(() => harness.close(context))
 		.then(() => Promise.all(mcpClients.map(({ client }) => client.close())))
@@ -137,5 +152,5 @@ const shutdown = () => {
 };
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, shutdown);
 await runTerminal({ human, input: process.stdin, output: process.stdout, programStatus: config.programStatus });
-// With Telegram on, soma also runs without a terminal (stdin at EOF under launchd) until a signal stops it.
-if (telegram === undefined) shutdown();
+// With Telegram or the web on, soma also runs without a terminal (stdin at EOF under launchd) until a signal stops it.
+if (telegram === undefined && webPage === undefined) shutdown();

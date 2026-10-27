@@ -3,8 +3,14 @@ import { copyFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ZodType } from "zod";
 import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "../../agent-cli/hangar-cap.ts";
-import { answerKeys, type BlockedScreen, readBlockedScreen } from "../../agent-cli/permission/blocked-screen.ts";
+import {
+	answerKeys,
+	type BlockedScreen,
+	isTrustDialog,
+	readBlockedScreen,
+} from "../../agent-cli/permission/blocked-screen.ts";
 import { awaitingReply, readLastRecord, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
+import { type Git, mainCheckout, openWorktree, runGit } from "../../agent-cli/worktree.ts";
 import type {
 	AgentListing,
 	AgentPort,
@@ -35,7 +41,6 @@ import {
 	ViewSchema,
 	WriteResultSchema,
 } from "./schema.ts";
-import { type Git, mainCheckout, openWorktree, runGit } from "./worktree.ts";
 
 export interface RexAgentPortOptions {
 	readonly client: RexClient;
@@ -78,11 +83,6 @@ const isRoot = (record: StatusRecord) => record.id === undefined || record.id ==
 const SCREEN_BYTES = 65_536;
 // Reads of a blocked record's screen, redrawMs apart, before it is taken not to parse.
 const BLOCKED_READS = 3;
-
-/** claude's folder-trust dialog, which it draws before it reports any status (ARCHITECTURE.md「rex 的實作」). */
-export const isTrustDialog = (screen: BlockedScreen) =>
-	screen.kind === "permission" &&
-	screen.prompt?.options.some((option) => /trust this folder/i.test(option.label)) === true;
 
 // rex's key event is client.key's `key` object, as a keyboard reports it; block.event takes it under type `key`.
 const NAMED_KEYS: Record<string, { key: string; text: string }> = {

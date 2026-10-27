@@ -1,4 +1,4 @@
-// rex has no worktree methods, so the adapter runs git itself (ARCHITECTURE.md「rex 的實作」).
+// rex and the native tty have no worktree methods, so their adapters run git themselves (ARCHITECTURE.md「rex 的實作」).
 import { execFile } from "node:child_process";
 import { join } from "node:path";
 

@@ -325,6 +325,7 @@ soma 啟動時讀一次設定檔：環境變數 `SOMA_CONFIG` 指定的檔案，
   "repo": "/Users/me/workspace/soma",
   "reflection": true,
   "anthropic": { "apiKey": "sk-ant-..." },
+  "exa": { "apiKey": "..." },
   "telegram": { "botToken": "123456:ABC...", "chatId": 123456789 }
 }
 ```

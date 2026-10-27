@@ -263,7 +263,12 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 			const record = stateOf(pairs);
 			if (record === undefined) return true;
 			agent.record = record;
-			enqueue(agent, async () => emit(agent, await statusOf(agent, record)));
+			enqueue(agent, async () => {
+				const status = await statusOf(agent, record);
+				// A block whose screen read saw a later report is over; that report follows in the queue.
+				if (record.state === "blocked" && agent.record !== record) return;
+				emit(agent, status);
+			});
 			return true;
 		});
 		// The emulator answers the terminal's other queries, such as the cursor position, itself.
@@ -344,6 +349,7 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 
 		async prompt(agent: string, text: string): Promise<void> {
 			const target = only(agent);
+			if (target.exited) throw new Error(`tty agent ${agent} has exited: a prompt would go nowhere`);
 			const state = target.record?.state;
 			// Typed into a prompt, the text's `\r` would choose the highlighted option.
 			if (state !== "idle" && state !== "done") {
@@ -370,7 +376,9 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 		 * does not end awaiting the reply, or as it is when replyMs passes first, with the end reported again later.
 		 */
 		async readResult(agent: string): Promise<AgentResult | undefined> {
-			const target = only(agent);
+			// An agent a restart lost has no transcript this process can name.
+			const target = agents.get(agent);
+			if (target === undefined) return undefined;
 			await target.queue;
 			const ended = target.turnEnded;
 			for (const deadline = now() + replyMs; ; ) {
@@ -387,10 +395,10 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 		},
 
 		async respond(agent: string, answer: Answer): Promise<AnswerOutcome> {
-			const target = only(agent);
-			const record = target.record;
-			// Without a record, the trust dialog is the one block claude can be in.
-			if (target.exited || (record !== undefined && record.state !== "blocked")) {
+			const target = agents.get(agent);
+			const record = target?.record;
+			// Without a record, the trust dialog is the one block claude can be in. An agent a restart lost waits on nothing.
+			if (target === undefined || target.exited || (record !== undefined && record.state !== "blocked")) {
 				return { sent: false, refusal: "not_blocked" };
 			}
 			const screen = await readScreen(target);

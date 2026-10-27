@@ -226,3 +226,32 @@ test("claude exiting is an error, listed until the name is started again or stop
 	expect(again.killed).toBe(true);
 	expect(await port.list()).toEqual([]);
 });
+
+test("an agent a restart lost has no result and waits on nothing", async () => {
+	const { port } = harness();
+	expect(await port.readResult("card-a")).toBeUndefined();
+	expect(await port.respond("card-a", { option: "1", fingerprint: "fp" })).toEqual({
+		sent: false,
+		refusal: "not_blocked",
+	});
+});
+
+test("an exited agent takes no prompt", async () => {
+	const { port, ptys } = harness();
+	const pty = await started(port, ptys);
+	pty.out(report("state=idle"));
+	pty.exit(0);
+	await settle();
+	await expect(port.prompt("card-a", "hi")).rejects.toThrow(/has exited/);
+	expect(pty.written.filter((data) => !data.startsWith("\x1b]"))).toEqual([]);
+});
+
+test("a block whose screen moved on before it was read is not reported", async () => {
+	const { port, ptys, events } = harness();
+	const pty = await started(port, ptys);
+	pty.out(herdrFixture("blocked-bash-prompt.txt"));
+	pty.out(report("state=blocked:kind=permission"));
+	pty.out(`\x1b[2J${report("state=working")}`);
+	await settle();
+	expect(events.map((event) => event.status.state)).toEqual(["working"]);
+});

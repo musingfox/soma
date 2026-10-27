@@ -32,6 +32,8 @@ const PROGRAM_STATUS_REPLY = "\x1b]7501;?";
 // Rounds started by these sources produce something the human did not ask for here: show them as notices.
 // A digest round is not among them: its report arrives as a notice entry of its own.
 const PUSHED_SOURCES = ["schedule:"];
+/** The entry kind of this client's inputs, which the core names as a push's target when it means this terminal. */
+const ENTRY_KIND = "chat.terminal";
 
 /**
  * Ask whether the terminal supports OSC 7501. Every terminal answers the device attributes query that follows it,
@@ -112,8 +114,10 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 		lastRoot = sequence;
 		report({ ...status, app: "soma" });
 	};
-	const notice = (kind: "question" | "report", content: string) => {
+	// A push meant for another interface is printed only: the root record is how this client rings.
+	const notice = (kind: "question" | "report", content: string, loud = true) => {
 		print(`[${kind === "question" ? "問題" : "通知"}] ${content}`);
+		if (!loud) return;
 		if (attention?.state !== "blocked" || kind === "question") {
 			attention =
 				kind === "question"
@@ -122,22 +126,24 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 		}
 	};
 
-	const fail = (content: string) => {
+	const fail = (content: string, loud = true) => {
 		print(`[失敗] ${content}`);
+		if (!loud) return;
 		if (attention?.state !== "blocked") attention = { state: "error", message: firstLine(content) };
 	};
 
+	const loud = ({ target }: { target?: string }) => target === undefined || target === ENTRY_KIND;
 	const mine = new Set<string>();
 	const onEvent = (event: SomaEvent) => {
 		if (event.type === "run") running = event.state === "working";
-		else if (event.type === "notice" && event.kind !== "forwarded") notice(event.kind, event.content);
+		else if (event.type === "notice" && event.kind !== "forwarded") notice(event.kind, event.content, loud(event));
 		else if (event.type === "answer") {
 			if (mine.delete(event.requestId)) print(event.content);
 			else if (PUSHED_SOURCES.some((source) => event.requestId.startsWith(source))) notice("report", event.content);
 		} else if (event.type === "failure") {
 			if (mine.delete(event.requestId)) fail(event.reason);
 			else if (PUSHED_FAILURES.some((source) => event.requestId.startsWith(source)))
-				fail(`${event.requestId} 那一輪：${event.reason}`);
+				fail(`${event.requestId} 那一輪：${event.reason}`, loud(event));
 		} else if (event.type === "job") report(jobStatus(event.card, event.status));
 		reportRoot();
 	};
@@ -154,7 +160,7 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 			mine.add(requestId);
 			attention = undefined;
 			reportRoot();
-			await human.submit({ content: line, entry: { kind: "chat.terminal" }, requestId });
+			await human.submit({ content: line, entry: { kind: ENTRY_KIND }, requestId });
 		}
 	} finally {
 		unsubscribe();

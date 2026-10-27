@@ -164,3 +164,16 @@ test("an unsupported terminal gets no OSC 7501 bytes", async () => {
 	expect(take()).toBe("[問題] ?\n");
 	await end();
 });
+
+test("a push meant for another interface is printed without raising the root record", async () => {
+	const { human, type, take, end } = await session(true);
+	await type("派 a");
+	expect(take()).toBe(root({ state: "idle" }));
+
+	human.emit({ type: "notice", kind: "question", content: "問 telegram", target: "chat.telegram" });
+	human.emit({ type: "failure", requestId: "schedule:1", reason: "boom", target: "chat.telegram" });
+	expect(take()).toBe("[問題] 問 telegram\n[失敗] schedule:1 那一輪：boom\n");
+	human.emit({ type: "notice", kind: "question", content: "問這裡", target: "chat.terminal" });
+	expect(take()).toBe(`[問題] 問這裡\n${root({ state: "blocked", kind: "question", message: "問這裡" })}`);
+	await end();
+});

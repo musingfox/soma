@@ -152,6 +152,11 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
  * over again.
  */
 export async function reconcileDispatches(conversation: Conversation, agents: AgentPort, context: Context) {
+	// Only jobs the listing could have seen: one dispatched while it ran is missing from it, not gone.
+	const known = await conversation.commit(
+		async (tx) => new Set((await tx.doc(Dispatches, conversation.id)).jobs.map((job) => job.agent)),
+		context,
+	);
 	const listed = await agents.list();
 	const bridge = eventBridge(conversation, agents, context);
 	for (const { name, status, seq } of listed) {
@@ -160,7 +165,8 @@ export async function reconcileDispatches(conversation: Conversation, agents: Ag
 	await conversation.commit(async (tx) => {
 		const doc = await tx.doc(Dispatches, conversation.id);
 		const before = doc.jobs.map((job) => job.status.state);
-		doc.jobs = [...reconcile(doc.jobs, listed)];
+		const reconciled = reconcile(doc.jobs, listed);
+		doc.jobs = doc.jobs.map((job, index) => (known.has(job.agent) ? (reconciled[index] ?? job) : job));
 		// Told in the commit that marks it, so a restart finds the job already failed and tells it no more.
 		for (const [index, job] of doc.jobs.entries()) {
 			if (job.status.state !== "error" || before[index] === "error" || before[index] === "done") continue;

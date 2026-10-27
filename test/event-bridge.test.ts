@@ -276,6 +276,24 @@ test("an agent gone at a restart is told to the human once, however often soma r
 	}
 });
 
+test("a job dispatched while the reconcile lists the agents is not taken for gone", async () => {
+	const db = await database();
+	const soma = await core(db, new FakeAgentPort());
+	// The listing misses card-a, as a dispatch that lands between the listing and the reconcile's commit does.
+	const racing = new (class extends FakeAgentPort {
+		override async list() {
+			const listed = await super.list();
+			const submission = await soma.root.submit({ type: "input", content: "派 card-a", requestId: "t:a" }, context);
+			await submission.wait(context);
+			return listed;
+		}
+	})();
+	await reconcileDispatches(soma.root, racing, context);
+	await soma.settle();
+	expect((await soma.job("card-a"))?.status.state).not.toBe("error");
+	expect(await entriesOf(soma.root, NOTICE)).toEqual([]);
+});
+
 /** An agent side whose listings carry no seq, as herdr's do. */
 class SeqlessAgentPort extends FakeAgentPort {
 	override async list() {

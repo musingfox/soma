@@ -77,6 +77,21 @@ body {
 	grid-template-columns: repeat(2, 1fr);
 	gap: 4px;
 }
+#debug .row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin: 6px 0;
+}
+#debug input[type="range"] {
+	flex: 1;
+	min-width: 0;
+}
+#debug output {
+	width: 36px;
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+}
 #debug .states {
 	display: grid;
 	grid-template-columns: repeat(2, 1fr);

@@ -38,6 +38,12 @@ for (const name of STATES) {
 	stateButtons.set(name, b);
 }
 
+const mouth = $("mouth");
+mouth.addEventListener("input", () => {
+	house.setMouth(Number(mouth.value));
+	$("mouth-out").textContent = Number(mouth.value).toFixed(2);
+});
+
 function sync() {
 	for (const [v, b] of viewButtons) b.setAttribute("aria-pressed", String(house.view === v));
 	for (const [name, b] of stateButtons) b.setAttribute("aria-pressed", String(house.state === name));
@@ -63,6 +69,7 @@ window.house = {
 		house.setView(v);
 		sync();
 	},
+	setMouth: house.setMouth,
 	setViewBlend: house.setViewBlend,
 	setOrbit: house.setOrbit,
 	stats: house.stats,

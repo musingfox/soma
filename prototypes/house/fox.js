@@ -104,7 +104,6 @@ const POSES = {
 		happyEyes: 1,
 		blush: 1.35,
 		smile: 1,
-		hop: 0.09,
 		earPerk: 0.1,
 		sparkle: 1,
 		blink: 0,
@@ -494,6 +493,20 @@ function buildFox() {
 // ---- the rig: pose, states and motion, without a renderer ----
 
 /**
+ * One step of a critically damped spring from `x` with velocity `v` toward
+ * `target`, solved exactly so a long frame cannot overshoot. It starts from
+ * the current velocity, so a new target never kicks the motion.
+ */
+export function spring(x, v, target, omega, dt) {
+	const d = x - target;
+	const e = Math.exp(-omega * dt);
+	const k = v + omega * d;
+	return [target + (d + k * dt) * e, (v - omega * k * dt) * e];
+}
+
+const POSE_OMEGA = 9;
+
+/**
  * The fox's meshes and the pose logic that moves them, for a scene owned by
  * someone else. `isReduced()` says whether ambient motion is off. The owner
  * calls `update(dt)` before each render, and keeps drawing while `settled()`
@@ -505,6 +518,8 @@ export function createFoxRig({ isReduced = () => false } = {}) {
 	let state = "idle";
 	let target = { ...BASE };
 	const pose = { ...BASE };
+	const vel = Object.fromEntries(Object.keys(BASE).map((k) => [k, 0]));
+	let offsets = {};
 	let mouthTarget = 0;
 	let mouth = 0;
 	let t = 0; // motion clock; it stands still under reduced motion
@@ -515,7 +530,7 @@ export function createFoxRig({ isReduced = () => false } = {}) {
 	let twitchSide = 1;
 
 	function settled() {
-		for (const k in target) if (Math.abs(target[k] - pose[k]) > 1e-3) return false;
+		for (const k in target) if (Math.abs(target[k] - pose[k]) > 1e-3 || Math.abs(vel[k]) > 1e-2) return false;
 		return Math.abs(mouthTarget - mouth) < 1e-3;
 	}
 
@@ -524,8 +539,7 @@ export function createFoxRig({ isReduced = () => false } = {}) {
 	}
 
 	function update(dt) {
-		const k = 1 - Math.exp(-dt * 7);
-		for (const key in target) pose[key] += (target[key] - pose[key]) * k;
+		for (const key in target) [pose[key], vel[key]] = spring(pose[key], vel[key], target[key], POSE_OMEGA, dt);
 		mouth += (mouthTarget - mouth) * (1 - Math.exp(-dt * 30));
 		if (!isReduced()) t += dt;
 		apply();
@@ -645,7 +659,18 @@ export function createFoxRig({ isReduced = () => false } = {}) {
 	function setState(name) {
 		if (!POSES[name]) throw new Error(`unknown state: ${name}`);
 		state = name;
-		target = { ...BASE, ...POSES[name] };
+		retarget();
+	}
+
+	function retarget() {
+		target = { ...BASE, ...POSES[state] };
+		for (const k in offsets) target[k] += offsets[k];
+	}
+
+	/** Pose values added on top of the state's, such as a glance to the side. */
+	function setOffsets(o) {
+		offsets = o;
+		retarget();
 	}
 
 	function setMouth(level) {
@@ -672,6 +697,7 @@ export function createFoxRig({ isReduced = () => false } = {}) {
 		fast,
 		setState,
 		setMouth,
+		setOffsets,
 		setTint,
 		get state() {
 			return state;

@@ -13,9 +13,24 @@ To run it, start `python3 -m http.server` in this folder and open `index.html`. 
 - **On-demand rendering.** The loop is the prototype's: 60 fps while anything eases, 30 fps for ambient motion, and nothing once settled under reduced motion. The capture measured 0 frames in 2 s for that last case.
 - **`tools/capture.mjs`.** It runs headful Chromium with puppeteer-core 25.3.0 from `~/node_modules`. It records the WebGL renderer in `screenshots/measurements.json` and exits 1 on SwiftShader or on a page error. It also drags past the turn limit with real mouse input, logs the fox's path for every state, and checks the reduced-motion frame count.
 
+## Milestone 2: the states are alive
+
+- **Springs.** Every head pose value (`fox.js`, `spring`) and every body channel (`scene.js`, `BODY` and `BODY_POSES`) eases with a critically damped spring that starts from its current velocity, so a change mid-change never kicks. The fox's heading is a spring too. The dim is a slower spring.
+- **Walking.** The fox steers a velocity toward the waypoints of a route, with capped acceleration, and lands on its spot with a spring. A new state mid-walk keeps the velocity, so the turn is a curve. Routes lead around the bed and the desk; leaving a place walks its route back out first. Legs swing and the body bobs and waddles with the distance walked. The fox faces its heading, capped at 0.7 rad off the viewer so the card never shows edge-on, and shows its back only when it walks almost straight away. Climbing onto the cushion, the bed or the chair is an arc. Under reduced motion it glides.
+- **The pose waits for the arrival.** While walking, the head and body hold the idle pose; the state's pose eases in once the fox is at its place.
+- **States.**
+  - idle: on the cushion. It breathes and blinks, flicks its ears, and every 2.5 to 5.5 s looks to one side or back.
+  - listening: front centre, facing the viewer, ears up, leaning toward the viewer.
+  - thinking: paces between two points in the middle with a pause at each end, one paw at its chin.
+  - working: sits on a chair behind the desk, which now stands out from the wall, facing the viewer over a laptop, paws tapping on the desk.
+  - talking: front centre; the mouth follows the debug panel's mouth slider, and one arm gestures with it.
+  - happy: hops, wags its tail fast, flaps its arms.
+  - worried: ears down, sweat drop, hunched with its arms across its chest.
+  - sleeping: curls up on the bed (body squashed, legs and arms tucked, tail wrapped in front, head lowered) while the room dims to night blue. The lamp stays lit.
+- **Limbs read in the flat view** because each arm, leg and the tail has a dark card a little larger behind it.
+- **Capture.** `tools/capture.mjs` now shoots all eight states in both views, the fox mid-walk, the view switch frozen at 0.5 while it walks, and checks that a retarget mid-walk moves the fox continuously. `screenshots/measurements.json` holds the paths and the checks.
+
 ## Stubs left
 
-- Every state only glides the fox to its place: idle to the cushion, sleeping to the bed, working to the desk, thinking to the middle, and the other four to the front centre. The head then holds the prototype's pose for that state. There is no walk cycle and no per-state body action: the fox does not curl up, pace, or reach the desk. It hops only when it climbs onto or off the bed or cushion.
-- The room does not dim for sleeping.
-- There is one set of screenshots: 2D idle, 3D idle, 3D at the drag limit, mid-switch at 0.5, and the debug panel open. The full 8 × 2 set is not done.
-- Bytes loaded and frame times are not reported.
+- Bytes loaded and frame times are not reported (M3).
+- No real phone, Safari or safe-area insets were checked.

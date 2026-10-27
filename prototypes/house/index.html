@@ -20,8 +20,9 @@
 
 <button id="debug-toggle" type="button" aria-expanded="false" aria-controls="debug" aria-label="Debug panel">⚙</button>
 <section id="debug" hidden>
-	<div class="row seg" id="views"></div>
+	<div class="seg" id="views"></div>
 	<div class="states" id="states"></div>
+	<label class="row">mouth <input id="mouth" type="range" min="0" max="1" step="0.01" value="0"> <output id="mouth-out">0.00</output></label>
 	<pre id="readout">frame time: waiting…</pre>
 </section>
 

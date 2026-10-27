@@ -71,15 +71,22 @@ try {
 		shots.push(path);
 	};
 
-	await run(() => window.house.setState("idle"));
-	await settle();
-	await shot("2d-idle");
-
-	await run(() => window.house.setView("3d"));
-	await settle();
-	await shot("3d-idle");
+	// Waits until the fox stands at its state's place with its pose on, then
+	// lets the springs finish. Some states never stop moving (pacing, hopping),
+	// so this does not wait for the loop to go idle.
+	const atPlace = async () => {
+		const end = Date.now() + 15000;
+		while (!(await run(() => window.house.scene.atPlace))) {
+			if (Date.now() > end) throw new Error("the fox never reached its place");
+			await wait(100);
+		}
+		await wait(1600);
+	};
+	const foxAt = async () => (await run(() => window.house.scene.foxAt)).map((v) => +v.toFixed(3));
 
 	// A real mouse drag far past the right limit, then back to the start.
+	await run(() => window.house.setView("3d"));
+	await settle();
 	const drag = async (dx, dy) => {
 		await page.mouse.move(190, 600);
 		await page.mouse.down();
@@ -100,28 +107,66 @@ try {
 	await shot("blend-0.5-idle");
 	await run(() => window.house.setViewBlend(null));
 
-	// Each state: the fox's position a few times during the move, then where it ended.
+	// Every state in both views. The order walks the fox between corners; each
+	// walk logs the fox's position every 150 ms.
+	const order = ["sleeping", "working", "thinking", "listening", "talking", "happy", "worried", "idle"];
 	const states = {};
-	for (const name of ["sleeping", "working", "thinking", "listening", "talking", "happy", "worried", "idle"]) {
-		await run((n) => window.house.setState(n), name);
-		const path = [];
-		for (let i = 0; i < 6; i++) {
-			await wait(150);
-			path.push((await run(() => window.house.scene.foxAt)).map((v) => +v.toFixed(2)));
-		}
+	for (const view of ["2d", "3d"]) {
+		await run((v) => window.house.setView(v), view);
 		await settle();
-		states[name] = { path, end: (await run(() => window.house.scene.foxAt)).map((v) => +v.toFixed(2)) };
+		for (const name of order) {
+			await run((n) => window.house.setState(n), name);
+			const path = [];
+			for (let i = 0; i < 6; i++) {
+				await wait(150);
+				path.push(await foxAt());
+			}
+			await atPlace();
+			if (name === "talking") {
+				await run(() => window.house.setMouth(0.7));
+				await wait(400);
+			}
+			await shot(`${view}-${name}`);
+			if (name === "talking") await run(() => window.house.setMouth(0));
+			states[`${view}-${name}`] = { path, end: await foxAt() };
+		}
 	}
 
-	// Reduced motion: once settled, nothing is drawn.
+	// Mid-walk, and mid-switch while walking: from idle on the cushion to the desk.
+	await run(() => window.house.setView("2d"));
+	await settle();
+	await run(() => window.house.setState("working"));
+	await wait(900);
+	const walking = await run(() => window.house.scene.walking);
+	await shot("2d-walking");
+	await run(() => window.house.setViewBlend(0.5));
+	await wait(250);
+	await shot("blend-0.5-walking");
+	await run(() => window.house.setViewBlend(null));
+	await atPlace();
+
+	// Turning back mid-walk: the position must stay continuous (no jump).
+	await run(() => window.house.setState("sleeping"));
+	const retarget = [];
+	for (let i = 0; i < 40; i++) {
+		if (i === 10) await run(() => window.house.setState("idle"));
+		await wait(50);
+		retarget.push(await foxAt());
+	}
+	const steps = retarget.slice(1).map((p, i) => Math.hypot(p[0] - retarget[i][0], p[2] - retarget[i][2]));
+	const retargetMaxStep = +Math.max(...steps).toFixed(3);
+	await atPlace();
+
+	// Reduced motion: thinking stops pacing, and once settled nothing is drawn.
 	await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "reduce" }]);
 	await run(() => window.house.setState("thinking"));
+	await atPlace();
 	await settle();
 	await wait(2200);
 	const reducedSettledFrames = (await run(() => window.house.stats())).frames;
 	await page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "no-preference" }]);
 	await run(() => window.house.setState("idle"));
-	await settle();
+	await atPlace();
 
 	await page.click("#debug-toggle");
 	await wait(600);
@@ -144,6 +189,8 @@ try {
 		layout,
 		orbit: { start: orbitStart, afterDragPastLimit: orbitLimit },
 		states,
+		walkingAmountMidWalk: walking,
+		retarget: { maxStepPer50ms: retargetMaxStep, path: retarget },
 		reducedSettledFrames,
 		screenshots: shots,
 		errors,

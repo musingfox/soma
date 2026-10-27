@@ -2,7 +2,7 @@
 // drawn unlit, like the fox. One camera blends between a fixed orthographic
 // front view (2D) and a perspective view the finger turns (3D).
 import * as THREE from "three";
-import { COLORS, createFoxRig, ellipse, frameStats, pill, polygon } from "./fox.js";
+import { COLORS, createFoxRig, ellipse, frameStats, pill, polygon, spring } from "./fox.js";
 
 const C = {
 	bg: "#2B1E18",
@@ -151,7 +151,7 @@ function buildRoom(scene) {
 	rug.position.set(-1.0, 0, 0.9);
 	room.add(rug);
 
-	room.add(buildBed(), buildDesk(), buildCushion(), buildPlant());
+	room.add(buildBed(), buildDesk(), buildChair(), buildCushion(), buildPlant());
 	return { room, sideWalls };
 }
 
@@ -176,41 +176,57 @@ function buildBed() {
 	return bed;
 }
 
+// The desk stands out from the wall, so the fox can sit behind it on a chair
+// and face the viewer while it works.
 function buildDesk() {
 	const desk = new THREE.Group();
 	const wood = paint2(C.woodLight, C.woodSide);
-	desk.add(flat(rect(1.7, 1.65, 3.9, 2.95), 0.14, wood, 1.3));
-	for (const lx of [1.8, 3.65]) desk.add(slab(rect(lx, 0, lx + 0.15, 1.16), 0.12, wood, -1.7));
-	for (const lx of [1.8, 3.65]) desk.add(slab(rect(lx, 0, lx + 0.15, 1.16), 0.12, wood, -2.75));
-	// A lamp and a stack of books, as cards standing on the top.
+	desk.add(flat(rect(1.7, 0.9, 3.9, 1.9), 0.12, wood, 1.05));
+	for (const z of [-0.92, -1.78]) {
+		for (const lx of [1.8, 3.65]) desk.add(slab(rect(lx, 0, lx + 0.15, 0.93), 0.1, wood, z));
+	}
+	desk.add(slab(rect(1.95, 0.45, 3.65, 0.93), 0.04, paint2(C.wood, C.woodSide), -0.94));
+
+	// A laptop to the fox's right, its lid's back to the viewer.
+	desk.add(flat(rect(1.95, 1.15, 2.55, 1.5), 0.04, paint2("#4A4F57", "#2C2F34"), 1.09));
+	desk.add(slab(rect(1.95, 1.09, 2.55, 1.42), 0.03, paint2("#5C626B", "#2C2F34"), -1.12));
+	const logo = slab(ellipse(0.05, 0.05), 0.01, paint("#C9CED6"), -1.11);
+	logo.position.set(2.25, 1.27, 0);
+	desk.add(logo);
+
+	// The lamp stays lit when the room dims.
 	const lamp = new THREE.Group();
-	lamp.position.set(3.4, 1.3, -2.5);
-	lamp.add(slab(rect(-0.04, 0, 0.04, 0.7), 0.06, paint2(C.wood, C.woodSide), 0.03));
+	lamp.position.set(3.7, 1.05, -1.6);
+	lamp.add(slab(rect(-0.04, 0, 0.04, 0.6), 0.06, paint2(C.wood, C.woodSide), 0.03));
+	const glow = [C.lamp, "#B8902E"].map((color) => {
+		const m = new THREE.MeshBasicMaterial({ color });
+		m.userData.glow = true;
+		return m;
+	});
 	lamp.add(
 		slab(
 			polygon([
-				[-0.32, 0.6],
-				[0.32, 0.6],
-				[0.16, 0.95],
-				[-0.16, 0.95],
+				[-0.28, 0.5],
+				[0.28, 0.5],
+				[0.14, 0.82],
+				[-0.14, 0.82],
 			]),
 			0.1,
-			paint2(C.lamp, "#B8902E"),
+			glow,
 			0.08,
 		),
 	);
 	desk.add(lamp);
-	const books = [
-		[C.cushion, 0.9, 0.16],
-		[C.rug, 0.8, 0.14],
-		[C.paper, 0.85, 0.12],
-	];
-	let by = 1.3;
-	for (const [color, w, t] of books) {
-		desk.add(slab(rect(2.0, by, 2.0 + w, by + t), 0.5, paint2(color, C.woodSide), -1.95));
-		by += t;
-	}
 	return desk;
+}
+
+function buildChair() {
+	const chair = new THREE.Group();
+	const wood = paint2(C.wood, C.woodSide);
+	chair.add(flat(rect(2.45, 2.2, 3.25, 2.7), 0.08, wood, 0.6));
+	for (const lx of [2.5, 3.1]) chair.add(slab(rect(lx, 0, lx + 0.1, 0.52), 0.08, wood, -2.25));
+	chair.add(slab(rect(2.45, 0, 3.25, 1.5), 0.08, wood, -2.72));
+	return chair;
 }
 
 function buildCushion() {
@@ -250,10 +266,31 @@ function buildPlant() {
 
 // ---- the fox's body: thin cards with gaps between them, like a pop-up book ----
 
+// The fox's own materials, apart from the room's, so the two dim differently.
+const foxMaterials = new Map();
+function foxPaint(color) {
+	if (!foxMaterials.has(color)) foxMaterials.set(color, new THREE.MeshBasicMaterial({ color }));
+	return foxMaterials.get(color);
+}
+
+// A limb card with a dark card a little bigger behind it: orange on the orange
+// body has no visible edge in the flat front view without it.
+function limb(length, width, front, depth) {
+	const g = new THREE.Group();
+	const card = slab(pill(length, width), depth, [foxPaint(COLORS.orange), foxPaint(COLORS.side)], front);
+	const back = slab(pill(length + 0.07, width + 0.07), 0.02, foxPaint(COLORS.side), front - depth);
+	card.position.y = back.position.y = -length / 2 + width / 2;
+	g.add(back, card);
+	return g;
+}
+
 function buildBody() {
 	const yb = -1.97; // the floor, in the fox's own units
-	const body = new THREE.Group();
-	const orange = paint2(COLORS.orange, COLORS.side);
+	const orange = [foxPaint(COLORS.orange), foxPaint(COLORS.side)];
+
+	// Torso, legs and arms squash together about the feet.
+	const torso = new THREE.Group();
+	torso.position.y = yb;
 	const shape = new THREE.Shape();
 	shape.moveTo(-0.55, -0.5);
 	shape.quadraticCurveTo(-0.6, -1.1, -0.95, -1.55);
@@ -262,22 +299,34 @@ function buildBody() {
 	shape.quadraticCurveTo(1.08, yb, 0.95, -1.55);
 	shape.quadraticCurveTo(0.6, -1.1, 0.55, -0.5);
 	shape.closePath();
-	body.add(slab(shape, 0.16, orange, -0.32));
-	const bib = slab(ellipse(0.38, 0.6), 0.02, paint(COLORS.cream), -0.3);
-	bib.position.set(0.04, -1.3, 0);
-	body.add(bib);
-	for (const lx of [-0.3, 0.36]) {
-		const leg = slab(pill(0.72, 0.26), 0.08, orange, -0.12);
-		leg.position.set(lx, yb + 0.36, 0);
-		const sock = slab(pill(0.36, 0.26), 0.02, paint(COLORS.side), -0.1);
-		sock.position.set(lx, yb + 0.18, 0);
-		body.add(leg, sock);
-	}
+	const trunk = slab(shape, 0.16, orange, -0.32);
+	trunk.position.y = -yb;
+	const bib = slab(ellipse(0.38, 0.6), 0.02, foxPaint(COLORS.cream), -0.3);
+	bib.position.set(0.04, -1.3 - yb, 0);
+	torso.add(trunk, bib);
+
+	const legs = [-1, 1].map((s) => {
+		const leg = limb(0.72, 0.26, -0.12, 0.08);
+		const sock = slab(pill(0.36, 0.26), 0.02, foxPaint(COLORS.side), -0.1);
+		sock.position.y = -0.48;
+		leg.add(sock);
+		leg.position.set(s * 0.33, -1.25 - yb, 0);
+		leg.userData.side = s;
+		torso.add(leg);
+		return leg;
+	});
+
+	const arms = [-1, 1].map((s) => {
+		const arm = limb(0.52, 0.2, -0.2, 0.05);
+		arm.position.set(s * 0.4, -0.72 - yb, 0);
+		arm.userData.side = s;
+		torso.add(arm);
+		return arm;
+	});
 
 	// The tail curls out to the fox's right (screen left), with a cream tip.
 	const tail = new THREE.Group();
 	tail.position.set(-0.7, yb + 0.25, 0);
-	body.add(tail);
 	const outline = smooth(
 		[
 			[0.1, -0.22],
@@ -294,26 +343,95 @@ function buildBody() {
 		90,
 	);
 	tail.add(slab(clipY(outline, 0.95, -1), 0.12, orange, -0.62));
-	tail.add(slab(clipY(outline, 0.95, 1), 0.12, paint2(COLORS.cream, "#C9AE95"), -0.62));
-	return { body, tail };
+	tail.add(slab(clipY(outline, 0.95, 1), 0.12, [foxPaint(COLORS.cream), foxPaint("#C9AE95")], -0.62));
+	const tailBack = slab(
+		new THREE.Shape(outline.map((p) => p.clone().multiplyScalar(1.05))),
+		0.02,
+		foxPaint(COLORS.side),
+		-0.74,
+	);
+	tail.add(tailBack);
+	return { torso, legs, arms, tail };
 }
 
-// ---- where each state happens ----
+// ---- where each state happens, and what the body does there ----
 
 const FOX_SCALE = 0.5;
 const FOX_FEET = 1.97;
 
-// x, floor height, z, and which way the fox faces once there (0 = the viewer).
+// `route` leads from the open floor to the spot, so the fox walks around the
+// bed and the desk instead of through them; `face` is its yaw once there
+// (0 = the viewer). Thinking paces between the two `pace` points.
 export const PLACES = {
-	idle: { at: [-1.8, 0.25, 1.2], face: 0.2 },
-	sleeping: { at: [-2.8, 0.95, -1.75], face: 0 },
-	working: { at: [2.6, 0, -1.0], face: 0.3 },
-	thinking: { at: [0.6, 0, 0.2], face: 0 },
-	listening: { at: [0.3, 0, 1.9], face: 0 },
-	talking: { at: [0.3, 0, 1.9], face: 0 },
-	happy: { at: [0.3, 0, 1.9], face: 0 },
-	worried: { at: [0.3, 0, 1.9], face: 0 },
+	idle: { route: [[-1.8, 0.25, 1.2]], face: 0.2 },
+	sleeping: {
+		route: [
+			[-1.3, 0, -0.45],
+			[-2.7, 0.95, -1.7],
+		],
+		face: 0,
+	},
+	working: {
+		route: [
+			[1.25, 0, -0.5],
+			[1.25, 0, -2.45],
+			[2.85, 0.6, -2.45],
+		],
+		face: 0,
+	},
+	thinking: {
+		route: [[-0.3, 0, 0.5]],
+		face: 0,
+		pace: [
+			[-0.3, 0, 0.5],
+			[1.4, 0, 0.5],
+		],
+	},
+	listening: { route: [[0.3, 0, 1.9]], face: 0 },
+	talking: { route: [[0.3, 0, 1.9]], face: 0 },
+	happy: { route: [[0.3, 0, 1.9]], face: 0 },
+	worried: { route: [[0.3, 0, 1.9]], face: 0 },
 };
+
+// Body channels per state, eased by springs like the head's pose. out* turn
+// each arm outward (negative: across the body), fwd* bring it in front of the
+// head, curl lies the fox down, dim darkens the room.
+const BODY = {
+	lean: 0,
+	hunch: 0,
+	curl: 0,
+	outL: 0.06,
+	outR: 0.06,
+	fwdL: 0,
+	fwdR: 0,
+	tail: 0.07,
+	tailHz: 0.35,
+	hop: 0,
+	flap: 0,
+	type: 0,
+	gesture: 0,
+	dim: 0,
+};
+const BODY_POSES = {
+	idle: {},
+	listening: { lean: 0.16, outL: 0.18, outR: 0.18, tail: 0.04 },
+	thinking: { outR: -1.15, fwdR: 1, tail: 0.04, tailHz: 0.25 },
+	working: { outL: 1.2, outR: 1.2, type: 1, tail: 0.03 },
+	talking: { outL: 0.12, outR: 0.3, gesture: 1, tail: 0.06, tailHz: 0.6 },
+	happy: { hop: 1, outL: 0.9, outR: 0.9, flap: 1, tail: 0.28, tailHz: 2.4 },
+	worried: { hunch: 1, outL: -0.55, outR: -0.55, tail: 0.02, tailHz: 0.2 },
+	sleeping: { curl: 1, outL: 0, outR: 0, tail: 0, dim: 1 },
+};
+const BODY_OMEGA = { dim: 2.6 };
+
+const WALK = { speed: 1.15, pace: 0.5, accel: 2.4, decel: 1.4, stride: 0.55, arrive: 0.25 };
+// Turned toward its heading, but never edge-on: a card seen edge-on is a line.
+const HEADING_CAP = 0.7;
+// Only a walk almost straight away shows the fox's back; a turn past side-on
+// would show the card edge-on on the way.
+const BACK_VIEW = 0.5;
+const ROOM_NIGHT = new THREE.Color("#39406A");
+const FOX_NIGHT = new THREE.Color("#8E92B8");
 
 // ---- cameras ----
 
@@ -327,6 +445,7 @@ const VIEW_SECONDS = 0.9;
 
 const ease = (p) => (p < 0.5 ? 4 * p * p * p : 1 - (-2 * p + 2) ** 3 / 2);
 const clamp = (v, [lo, hi]) => Math.min(hi, Math.max(lo, v));
+const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 
 const FPS_FAST = 60;
 const FPS_SLOW = 30;
@@ -353,50 +472,258 @@ export function createHouse(container) {
 		wake();
 	});
 
-	const { sideWalls } = buildRoom(scene);
+	const { room, sideWalls } = buildRoom(scene);
 
+	// actor: on the floor, turned to its heading. lean: tilts and hops about
+	// the feet. fox: the fox's own units, origin at the neck.
 	const actor = new THREE.Group();
 	scene.add(actor);
+	const lean = new THREE.Group();
+	actor.add(lean);
 	const fox = new THREE.Group();
 	fox.scale.setScalar(FOX_SCALE);
 	fox.position.y = FOX_FEET * FOX_SCALE;
-	actor.add(fox);
+	lean.add(fox);
 	const rig = createFoxRig({ isReduced: () => reduced });
-	fox.add(rig.root);
-	const { body, tail } = buildBody();
-	fox.add(body);
+	const headMount = new THREE.Group();
+	headMount.add(rig.root);
+	fox.add(headMount);
+	const { torso, legs, arms, tail } = buildBody();
+	fox.add(torso, tail);
 
-	// ---- the fox's place ----
+	// ---- dimming: every colour times a tint, the lamp left alone ----
 
-	const place = PLACES.idle;
-	actor.position.fromArray(place.at);
-	let faceTarget = place.face;
-	actor.rotation.y = faceTarget;
-	let move = null; // { from, to, start, dur }
-	let time = 0; // real seconds; moves and view switches ease even under reduced motion
+	function materialsOf(group) {
+		const set = new Set();
+		group.traverse((o) => {
+			if (!o.material) return;
+			for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
+				if (m.userData.glow) continue;
+				m.userData.base ??= m.color.clone();
+				set.add(m);
+			}
+		});
+		return [...set];
+	}
+	const roomMats = materialsOf(room);
+	const foxMats = materialsOf(fox);
+	const tint = new THREE.Color();
+	let shownDim = -1;
+	function applyDim(d) {
+		if (Math.abs(d - shownDim) < 1e-4) return;
+		shownDim = d;
+		tint.setRGB(1, 1, 1).lerp(ROOM_NIGHT, d);
+		for (const m of roomMats) m.color.copy(m.userData.base).multiply(tint);
+		tint.setRGB(1, 1, 1).lerp(FOX_NIGHT, d);
+		for (const m of foxMats) m.color.copy(m.userData.base).multiply(tint);
+		renderer.setClearColor(new THREE.Color(C.bg).lerp(new THREE.Color("#141520"), d));
+	}
+
+	// ---- the fox's state, place and walk ----
+
+	let time = 0; // real seconds; walks and view switches ease even under reduced motion
+	let clock = 0; // ambient motion; stands still under reduced motion
+	let state = "idle";
+	let posed = true; // the state's pose is on; it waits until the fox arrives
+	const ch = {};
+	for (const k in BODY) ch[k] = { x: BODY[k], v: 0, target: BODY[k] };
+	function setBody(name) {
+		const p = { ...BODY, ...BODY_POSES[name] };
+		for (const k in ch) ch[k].target = p[k];
+	}
+
+	const start = PLACES.idle.route[0];
+	const pos = { x: start[0], y: start[1], z: start[2] };
+	const vel = { x: 0, z: 0 };
+	let path = []; // [{ p: [x, y, z], tag: { place, idx, exit } }]
+	let seg = { x: pos.x, y: pos.y, z: pos.z, len: 0 }; // where the current leg started
+	let landing = false; // the last stretch: a spring onto the spot
+	let zone = { place: "idle", k: 1 }; // how deep into a place's route the fox is
+	let arrived = true;
+	let pausedUntil = 0;
+	let paceIdx = 0;
+	const yaw = { x: PLACES.idle.face, v: 0, target: PLACES.idle.face };
+	let walkPhase = 0;
+	const walk = { x: 0, v: 0 };
+	let nextLook = 3;
+	let tailPhase = 0;
+
+	function beginLeg() {
+		const wp = path[0].p;
+		seg = { x: pos.x, y: pos.y, z: pos.z, len: Math.hypot(wp[0] - pos.x, wp[2] - pos.z) };
+	}
 
 	function setState(name) {
-		rig.setState(name);
-		const p = PLACES[name];
-		const to = new THREE.Vector3().fromArray(p.at);
-		const dist = actor.position.distanceTo(to);
-		move = dist > 0.01 ? { from: actor.position.clone(), to, start: time, dur: 0.6 + dist * 0.32, face: p.face } : null;
-		if (!move) faceTarget = p.face;
+		if (!PLACES[name]) throw new Error(`unknown state: ${name}`);
+		if (name === state) return;
+		state = name;
+		pausedUntil = 0;
+		paceIdx = 0;
+		rig.setOffsets({});
+		const route = PLACES[name].route;
+		const here = route[route.length - 1];
+		const there = Math.hypot(here[0] - pos.x, here[1] - pos.y, here[2] - pos.z);
+		if (zone.place === name && there < 0.05 && !path.length) {
+			pose();
+			wake();
+			return;
+		}
+		// Back out of the place the fox is in, then in along the new route.
+		const exitRoute = PLACES[zone.place]?.route ?? [];
+		const exit = exitRoute
+			.slice(0, Math.min(zone.k, exitRoute.length - 1))
+			.map((p, idx) => ({ p, tag: { place: zone.place, idx, exit: true } }))
+			.reverse();
+		path = [...exit, ...route.map((p, idx) => ({ p, tag: { place: name, idx, exit: false } }))];
+		landing = false;
+		arrived = false;
+		posed = false;
+		rig.setState("idle");
+		setBody("idle");
+		beginLeg();
 		wake();
 	}
 
-	function updateMove() {
-		if (!move) return;
-		const p = Math.min(1, (time - move.start) / move.dur);
-		const e = ease(p);
-		actor.position.lerpVectors(move.from, move.to, e);
-		// A small hop when it climbs onto or off something.
-		if (Math.abs(move.to.y - move.from.y) > 0.1) actor.position.y += Math.sin(p * Math.PI) * 0.45;
-		const dx = move.to.x - move.from.x;
-		const dz = move.to.z - move.from.z;
-		// Turned toward where it goes, but never edge-on: a card seen edge-on is a line.
-		faceTarget = p < 0.85 ? THREE.MathUtils.clamp(Math.atan2(dx, Math.abs(dz) + 0.5), -0.7, 0.7) : move.face;
-		if (p >= 1) move = null;
+	function pose() {
+		posed = true;
+		arrived = true;
+		rig.setState(state);
+		setBody(state);
+	}
+
+	function reach(wp) {
+		const { place, idx, exit } = wp.tag ?? {};
+		if (place) zone = { place, k: exit ? idx : idx + 1 };
+	}
+
+	function updateWalk(dt) {
+		if (!path.length && state === "thinking" && posed && !reduced) {
+			// Pacing: a short pause at each end, then off to the other one.
+			if (!pausedUntil) pausedUntil = time + 0.9;
+			if (time >= pausedUntil) {
+				paceIdx = 1 - paceIdx;
+				path = [{ p: PLACES.thinking.pace[paceIdx] }];
+				landing = false;
+				pausedUntil = 0;
+				beginLeg();
+			}
+		}
+		if (!path.length) return;
+		const wp = path[0];
+		const [tx, ty, tz] = wp.p;
+		const dx = tx - pos.x;
+		const dz = tz - pos.z;
+		const dist = Math.hypot(dx, dz);
+		const last = path.length === 1;
+		const top = !wp.tag && state === "thinking" ? WALK.pace : WALK.speed;
+
+		if (last && dist < WALK.arrive) landing = true;
+		if (landing) {
+			// The last stretch is a spring from the current velocity onto the
+			// spot, so the stop eases instead of snapping.
+			[pos.x, vel.x] = spring(pos.x, vel.x, tx, 6, dt);
+			[pos.z, vel.z] = spring(pos.z, vel.z, tz, 6, dt);
+		} else {
+			const want = last ? Math.min(top, Math.sqrt(2 * WALK.decel * dist)) : top;
+			let ax = (dx / dist) * want - vel.x;
+			let az = (dz / dist) * want - vel.z;
+			const a = Math.hypot(ax, az);
+			const cap = WALK.accel * dt;
+			if (a > cap) {
+				ax *= cap / a;
+				az *= cap / a;
+			}
+			vel.x += ax;
+			vel.z += az;
+			pos.x += vel.x * dt;
+			pos.z += vel.z * dt;
+		}
+
+		// Height follows the leg, with an arc when it climbs onto or off something.
+		const left = Math.hypot(tx - pos.x, tz - pos.z);
+		const u = seg.len > 1e-3 ? Math.min(1, Math.max(0, 1 - left / seg.len)) : 1;
+		const climb = Math.abs(ty - seg.y) > 0.1 ? Math.sin(u * Math.PI) * 0.35 : 0;
+		pos.y = seg.y + (ty - seg.y) * u + climb;
+
+		const speed = Math.hypot(vel.x, vel.z);
+		if (!last && left < 0.2) {
+			reach(path.shift());
+			beginLeg();
+		} else if (last && left < 2e-3 && speed < 1e-2) {
+			pos.x = tx;
+			pos.z = tz;
+			pos.y = ty;
+			vel.x = vel.z = 0;
+			reach(path.shift());
+			landing = false;
+			if (!posed) pose();
+		}
+	}
+
+	function updateFacing(dt) {
+		const speed = Math.hypot(vel.x, vel.z);
+		if (speed > 0.12 && !landing) {
+			let h = Math.atan2(vel.x, vel.z);
+			const a = Math.abs(h);
+			if (a > HEADING_CAP && a < Math.PI - BACK_VIEW) h = Math.sign(h) * HEADING_CAP;
+			yaw.target = h;
+		} else if (!path.length) {
+			yaw.target = PLACES[state].face;
+		}
+		const goal = yaw.x + wrap(yaw.target - yaw.x);
+		[yaw.x, yaw.v] = spring(yaw.x, yaw.v, goal, 7, dt);
+		[walk.x, walk.v] = spring(walk.x, walk.v, reduced ? 0 : Math.min(1, speed / 0.5), 10, dt);
+		walkPhase += (speed / WALK.stride) * Math.PI * dt;
+	}
+
+	// Idle looks around now and then.
+	function updateLook() {
+		if (state !== "idle" || !posed || reduced) return;
+		if (clock < nextLook) return;
+		const v = [-0.4, 0, 0.32, 0][Math.floor(Math.random() * 4)];
+		rig.setOffsets({ yaw: v, lookX: v * 0.12 });
+		nextLook = clock + 2.5 + Math.random() * 3;
+	}
+
+	function applyBody() {
+		const b = Object.fromEntries(Object.entries(ch).map(([k, c]) => [k, c.x]));
+		const m = reduced ? 0 : 1;
+		const w = walk.x;
+		const step = Math.sin(walkPhase);
+
+		actor.position.set(pos.x, pos.y, pos.z);
+		actor.rotation.y = yaw.x;
+		const hop = m * b.hop * Math.abs(Math.sin(clock * Math.PI * 1.6)) * 0.3;
+		lean.position.y = hop + w * 0.05 * Math.abs(step);
+		lean.rotation.x = b.lean;
+		lean.rotation.z = w * 0.06 * step;
+
+		torso.scale.set(1 + 0.15 * b.curl, 1 - 0.42 * b.curl - 0.07 * b.hunch, 1);
+		headMount.position.set(0.25 * b.curl, -0.78 * b.curl - 0.1 * b.hunch, 0);
+		headMount.rotation.z = -0.12 * b.curl;
+
+		for (const leg of legs) {
+			leg.rotation.z = leg.userData.side * w * 0.5 * step;
+			leg.scale.y = Math.max(0.001, 1 - b.curl);
+			leg.visible = b.curl < 0.98;
+		}
+		for (const arm of arms) {
+			const s = arm.userData.side;
+			const right = s > 0;
+			let out = right ? b.outR : b.outL;
+			out += m * b.type * 0.12 * Math.sin(clock * 11 + (right ? 0 : Math.PI));
+			out += m * b.flap * 0.3 * Math.sin(clock * 9 + (right ? 0 : Math.PI));
+			if (right) out += b.gesture * 0.5 * rig.mouth;
+			out -= w * 0.35 * step * s;
+			arm.rotation.z = s * out;
+			arm.position.z = 0.3 * (right ? b.fwdR : b.fwdL);
+			arm.scale.y = Math.max(0.001, 1 - b.curl);
+			arm.visible = b.curl < 0.98;
+		}
+
+		tail.rotation.z = -2.35 * b.curl + m * b.tail * Math.sin(tailPhase);
+		tail.position.z = 0.7 * b.curl;
+		applyDim(b.dim);
 	}
 
 	// ---- the view ----
@@ -517,7 +844,6 @@ export function createHouse(container) {
 
 	// ---- the loop: draws only while something changes ----
 
-	let clock = 0; // ambient motion; stands still under reduced motion
 	let raf = 0;
 	let lastTick = 0;
 	let lastRender = 0;
@@ -531,11 +857,19 @@ export function createHouse(container) {
 		}
 	}
 
+	function channelsBusy() {
+		for (const k in ch) if (Math.abs(ch[k].x - ch[k].target) > 1e-3 || Math.abs(ch[k].v) > 1e-2) return true;
+		return Math.abs(wrap(yaw.target - yaw.x)) > 1e-3 || Math.abs(yaw.v) > 1e-2 || walk.x > 1e-3;
+	}
+
+	const pacing = () => state === "thinking" && posed && !reduced;
+
 	function busy() {
 		return (
 			!rig.settled() ||
-			move !== null ||
-			Math.abs(faceTarget - actor.rotation.y) > 1e-3 ||
+			path.length > 0 ||
+			pacing() ||
+			channelsBusy() ||
 			(viewStart >= 0 && frozenBlend === null) ||
 			dragging !== null
 		);
@@ -565,10 +899,15 @@ export function createHouse(container) {
 		time += dt;
 		if (!reduced) clock += dt;
 		rig.update(dt);
-		updateMove();
-		actor.rotation.y += (faceTarget - actor.rotation.y) * (1 - Math.exp(-dt * 8));
-		if (Math.abs(faceTarget - actor.rotation.y) <= 1e-3) actor.rotation.y = faceTarget;
-		tail.rotation.z = reduced ? 0 : 0.07 * Math.sin(clock * Math.PI * 2 * 0.35);
+		updateWalk(dt);
+		updateFacing(dt);
+		updateLook();
+		for (const k in ch) {
+			const c = ch[k];
+			[c.x, c.v] = spring(c.x, c.v, c.target, BODY_OMEGA[k] ?? 8, dt);
+		}
+		tailPhase += dt * Math.PI * 2 * ch.tailHz.x;
+		applyBody();
 		updateBlend();
 		applyCamera();
 	}
@@ -578,9 +917,15 @@ export function createHouse(container) {
 	});
 
 	resize();
+	applyBody();
 	return {
 		setState,
 		setView,
+		/** Sets how open the mouth is while talking, 0 to 1. */
+		setMouth(level) {
+			rig.setMouth(level);
+			wake();
+		},
 		/** Freezes the view switch at `v` (0 = 2D, 1 = 3D); `null` lets it run again. */
 		setViewBlend(v) {
 			frozenBlend = v === null ? null : Math.min(1, Math.max(0, Number(v)));
@@ -593,7 +938,7 @@ export function createHouse(container) {
 			wake();
 		},
 		get state() {
-			return rig.state;
+			return state;
 		},
 		get view() {
 			return viewTarget ? "3d" : "2d";
@@ -607,8 +952,18 @@ export function createHouse(container) {
 		get moving() {
 			return busy();
 		},
+		/** Whether the fox has reached its state's place and taken its pose. */
+		get atPlace() {
+			return posed && arrived;
+		},
 		get foxAt() {
-			return actor.position.toArray();
+			return [pos.x, pos.y, pos.z];
+		},
+		get walking() {
+			return walk.x;
+		},
+		get heading() {
+			return yaw.x;
 		},
 		renderer,
 		stats: () => frameStats(samples),

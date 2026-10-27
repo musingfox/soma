@@ -10,6 +10,8 @@ import { createRexAgentPort } from "./adapters/rex/agent-port.ts";
 import { createRexClient } from "./adapters/rex/client.ts";
 import { runTelegram } from "./adapters/telegram/index.ts";
 import { runTerminal } from "./adapters/terminal/index.ts";
+import { createTtyAgentPort } from "./adapters/tty/agent-port.ts";
+import { spawnPty } from "./adapters/tty/pty.ts";
 import { anthropicAuthContext, type Config, ConfigError, configPath, loadConfig } from "./config.ts";
 import { clock } from "./core/extensions/clock/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
@@ -55,6 +57,10 @@ function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap }: Config): A
 		const onError = (error: Error) => console.error("[soma] rex:", error.message);
 		const client = createRexClient({ socketPath: rex.socket, onError });
 		return createRexAgentPort({ client, sessionId: rex.sessionId, onError, ...cap });
+	}
+	if (agentAdapter === "tty") {
+		const onError = (error: Error) => console.error("[soma] tty:", error.message);
+		return createTtyAgentPort({ spawn: spawnPty, env: process.env, onError, ...cap });
 	}
 	return createHerdrAgentPort({ client: createHerdrClient({ socketPath: herdrSocket }), ...cap });
 }

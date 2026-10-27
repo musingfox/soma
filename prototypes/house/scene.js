@@ -982,6 +982,10 @@ export function createHouse(container) {
 		get foxAt() {
 			return [pos.x, pos.y, pos.z];
 		},
+		/** Seconds of scene time at the last drawn frame, which `foxAt` belongs to. */
+		get time() {
+			return time;
+		},
 		get walking() {
 			return walk.x;
 		},

@@ -1,12 +1,13 @@
 // Drives index.html in headful Chromium, so WebGL draws on the hardware GPU,
-// at 375 x 812: the renderer string and one screenshot per view plus one
-// mid-switch. Exits non-zero when the renderer is SwiftShader. Not loaded by
-// the page. Usage (with the folder served):
+// at 375 x 812: the renderer string, every state in both views, the camera
+// mid-switch, the bytes the page loaded and its frame times. Exits non-zero
+// when the renderer is SwiftShader. Not loaded by the page. Usage (with the folder served):
 //   URL=http://100.88.181.24:8791/index.html node tools/capture.mjs [outDir]
 // CHROME names the browser; PUPPETEER the puppeteer-core entry file, which is
 // not installed in this repo.
 import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { gzipSync } from "node:zlib";
 
 const entry = process.env.PUPPETEER ?? `${homedir()}/node_modules/puppeteer-core/lib/puppeteer/puppeteer-core.js`;
 const puppeteer = (await import(entry)).default;
@@ -34,6 +35,22 @@ try {
 		console.log("page error:", msg);
 	});
 	await cdp.send("Runtime.enable");
+
+	// Bytes loaded: every response body, raw and gzip -9, with the cache off.
+	const requests = new Map();
+	const loaded = [];
+	cdp.on("Network.responseReceived", (e) => requests.set(e.requestId, e.response.url));
+	cdp.on("Network.loadingFinished", async (e) => {
+		const at = requests.get(e.requestId);
+		if (!at || at.startsWith("data:")) return;
+		try {
+			const r = await cdp.send("Network.getResponseBody", { requestId: e.requestId });
+			const body = Buffer.from(r.body, r.base64Encoded ? "base64" : "utf8");
+			loaded.push({ url: at, raw: body.length, gzip: gzipSync(body, { level: 9 }).length });
+		} catch {}
+	});
+	await cdp.send("Network.enable");
+	await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
 	const run = async (fn, ...args) => {
 		const expression = `(${fn})(...${JSON.stringify(args)})`;
 		const r = await cdp.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
@@ -136,7 +153,7 @@ try {
 	await run(() => window.house.setView("2d"));
 	await settle();
 	await run(() => window.house.setState("working"));
-	await wait(900);
+	await wait(500);
 	const walking = await run(() => window.house.scene.walking);
 	await shot("2d-walking");
 	await run(() => window.house.setViewBlend(0.5));
@@ -151,10 +168,60 @@ try {
 	for (let i = 0; i < 40; i++) {
 		if (i === 10) await run(() => window.house.setState("idle"));
 		await wait(50);
-		retarget.push(await foxAt());
+		retarget.push(
+			await run(() => [window.house.scene.time * 1000, ...window.house.scene.foxAt].map((v) => +v.toFixed(3))),
+		);
 	}
-	const steps = retarget.slice(1).map((p, i) => Math.hypot(p[0] - retarget[i][0], p[2] - retarget[i][2]));
-	const retargetMaxStep = +Math.max(...steps).toFixed(3);
+	// Speed between samples, from the scene's own clock at the frame each
+	// position was drawn: a jump would show as a speed far above the walking
+	// speed.
+	const speeds = retarget
+		.slice(1)
+		.map((p, i) => [p, retarget[i]])
+		.filter(([p, q]) => p[0] > q[0])
+		.map(([p, q]) => Math.hypot(p[1] - q[1], p[3] - q[3]) / ((p[0] - q[0]) / 1000));
+	const retargetMaxSpeed = +Math.max(...speeds).toFixed(2);
+	await atPlace();
+
+	// Frame times over the stats' 2 s window. Idle: each state settled at its
+	// place; only ambient motion is left. Animating: a walk across the room,
+	// and the camera switch.
+	const stats = () => run(() => window.house.stats());
+	const round = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, +v.toFixed(2)]));
+	const frameTimes = {};
+	await run(() => window.house.setView("2d"));
+	await settle();
+	for (const name of order) {
+		await run((n) => window.house.setState(n), name);
+		await atPlace();
+		await wait(2200);
+		frameTimes[`settled ${name}`] = round(await stats());
+	}
+	await run(() => window.house.setState("idle"));
+	await atPlace();
+	await run(() => window.house.setState("working"));
+	await wait(2000);
+	frameTimes["walking, idle to working"] = round(await stats());
+	await atPlace();
+	await run(() => window.house.setState("idle"));
+	await atPlace();
+	await wait(2200);
+	await run(() => window.house.setView("3d"));
+	await wait(2000);
+	frameTimes["camera switch 2D to 3D, then settled"] = round(await stats());
+	await run(() => window.house.setView("2d"));
+	await settle();
+
+	// Normal motion: does any state ever stop drawing? Every state breathes
+	// and blinks, so none should; this records it.
+	const normalSettledFrames = {};
+	for (const name of ["idle", "sleeping"]) {
+		await run((n) => window.house.setState(n), name);
+		await atPlace();
+		await wait(2200);
+		normalSettledFrames[name] = (await stats()).frames;
+	}
+	await run(() => window.house.setState("idle"));
 	await atPlace();
 
 	// Reduced motion: thinking stops pacing, and once settled nothing is drawn.
@@ -190,8 +257,11 @@ try {
 		orbit: { start: orbitStart, afterDragPastLimit: orbitLimit },
 		states,
 		walkingAmountMidWalk: walking,
-		retarget: { maxStepPer50ms: retargetMaxStep, path: retarget },
+		retarget: { maxSpeedUnitsPerSecond: retargetMaxSpeed, walkSpeed: 4.6, samples: retarget },
 		reducedSettledFrames,
+		normalSettledFrames,
+		frameTimes,
+		loaded,
 		screenshots: shots,
 		errors,
 	};

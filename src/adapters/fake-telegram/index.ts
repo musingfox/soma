@@ -29,6 +29,8 @@ export interface SentMessage {
 	readonly chat_id: number;
 	readonly text: string;
 	readonly reply_markup?: InlineKeyboard;
+	/** Present only when the message was sent without a sound. */
+	readonly disable_notification?: true;
 }
 
 /**
@@ -81,7 +83,10 @@ export class FakeBotApi {
 					return bytes < 1 || bytes > 64;
 				});
 				if (tooLong) return reply(400, { ok: false, error_code: 400, description: "Bad Request: BUTTON_DATA_INVALID" });
-				this.sent.push(markup === undefined ? message : { ...message, reply_markup: markup });
+				const silent = params.disable_notification === true ? { disable_notification: true as const } : {};
+				this.sent.push(
+					markup === undefined ? { ...message, ...silent } : { ...message, reply_markup: markup, ...silent },
+				);
 				const messageId = this.#nextMessage++;
 				if (markup !== undefined) this.#markups.set(messageId, markup);
 				return reply(200, { ok: true, result: { message_id: messageId, chat: { id: message.chat_id } } });

@@ -383,3 +383,48 @@ test("a second tap on the same question answers nothing and leaves the first res
 		params: { callback_query_id: second.callback_query.id },
 	});
 });
+
+test("a push meant for another interface arrives silently; one for Telegram, or with no target, rings", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	human.emit({ type: "notice", kind: "report", content: "elsewhere", target: "chat.terminal" });
+	human.emit({ type: "notice", kind: "report", content: "here", target: "chat.telegram" });
+	human.emit({ type: "notice", kind: "report", content: "anywhere" });
+	human.emit({ type: "failure", requestId: "schedule:1", reason: "boom", target: "chat.terminal" });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(4));
+	expect(api.sent.map((message) => message.disable_notification ?? false)).toEqual([true, false, false, true]);
+});
+
+const elsewhere = chosen("已在別處處理");
+
+test("a prompt's buttons go once its job leaves that prompt, unless a press here already settled it", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+	const blocked = { state: "blocked", kind: "permission", fingerprint: "f00d" } as const;
+
+	human.emit({ type: "notice", kind: "question", content: "要讓它執行嗎？", choices });
+	human.emit({ type: "notice", kind: "question", content: "還是要嗎？", choices, target: "chat.telegram" });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	human.emit({ type: "job", card: "card-a", agent: "card-a", status: blocked });
+	human.emit({ type: "job", card: "card-b", agent: "card-b", status: { state: "working" } });
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	expect(api.calls).toEqual([]);
+
+	human.emit({ type: "job", card: "card-a", agent: "card-a", status: { state: "working" } });
+	await vi.waitFor(() => expect(api.calls).toHaveLength(2));
+	expect(api.calls.map(({ method, params }) => [method, params.reply_markup])).toEqual([
+		["editMessageReplyMarkup", elsewhere],
+		["editMessageReplyMarkup", elsewhere],
+	]);
+
+	human.emit({ type: "notice", kind: "question", content: "第三次", choices: { ...choices, fingerprint: "beef" } });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(3));
+	api.press("1:beef:card-a", CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(4));
+	human.emit({ type: "job", card: "card-a", agent: "card-a", status: { state: "idle" } });
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	expect(api.calls).toHaveLength(4);
+});

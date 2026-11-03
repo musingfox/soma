@@ -70,7 +70,7 @@ Each part maps to a Pi Durable component, and each is an extension.
 | Event bridge | host-side code, not an LLM | See the next section |
 | Schedule | tool + background task | `schedule(at, instruction)` creates a background task that sleeps until `at`, then submits an input (`requestId: schedule:<id>`). The scheduled digest is one fixed instance of it. See "Scheduled digest" |
 | Memory | section + document + tool | Ports shikigami's design; see the section below |
-| External tools | pi-mcp bridge | Abilities such as email and calendar come in as MCP servers; the core has no service-specific code for any of them. Exception (2026-10-27): read-only tools whose output soma must shape, such as web search, may be core extensions; see "Decisions made". See "Basic assistant abilities" |
+| External tools | pi-mcp bridge | Abilities such as email and calendar come in as MCP servers; the core has no service-specific code for any of them. Exceptions: read-only tools whose output soma must shape, such as web search, may be core extensions (2026-10-27), and so may the vault tools, which are to write too (2026-11-03); see "Decisions made". See "Basic assistant abilities" |
 
 ### Compacting the root conversation
 
@@ -451,6 +451,13 @@ Decided 2026-10-27:
   - **Tailscale only.** The page is not public, so the first step needs no login of its own.
   - **A new character**, not shikigami's avatar: a fox, with every piece of art produced by code, never in an editor or by a commissioned artist. The rendering technology is three.js, picked by throwaway prototypes (M7 step 2) because the den should be able to become 3D.
   - **A creature in its own space, not a chat window.** The human wants the page to feel like a living thing talking from its den rather than a conversation log, so the fox's words fade, the human's typed words do not stay on screen, and state shows as objects in the room and actions of the fox (M7 steps 3 to 6). The room is one scene with a flat 2D view and a turnable 3D view, and the fox is paper-cut, flat slabs that read like a pop-up book from the side, both chosen by the human on 2026-10-27.
+
+Decided 2026-11-03:
+
+- **soma reads and writes the human's Obsidian vault through the obsidian CLI, as core extension tools.** This widens the 2026-10-27 exception from read-only tools to vault access, decided with the human for the `vault-read` and `vault-write` cards. The CLI is already prod's path to the vault for `open_card` (`src/adapters/obsidian/card.ts`), its search uses Obsidian's own index, and it needs the Obsidian app running on the machine. Rejected: plain file I/O on the vault folder, which works with the app closed but has no index search and leaves links stale on a rename; and a third-party Obsidian MCP server, which goes through the Local REST API plugin and makes every tool replay-unsafe.
+  - **Reading** (`src/core/extensions/vault/`): `note_search` and `note_read`, both `replay: "safe"`, return the note's path and text inside the observed-content fence of the memory section. The fence's own markers are dropped from the text until none is left, so a note cannot end the fence. A note is cut at 20,000 characters, as `web_fetch` is. An empty path is refused, because the CLI reads the note open in the app when it gets none. The CLI exits 0 on a failure and prints it where the answer would be, so the adapter checks each answer's shape: `file` before `read`, since `read` prints a note that begins with "Error:" the same way as a failure (`src/adapters/obsidian/vault.ts`).
+  - **Writing** (the `vault-write` card, not built yet) is to create and append only, never overwrite or delete; the vault is a git repo that obsidian-git commits every 30 minutes, so git history is the undo. A write is to ask no confirmation and to append a bullet linking to the changed note to the day's journal, as the vault's own `AGENTS.md` asks. `Readwise/` is never to be written, since its plugin overwrites it.
+  - **Denied folders.** `vault.deny` in soma's config names folders soma does not read, and is to cover writing too; the human set `Clippings`, the folder of web clippings, the likeliest carrier of injected instructions. Folders compare case-insensitively: the CLI matches paths exactly today, but the check does not lean on that. Without `vault.name` the tools are not registered.
 
 ## Open questions
 

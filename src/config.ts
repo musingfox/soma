@@ -62,6 +62,10 @@ const FileConfig = z
 			.object({ host: z.string().min(1), port: z.number().int().min(1).max(65535) })
 			.partial()
 			.strict(),
+		vault: z
+			.object({ name: z.string().min(1), deny: z.array(z.string().min(1)) })
+			.partial()
+			.strict(),
 	})
 	.partial()
 	.strict();
@@ -90,6 +94,14 @@ export interface Config {
 	readonly telegram?: TelegramConfig;
 	/** Set only when both a host and a port are; the host is a tailnet address. */
 	readonly web?: WebConfig;
+	/** The Obsidian vault soma may read, by the name the obsidian CLI knows; set only when a name is. */
+	readonly vault?: VaultConfig;
+}
+
+export interface VaultConfig {
+	readonly name: string;
+	/** Folders soma neither reads nor writes. */
+	readonly deny: readonly string[];
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -214,6 +226,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		...(exaApiKey !== undefined && { exaApiKey }),
 		...(token !== undefined && chatId !== undefined && { telegram: { token, chatId, apiBase } }),
 		...(webHost !== undefined && webPort !== undefined && { web: { host: webHost, port: webPort } }),
+		...(file?.vault?.name !== undefined && { vault: { name: file.vault.name, deny: file.vault.deny ?? [] } }),
 	};
 }
 

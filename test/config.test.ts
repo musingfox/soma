@@ -256,6 +256,22 @@ describe("the web page", () => {
 	});
 });
 
+describe("the vault", () => {
+	test("is on only with a name, and denies nothing unless told", () => {
+		expect(resolveConfig(undefined, {}, HOME).vault).toBeUndefined();
+		expect(resolveConfig({ vault: { deny: ["Clippings"] } }, {}, HOME).vault).toBeUndefined();
+		expect(resolveConfig({ vault: { name: "obsidian" } }, {}, HOME).vault).toEqual({ name: "obsidian", deny: [] });
+		expect(resolveConfig({ vault: { name: "obsidian", deny: ["Clippings"] } }, {}, HOME).vault).toEqual({
+			name: "obsidian",
+			deny: ["Clippings"],
+		});
+	});
+	test("an unknown vault field throws with its name", () => {
+		const path = write(JSON.stringify({ vault: { name: "obsidian", path: "/x" } }));
+		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: vault.path:`);
+	});
+});
+
 describe("invalid environment variables", () => {
 	test.each([
 		["SOMA_HANGAR_CAP", "0"],

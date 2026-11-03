@@ -29,6 +29,7 @@ import { web } from "./core/extensions/web/index.ts";
 import { acquireDbLock, DbLockedError, openHarness, openStorage } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
 import type { AgentPort } from "./ports/agent.ts";
+import { vaultExtensions } from "./vault.ts";
 
 let config: Config;
 try {
@@ -100,6 +101,7 @@ const extensions = [
 	...(config.reflection ? [reflections.extension] : []),
 	inspectExtension(storage),
 	web({ exaApiKey: config.exaApiKey }),
+	...vaultExtensions(config.vault),
 	...(await Promise.all(mcpClients.map(({ name, client }) => mcpExtension(name, client)))),
 ];
 const harness: Harness = await openHarness(storage, extensions, context, { models });

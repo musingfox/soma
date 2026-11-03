@@ -1,10 +1,10 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { Conversation, Harness, SubmissionId } from "@earendil-works/pi-durable";
+import type { Conversation, Harness, SubmissionDraft, SubmissionId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { HUMAN_CHOSEN, type Job } from "../src/core/domain/dispatch.ts";
@@ -92,8 +92,8 @@ function watchSubmits(conversation: Conversation, ids: SubmissionId[]): Conversa
 	return new Proxy(conversation, {
 		get(target, key) {
 			if (key === "submit") {
-				return async (...args: Parameters<Conversation["submit"]>) => {
-					const submission = await target.submit(...args);
+				return async (draft: SubmissionDraft, ctx: Context) => {
+					const submission = await target.submit(draft, ctx);
 					ids.push(submission.id);
 					return submission;
 				};

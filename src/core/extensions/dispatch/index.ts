@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord/context";
-import { Type } from "@earendil-works/pi-ai";
 import {
 	type Conversation,
 	defineDoc,
@@ -9,6 +8,7 @@ import {
 	type ToolExecutionApi,
 	type Tx,
 } from "@earendil-works/pi-durable";
+import { obj, str } from "@earendil-works/pi-schema";
 import type { AgentPort, Answer } from "../../../ports/agent.ts";
 import type { Choices, HumanAnswerOutcome } from "../../../ports/human.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
@@ -23,6 +23,7 @@ export const Dispatches = defineDoc<{ jobs: Job[] }>({
 	history: "latest",
 	fork: "initial",
 	initial: () => ({ jobs: [] }),
+	checkpointWhen: () => false,
 });
 
 const text = (value: unknown) => ({ output: [{ type: "text" as const, text: JSON.stringify(value) }] });
@@ -106,9 +107,9 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 		description:
 			"Start a coding agent on an obw task card, in a fleet/<card> worktree of the repo. " +
 			"A card that already has a job, or a running agent named after it, is not started again.",
-		parameters: Type.Object({
-			card: Type.String({ pattern: "^[a-z0-9][a-z0-9-]*$", description: "The card's file name, without .md" }),
-			repo: Type.String({ description: "Absolute path of the git repository the card belongs to" }),
+		parameters: obj({
+			card: str({ pattern: "^[a-z0-9][a-z0-9-]*$", description: "The card's file name, without .md" }),
+			repo: str({ description: "Absolute path of the git repository the card belongs to" }),
 		}),
 		// A rerun after a crash checks the dispatch list, then the agents listed, before it starts anything.
 		replay: "safe",
@@ -119,7 +120,7 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 	const jobs = defineTool({
 		name: "jobs",
 		description: "List every dispatched job with its card, agent, session id and last known status.",
-		parameters: Type.Object({}),
+		parameters: obj({}),
 		replay: "safe",
 		execute: async (_args, api, context) =>
 			text(
@@ -130,18 +131,18 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 			),
 	});
 
-	const card = Type.String({ description: "The blocked job's card" });
-	const reason = Type.String({ description: "Why: written into the dispatch list for the human to check later" });
+	const card = str({ description: "The blocked job's card" });
+	const reason = str({ description: "Why: written into the dispatch list for the human to check later" });
 	const respond = defineTool({
 		name: "respond",
 		description:
 			"Answer a blocked agent's prompt by choosing one of its options. The agent's screen is read again first: " +
 			"if it no longer shows the prompt the fingerprint names, nothing is sent and the refusal is returned. " +
 			"Never for kind=auth.",
-		parameters: Type.Object({
+		parameters: obj({
 			card,
-			option: Type.String({ description: "The option's number as the wake listed it" }),
-			fingerprint: Type.String({ description: "The fingerprint the wake gave for this prompt" }),
+			option: str({ description: "The option's number as the wake listed it" }),
+			fingerprint: str({ description: "The fingerprint the wake gave for this prompt" }),
 			reason,
 		}),
 		// Not replayed: a crash mid-call reports it interrupted rather than pressing keys a second time.
@@ -161,9 +162,9 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 	const escalate = defineTool({
 		name: "escalate",
 		description: "Hand a blocked agent's prompt to the human instead of answering it, with the reason why.",
-		parameters: Type.Object({
+		parameters: obj({
 			card,
-			question: Type.String({ description: "What the human needs to decide, in their language" }),
+			question: str({ description: "What the human needs to decide, in their language" }),
 			reason,
 		}),
 		replay: "unsafe",
@@ -198,9 +199,9 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 		description:
 			"Send the human's answer to an agent whose result was 需要你, as its next prompt. " +
 			"Its next result comes back in the report like any other.",
-		parameters: Type.Object({
-			card: Type.String({ description: "The card of the job that asked" }),
-			text: Type.String({ description: "What to send the agent: the human's answer, in their words" }),
+		parameters: obj({
+			card: str({ description: "The card of the job that asked" }),
+			text: str({ description: "What to send the agent: the human's answer, in their words" }),
 			reason,
 		}),
 		// Not replayed: a crash mid-call reports it interrupted rather than sending the answer a second time.

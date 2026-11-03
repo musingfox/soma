@@ -1,4 +1,3 @@
-import { Type } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
 	type ConversationId,
@@ -11,6 +10,7 @@ import {
 	type Tx,
 	UserEntry,
 } from "@earendil-works/pi-durable";
+import { arr, int, num, obj, opt, str } from "@earendil-works/pi-schema";
 import {
 	appendModelLine,
 	type Change,
@@ -42,6 +42,7 @@ export const Curated = defineDoc<{ next: number; lines: StoredLine[]; history: R
 	version: 2,
 	scope: "session",
 	initial: () => ({ next: 1, lines: [], history: [] }),
+	checkpointWhen: () => false,
 	migrate: (value) => {
 		const lines = (value as { lines: CuratedLine[] }).lines.map((line, index) => ({ id: index + 1, ...line }));
 		return { next: lines.length + 1, lines, history: [] };
@@ -54,6 +55,7 @@ export const Facts = defineDoc<{ rows: Fact[] }>({
 	version: 1,
 	scope: "session",
 	initial: () => ({ rows: [] }),
+	checkpointWhen: () => false,
 });
 
 /** A fact whose key is already recorded is not recorded again. */
@@ -94,7 +96,7 @@ const remember = defineTool({
 	name: "remember",
 	description:
 		"把一件值得長期記住的事追加到長期記憶。要改或刪既有的條目用 revise_memory、forget_memory；超過容量上限時會被拒絕，原因會回報給你。",
-	parameters: Type.Object({ text: Type.String({ description: "要記住的一句話" }) }),
+	parameters: obj({ text: str({ description: "要記住的一句話" }) }),
 	execute: async (args, api, context) => {
 		const reason = await api.commit(async (tx) => {
 			const curated = await tx.doc(Curated);
@@ -108,9 +110,9 @@ const remember = defineTool({
 	},
 });
 
-const line = Type.Number({ description: "條目編號，系統提示裡每一條前面的 [#編號]" });
-const reason = Type.String({ description: "為什麼要改：會寫進修訂紀錄並通知使用者" });
-const evidence = Type.Array(Type.String(), {
+const line = num({ description: "條目編號，系統提示裡每一條前面的 [#編號]" });
+const reason = str({ description: "為什麼要改：會寫進修訂紀錄並通知使用者" });
+const evidence = arr(str(), {
 	description:
 		"至少一個證據 id，格式 entry:<id>、submission:<id>、task:<id>、document:<id>@<seq> 或 decision:<卡片>#<序號>",
 });
@@ -137,7 +139,7 @@ const revise = defineTool({
 	name: "revise_memory",
 	description:
 		"改寫長期記憶的一條。必須附理由和至少一個證據 id；沒有就會被拒絕，原因會回報給你。改過的條目算你寫的，修改前的原文會留在修訂紀錄，使用者會收到通知。",
-	parameters: Type.Object({ line, text: Type.String({ description: "這一條的新內容" }), reason, evidence }),
+	parameters: obj({ line, text: str({ description: "這一條的新內容" }), reason, evidence }),
 	execute: async (args, api, context) => {
 		const change: Change = { line: args.line, reason: args.reason, evidence: args.evidence, at: Date.now() };
 		return answer(
@@ -153,7 +155,7 @@ const forget = defineTool({
 	name: "forget_memory",
 	description:
 		"刪除長期記憶的一條。必須附理由和至少一個證據 id；沒有就會被拒絕。刪掉的原文會留在修訂紀錄，可以用 restore_memory 還原，使用者會收到通知。",
-	parameters: Type.Object({ line, reason, evidence }),
+	parameters: obj({ line, reason, evidence }),
 	execute: async (args, api, context) => {
 		const change: Change = { line: args.line, reason: args.reason, evidence: args.evidence, at: Date.now() };
 		return answer(
@@ -168,7 +170,7 @@ const forget = defineTool({
 const history = defineTool({
 	name: "memory_history",
 	description: "列出長期記憶某一條的每一版，含修訂時間與理由，用來挑 restore_memory 要還原的版本。",
-	parameters: Type.Object({ line }),
+	parameters: obj({ line }),
 	replay: "safe",
 	execute: async (args, api, context) =>
 		// Rendered inside the commit: a doc is a live proxy only valid there.
@@ -179,9 +181,9 @@ const restore = defineTool({
 	name: "restore_memory",
 	description:
 		"把長期記憶的一條還原成 memory_history 列出的某一版，也能找回刪掉的條目。必須附理由和至少一個證據 id；這次還原本身也會記進修訂紀錄，使用者會收到通知。",
-	parameters: Type.Object({
+	parameters: obj({
 		line,
-		version: Type.Number({ description: "memory_history 列出的版本號" }),
+		version: num({ description: "memory_history 列出的版本號" }),
 		reason,
 		evidence,
 	}),
@@ -202,7 +204,7 @@ const restore = defineTool({
 const recall = defineTool({
 	name: "recall",
 	description: "搜尋所有舊對話紀錄和事實紀錄，回傳含有查詢中每個詞的句子與時間，最新的在前。",
-	parameters: Type.Object({ query: Type.String({ description: "以空白分隔的關鍵詞" }) }),
+	parameters: obj({ query: str({ description: "以空白分隔的關鍵詞" }) }),
 	replay: "safe",
 	execute: async (args, api, context) => {
 		const rows = await api.commit(async (tx) => {
@@ -255,10 +257,8 @@ const denied = defineTool({
 	description:
 		"使用者這一輪否定了你先前的回答（說你錯了、不是這樣、沒做到）時呼叫，記一筆結果訊號供日後反省。" +
 		"只記錄，不會改動任何回答。",
-	parameters: Type.Object({
-		turns_ago: Type.Optional(
-			Type.Integer({ minimum: 1, description: "被否定的是往回數第幾輪的回答；上一輪是 1，預設 1" }),
-		),
+	parameters: obj({
+		turns_ago: opt(int({ minimum: 1, description: "被否定的是往回數第幾輪的回答；上一輪是 1，預設 1" })),
 	}),
 	// The row is keyed by the denied answer, so a rerun after a crash finds it instead of adding another.
 	replay: "safe",

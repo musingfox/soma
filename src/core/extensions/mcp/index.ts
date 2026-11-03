@@ -1,5 +1,4 @@
 import { existsSync, readFileSync } from "node:fs";
-import { Type } from "@earendil-works/pi-ai";
 import { defineExtension, defineTool, type Extension } from "@earendil-works/pi-durable";
 import { McpClient, StdioTransport, toLlmContent } from "@earendil-works/pi-mcp";
 import { z } from "zod";
@@ -39,14 +38,16 @@ export async function mcpExtension(server: string, client: McpClient): Promise<E
 			name: toolName(server, tool.name),
 			description: tool.description ?? tool.title ?? tool.name,
 			// Providers require an object schema, and some reject one without `properties`.
-			parameters: Type.Unsafe<Record<string, unknown>>({
+			parameters: {
 				...tool.inputSchema,
 				type: "object",
 				properties: tool.inputSchema.properties ?? {},
-			}),
+			},
 			replay: "unsafe",
 			execute: async (args, _api, context) => {
-				const result = await client.callTool(tool.name, args, { signal: context.abortSignal });
+				const result = await client.callTool(tool.name, args as Record<string, unknown>, {
+					signal: context.abortSignal,
+				});
 				// MCP reports tool failures in the result instead of as a protocol error.
 				return { output: toLlmContent(result), isError: result.isError === true };
 			},

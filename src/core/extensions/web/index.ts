@@ -1,5 +1,5 @@
-import { Type } from "@earendil-works/pi-ai";
 import { defineExtension, defineTool } from "@earendil-works/pi-durable";
+import { int, obj, opt, str } from "@earendil-works/pi-schema";
 import { Defuddle } from "defuddle/node";
 import { parseHTML } from "linkedom";
 import { z } from "zod";
@@ -176,7 +176,7 @@ export function web(options: { fetch?: Fetch; exaApiKey?: string } = {}) {
 		description:
 			"Read one web page. Returns its main content as markdown without navigation or ads, or the body as it is " +
 			`for plain text and JSON. Long pages are cut at ${FETCH_MAX_CHARS} characters.`,
-		parameters: Type.Object({ url: Type.String({ description: "An http or https URL" }) }),
+		parameters: obj({ url: str({ description: "An http or https URL" }) }),
 		replay: "safe",
 		execute: async ({ url }, _api, context) => {
 			const { text, isError } = await fetchPage(url, fetchImpl, context.abortSignal);
@@ -191,10 +191,10 @@ export function web(options: { fetch?: Fetch; exaApiKey?: string } = {}) {
 			description:
 				"Search the web for current information. Returns numbered results, each with title, URL, date when known " +
 				"and the passages most relevant to the query. Read a result in full with web_fetch.",
-			parameters: Type.Object({
-				query: Type.String({ description: "What to look for, in natural language" }),
-				limit: Type.Optional(
-					Type.Integer({
+			parameters: obj({
+				query: str({ description: "What to look for, in natural language" }),
+				limit: opt(
+					int({
 						minimum: 1,
 						maximum: SEARCH_MAX_RESULTS,
 						description: `How many results, ${SEARCH_DEFAULT_RESULTS} unless set`,

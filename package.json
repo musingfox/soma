@@ -30,15 +30,16 @@
 		"smoke:reflection-card": "node smoke/reflection-card.ts"
 	},
 	"dependencies": {
-		"@earendil-works/chord": "1.3.0",
-		"@earendil-works/pi-ai": "1.3.0",
-		"@earendil-works/pi-durable": "1.3.0",
-		"@earendil-works/pi-mcp": "1.3.0",
+		"@earendil-works/chord": "1.5.0",
+		"@earendil-works/pi-ai": "1.5.0",
+		"@earendil-works/pi-durable": "1.5.0",
+		"@earendil-works/pi-mcp": "1.5.0",
+		"@earendil-works/pi-schema": "1.5.0",
 		"@lydell/node-pty": "1.1.0",
 		"@xterm/headless": "6.0.0",
 		"defuddle": "0.19.6",
 		"linkedom": "0.18.14",
-		"ws": "8.22.0",
+		"ws": "8.21.0",
 		"zod": "3.25.76"
 	},
 	"devDependencies": {

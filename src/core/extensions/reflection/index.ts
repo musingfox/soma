@@ -1,5 +1,4 @@
 import type { Context } from "@earendil-works/chord/context";
-import { Type } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
 	type Conversation,
@@ -11,6 +10,7 @@ import {
 	type EntryRecord,
 	type Tx,
 } from "@earendil-works/pi-durable";
+import { arr, obj, str } from "@earendil-works/pi-schema";
 import type { AgentPort } from "../../../ports/agent.ts";
 import type { Fact } from "../../domain/memory.ts";
 import {
@@ -43,6 +43,7 @@ export const Reflections = defineDoc<{ taskId?: number; cards: OpenedCard[]; ale
 	history: "latest",
 	fork: "initial",
 	initial: () => ({ cards: [], alerted: [] }),
+	checkpointWhen: () => false,
 });
 
 type Checkpoint = {
@@ -135,7 +136,7 @@ export function reflection({ repo, createCard, readCard, agents }: ReflectionOpt
 			tick: async (task, runtime, context) => {
 				const checkpoint = task.state.checkpoint;
 				const { since, next, cursor } = checkpoint;
-				await runtime.sleep(next, context);
+				if (runtime.now() < next) return runtime.sleepUntil(next, checkpoint, context);
 				const advance = (reflected: number) => ({
 					status: "running" as const,
 					// After a long downtime, one tick covers the gap instead of one per missed period.
@@ -206,11 +207,11 @@ export function reflection({ repo, createCard, readCard, agents }: ReflectionOpt
 		description:
 			"要改 soma 的程式碼時，在 soma 的 obw 專案開一張任務卡（status todo），接著把它派進 fleet，並通知使用者。" +
 			"正文要寫明問題和證據。同名的卡已存在就不會再開。soma 不能合併任何東西。",
-		parameters: Type.Object({
-			card: Type.String({ pattern: "^[a-z0-9][a-z0-9-]*$", description: "卡片檔名，kebab-case，不含 .md" }),
-			title: Type.String({ description: "卡片標題" }),
-			body: Type.String({ description: "卡片的 Description：要改什麼、為什麼，含證據 id" }),
-			evidence: Type.Array(Type.String(), {
+		parameters: obj({
+			card: str({ pattern: "^[a-z0-9][a-z0-9-]*$", description: "卡片檔名，kebab-case，不含 .md" }),
+			title: str({ description: "卡片標題" }),
+			body: str({ description: "卡片的 Description：要改什麼、為什麼，含證據 id" }),
+			evidence: arr(str(), {
 				description: "至少一個證據 id，格式同 revise_memory",
 			}),
 		}),

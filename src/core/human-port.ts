@@ -1,13 +1,17 @@
 import type { JsonValue } from "@earendil-works/chord";
 import type { Context } from "@earendil-works/chord/context";
 import {
+	type CommitChange,
 	type Conversation,
 	defineDoc,
 	type EntryId,
 	type EntryRecord,
 	type Harness,
+	LiveDoc,
+	type LiveRun,
+	type LiveState,
 	type SubmissionId,
-	watchEvents,
+	type SubmissionRecord,
 } from "@earendil-works/pi-durable";
 import type { AgentPort, AgentState } from "../ports/agent.ts";
 import { type Choices, type HumanPort, type NoticeKind, PUSHED_FAILURES, type SomaEvent } from "../ports/human.ts";
@@ -46,6 +50,7 @@ export const Pushes = defineDoc<{ presence: Presence; pending: PendingPush[] }>(
 	history: "latest",
 	fork: "initial",
 	initial: () => ({ presence: {}, pending: [] }),
+	checkpointWhen: () => false,
 });
 
 /** ARCHITECTURE.md "Whom to push to when there are several interfaces"; the windows are its 15 minutes by default. */
@@ -65,8 +70,8 @@ type Target = { target?: string };
 
 /**
  * The in-process HumanPort over the root conversation. A new subscriber first gets the current run state and every
- * job, so it can show them without waiting for the next change. The event snapshot holds no submissions, so an
- * answer or failure settled before attachment, say before a restart, is never emitted again.
+ * job, so it can show them without waiting for the next change. Only commits stored after attachment are seen, so an
+ * answer or failure settled before it, say before a restart, is never emitted again.
  */
 export async function openHumanPort(
 	harness: Harness,
@@ -98,88 +103,115 @@ export async function openHumanPort(
 					const doc = await tx.doc(Pushes, root.id);
 					if (!doc.pending.some((each) => each.key === key)) doc.pending.push({ key, at, ...pending });
 				}, context)
-				// A listener that throws ends the watch: the push still goes out, only its escalation is lost.
+				// A throw would drop the rest of the commit's events: the push still goes out, only its escalation is lost.
 				.catch((error: unknown) => console.error("[soma] pending push:", error));
 		}
 		return { target };
 	}
 
 	const listeners = new Set<(event: SomaEvent) => void>();
-	// Notices from before the first subscriber, such as the startup reconcile's, which no snapshot replays.
+	// Notices from before the first subscriber, such as the startup reconcile's, which nothing replays.
 	let unheard: SomaEvent[] | undefined = [];
 	const emit = (event: SomaEvent) => {
 		if (unheard !== undefined && event.type === "notice") unheard.push(event);
 		for (const listener of listeners) listener(event);
 	};
 
-	const events = await watchEvents(harness, root.id, context);
-	let running = events.snapshot.run !== undefined;
-	const setRunning = (next: boolean) => {
-		if (next === running) return;
-		running = next;
-		emit({ type: "run", state: running ? "working" : "idle" });
+	let run: LiveRun | undefined;
+	/**
+	 * Emits the end of the run that was, and says whether one began. A run is known by its first input: one commit can
+	 * end a run and start the next with the inputs queued behind it.
+	 */
+	const setRun = (next: LiveRun | undefined) => {
+		const changed = next?.inputs[0] !== run?.inputs[0] || (next === undefined) !== (run === undefined);
+		const before = run;
+		run = next;
+		if (changed && before !== undefined) emit({ type: "run", state: "idle" });
+		return changed && next !== undefined;
 	};
 	// requestIds of inputs placed in the running round; a follow-up input joins a round already running.
 	const placed = new Map<SubmissionId, string>();
-	events.start(async (batch) => {
-		// An answer's entry and its submission settle in the same commit, so the same batch.
+	const onCommit = async (changes: readonly CommitChange[]) => {
+		// Change order within a commit is unspecified. An answer's entry and its submission settle in the same commit,
+		// so entries go before submissions; a run that ended goes before both, and one that began after them.
+		const entries: EntryRecord[] = [];
+		const submissions: SubmissionRecord[] = [];
+		let began = false;
+		for (const change of changes) {
+			if (change.type === "entry" && change.value.conversationId === root.id) entries.push(change.value);
+			else if (change.type === "submission" && change.value.conversationId === root.id) submissions.push(change.value);
+			else if (
+				change.type === "document" &&
+				change.kind === "change" &&
+				change.conversationId === root.id &&
+				change.record.kind === LiveDoc.definition.kind
+			)
+				began = setRun((change.value as LiveState).run);
+		}
+		entries.sort((a, b) => a.id - b.id);
 		const answers = new Map<EntryId, string>();
-		for (const event of batch) {
-			if (event.type === "snapshot") {
-				for (const entry of event.entries) answers.set(entry.id, textOf(entry));
-				setRunning(event.run !== undefined);
-			} else if (event.type === "run_start") setRunning(true);
-			else if (event.type === "run_end") setRunning(false);
-			else if (event.type === "message_end") answers.set(event.entry.id, textOf(event.entry));
-			else if (event.type === "tool_execution_end") {
-				const forwarded = (event.entry?.model ?? []).some(
-					(message) => message.role === "toolResult" && isForwarded(message.details),
-				);
-				if (forwarded) for (const requestId of placed.values()) emit({ type: "notice", kind: "forwarded", requestId });
-			} else if (event.type === "entry_appended" && event.entry.kind === NOTICE) {
-				const { kind, content, choices, target } = event.entry.data as {
-					kind: NoticeKind;
-					content: string;
-					choices?: Choices;
-					target?: string;
-				};
-				// An escalation names its target; reports never escalate.
-				const pushed =
-					target !== undefined
-						? { target }
-						: await targetOf(
-								`notice:${event.entry.id}`,
-								kind === "question" ? { kind, content, ...(choices && { choices }) } : undefined,
-							);
-				emit({ type: "notice", kind, content, ...(choices && { choices }), ...pushed });
-			} else if (event.type === "submission") {
-				const { record } = event;
-				if (record.type !== "input") continue;
-				const { requestId } = record;
-				if (record.status === "placed" && requestId !== undefined) placed.set(record.id, requestId);
-				else placed.delete(record.id);
-				if (record.status === "unanswered") {
-					const reason = failureReason(record.reason, record.detail);
-					if (requestId !== undefined && PUSHED_FAILURES.some((source) => requestId.startsWith(source))) {
-						const content = `${requestId} 那一輪失敗：${reason}`;
-						emit({
-							type: "failure",
-							requestId,
-							reason,
-							...(await targetOf(`failure:${record.id}`, { kind: "report", content })),
-						});
-					} else if (requestId !== undefined) emit({ type: "failure", requestId, reason });
-					const round = { submission: record.id, requestId, entry: record.entry, reason };
-					// A listener that throws ends the watch, and with it every later event to the human.
-					await root
-						.commit((tx) => recordFact(tx, turnSignal(round, Date.now())), context)
-						.catch((error: unknown) => console.error("[soma] outcome signal:", error));
-				} else if (record.status === "done" && requestId !== undefined) {
-					emit({ type: "answer", requestId, content: answers.get(record.answer) ?? "" });
-				}
+		for (const entry of entries) {
+			answers.set(entry.id, textOf(entry));
+			const forwarded = (entry.model ?? []).some(
+				(message) => message.role === "toolResult" && isForwarded(message.details),
+			);
+			if (forwarded) for (const requestId of placed.values()) emit({ type: "notice", kind: "forwarded", requestId });
+			if (entry.kind !== NOTICE) continue;
+			const { kind, content, choices, target } = entry.data as {
+				kind: NoticeKind;
+				content: string;
+				choices?: Choices;
+				target?: string;
+			};
+			// An escalation names its target; reports never escalate.
+			const pushed =
+				target !== undefined
+					? { target }
+					: await targetOf(
+							`notice:${entry.id}`,
+							kind === "question" ? { kind, content, ...(choices && { choices }) } : undefined,
+						);
+			emit({ type: "notice", kind, content, ...(choices && { choices }), ...pushed });
+		}
+		for (const record of submissions) {
+			if (record.type !== "input") continue;
+			const { requestId } = record;
+			if (record.status === "placed" && requestId !== undefined) placed.set(record.id, requestId);
+			else placed.delete(record.id);
+			if (record.status === "unanswered") {
+				const reason = failureReason(record.reason, record.detail);
+				if (requestId !== undefined && PUSHED_FAILURES.some((source) => requestId.startsWith(source))) {
+					const content = `${requestId} 那一輪失敗：${reason}`;
+					emit({
+						type: "failure",
+						requestId,
+						reason,
+						...(await targetOf(`failure:${record.id}`, { kind: "report", content })),
+					});
+				} else if (requestId !== undefined) emit({ type: "failure", requestId, reason });
+				const round = { submission: record.id, requestId, entry: record.entry, reason };
+				await root
+					.commit((tx) => recordFact(tx, turnSignal(round, Date.now())), context)
+					.catch((error: unknown) => console.error("[soma] outcome signal:", error));
+			} else if (record.status === "done" && requestId !== undefined) {
+				emit({ type: "answer", requestId, content: answers.get(record.answer) ?? "" });
 			}
 		}
+		if (began) emit({ type: "run", state: "working" });
+	};
+	// Commits are handled one at a time, in order. The observer attaches before the run state is read, so no commit
+	// falls between the two.
+	let handled = Promise.resolve();
+	const commits = harness.observeCommits({
+		advance({ changes }) {
+			handled = handled.then(() => onCommit(changes)).catch((error: unknown) => console.error("[soma] commit:", error));
+		},
+		end() {},
 	});
+	run = await root.commit(
+		async (tx) => JSON.parse(JSON.stringify((await tx.doc(LiveDoc, root.id)).run ?? null)) ?? undefined,
+		context,
+	);
 
 	// Event-bridge and reconcile write job states into the dispatch list; the doc is where a change shows.
 	await root.commit((tx) => tx.doc(Dispatches, root.id), context);
@@ -195,7 +227,9 @@ export async function openHumanPort(
 		}
 	};
 	updateJobs(watch.value);
-	watch.start(async (value) => updateJobs(value));
+	watch.start(async (call) => {
+		if (call.kind === "value") updateJobs(call.value);
+	});
 
 	// Each due push becomes a notice to the default interface in the commit that drops it, so a restart repeats none.
 	let checking = false;
@@ -244,7 +278,7 @@ export async function openHumanPort(
 			);
 		},
 		subscribe(listener) {
-			listener({ type: "run", state: running ? "working" : "idle" });
+			listener({ type: "run", state: run !== undefined ? "working" : "idle" });
 			// Held notices first, so a client that shows a prompt's buttons sees the job that may have moved past it.
 			for (const event of unheard ?? []) listener(event);
 			for (const [card, job] of jobs) listener({ type: "job", card, ...job });
@@ -264,7 +298,8 @@ export async function openHumanPort(
 		},
 		async close() {
 			clearInterval(checker);
-			await Promise.all([events.stop(), watch.stop()]);
+			commits.detach();
+			await watch.stop();
 		},
 	};
 }

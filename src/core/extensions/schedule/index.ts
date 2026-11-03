@@ -1,6 +1,6 @@
 import type { Context } from "@earendil-works/chord/context";
-import { Type } from "@earendil-works/pi-ai";
 import { defineDoc, defineExtension, defineTask, defineTool, type TaskId } from "@earendil-works/pi-durable";
+import { obj, str } from "@earendil-works/pi-schema";
 import { resolveAt } from "../../domain/schedule.ts";
 
 export type Scheduled = { at: number; instruction: string; callId: string };
@@ -13,20 +13,21 @@ export const Schedules = defineDoc<{ items: Record<string, Scheduled> }>({
 	history: "latest",
 	fork: "initial",
 	initial: () => ({ items: {} }),
+	checkpointWhen: () => false,
 });
 
 const text = (value: string) => ({ output: [{ type: "text" as const, text: value }] });
 
-// `at` lives in the checkpoint because `runtime.sleep` is in-memory only: after a restart the phase
-// reruns and sleeps for whatever time is left. The input is submitted before the terminal commit, so a
-// crash between the two resubmits it, and the requestId makes the second submit return the first.
+// The input is submitted before the terminal commit, so a crash between the two resubmits it, and the requestId makes
+// the second submit return the first.
 export const Reminder = defineTask<Scheduled, { phase: "wait"; at: number }, null>({
 	name: "soma.schedule.reminder",
 	version: 1,
 	initial: ({ at }) => ({ phase: "wait", at }),
 	phases: {
 		wait: async (task, runtime, context) => {
-			await runtime.sleep(task.state.checkpoint.at, context);
+			const { at } = task.state.checkpoint;
+			if (runtime.now() < at) return runtime.sleepUntil(at, task.state.checkpoint, context);
 			const root = await runtime.conversation(runtime.conversationId, context);
 			await root?.submit(
 				{
@@ -59,7 +60,7 @@ export function schedule(abortTask: (id: TaskId, context: Context) => Promise<un
 		description:
 			"Deliver an instruction back to you at a given time. at: an ISO 8601 date-time with offset, or an ISO 8601 " +
 			"duration from now such as PT2M. instruction: what to do then, in the user's words.",
-		parameters: Type.Object({ at: Type.String(), instruction: Type.String() }),
+		parameters: obj({ at: str(), instruction: str() }),
 		// A rerun finds the reminder its first run created by call id instead of creating another.
 		replay: "safe",
 		execute: async ({ at, instruction }, api, context) => {
@@ -83,7 +84,7 @@ export function schedule(abortTask: (id: TaskId, context: Context) => Promise<un
 	const listTool = defineTool({
 		name: "schedule_list",
 		description: "List pending scheduled instructions with their ids and times.",
-		parameters: Type.Object({}),
+		parameters: obj({}),
 		replay: "safe",
 		execute: async (_args, api, context) => {
 			const items = (await api.snapshot(Schedules, api.conversationId, context))?.items ?? {};
@@ -97,7 +98,7 @@ export function schedule(abortTask: (id: TaskId, context: Context) => Promise<un
 	const cancelTool = defineTool({
 		name: "schedule_cancel",
 		description: "Cancel a pending scheduled instruction by the id schedule or schedule_list gave.",
-		parameters: Type.Object({ id: Type.String() }),
+		parameters: obj({ id: str() }),
 		replay: "safe",
 		execute: async ({ id }, api, context) => {
 			const items = (await api.snapshot(Schedules, api.conversationId, context))?.items ?? {};

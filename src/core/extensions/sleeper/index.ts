@@ -8,10 +8,9 @@ export const Wakeups = defineDoc<{ log: { taskId: number; until: number; firedAt
 	history: "latest",
 	fork: "initial",
 	initial: () => ({ log: [] }),
+	checkpointWhen: () => false,
 });
 
-// `until` lives in the checkpoint, not in the timer: `runtime.sleep` is in-memory only,
-// so after a restart the phase reruns and sleeps for whatever time is left.
 export const Sleeper = defineTask<{ until: number }, { phase: "wait"; until: number }, { firedAt: number }>({
 	name: "soma.sleeper",
 	version: 1,
@@ -19,7 +18,7 @@ export const Sleeper = defineTask<{ until: number }, { phase: "wait"; until: num
 	phases: {
 		wait: async (task, runtime, context) => {
 			const { until } = task.state.checkpoint;
-			await runtime.sleep(until, context);
+			if (runtime.now() < until) return runtime.sleepUntil(until, task.state.checkpoint, context);
 			const firedAt = runtime.now();
 			if ((await runtime.memo("announced", context)) === undefined) {
 				await runtime.memo("announced", true, context);

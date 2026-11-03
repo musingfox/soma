@@ -1,5 +1,4 @@
 import type { Context } from "@earendil-works/chord/context";
-import { Type } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
 	type ConversationId,
@@ -14,6 +13,7 @@ import {
 	type Tx,
 	UserEntry,
 } from "@earendil-works/pi-durable";
+import { int, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
 import {
 	clip,
 	decisionRows,
@@ -115,17 +115,12 @@ export function inspectExtension(storage: Pick<Storage, "scanSubmissions">) {
 			"唯讀查詢 soma 自己的執行紀錄，最新的在前。what=failures：沒有得到回答的輪次與原因；usage：每輪的 token 與成本；" +
 			"decisions：代答（answered）、轉人（escalated）與轉達人的回答（replied）的紀錄與理由；jobs：每張派工卡最後的狀態與結果，不受時間範圍篩選。" +
 			"每筆的 evidence 是穩定的證據 id（submission:<id>、entry:<id> 或 decision:<卡片>#<序號>），可以直接當記憶修訂的證據。超過 limit 時只回傳最新的幾筆並註明總數。",
-		parameters: Type.Object({
-			what: Type.Union([
-				Type.Literal("failures"),
-				Type.Literal("usage"),
-				Type.Literal("decisions"),
-				Type.Literal("jobs"),
-			]),
-			since: Type.Optional(Type.String({ description: "ISO 8601 時間，含這一刻；不填就不設下限" })),
-			until: Type.Optional(Type.String({ description: "ISO 8601 時間，含這一刻；不填就不設上限" })),
-			limit: Type.Optional(
-				Type.Integer({
+		parameters: obj({
+			what: oneOf(["failures", "usage", "decisions", "jobs"]),
+			since: opt(str({ description: "ISO 8601 時間，含這一刻；不填就不設下限" })),
+			until: opt(str({ description: "ISO 8601 時間，含這一刻；不填就不設上限" })),
+			limit: opt(
+				int({
 					minimum: 1,
 					maximum: INSPECT_MAX_LIMIT,
 					description: `最多回傳幾筆，預設 ${INSPECT_DEFAULT_LIMIT}`,

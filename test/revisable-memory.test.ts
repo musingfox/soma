@@ -223,6 +223,7 @@ describe("revising the curated layer on the real harness", () => {
 			version: 1,
 			scope: "session",
 			initial: () => ({ lines: [] }),
+			checkpointWhen: () => false,
 		});
 		const old = await openHarness(path, [], context);
 		await (await old.root(context)).commit(async (tx) => {

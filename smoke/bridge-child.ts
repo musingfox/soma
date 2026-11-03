@@ -5,11 +5,11 @@
 // Each report line carries the faux request count of this process, the bridge's entries and the jobs.
 // SOMA_SMOKE_HANG_AFTER_WAKE=1 freezes the process once a wake's run has finished, before the bridge
 // commits the job's seq, so the driver can kill -9 it in that window.
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { Conversation } from "@earendil-works/pi-durable";
+import type { Conversation, SubmissionDraft } from "@earendil-works/pi-durable";
 import { createHerdrAgentPort } from "../src/adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "../src/adapters/herdr/client.ts";
 import {
@@ -55,11 +55,11 @@ const watched: Conversation =
 				get(target, key) {
 					const value = Reflect.get(target, key);
 					if (key !== "submit") return typeof value === "function" ? value.bind(target) : value;
-					return async (...args: Parameters<Conversation["submit"]>) => {
-						const submission = await target.submit(...args);
-						if (!args[0].requestId?.startsWith("agent:")) return submission;
+					return async (draft: SubmissionDraft, ctx: Context) => {
+						const submission = await target.submit(draft, ctx);
+						if (!draft.requestId?.startsWith("agent:")) return submission;
 						await submission.wait(context);
-						emit({ event: "woke", requestId: args[0].requestId, calls: faux.state.callCount });
+						emit({ event: "woke", requestId: draft.requestId, calls: faux.state.callCount });
 						// A pending promise alone lets node exit; the timer keeps it alive until the kill.
 						return new Promise(() => setInterval(() => {}, 60_000));
 					};

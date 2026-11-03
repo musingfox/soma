@@ -28,6 +28,7 @@ export const Digests = defineDoc<{ taskId?: number }>({
 	history: "latest",
 	fork: "initial",
 	initial: () => ({}),
+	checkpointWhen: () => false,
 });
 
 type Done = { agent: string; card: string; outcome: Outcome | "未知"; notified?: boolean };
@@ -93,7 +94,7 @@ export function digest(agents: Pick<AgentPort, "readResult">) {
 			tick: async (task, runtime, context) => {
 				const checkpoint = task.state.checkpoint;
 				const { since, next, cursor } = checkpoint;
-				await runtime.sleep(next, context);
+				if (runtime.now() < next) return runtime.sleepUntil(next, checkpoint, context);
 				const advance = (reported: number) => ({
 					status: "running" as const,
 					// After a long downtime, one tick covers the gap instead of one per missed period.

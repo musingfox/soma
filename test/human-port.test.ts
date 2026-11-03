@@ -56,6 +56,38 @@ test("a submitted input shows the run working, then idle with its answer", async
 	]);
 });
 
+test("a follow-up input that starts the next run in the commit ending the first shows idle, then working", async () => {
+	const { faux, root, human, seen } = await setup();
+	let release = () => {};
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	faux.setResponses([
+		async () => {
+			await gate;
+			return fauxAssistantMessage("一");
+		},
+		fauxAssistantMessage("二"),
+	]);
+
+	await human.submit({ content: "a", entry: { kind: "chat.terminal" }, requestId: "terminal:1" });
+	await vi.waitFor(() => expect(seen).toContainEqual({ type: "run", state: "working" }));
+	await human.submit({ content: "b", entry: { kind: "chat.terminal" }, requestId: "terminal:2" });
+	release();
+	await root.waitForIdle(context);
+
+	await vi.waitFor(() => expect(seen.at(-1)).toMatchObject({ type: "answer", requestId: "terminal:2" }));
+	expect(seen).toEqual([
+		{ type: "run", state: "idle" },
+		{ type: "run", state: "working" },
+		{ type: "run", state: "idle" },
+		{ type: "answer", requestId: "terminal:1", content: "一" },
+		{ type: "run", state: "working" },
+		{ type: "run", state: "idle" },
+		{ type: "answer", requestId: "terminal:2", content: "二" },
+	]);
+});
+
 const seedJob = (root: Awaited<ReturnType<typeof setup>>["root"]) =>
 	root.commit(async (tx) => {
 		(await tx.doc(Dispatches, root.id)).jobs = [

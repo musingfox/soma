@@ -10,6 +10,10 @@ const MATCH_MAX_CHARS = 300;
 // Denied folders are dropped after the CLI's own file limit, so it is asked for more than the model wants.
 const CLI_SEARCH_FILES = 100;
 
+// The vault's AGENTS.md: the Readwise plugin overwrites that folder, so nobody edits it. Reading it stays open.
+const WRITE_DENIED = ["Readwise"];
+const DEFAULT_FOLDER = "inbox";
+
 export type NoteMatch = { file: string; matches: { line: number; text: string }[] };
 
 /** The human's notes, by vault-relative path. A rejection's message is shown to the model as it is. */
@@ -17,6 +21,13 @@ export interface VaultAccess {
 	/** `folder` is vault-relative; absent, the whole vault. */
 	search(query: string, limit: number, folder?: string): Promise<readonly NoteMatch[]>;
 	read(path: string): Promise<string>;
+	/** Rejects when `path` exists: nothing is ever overwritten. */
+	create(path: string, content: string): Promise<void>;
+	/** Rejects when `path` or `heading` is missing. */
+	append(path: string, content: string, heading?: string): Promise<void>;
+	journalAppend(content: string): Promise<void>;
+	/** Today's journal, whether or not it exists yet. */
+	journalPath(): Promise<string>;
 }
 
 type Result = { text: string; isError: boolean };
@@ -44,10 +55,19 @@ const cut = (text: string, max: number) => {
 	return chars.length > max ? { text: chars.slice(0, max).join(""), cut: true } : { text, cut: false };
 };
 
-/** `path` relative to the vault root without `.`, `..` or empty segments; undefined when it climbs out of the vault. */
+/**
+ * `path` relative to the vault root without `.`, `..` or empty segments; undefined when it climbs out of the vault.
+ * It first does what Obsidian's normalizePath does to a path `create` is given (trim, backslash as a separator, no-break
+ * spaces as spaces, NFC), so a path that the check passes cannot land in a denied folder.
+ */
 function normalize(path: string): string | undefined {
+	const obsidian = path
+		.trim()
+		.replaceAll("\\", "/")
+		.replace(/[\u00a0\u202f]/g, " ")
+		.normalize("NFC");
 	const segments: string[] = [];
-	for (const segment of path.split("/")) {
+	for (const segment of obsidian.split("/")) {
 		if (segment === "" || segment === ".") continue;
 		if (segment === "..") {
 			if (segments.pop() === undefined) return undefined;
@@ -128,6 +148,86 @@ export async function searchNotes(
 	};
 }
 
+/** Where `note_create` puts `path`: a bare title goes to the inbox, and every note ends in `.md`. */
+function newNotePath(path: string, deny: readonly string[]): { path: string } | { refused: string } {
+	// Denied folders are checked where the note lands: a bare title "Clippings" goes to the inbox.
+	const named = notePath(path, []);
+	if ("refused" in named) return named;
+	const placed = named.path.includes("/") ? named.path : `${DEFAULT_FOLDER}/${named.path}`;
+	return notePath(/\.md$/i.test(placed) ? placed : `${placed}.md`, deny);
+}
+
+const link = (path: string) => `[[${path.replace(/\.md$/i, "")}]]`;
+
+/** The AGENTS.md rule that every change gets a line in today's journal; a change to the journal itself needs none. */
+async function brief(access: VaultAccess, path: string, summary: string, done: string): Promise<Result> {
+	try {
+		if (path === (await access.journalPath())) return { text: `${done}.`, isError: false };
+		await access.journalAppend(`- ${summary} ${link(path)}`);
+		return { text: `${done}; today's journal links to it.`, isError: false };
+	} catch (error) {
+		return { text: `${done}, but today's journal did not get its link: ${failure(error).text}`, isError: false };
+	}
+}
+
+const empty = (content: string) =>
+	content.trim() === "" ? { text: "There is nothing to write.", isError: true } : undefined;
+
+export async function createNote(
+	access: VaultAccess,
+	deny: readonly string[],
+	path: string,
+	content: string,
+	summary: string,
+): Promise<Result> {
+	const placed = newNotePath(path, [...deny, ...WRITE_DENIED]);
+	if ("refused" in placed) return { text: placed.refused, isError: true };
+	const nothing = empty(content);
+	if (nothing) return nothing;
+	try {
+		await access.create(placed.path, content);
+	} catch (error) {
+		return failure(error);
+	}
+	return brief(access, placed.path, summary, `Created ${placed.path}`);
+}
+
+export async function appendNote(
+	access: VaultAccess,
+	deny: readonly string[],
+	path: string,
+	content: string,
+	summary: string,
+	heading: string | undefined,
+): Promise<Result> {
+	const checked = notePath(path, [...deny, ...WRITE_DENIED]);
+	if ("refused" in checked) return { text: checked.refused, isError: true };
+	const nothing = empty(content);
+	if (nothing) return nothing;
+	try {
+		await access.append(checked.path, content, heading);
+	} catch (error) {
+		return failure(error);
+	}
+	return brief(access, checked.path, summary, `Appended to ${checked.path}`);
+}
+
+export async function appendJournal(access: VaultAccess, content: string): Promise<Result> {
+	const nothing = empty(content);
+	if (nothing) return nothing;
+	try {
+		await access.journalAppend(content);
+		return { text: `Appended to today's journal, ${await access.journalPath()}.`, isError: false };
+	} catch (error) {
+		return failure(error);
+	}
+}
+
+const TELL = " Tell the human what you wrote and where.";
+const SUMMARY = str({
+	description: "One short line for today's journal saying what changed, such as: noted the fox's diet",
+});
+
 export function vaultExtension(access: VaultAccess, deny: readonly string[]) {
 	const noteSearch = defineTool({
 		name: "note_search",
@@ -161,5 +261,50 @@ export function vaultExtension(access: VaultAccess, deny: readonly string[]) {
 			return { output: [{ type: "text" as const, text }], isError };
 		},
 	});
-	return defineExtension({ name: "soma.vault", tools: [noteSearch, noteRead] });
+	const text = (result: Result) => ({
+		output: [{ type: "text" as const, text: result.text }],
+		isError: result.isError,
+	});
+	// A write is not rerun after a crash: it could land twice. The model is told the call was cut off instead.
+	const noteCreate = defineTool({
+		name: "note_create",
+		description:
+			"Create a new note in the human's Obsidian vault. A bare title goes to inbox/. It never overwrites: an " +
+			`existing path is refused. Today's journal gets a line linking to the note.${TELL}`,
+		parameters: obj({
+			path: str({ description: "A title, or a vault path such as notes/fox.md; .md is added when missing" }),
+			content: str({ description: "The note's Markdown" }),
+			summary: SUMMARY,
+		}),
+		replay: "unsafe",
+		execute: async ({ path, content, summary }) => text(await createNote(access, deny, path, content, summary)),
+	});
+	const noteAppend = defineTool({
+		name: "note_append",
+		description:
+			"Append to the end of an existing note, or of one heading's section in it. Nothing already in the note " +
+			`changes. Today's journal gets a line linking to the note.${TELL}`,
+		parameters: obj({
+			path: str({ description: "The note's vault path, as note_search lists it" }),
+			content: str({ description: "The Markdown to append" }),
+			summary: SUMMARY,
+			heading: opt(str({ description: "Append under this heading instead of at the end; its text without #" })),
+		}),
+		replay: "unsafe",
+		execute: async ({ path, content, summary, heading }) =>
+			text(await appendNote(access, deny, path, content, summary, heading)),
+	});
+	const journalAppend = defineTool({
+		name: "journal_append",
+		description:
+			"Append to the human's journal for today, for 記一下 and anything the human asks to note down. Write " +
+			`nested Markdown bullets (- item, indented - detail), never paragraphs or headings.${TELL}`,
+		parameters: obj({ content: str({ description: "One or more bullets" }) }),
+		replay: "unsafe",
+		execute: async ({ content }) => text(await appendJournal(access, content)),
+	});
+	return defineExtension({
+		name: "soma.vault",
+		tools: [noteSearch, noteRead, noteCreate, noteAppend, journalAppend],
+	});
 }

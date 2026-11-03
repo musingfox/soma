@@ -1,6 +1,9 @@
 import { expect, test } from "vitest";
 import { FENCE_CLOSE, FENCE_OPEN } from "../src/core/domain/memory.ts";
 import {
+	appendJournal,
+	appendNote,
+	createNote,
 	NOTE_MAX_CHARS,
 	type NoteMatch,
 	readNote,
@@ -11,11 +14,15 @@ import {
 } from "../src/core/extensions/vault/index.ts";
 
 const deny = ["Clippings"];
+const TODAY = "journals/2026-11-04.md";
 
-function fakeVault(notes: Record<string, string>): VaultAccess & { reads: string[] } {
+/** Notes by path; `writes` records each write in order, as "<method> <path>". */
+function fakeVault(notes: Record<string, string>): VaultAccess & { reads: string[]; writes: string[] } {
 	const reads: string[] = [];
+	const writes: string[] = [];
 	return {
 		reads,
+		writes,
 		async search(query, limit) {
 			const found: NoteMatch[] = Object.entries(notes)
 				.map(([file, text]) => ({
@@ -34,14 +41,34 @@ function fakeVault(notes: Record<string, string>): VaultAccess & { reads: string
 			if (text === undefined) throw new Error(`Error: File "${path}" not found.`);
 			return text;
 		},
+		async create(path, content) {
+			writes.push(`create ${path}`);
+			if (notes[path] !== undefined) throw new Error(`${path} exists; a note is never overwritten`);
+			notes[path] = content;
+		},
+		async append(path, content) {
+			writes.push(`append ${path}`);
+			if (notes[path] === undefined) throw new Error(`Error: File "${path}" not found.`);
+			notes[path] += `\n${content}`;
+		},
+		async journalAppend(content) {
+			writes.push(`journal ${TODAY}`);
+			notes[TODAY] = notes[TODAY] === undefined ? content : `${notes[TODAY]}\n${content}`;
+		},
+		async journalPath() {
+			return TODAY;
+		},
 	};
 }
 
-test("the vault tools may rerun on recovery", () => {
+test("the reading tools may rerun on recovery, the writing ones may not, and none deletes or overwrites", () => {
 	const tools = (vaultExtension(fakeVault({}), deny).tools ?? []).map((tool) => [tool.name, tool.replay]);
 	expect(tools).toEqual([
 		["note_search", "safe"],
 		["note_read", "safe"],
+		["note_create", "unsafe"],
+		["note_append", "unsafe"],
+		["journal_append", "unsafe"],
 	]);
 });
 
@@ -176,4 +203,119 @@ test("a search can stay in one folder, but not in a denied one", async () => {
 		text: "Clippings/ is not open to soma",
 	});
 	expect(asked).toEqual(["journals"]);
+});
+
+test("a new note with a bare title goes to the inbox, and today's journal links to it", async () => {
+	const notes: Record<string, string> = {};
+	const vault = fakeVault(notes);
+	const result = await createNote(vault, deny, "Fox diet", "# Fox diet", "noted the fox's diet");
+	expect(result).toEqual({ isError: false, text: "Created inbox/Fox diet.md; today's journal links to it." });
+	expect(notes["inbox/Fox diet.md"]).toBe("# Fox diet");
+	expect(notes[TODAY]).toBe("- noted the fox's diet [[inbox/Fox diet]]");
+});
+
+test("a new note keeps the folder it is given", async () => {
+	const notes: Record<string, string> = {};
+	await createNote(fakeVault(notes), deny, "./notes/fox.md", "text", "fox");
+	expect(Object.keys(notes)).toEqual(["notes/fox.md", TODAY]);
+});
+
+test("note_create never overwrites: an existing note is refused and left as it was", async () => {
+	const notes = { "notes/fox.md": "old" };
+	const vault = fakeVault(notes);
+	const result = await createNote(vault, deny, "notes/fox.md", "new", "fox");
+	expect(result.isError).toBe(true);
+	expect(notes).toEqual({ "notes/fox.md": "old" });
+	expect(vault.writes).toEqual(["create notes/fox.md"]);
+});
+
+test.each([
+	["create", (vault: VaultAccess, path: string) => createNote(vault, deny, path, "x", "s")],
+	["append", (vault: VaultAccess, path: string) => appendNote(vault, deny, path, "x", "s", undefined)],
+])("%s under Readwise or Clippings is refused without a write, whatever the spelling", async (_name, write) => {
+	const vault = fakeVault({ "Readwise/a.md": "highlight", "Clippings/a.md": "clip" });
+	for (const path of [
+		"Readwise/a.md",
+		"readwise/b.md",
+		"notes/../Readwise/c",
+		"Clippings/a.md",
+		"/clippings/d.md",
+		" Clippings/e.md",
+		"\\Readwise/f.md",
+		"Clippings\\sub/g.md",
+	]) {
+		const result = await write(vault, path);
+		expect(result.isError, path).toBe(true);
+	}
+	expect(vault.writes).toEqual([]);
+});
+
+test("Readwise stays open to reading", async () => {
+	const result = await readNote(fakeVault({ "Readwise/a.md": "highlight" }), deny, "Readwise/a.md");
+	expect(result.isError).toBe(false);
+});
+
+test("an append goes to an existing note and today's journal links to it", async () => {
+	const notes: Record<string, string> = { "notes/fox.md": "# Fox" };
+	const result = await appendNote(fakeVault(notes), deny, "notes/fox.md", "- eats mice", "fox eats mice", undefined);
+	expect(result).toEqual({ isError: false, text: "Appended to notes/fox.md; today's journal links to it." });
+	expect(notes["notes/fox.md"]).toBe("# Fox\n- eats mice");
+	expect(notes[TODAY]).toBe("- fox eats mice [[notes/fox]]");
+});
+
+test("an append to a missing note is an error and writes no journal line", async () => {
+	const vault = fakeVault({});
+	const result = await appendNote(vault, deny, "notes/none.md", "x", "s", undefined);
+	expect(result).toEqual({ isError: true, text: 'Error: File "notes/none.md" not found.' });
+	expect(vault.writes).toEqual(["append notes/none.md"]);
+});
+
+test("an append to today's journal adds no second line about itself", async () => {
+	const notes = { [TODAY]: "- morning" };
+	const vault = fakeVault(notes);
+	const result = await appendNote(vault, deny, TODAY, "- noon", "s", undefined);
+	expect(result).toEqual({ isError: false, text: `Appended to ${TODAY}.` });
+	expect(vault.writes).toEqual([`append ${TODAY}`]);
+});
+
+test("journal_append writes to today's journal once and names it", async () => {
+	const vault = fakeVault({});
+	const result = await appendJournal(vault, "- buy cat food");
+	expect(result).toEqual({ isError: false, text: `Appended to today's journal, ${TODAY}.` });
+	expect(vault.writes).toEqual([`journal ${TODAY}`]);
+});
+
+test("a write that landed says so even when its journal line did not", async () => {
+	const notes: Record<string, string> = {};
+	const vault = fakeVault(notes);
+	vault.journalAppend = async () => {
+		throw new Error("Error: daily notes are off");
+	};
+	const result = await createNote(vault, deny, "notes/fox.md", "x", "s");
+	expect(result.text).toBe(
+		"Created notes/fox.md, but today's journal did not get its link: Error: daily notes are off",
+	);
+	expect(notes["notes/fox.md"]).toBe("x");
+});
+
+test("empty content and an empty path are refused without a write", async () => {
+	const vault = fakeVault({ "notes/fox.md": "x" });
+	expect((await createNote(vault, deny, "notes/new.md", "  \n", "s")).isError).toBe(true);
+	expect((await createNote(vault, deny, "", "x", "s")).isError).toBe(true);
+	expect((await appendNote(vault, deny, "notes/fox.md", "", "s", undefined)).isError).toBe(true);
+	expect((await appendJournal(vault, " ")).isError).toBe(true);
+	expect(vault.writes).toEqual([]);
+});
+
+test("a bare title that names a denied folder is a note in the inbox", async () => {
+	const notes: Record<string, string> = {};
+	expect((await createNote(fakeVault(notes), deny, "Clippings", "x", "s")).isError).toBe(false);
+	expect(notes["inbox/Clippings.md"]).toBe("x");
+});
+
+test("a path ending in .MD gets no second extension", async () => {
+	const notes: Record<string, string> = {};
+	await createNote(fakeVault(notes), deny, "Fox.MD", "x", "s");
+	expect(Object.keys(notes)).toEqual(["inbox/Fox.MD", TODAY]);
+	expect(notes[TODAY]).toBe("- s [[inbox/Fox]]");
 });

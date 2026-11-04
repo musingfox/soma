@@ -28,7 +28,8 @@ type Checkpoint =
 	| { phase: "resuming"; tries: number; session: string; until: number }
 	// Committed once the start went out, or a window of the agent's name was found: a rerun starts nothing. `until`
 	// bounds the wait for the agent to be listed at rest, and `readyMs` past it the wait for a listing that answers.
-	| { phase: "ready"; tries: number; until: number }
+	// `started` when a start returned, so a notice never tells of one that failed or was never made.
+	| { phase: "ready"; tries: number; until: number; started: boolean }
 	// Committed before the prompt goes out: a rerun that finds it cannot tell whether the agent got it.
 	| { phase: "sending"; tries: number };
 
@@ -301,6 +302,7 @@ export function deferExtension(
 				const { end } = steps(id, task.input, tried, runtime, context);
 				const unresumed = (error: unknown) =>
 					end("unresumed", deferNotice.unresumed(id, task.input, errorText(error)), true);
+				let started = false;
 				for (;;) {
 					let listed: boolean;
 					try {
@@ -313,6 +315,7 @@ export function deferExtension(
 					if (!listed) {
 						try {
 							await agents.resume({ name: task.input.agent, card: task.input.card, sessionId: session });
+							started = true;
 						} catch (error) {
 							// A side that cannot start an agent again ends this as it did before it could.
 							if (error instanceof NotImplemented) return end("gone", deferNotice.gone(id, task.input), true);
@@ -329,7 +332,10 @@ export function deferExtension(
 				}
 				// Timed from the start, so a start a crash cut short long ago still gets the whole wait.
 				return runtime.commit(
-					() => ({ status: "running", checkpoint: { phase: "ready", tries: tried, until: runtime.now() + readyMs } }),
+					() => ({
+						status: "running",
+						checkpoint: { phase: "ready", tries: tried, until: runtime.now() + readyMs, started },
+					}),
 					context,
 				);
 			},
@@ -337,21 +343,22 @@ export function deferExtension(
 			// Only a listing that answers decides, past `until` too: one that fails is no sign of the agent either way. Listings
 			// that still fail `readyMs` past `until`, as rex's do while two windows share the name, end this in doubt.
 			ready: async (task, runtime, context) => {
-				const { tries: tried, until } = task.state.checkpoint;
+				const { tries: tried, until, started } = task.state.checkpoint;
 				const id = String(task.id);
 				const { end, send } = steps(id, task.input, tried, runtime, context);
 				for (; ; await pause(runtime, pollMs)) {
 					let state: string;
 					try {
 						const found = await listing(task.input.agent);
-						if (found === undefined) return end("gone", deferNotice.closed(id, task.input), true);
+						if (found === undefined) return end("gone", deferNotice.closed(id, task.input, started), true);
 						state = found.status?.state ?? "without a status";
 					} catch (error) {
 						if (runtime.now() < until + readyMs) continue;
 						return end("failed", deferNotice.unlisted(id, task.input, (2 * readyMs) / 1000, errorText(error)));
 					}
 					if (state === "idle" || state === "done") return send();
-					if (runtime.now() >= until) return end("failed", deferNotice.unready(id, task.input, readyMs / 1000, state));
+					if (runtime.now() >= until)
+						return end("failed", deferNotice.unready(id, task.input, readyMs / 1000, state, started));
 				}
 			},
 			// Reached only by a rerun: the run that committed `sending` went on to prompt without ending.

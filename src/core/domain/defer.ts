@@ -45,11 +45,14 @@ export const deferNotice = {
 	// The agent was gone at `at`, and starting it again in its session failed.
 	unresumed: (id: string, item: Deferred, error: string) =>
 		`${named(id, item)} was not sent: the agent was gone when it fell due at ${iso(item.at)}, and soma could not start it again: ${error}. The instruction was: ${item.instruction}`,
-	// soma started the agent again, and its window was gone before it could take the instruction.
-	closed: (id: string, item: Deferred) =>
-		`${named(id, item)} was not sent: soma started the agent again when it fell due at ${iso(item.at)}, but its window closed before the instruction went out. The instruction was: ${item.instruction}`,
-	unready: (id: string, item: Deferred, seconds: number, state: string) =>
-		`${named(id, item)} was not sent: soma started the agent again when it fell due at ${iso(item.at)}, but it was not ready for the instruction within ${seconds} s (it was ${state}); it is left open. The instruction was: ${item.instruction}`,
+	// The agent was gone at `at`, started again only if `started`, and no window of it was listed before it took the
+	// instruction.
+	closed: (id: string, item: Deferred, started: boolean) =>
+		started
+			? `${named(id, item)} was not sent: soma started the agent again when it fell due at ${iso(item.at)}, but its window closed before the instruction went out. The instruction was: ${item.instruction}`
+			: `${named(id, item)} was not sent: the agent was not listed when it fell due at ${iso(item.at)}, soma did not get it started again, and no window of it was listed when soma looked again. The instruction was: ${item.instruction}`,
+	unready: (id: string, item: Deferred, seconds: number, state: string, started: boolean) =>
+		`${named(id, item)} was not sent: ${started ? "soma started the agent again" : "the agent was not listed"} when it fell due at ${iso(item.at)}${started ? "" : ", and soma did not get it started again; a window of it was listed later"}, but it was not ready for the instruction within ${seconds} s (it was ${state}); it is left open. The instruction was: ${item.instruction}`,
 	// No listing answered from the wait for the agent to be ready until well past it: soma cannot tell where it is.
 	unlisted: (id: string, item: Deferred, seconds: number, error: string) =>
 		`${named(id, item)} was not sent: when it fell due at ${iso(item.at)}, soma waited ${seconds} s for the agent to be ready for it, and in the end could not list the hangar to tell: ${error}. The agent may be running; it is left as it is, and the instruction was not sent. The instruction was: ${item.instruction}`,

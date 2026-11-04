@@ -698,6 +698,35 @@ test("listings that keep failing once the resumed window is up end the deferral 
 	expect(await soma.notices()).toEqual(told);
 });
 
+test("an agent never started again, as listings failed past the start's deadline, is not said to have been", {
+	timeout: 20_000,
+}, async () => {
+	// The fire-time listing finds the agent gone, then rex stops answering past the deadline the start has to list it,
+	// and the first listing that answers shows no window of it.
+	const agents = new (class extends FakeAgentPort {
+		failUntil = 0;
+		override async list() {
+			if (Date.now() < this.failUntil) throw new Error("rex connection lost");
+			const listed = await super.list();
+			if (this.stopped.length > 0 && this.failUntil === 0) this.failUntil = Date.now() + 500;
+			return listed;
+		}
+	})();
+	agents.emit("card-a", { state: "idle" });
+	const soma = await core(await database(), agents, { readyMs: 300, pollMs: 50 });
+	const id = await accepted(await soma.defer("PT1S"));
+
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "gone" });
+	expect(agents.resumed).toEqual([]);
+	expect(agents.prompts).toEqual([]);
+	const notices = await soma.notices();
+	expect(notices).toEqual([
+		expect.stringMatching(new RegExp(`^Deferred instruction ${id} .* was not sent: .*did not get it started again`)),
+	]);
+	expect(notices[0]).not.toMatch(/soma started the agent again/);
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
+});
+
 test("a resumed window that closes before the instruction goes is not prompted, and the human is told once", {
 	timeout: 20_000,
 }, async () => {

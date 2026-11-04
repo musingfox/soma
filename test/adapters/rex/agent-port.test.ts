@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, expect, test } from "vitest";
-import { createRexAgentPort, seqOf, stateOf } from "../../../src/adapters/rex/agent-port.ts";
+import { createRexAgentPort, launchCommand, seqOf, stateOf } from "../../../src/adapters/rex/agent-port.ts";
 import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
 import type { AgentPort, AgentResult, AgentStatusEvent } from "../../../src/ports/agent.ts";
 import { AT, AT_US, type Block, fixture, git, HANGAR, rex, SESSION } from "./fake.ts";
@@ -16,9 +17,14 @@ test("start adds fleet/<card> under .claude/worktrees and types claude's command
 	const fake = rex([]);
 	const { git: run, runs } = git();
 
-	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, git: run }).start(
-		request,
-	);
+	await createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		env: { SOMA_SOCKET: "/run/soma.sock" },
+		path: "/opt/soma/bin",
+	}).start(request);
 
 	expect(runs).toEqual([
 		["/nonexistent/repo", "worktree", "list", "--porcelain"],
@@ -40,13 +46,44 @@ test("start adds fleet/<card> under .claude/worktrees and types claude's command
 						label: SESSION,
 						options: {
 							cwd: "/nonexistent/repo/.claude/worktrees/card-a",
-							initial_input: `claude --session-id ${SESSION}\n`,
+							initial_input: `SOMA_SOCKET='/run/soma.sock' SOMA_AGENT='card-a' PATH='/opt/soma/bin':"$PATH" claude --session-id ${SESSION}\n`,
 						},
 					},
 				},
 			},
 		},
 	]);
+});
+
+test("the launch command names the card in SOMA_AGENT even with no other variable", () => {
+	expect(launchCommand(request)).toBe(`SOMA_AGENT='card-a' claude --session-id ${SESSION}\n`);
+});
+
+test("the launch command sets SOMA_AGENT and PATH for claude in sh, zsh and fish alike", () => {
+	const line = launchCommand(
+		{ ...request, card: "卡 a" },
+		{ SOMA_SOCKET: "/Users/me/Library/Application Support/soma.sock" },
+		"/opt/soma bin",
+	).replace(/claude --session-id \S+\n$/, `sh -c 'printf "%s|%s|%s" "$SOMA_AGENT" "$SOMA_SOCKET" "$PATH"'`);
+	// Each without its startup files, which may change PATH.
+	const shells = { "/bin/sh": [], "/bin/zsh": ["-f"], "/opt/homebrew/bin/fish": ["--no-config"] };
+	for (const [shell, flags] of Object.entries(shells).filter(([path]) => existsSync(path))) {
+		const out = spawnSync(shell, [...flags, "-c", line], { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } }).stdout;
+		expect([shell, out]).toEqual([
+			shell,
+			"卡 a|/Users/me/Library/Application Support/soma.sock|/opt/soma bin:/usr/bin:/bin",
+		]);
+	}
+});
+
+test("start refuses a card the launch command cannot quote, before git or rex is touched", async () => {
+	const fake = rex([]);
+	const { git: run, runs } = git();
+	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, git: run });
+
+	await expect(port.start({ ...request, card: "it's" })).rejects.toThrow("cannot put");
+	expect(runs).toEqual([]);
+	expect(fake.calls).toEqual([]);
 });
 
 test("start refuses when the hangar's claude blocks already fill the cap, and leaves git and rex alone", async () => {

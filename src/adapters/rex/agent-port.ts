@@ -65,6 +65,10 @@ export interface RexAgentPortOptions {
 	readonly redrawMs?: number;
 	readonly now?: () => number;
 	readonly onError?: (error: Error) => void;
+	/** Set in every agent's environment, next to `SOMA_AGENT`, which names the agent's card. */
+	readonly env?: Readonly<Record<string, string>>;
+	/** A directory put first on every agent's PATH, so its shell finds soma's own commands. */
+	readonly path?: string;
 }
 
 type Seen = { readonly status: AgentState; readonly seq: number };
@@ -76,6 +80,26 @@ const BLOCKED_KINDS: readonly string[] = ["permission", "question", "auth"] sati
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Any of these can change which window a block is in, or what the window is called.
 const VIEW_EVENTS = new Set(["session_view_changed", "window_created", "window_closed", "window_label_changed"]);
+
+/**
+ * claude's launch command, typed into the block's shell. rex takes no env on creation, so the variables are prefix
+ * assignments, which sh, bash, zsh and fish all read; fish joins a quoted `$PATH` with colons, as the others keep it.
+ * A value goes in single quotes, which no shell expands, so one holding a quote or a backslash, which fish reads
+ * differently from the others, is refused.
+ */
+export function launchCommand(request: StartRequest, env: Readonly<Record<string, string>> = {}, path?: string) {
+	const quote = (value: string) => {
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: a control character would end or garble the command
+		if (/['\\\x00-\x1f]/.test(value)) throw new Error(`cannot put ${JSON.stringify(value)} in a launch command`);
+		return `'${value}'`;
+	};
+	const assignments = Object.entries({ ...env, SOMA_AGENT: request.card }).map(([name, value]) => {
+		if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) throw new Error(`not an environment variable name: ${name}`);
+		return `${name}=${quote(value)}`;
+	});
+	if (path !== undefined) assignments.push(`PATH=${quote(path)}:"$PATH"`);
+	return `${assignments.join(" ")} claude --session-id ${request.sessionId}\n`;
+}
 
 const isRoot = (record: StatusRecord) => record.id === undefined || record.id === "";
 
@@ -532,6 +556,8 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 
 	return {
 		async start(request: StartRequest): Promise<void> {
+			// Built first, so a card the command cannot hold leaves git and rex alone.
+			const launch = launchCommand(request, options.env, options.path);
 			await client.attach(sessionId);
 			const running = await occupied();
 			if (running >= cap) throw new Error(`hangar is full: ${running} of ${cap} agents running`);
@@ -554,7 +580,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 						block: {
 							flavor: SHELL_FLAVOR,
 							label: request.sessionId,
-							options: { cwd: path, initial_input: `claude --session-id ${request.sessionId}\n` },
+							options: { cwd: path, initial_input: launch },
 						},
 					},
 				},

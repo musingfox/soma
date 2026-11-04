@@ -475,6 +475,32 @@ test("a resumed agent not ready in time is left open, not prompted, and the huma
 	expect((await agents.list()).map((each) => each.name)).toEqual(["card-a"]);
 });
 
+test("listings that fail until past the ready deadline decide nothing: the first that answers does", {
+	timeout: 20_000,
+}, async () => {
+	// The window is up at rest, and rex answers no listing until the wait for it to be ready is over.
+	const agents = new (class extends FakeAgentPort {
+		failUntil = 0;
+		override async list() {
+			if (Date.now() < this.failUntil) throw new Error("rex connection lost");
+			return super.list();
+		}
+		override async resume(request: ResumeRequest): Promise<void> {
+			this.resumed.push(request);
+			this.emit(request.name, { state: "idle" });
+			this.failUntil = Date.now() + 600;
+		}
+	})();
+	agents.emit("card-a", { state: "idle" });
+	const soma = await core(await database(), agents, { readyMs: 300, pollMs: 50 });
+	const id = await accepted(await soma.defer("PT1S"));
+
+	expect(await soma.outcome(id)).toEqual(sent);
+	expect(agents.resumed).toEqual([session]);
+	expect(agents.prompts).toEqual([instruction(id)]);
+	expect(await soma.notices()).toEqual([]);
+});
+
 test("a resumed window that closes before the instruction goes is not prompted, and the human is told once", {
 	timeout: 20_000,
 }, async () => {

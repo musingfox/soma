@@ -293,22 +293,22 @@ export function deferExtension(
 				);
 			},
 			// The agent's window is up: it is prompted once it is listed idle or done, which is when claude takes a prompt.
+			// Only a listing that answers decides, past `until` too: one that fails is no sign of the agent either way.
 			ready: async (task, runtime, context) => {
 				const { tries: tried, until } = task.state.checkpoint;
 				const id = String(task.id);
 				const { end, send } = steps(id, task.input, tried, runtime, context);
-				for (;;) {
+				for (; ; await pause(runtime, pollMs)) {
 					let state: string;
 					try {
 						const found = await listing(task.input.agent);
 						if (found === undefined) return end("gone", deferNotice.closed(id, task.input), true);
 						state = found.status?.state ?? "without a status";
-					} catch (error) {
-						state = `not listed: ${errorText(error)}`;
+					} catch {
+						continue;
 					}
 					if (state === "idle" || state === "done") return send();
 					if (runtime.now() >= until) return end("failed", deferNotice.unready(id, task.input, readyMs / 1000, state));
-					await pause(runtime, pollMs);
 				}
 			},
 			// Reached only by a rerun: the run that committed `sending` went on to prompt without ending.

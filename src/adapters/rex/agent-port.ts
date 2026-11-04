@@ -9,7 +9,7 @@ import {
 	isTrustDialog,
 	readBlockedScreen,
 } from "../../agent-cli/permission/blocked-screen.ts";
-import { awaitingReply, readLastRecord, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
+import { awaitingReply, readLastRecord, readSessionCwd, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
 import { type Git, mainCheckout, openWorktree, runGit } from "../../agent-cli/worktree.ts";
 import {
 	type AgentListing,
@@ -21,6 +21,7 @@ import {
 	type AnswerOutcome,
 	type BlockedKind,
 	PromptRefused,
+	type ResumeRequest,
 	type StartRequest,
 } from "../../ports/agent.ts";
 import type { RexClient } from "./client.ts";
@@ -86,9 +87,14 @@ const VIEW_EVENTS = new Set(["session_view_changed", "window_created", "window_c
  * claude's launch command, typed into the block's shell. rex takes no env on creation, so the variables are prefix
  * assignments, which sh, bash, zsh and fish all read; fish joins a quoted `$PATH` with colons, as the others keep it.
  * A value goes in single quotes, which no shell expands, so one holding a quote or a backslash, which fish reads
- * differently from the others, is refused.
+ * differently from the others, is refused. With `resume`, claude goes on with the session instead of starting it.
  */
-export function launchCommand(request: StartRequest, env: Readonly<Record<string, string>> = {}, path?: string) {
+export function launchCommand(
+	request: Pick<StartRequest, "card" | "sessionId">,
+	env: Readonly<Record<string, string>> = {},
+	path?: string,
+	resume = false,
+) {
 	const quote = (value: string) => {
 		// biome-ignore lint/suspicious/noControlCharactersInRegex: a control character would end or garble the command
 		if (/['\\\x00-\x1f]/.test(value)) throw new Error(`cannot put ${JSON.stringify(value)} in a launch command`);
@@ -99,7 +105,7 @@ export function launchCommand(request: StartRequest, env: Readonly<Record<string
 		return `${name}=${quote(value)}`;
 	});
 	if (path !== undefined) assignments.push(`PATH=${quote(path)}:"$PATH"`);
-	return `${assignments.join(" ")} claude --session-id ${request.sessionId}\n`;
+	return `${assignments.join(" ")} claude ${resume ? "--resume" : "--session-id"} ${request.sessionId}\n`;
 }
 
 const isRoot = (record: StatusRecord) => record.id === undefined || record.id === "";
@@ -391,6 +397,23 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		return { done, stop: () => stop() };
 	}
 
+	/**
+	 * A window named `name` whose one block is an interactive shell typing `launch`, so the block outlives claude
+	 * exiting, as a herdr pane does. The block's label keeps the session id, which nothing else in rex records.
+	 */
+	async function openWindow(name: string, session: string, cwd: string, launch: string): Promise<void> {
+		await client.call(
+			"session.new_window",
+			{
+				session_id: sessionId,
+				window_label: name,
+				focus: false,
+				layout: { block: { flavor: SHELL_FLAVOR, label: session, options: { cwd, initial_input: launch } } },
+			},
+			NewWindowResultSchema,
+		);
+	}
+
 	const listeners = new Set<(event: AgentStatusEvent) => void>();
 	let unwatch: (() => void) | undefined;
 
@@ -577,24 +600,34 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 					if (error.code !== "ENOENT" && error.code !== "EEXIST") throw error;
 				},
 			);
-			// An interactive shell types claude's command, so the block outlives claude exiting, as a herdr pane does.
-			// The block's label keeps the session id, which nothing else in rex records.
-			await client.call(
-				"session.new_window",
-				{
-					session_id: sessionId,
-					window_label: request.name,
-					focus: false,
-					layout: {
-						block: {
-							flavor: SHELL_FLAVOR,
-							label: request.sessionId,
-							options: { cwd: path, initial_input: launch },
-						},
-					},
-				},
-				NewWindowResultSchema,
-			);
+			await openWindow(request.name, request.sessionId, path, launch);
+		},
+
+		/**
+		 * As start, with `claude --resume` and the same environment, in the directory the session's transcript says it ran
+		 * in, the card's worktree, since claude looks a session up under its directory. Not held to the cap: a due
+		 * deferred instruction outranks it (ARCHITECTURE.md "Agent-deferred instructions"). Refuses, with nothing made, a
+		 * worktree gone since, and a name a window of the hangar has, as one the human reopened.
+		 */
+		async resume(request: ResumeRequest): Promise<void> {
+			// Typed unquoted into the shell, and part of a file name below.
+			if (!SESSION_ID.test(request.sessionId)) {
+				throw new Error(`not a claude session id: ${JSON.stringify(request.sessionId)}`);
+			}
+			const launch = launchCommand(request, options.env, options.path, true);
+			const transcript = await resolveTranscriptPath(request.sessionId, undefined, options.projectsDir);
+			const cwd = transcript && (await readSessionCwd(transcript));
+			if (cwd === undefined) {
+				throw new Error(`no transcript of claude session ${request.sessionId} names the directory it ran in`);
+			}
+			const directory = await stat(cwd).catch(() => undefined);
+			if (!directory?.isDirectory()) {
+				throw new Error(`the worktree ${cwd} claude session ${request.sessionId} ran in no longer exists`);
+			}
+			if ((await panes()).has(request.name)) {
+				throw new Error(`rex hangar ${sessionId} already has a window named ${request.name}`);
+			}
+			await openWindow(request.name, request.sessionId, cwd, launch);
 		},
 
 		async list(): Promise<readonly AgentListing[]> {

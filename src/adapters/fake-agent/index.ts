@@ -6,6 +6,7 @@ import type {
 	AgentStatusEvent,
 	Answer,
 	AnswerOutcome,
+	ResumeRequest,
 	StartRequest,
 } from "../../ports/agent.ts";
 
@@ -13,6 +14,7 @@ export class FakeAgentPort implements AgentPort {
 	readonly prompts: { readonly agent: string; readonly text: string }[] = [];
 	readonly responses: { readonly agent: string; readonly answer: Answer }[] = [];
 	readonly started: StartRequest[] = [];
+	readonly resumed: ResumeRequest[] = [];
 	// One entry per call, so a second stop of the same agent shows.
 	readonly stopped: string[] = [];
 	readonly #listeners = new Set<(event: AgentStatusEvent) => void>();
@@ -23,6 +25,12 @@ export class FakeAgentPort implements AgentPort {
 
 	async start(request: StartRequest): Promise<void> {
 		this.started.push(request);
+		this.emit(request.name, { state: "idle" });
+	}
+
+	/** Ready at once, as start is; the hangar has no cap here. */
+	async resume(request: ResumeRequest): Promise<void> {
+		this.resumed.push(request);
 		this.emit(request.name, { state: "idle" });
 	}
 

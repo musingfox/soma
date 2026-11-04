@@ -137,6 +137,28 @@ function thinkingOnly(content: unknown): boolean {
 	);
 }
 
+/**
+ * The directory the session ran in: the `cwd` claude stamps on its records, read off the first that carries an absolute
+ * one. Read from the file's start in growing windows; undefined when no record names one.
+ */
+export async function readSessionCwd(path: string, firstWindowBytes = 64 * 1024): Promise<string | undefined> {
+	const file = await open(path, "r");
+	try {
+		const { size } = await file.stat();
+		for (let window = firstWindowBytes; ; window *= 2) {
+			const bytes = Buffer.alloc(Math.min(size, window));
+			await file.read(bytes, 0, bytes.length, 0);
+			// A record the window cut short does not parse, and is read whole in the next.
+			const cwd = parseWindow(bytes, true)
+				.map((record) => (record as { cwd?: unknown }).cwd)
+				.find((each): each is string => typeof each === "string" && each.startsWith("/"));
+			if (cwd !== undefined || bytes.length === size) return cwd;
+		}
+	} finally {
+		await file.close();
+	}
+}
+
 /** The text of the last assistant message; undefined when it has none. */
 export async function readFinalAnswer(path: string, firstWindowBytes = 64 * 1024): Promise<string | undefined> {
 	return (await windowed(path, firstWindowBytes, lastMessage))?.text || undefined;

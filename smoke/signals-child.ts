@@ -22,6 +22,7 @@ const emit = (record: object) => console.log(JSON.stringify(record));
 
 const agents: AgentPort = {
 	start: async () => {},
+	resume: async () => {},
 	list: async () => [{ name: "card-x", status: { state: "done" }, seq: 5 }],
 	prompt: async () => {},
 	onStatus: () => () => {},

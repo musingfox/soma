@@ -6,6 +6,7 @@ import {
 	awaitingReply,
 	readFinalAnswer,
 	readLastRecord,
+	readSessionCwd,
 	resolveTranscriptPath,
 } from "../../src/agent-cli/transcript.ts";
 
@@ -213,4 +214,13 @@ test("a reply is awaited while the conversation's last record is the user's, or 
 	expect(await awaitingReply(await transcript(user("一") + assistant("msg_1", text("ok")) + attachment), 64)).toBe(
 		false,
 	);
+});
+
+test("the directory a session ran in is the first absolute cwd on its records, read past a first record the window cuts", async () => {
+	const owner = line({ type: "session-owner", sessionId: SESSION, note: "x".repeat(200) });
+	const at = (cwd: unknown) => line({ type: "user", uuid: "u-1", cwd, message: { role: "user", content: "go" } });
+	expect(await readSessionCwd(await transcript(owner + at("/wt/card-a") + at("/wt/elsewhere")), 64)).toBe("/wt/card-a");
+	expect(await readSessionCwd(await transcript(at("") + at("relative") + at(7) + at("/wt/card-a")))).toBe("/wt/card-a");
+	expect(await readSessionCwd(await transcript(owner + user("go")), 64)).toBeUndefined();
+	expect(await readSessionCwd(await transcript(""))).toBeUndefined();
 });

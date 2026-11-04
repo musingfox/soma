@@ -802,6 +802,98 @@ test("stop closes the agent's block", async () => {
 	expect(fake.calls.at(-1)).toEqual({ method: "block.close", payload: { session_id: HANGAR, block_id: "block:a" } });
 });
 
+/** A session of its own that claude ran in `cwd`, with the projects directory holding only its transcript. */
+function resumable(cwd: string) {
+	const session = "5b1c0d2e-3f40-4a51-8b62-7c83d94e0a15";
+	const dir = mkdtempSync(join(tmpdir(), "soma-rex-resume-"));
+	mkdirSync(join(dir, cwd.replace(/[^a-zA-Z0-9]/g, "-")));
+	writeFileSync(
+		join(dir, cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${session}.jsonl`),
+		[
+			{ type: "session-owner", sessionId: session },
+			{ ...user("go"), cwd, sessionId: session },
+		]
+			.map(line)
+			.join(""),
+	);
+	return { session, projectsDir: dir, request: { name: "card-a", card: "card-a", sessionId: session } };
+}
+const worktree = mkdtempSync(join(tmpdir(), "soma-rex-worktree-"));
+afterAll(() => rmSync(worktree, { recursive: true, force: true }));
+
+test("resume types claude --resume <id> with a dispatch's environment, in the directory the session ran in, past a full cap", async () => {
+	const { session, projectsDir, request: resumed } = resumable(worktree);
+	// Both slots taken by claude: a start would be refused.
+	const fake = rex([
+		{ name: "card-b", block: "block:b", argv0: "claude" },
+		{ name: "card-c", block: "block:c", argv0: "claude" },
+	]);
+	const { git: run, runs } = git();
+	const env = { SOMA_SOCKET: "/run/soma.sock", SOMA_NODE: "/opt/node/bin/node" };
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		projectsDir,
+		cap: 2,
+		env,
+		path: "/opt/soma/bin",
+	});
+	await expect(port.start(request)).rejects.toThrow("hangar is full");
+
+	await port.resume(resumed);
+
+	const dispatched = launchCommand({ ...request, sessionId: session }, env, "/opt/soma/bin");
+	expect(dispatched).toMatch(/ claude --session-id /);
+	const typed = dispatched.replace(" claude --session-id ", " claude --resume ");
+	expect(typed).toBe(
+		`SOMA_SOCKET='/run/soma.sock' SOMA_NODE='/opt/node/bin/node' SOMA_AGENT='card-a' PATH='/opt/soma/bin':"$PATH" claude --resume ${session}\n`,
+	);
+	expect(fake.calls.filter((call) => call.method === "session.new_window").map((call) => call.payload)).toEqual([
+		{
+			session_id: HANGAR,
+			window_label: "card-a",
+			focus: false,
+			layout: {
+				block: {
+					flavor: "com.superlogical.terminal.shell",
+					label: session,
+					options: { cwd: worktree, initial_input: typed },
+				},
+			},
+		},
+	]);
+	// No worktree is made, and the claude blocks the cap counts were never looked at for the resume.
+	expect(runs).toEqual([]);
+	const afterStart = fake.calls.findLastIndex((call) => call.method === "com.superlogical.terminal.process");
+	expect(fake.calls.slice(afterStart + 1).map((call) => call.method)).toEqual(["session.view", "session.new_window"]);
+	rmSync(projectsDir, { recursive: true, force: true });
+});
+
+test("resume refuses, and opens no window, a session whose directory is gone, one with no transcript, or a name already open", async () => {
+	const gone = resumable(join(worktree, "removed"));
+	const open = resumable(worktree);
+	const cases = [
+		{
+			...gone,
+			blocks: [],
+			error: `the worktree ${join(worktree, "removed")} claude session ${gone.session} ran in no longer exists`,
+		},
+		{ ...open, projectsDir: worktree, blocks: [], error: `no transcript of claude session ${open.session}` },
+		{ ...open, blocks: [{ name: "card-a", block: "block:a" }], error: "already has a window named card-a" },
+		{ ...open, request: { ...open.request, sessionId: "x; rm -rf ~" }, blocks: [], error: "not a claude session id" },
+	];
+	for (const { projectsDir, request: resumed, blocks, error } of cases) {
+		const fake = rex(blocks);
+		const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, projectsDir });
+
+		await expect(port.resume(resumed)).rejects.toThrow(error);
+		expect(fake.methods()).not.toContain("session.new_window");
+	}
+	for (const { projectsDir } of [gone, open]) rmSync(projectsDir, { recursive: true, force: true });
+});
+
 const BASH = fixture("claude-bash-prompt-2.1.302.txt");
 const TRUST = fixture("claude-trust-dialog-2.1.302.txt");
 const fingerprintOf = (screen: string) => readBlockedScreen(screen).prompt?.fingerprint as string;

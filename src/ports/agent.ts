@@ -24,6 +24,14 @@ export interface StartRequest {
 	readonly sessionId: string;
 }
 
+/** An agent to start again in the session it was started with, in the directory that session ran in. */
+export interface ResumeRequest {
+	readonly name: string;
+	readonly card: string;
+	// The one its StartRequest carried, as the dispatch list holds it.
+	readonly sessionId: string;
+}
+
 export interface AgentListing {
 	readonly name: string;
 	// Absent when the agent side cannot tell, which is no claim either way.
@@ -72,6 +80,9 @@ export class PromptRefused extends Error {}
 
 export interface AgentPort {
 	start(request: StartRequest): Promise<void>;
+	// Keeps the session's conversation; makes no worktree, and is not held to the hangar cap that start is, since only a
+	// due deferred instruction resumes an agent. Refuses a name already listed.
+	resume(request: ResumeRequest): Promise<void>;
 	list(): Promise<readonly AgentListing[]>;
 	// Throws PromptRefused when it typed nothing.
 	prompt(agent: string, text: string): Promise<void>;

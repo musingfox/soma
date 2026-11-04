@@ -115,6 +115,8 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 			);
 		},
 
+		resume: notYet("resume"),
+
 		async list(): Promise<readonly AgentListing[]> {
 			const named = (await client.agentList()).filter((agent) => agent.name);
 			return Promise.all(

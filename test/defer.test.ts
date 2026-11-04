@@ -32,7 +32,7 @@ async function database() {
 }
 
 /** A core on `db` with the dispatch list holding `job`; the model is never set up, so a turn it ran would fail. */
-async function core(db: string, agents: Pick<AgentPort, "list" | "prompt">, options: DeferOptions = {}) {
+async function core(db: string, agents: Pick<AgentPort, "list" | "prompt" | "stop">, options: DeferOptions = {}) {
 	const defers = deferExtension(agents, options);
 	const harness = await openHarness(
 		db,
@@ -121,7 +121,8 @@ test("a missing or malformed --at is refused and creates nothing", async () => {
 
 test("at fire time a listed agent gets one prompt, and the root conversation gets no input", async () => {
 	const agents = new FakeAgentPort();
-	agents.emit("card-a", { state: "idle" });
+	// At work when it defers, as an agent running `soma defer` is: one at rest is stopped at once.
+	agents.emit("card-a", { state: "working" });
 	const { harness, root, defer } = await core(await database(), agents);
 
 	const reply = await defer("PT1S");
@@ -163,7 +164,8 @@ test("an agent not listed at fire time is not prompted, and the human gets one n
 test("a restart while waiting still fires once", { timeout: 20_000 }, async () => {
 	const db = await database();
 	const agents = new FakeAgentPort();
-	agents.emit("card-a", { state: "idle" });
+	// At work when it defers, as an agent running `soma defer` is: one at rest is stopped at once.
+	agents.emit("card-a", { state: "working" });
 	const first = await core(db, agents);
 	const reply = await first.defer("PT2S");
 	if (!reply.accepted) throw new Error(reply.reason);
@@ -196,8 +198,9 @@ test("a core stopped while the prompt was going out does not prompt again, and t
 	const reached = new Promise<void>((resolve) => {
 		sent = resolve;
 	});
-	const hanging: Pick<AgentPort, "list" | "prompt"> = {
+	const hanging: Pick<AgentPort, "list" | "prompt" | "stop"> = {
 		list: async () => [{ name: "card-a" }],
+		stop: async () => {},
 		prompt: (_agent, text) => {
 			prompts.push(text);
 			sent();
@@ -235,8 +238,9 @@ test("a prompt the agent side refuses, as for a busy agent, is tried again; one 
 }, async () => {
 	let refusals = 1;
 	const prompts: string[] = [];
-	const busy: Pick<AgentPort, "list" | "prompt"> = {
+	const busy: Pick<AgentPort, "list" | "prompt" | "stop"> = {
 		list: async () => [{ name: "card-a" }],
+		stop: async () => {},
 		prompt: async (_agent, text) => {
 			if (refusals-- > 0) throw new PromptRefused("rex agent card-a is working: a prompt goes only to idle or done");
 			prompts.push(text);
@@ -264,8 +268,9 @@ test("an adapter error that may come after typing is not tried again, and tells 
 }, async () => {
 	const prompts: string[] = [];
 	// As rex's prompt can: the paste went out, then pressing Enter failed.
-	const typedThenFailed: Pick<AgentPort, "list" | "prompt"> = {
+	const typedThenFailed: Pick<AgentPort, "list" | "prompt" | "stop"> = {
 		list: async () => [{ name: "card-a" }],
+		stop: async () => {},
 		prompt: async (_agent, text) => {
 			prompts.push(text);
 			throw new Error("rex connection lost");

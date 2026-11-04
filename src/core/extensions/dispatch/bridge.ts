@@ -9,6 +9,7 @@ import { dispatchSignal, reblockSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
 import { recordFact } from "../memory/index.ts";
 import { Dispatches } from "./index.ts";
+import { reclaimer } from "./reclaim.ts";
 
 /** Entry kind of a turn the bridge recorded as finished; it carries no model message. */
 export const JOB_DONE = "soma.dispatch.done";
@@ -37,10 +38,13 @@ function wakeContent(job: Job, status: Extract<AgentState, { state: "blocked" }>
  * decision, so the model never sees it to answer. The input's requestId carries the observation's
  * seq, so a resent event, from a repeated snapshot or a restarted core, is admitted once. A turn is
  * recorded once per last transcript record: the same record under a new seq is the same turn.
+ * An idle or done agent with a deferral pending is stopped after its turn is recorded (`reclaimer`), and a job soma
+ * stopped takes no more statuses: what its closed window reports is no news.
  */
 export function eventBridge(conversation: Conversation, agents: AgentPort, context: Context) {
 	// One event at a time: each reads the job, acts, then commits what it saw.
 	let queue = Promise.resolve();
+	const reclaim = reclaimer(conversation, agents, context);
 
 	async function apply(event: AgentStatusEvent): Promise<void> {
 		// A doc is a live proxy only valid inside its commit, so the job is copied out as the JSON it is stored as.
@@ -50,7 +54,7 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			);
 			return found && (JSON.parse(JSON.stringify(found)) as Job);
 		}, context);
-		if (job === undefined) return;
+		if (job === undefined || job.reclaim?.phase === "stopped") return;
 		const observed = observe(job, event.status, event.seq);
 		if (observed.job === job) return;
 		const result = observed.action === "complete" ? await agents.readResult(job.agent) : undefined;
@@ -80,9 +84,10 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			const index = doc.jobs.findIndex((candidate) => candidate.agent === event.agent);
 			const current = doc.jobs[index];
 			if (current === undefined || current.seq === event.seq) return;
-			// Decisions come from the current job, not the one read above: a respond tool may have added one since.
+			// Decisions come from the current job, not the one read above: a respond tool may have added one since, and
+			// so may the reclaim, which a defer may have armed since.
 			const { launch: _held, handedOver: _handed, ...kept } = current;
-			const { decisions: _read, ...fields } = next;
+			const { decisions: _read, reclaim: _armed, ...fields } = next;
 			doc.jobs[index] = { ...kept, ...fields };
 			if (action === "escalate") {
 				const decision: Decision = {
@@ -128,6 +133,7 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 				if (signal !== undefined) await recordFact(tx, signal);
 			}
 		}, context);
+		if (event.status.state === "idle" || event.status.state === "done") await reclaim(job.agent);
 	}
 
 	function handle(event: AgentStatusEvent): Promise<void> {
@@ -149,7 +155,8 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
  * Startup step after `harness.resume()`: catch the dispatch list up with what changed while the
  * core was down. A listing with a seq goes through the bridge like any event, so a turn that
  * finished in the gap is recorded and a block that was already handed to the model is not handed
- * over again.
+ * over again. A job left `stopping` by the last process is settled, and one `due` whose agent is at
+ * rest is stopped, so a reclaim a crash cut short neither leaves its window open nor reads as a vanished agent.
  */
 export async function reconcileDispatches(conversation: Conversation, agents: AgentPort, context: Context) {
 	// Only jobs the listing could have seen: one dispatched while it ran is missing from it, not gone.
@@ -162,7 +169,7 @@ export async function reconcileDispatches(conversation: Conversation, agents: Ag
 	for (const { name, status, seq } of listed) {
 		if (status !== undefined && seq !== undefined) await bridge.handle({ agent: name, status, seq });
 	}
-	await conversation.commit(async (tx) => {
+	const armed = await conversation.commit(async (tx) => {
 		const doc = await tx.doc(Dispatches, conversation.id);
 		const before = doc.jobs.map((job) => job.status.state);
 		const reconciled = reconcile(doc.jobs, listed);
@@ -179,5 +186,10 @@ export async function reconcileDispatches(conversation: Conversation, agents: Ag
 				data: { agent: job.agent, card: job.card, state: "error", outcome: "失敗", notified: true },
 			});
 		}
+		return doc.jobs
+			.filter((job) => job.reclaim?.phase === "due" || job.reclaim?.phase === "stopping")
+			.map((job) => job.agent);
 	}, context);
+	const reclaim = reclaimer(conversation, agents, context);
+	for (const agent of armed) await reclaim(agent, true);
 }

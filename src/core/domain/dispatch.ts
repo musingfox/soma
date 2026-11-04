@@ -19,6 +19,14 @@ export type Decision = {
 
 export type HandedOver = { readonly fingerprint?: string; readonly msg?: string };
 
+/**
+ * Where soma is in stopping an agent that deferred an instruction (ARCHITECTURE.md "Agent-deferred instructions").
+ * due: a deferral is pending, so the agent is stopped the first time it is seen idle or done. stopping: committed
+ * before `stop`, so a restart knows a stop may have gone out. stopped: the agent is gone because soma stopped it, so
+ * its absence is no failure. failed: `stop` failed and the human was told; not tried again for the deferrals pending.
+ */
+export type Reclaim = { readonly phase: "due" | "stopping" | "stopped" | "failed"; readonly error?: string };
+
 export type Job = {
 	readonly card: string;
 	readonly agent: string;
@@ -36,6 +44,8 @@ export type Job = {
 	// The prompt of the last block handed to the model or the human, until a status other than blocked is seen: the
 	// same prompt observed again is not handed over twice. `status` cannot tell, since reconcile writes it unobserved.
 	readonly handedOver?: HandedOver;
+	// Absent for a job with no deferral pending that soma has not stopped.
+	readonly reclaim?: Reclaim;
 	readonly decisions: Decision[];
 };
 

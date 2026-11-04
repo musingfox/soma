@@ -34,6 +34,10 @@ export function deferredPrompt(id: string, { instruction, setAt }: Deferred): st
 
 const named = (id: string, { agent, card }: Deferred) => `Deferred instruction ${id} for agent ${agent} (card ${card})`;
 
+/** The one notice for an agent soma could not stop once it deferred: it stays open, and its deferrals still go to it. */
+export const reclaimFailedNotice = (agent: string, card: string, error: string) =>
+	`soma could not stop agent ${agent} (card ${card}) after it deferred an instruction: ${error}. It may still hold its hangar slot; soma tries again only if the agent defers again, and its pending deferred instructions still go to it if it is there when they fall due.`;
+
 /** The one notice for a deferral that ended unsent, or perhaps unsent. */
 export const deferNotice = {
 	gone: (id: string, item: Deferred) =>

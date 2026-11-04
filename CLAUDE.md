@@ -21,5 +21,5 @@ Without `SOMA_CONFIG`, soma reads prod's config; while prod is up that run fails
 
 ## Tests
 
-- Smoke scripts (`npm run smoke:*`) talk to a real herdr. Point `HERDR_SOCKET_PATH` at a test session, never `fleet`: that is prod's hangar.
+- Smoke scripts (`npm run smoke:*`) talk to a real herdr or rex. prod's hangar is the rex session `soma-hangar` (`rex.sessionId` in prod's config); never point a smoke at it. The rex smokes make their own `soma-smoke-<random>` session. The herdr smokes need `HERDR_SOCKET_PATH` at a test session, never `fleet`, prod's herdr hangar before it moved to rex.
 - `.githooks/pre-commit` runs `npm run lint` and `npm test` (about 30 s); `.githooks/commit-msg` enforces Conventional Commits.

@@ -131,8 +131,13 @@ export function digest(agents: Pick<AgentPort, "readResult">) {
 						decisions: JSON.parse(JSON.stringify(listed.find((job) => job.card === each.card)?.decisions ?? [])),
 					}));
 				}, context);
+				// A reply that cannot be read, as for an agent soma stopped since, leaves only that job without one: a read
+				// that threw would fault the task, and with it every later report.
 				const reports: JobReport[] = await Promise.all(
-					jobs.map(async (job) => ({ ...job, result: (await agents.readResult(job.agent))?.text || undefined })),
+					jobs.map(async (job) => ({
+						...job,
+						result: (await agents.readResult(job.agent).catch(() => undefined))?.text || undefined,
+					})),
 				);
 				const window = { since: new Date(since).toISOString(), until: new Date(next).toISOString() };
 				const root = await runtime.conversation(runtime.conversationId, context);

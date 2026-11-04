@@ -8,7 +8,7 @@ import { runDigestSmoke } from "../smoke/digest.ts";
 import { digestModels } from "../smoke/digest-faux.ts";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { DIGEST, Digests, digest, NOTICE } from "../src/core/extensions/digest/index.ts";
-import { eventBridge } from "../src/core/extensions/dispatch/bridge.ts";
+import { eventBridge, JOB_DONE } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { openHumanPort } from "../src/core/human-port.ts";
@@ -165,6 +165,74 @@ test("a turn already told at once is left out of the report, and a period of onl
 		await delay(2.5 * PERIOD);
 		expect((await reports()).map(({ kind }) => kind)).toEqual(["question", "report", "report"]);
 		expect(calls()).toBe(1);
+	} finally {
+		await harness.close(context);
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+/** Throws for a stopped agent as rex does once its window is closed. */
+class ClosingAgentPort extends FakeAgentPort {
+	override async readResult(agent: string) {
+		if (this.stopped.includes(agent)) throw new Error(`rex hangar s has no window named ${agent}`);
+		return super.readResult(agent);
+	}
+}
+
+test("a job whose reply can no longer be read is reported without it, and later reports still come", {
+	timeout: 30_000,
+}, async () => {
+	const directory = await mkdtemp(join(tmpdir(), "soma-digest-"));
+	const agents = new ClosingAgentPort();
+	const { models, model } = digestModels();
+	const { extension, startDigest } = digest(agents);
+	const harness: Harness = await openHarness(
+		join(directory, "soma.sqlite"),
+		[dispatchExtension(agents, async () => ""), extension],
+		context,
+		{ models },
+	);
+	try {
+		const root = await harness.root(context, { agent: { model } });
+		harness.resume();
+		await root.commit(async (tx) => {
+			(await tx.doc(Dispatches, root.id)).jobs = ["a", "b"].map((card) => ({
+				card,
+				agent: card,
+				sessionId: card,
+				status: { state: "working" },
+				decisions: [],
+			}));
+		}, context);
+		eventBridge(root, agents, context).listen(() => {});
+		await startDigest(root, PERIOD, context);
+		const entries = async () => (await root.entries({ order: "ascending" }, 1000, undefined, context)).items;
+		const notices = async () =>
+			(await entries()).flatMap((entry) =>
+				entry.kind === NOTICE ? [(entry.data as { content: string }).content] : [],
+			);
+		const digests = async () =>
+			(await entries()).flatMap((entry) => (entry.kind === DIGEST ? [entry.model ?? entry.data] : []));
+
+		// As a reclaim does after a finished turn: the bridge read the reply, then the window closed.
+		agents.finish("a", "結果：完成");
+		for (const deadline = Date.now() + 5 * PERIOD; agents.stopped.length === 0; await delay(50)) {
+			expect(Date.now()).toBeLessThan(deadline);
+			if ((await entries()).some((entry) => entry.kind === JOB_DONE)) await agents.stop("a");
+		}
+		for (const deadline = Date.now() + 5 * PERIOD; (await notices()).length === 0; await delay(100)) {
+			expect(Date.now()).toBeLessThan(deadline);
+		}
+		expect(await notices()).toEqual(["報告：a 完成"]);
+		expect(JSON.stringify(await digests())).not.toContain("回覆");
+
+		agents.finish("b", "結果：完成");
+		for (const deadline = Date.now() + 5 * PERIOD; (await notices()).length < 2; await delay(100)) {
+			expect(Date.now()).toBeLessThan(deadline);
+		}
+		expect(await notices()).toEqual(["報告：a 完成", "報告：b 完成"]);
+		const taskId = (await harness.snapshot(Digests, root.id, context))?.taskId as TaskId;
+		expect((await harness.getTask(taskId, context))?.state.status).toBe("sleeping");
 	} finally {
 		await harness.close(context);
 		await rm(directory, { recursive: true, force: true });

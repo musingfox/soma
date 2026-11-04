@@ -27,7 +27,7 @@ type Checkpoint =
 	// `until` bounds the tries to list the agent before it is started; past it, the agent is waited for unstarted.
 	| { phase: "resuming"; tries: number; session: string; until: number }
 	// Committed once the start went out, or a window of the agent's name was found: a rerun starts nothing. `until`
-	// bounds the wait for the agent to be listed at rest.
+	// bounds the wait for the agent to be listed at rest, and `readyMs` past it the wait for a listing that answers.
 	| { phase: "ready"; tries: number; until: number }
 	// Committed before the prompt goes out: a rerun that finds it cannot tell whether the agent got it.
 	| { phase: "sending"; tries: number };
@@ -335,7 +335,8 @@ export function deferExtension(
 				);
 			},
 			// The agent's window is up: it is prompted once it is listed idle or done, which is when claude takes a prompt.
-			// Only a listing that answers decides, past `until` too: one that fails is no sign of the agent either way.
+			// Only a listing that answers decides, past `until` too: one that fails is no sign of the agent either way. Listings
+			// that still fail `readyMs` past `until`, as rex's do while two windows share the name, end this in doubt.
 			ready: async (task, runtime, context) => {
 				const { tries: tried, until } = task.state.checkpoint;
 				const id = String(task.id);
@@ -346,8 +347,9 @@ export function deferExtension(
 						const found = await listing(task.input.agent);
 						if (found === undefined) return end("gone", deferNotice.closed(id, task.input), true);
 						state = found.status?.state ?? "without a status";
-					} catch {
-						continue;
+					} catch (error) {
+						if (runtime.now() < until + readyMs) continue;
+						return end("failed", deferNotice.unlisted(id, task.input, (2 * readyMs) / 1000, errorText(error)));
 					}
 					if (state === "idle" || state === "done") return send();
 					if (runtime.now() >= until) return end("failed", deferNotice.unready(id, task.input, readyMs / 1000, state));

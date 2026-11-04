@@ -607,6 +607,45 @@ test("listings that fail until past the ready deadline decide nothing: the first
 	expect(await soma.notices()).toEqual([]);
 });
 
+test("listings that keep failing once the resumed window is up end the deferral with one notice, holding nothing", {
+	timeout: 20_000,
+}, async () => {
+	// The window is up at rest, and from then on rex lists nothing, as when two windows share the agent's name.
+	const error = "rex hangar session:hangar has more than one window named card-a";
+	const agents = new (class extends FakeAgentPort {
+		failing = false;
+		override async list() {
+			if (this.failing) throw new Error(error);
+			return super.list();
+		}
+		override async resume(request: ResumeRequest): Promise<void> {
+			this.resumed.push(request);
+			this.emit(request.name, { state: "idle" });
+			this.failing = true;
+		}
+	})();
+	agents.emit("card-a", { state: "idle" });
+	const soma = await core(await database(), agents, { readyMs: 300, pollMs: 50, retryMs: 100, tries: 50 });
+	const id = await accepted(await soma.defer("PT1S"));
+	const later = await accepted(await soma.defer("PT2S"));
+
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "failed" });
+	expect(agents.prompts).toEqual([]);
+	const told = [
+		expect.stringMatching(
+			new RegExp(`^Deferred instruction ${id} .* was not sent: .*${error}.*may be running.*run the tests$`),
+		),
+	];
+	expect(await soma.notices()).toEqual(told);
+	// Seen by the bridge, and held for no deferral: the later one goes out once rex lists again.
+	expect((await soma.job("card-a"))?.reclaim).toEqual({ phase: "due" });
+	agents.failing = false;
+	expect(await soma.outcome(later)).toEqual(sent);
+	expect(agents.resumed).toEqual([session]);
+	expect(agents.prompts).toEqual([instruction(later)]);
+	expect(await soma.notices()).toEqual(told);
+});
+
 test("a resumed window that closes before the instruction goes is not prompted, and the human is told once", {
 	timeout: 20_000,
 }, async () => {

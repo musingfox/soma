@@ -400,6 +400,11 @@ export function deferExtension(
 		}
 		const instruction = request.instruction.trim();
 		if (instruction === "") return { accepted: false, reason: "the instruction is empty" };
+		// Agents rex lists now, none when the listing fails: the defer goes ahead either way.
+		const shown = await agents.list().then(
+			(listed) => new Set(listed.map((each) => each.name)),
+			() => new Set<string>(),
+		);
 		const { reply, agent } = await conversation.commit(async (tx) => {
 			const doc = await tx.doc(Dispatches, conversation.id);
 			const index = doc.jobs.findIndex((each) => each.card === request.agent);
@@ -416,10 +421,11 @@ export function deferExtension(
 			const id = await tx.createTask(Deferral, item, { ownership: { kind: "conversation" }, background: true });
 			(await tx.doc(Deferrals, conversation.id)).items[String(id)] = item;
 			// A failed stop is tried once more for a new deferral, and a stopped agent that defers is open again, its window
-			// reopened since; one under way is left as it is.
+			// reopened since, when rex lists it; one rex does not, as a forged SOMA_AGENT or a child that outlived the
+			// window, stays stopped, so no reconcile takes it for a vanished agent. One under way is left as it is.
 			const current = doc.jobs[index] ?? job;
 			const phase = current.reclaim?.phase;
-			if (phase === undefined || phase === "failed" || phase === "stopped") {
+			if (phase === undefined || phase === "failed" || (phase === "stopped" && shown.has(job.agent))) {
 				doc.jobs[index] = { ...current, reclaim: { phase: "due" } };
 			}
 			const reply: DeferReply = { accepted: true, id: String(id), at: new Date(at).toISOString() };

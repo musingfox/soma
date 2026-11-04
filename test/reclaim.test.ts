@@ -36,11 +36,55 @@ test("an agent already idle when its defer is accepted is stopped once, before t
 	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
 
 	await accepted(await soma.defer("PT2H"));
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
 	// The closed window's last report, which rex no longer lists: no second stop.
 	agents.emit("card-a", { state: "idle" });
 	agents.close("card-a");
 	await soma.settle();
 	expect(agents.stopped).toEqual(["card-a"]);
+});
+
+test("a stopped agent rex no longer lists that defers again stays stopped, and a restart tells of no vanished agent", {
+	timeout: 20_000,
+}, async () => {
+	const db = await database();
+	const agents = new FakeAgentPort();
+	agents.emit("card-a", { state: "idle" });
+	const first = await core(db, agents);
+	await accepted(await first.defer("PT1H"));
+	expect(agents.stopped).toEqual(["card-a"]);
+
+	// A detached child of the closed window, or a forged SOMA_AGENT, defers again: rex lists no such agent.
+	expect(await agents.list()).toEqual([]);
+	await accepted(await first.defer("PT2H"));
+	expect(await first.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
+	await first.close();
+
+	const soma = await core(db, agents);
+	await soma.settle();
+	expect(await soma.job("card-a")).toMatchObject({ status: { state: "idle" }, reclaim: { phase: "stopped" } });
+	expect(await soma.notices()).toEqual([]);
+	expect(agents.stopped).toEqual(["card-a"]);
+});
+
+test("a listing that fails while a stopped agent defers again leaves it stopped, and the defer is accepted", async () => {
+	const agents = new (class extends FakeAgentPort {
+		failing = false;
+		override async list() {
+			if (this.failing) throw new Error("rex call block.list failed");
+			return super.list();
+		}
+	})();
+	agents.emit("card-a", { state: "idle" });
+	const soma = await core(await database(), agents);
+	await accepted(await soma.defer("PT1H"));
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
+
+	agents.failing = true;
+	await accepted(await soma.defer("PT2H"));
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
+	expect(agents.stopped).toEqual(["card-a"]);
+	expect(await soma.notices()).toEqual([]);
 });
 
 test("an agent that never deferred is not stopped when its turn ends; one that deferred is", async () => {

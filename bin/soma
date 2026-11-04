@@ -1,3 +1,10 @@
 #!/bin/sh
 # launchd names the background item after this file, not after node.
-cd "$(dirname "$0")/.." && exec node src/main.ts
+# `soma defer ...` is what a dispatched agent runs; SOMA_NODE, which soma sets for its agents, is the node soma runs
+# on, since the node on the agent's PATH may be one its project pins.
+root=$(cd "$(dirname "$0")/.." && pwd)
+if [ "${1-}" = defer ]; then
+	shift
+	exec "${SOMA_NODE:-node}" "$root/src/defer-cli.ts" "$@"
+fi
+cd "$root" && exec node src/main.ts

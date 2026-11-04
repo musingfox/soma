@@ -53,6 +53,14 @@ const fields = [
 		values: ["env.sqlite", "file.sqlite", "soma.sqlite"],
 	},
 	{
+		name: "deferSocket",
+		env: ["SOMA_DEFER_SOCKET", "/env.sock"],
+		file: { deferSocket: "/file.sock" },
+		base: { env: { SOMA_DB: "/data/soma.sqlite" } },
+		read: (c) => c.deferSocket,
+		values: ["/env.sock", "/file.sock", "/data/soma.sqlite.defer.sock"],
+	},
+	{
 		name: "model",
 		env: ["SOMA_MODEL", "env-model"],
 		file: { model: "file-model" },

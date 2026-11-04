@@ -1,8 +1,11 @@
 import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import type { Harness } from "@earendil-works/pi-durable";
+import { serveDefer } from "./adapters/defer-socket/index.ts";
 import { createHerdrAgentPort } from "./adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "./adapters/herdr/client.ts";
 import { createCard, readCard } from "./adapters/obsidian/card.ts";
@@ -15,6 +18,7 @@ import { spawnPty } from "./adapters/tty/pty.ts";
 import { startWeb } from "./adapters/web/index.ts";
 import { anthropicAuthContext, type Config, ConfigError, configPath, loadConfig } from "./config.ts";
 import { clock } from "./core/extensions/clock/index.ts";
+import { deferExtension } from "./core/extensions/defer/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
 import { dispatchExtension } from "./core/extensions/dispatch/index.ts";
@@ -51,14 +55,18 @@ const context = BACKGROUND_CONTEXT;
 const models = createModels({ authContext: anthropicAuthContext(config.anthropicApiKey) });
 models.setProvider(anthropicProvider());
 /** The one place the agent-side adapter is chosen, by the config's `agentAdapter`. */
-function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap }: Config): AgentPort {
+function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, deferSocket }: Config): AgentPort {
 	const cap = hangarCap === undefined ? {} : { cap: hangarCap };
 	if (agentAdapter === "rex") {
 		// resolveConfig sets rex exactly when it is selected.
 		if (rex === undefined) throw new Error("agentAdapter is rex but the config holds no rex settings");
 		const onError = (error: Error) => console.error("[soma] rex:", error.message);
 		const client = createRexClient({ socketPath: rex.socket, onError });
-		return createRexAgentPort({ client, sessionId: rex.sessionId, onError, ...cap });
+		// What `soma defer` needs in an agent's shell: this release's bin/soma on PATH, the socket, and the node soma
+		// runs on, since the agent's own may be one its project pins.
+		const env = { SOMA_SOCKET: deferSocket, SOMA_NODE: process.execPath };
+		const path = join(dirname(dirname(fileURLToPath(import.meta.url))), "bin");
+		return createRexAgentPort({ client, sessionId: rex.sessionId, onError, env, path, ...cap });
 	}
 	if (agentAdapter === "tty") {
 		const onError = (error: Error) => console.error("[soma] tty:", error.message);
@@ -68,6 +76,7 @@ function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap }: Config): A
 }
 const agents = openAgentPort(config);
 const digests = digest(agents);
+const defers = deferExtension(agents);
 const reflections = reflection({
 	repo: config.repo,
 	createCard,
@@ -98,6 +107,7 @@ const extensions = [
 	schedule((id, c) => harness.abortTask(id, c)),
 	dispatchExtension(agents, readCard),
 	digests.extension,
+	defers.extension,
 	...(config.reflection ? [reflections.extension] : []),
 	inspectExtension(storage),
 	web({ exaApiKey: config.exaApiKey }),
@@ -124,6 +134,15 @@ const human = await openHumanPort(
 );
 await reconcileDispatches(root, agents, context);
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
+// Served after the reconcile, so a defer is checked against a dispatch list caught up with the hangar. A socket that
+// cannot be served leaves soma running without `soma defer`, as the web page does.
+const deferServer = await serveDefer({
+	path: config.deferSocket,
+	defer: (request) => defers.defer(root, request, context),
+}).catch((error: unknown) => {
+	console.error("[soma] soma defer not served:", error);
+	return undefined;
+});
 
 const { telegram } = config;
 const stopTelegram = new AbortController();
@@ -145,7 +164,7 @@ const webPage =
 const shutdown = () => {
 	unlisten();
 	stopTelegram.abort();
-	void Promise.all([telegramDone, webPage?.close()])
+	void Promise.all([telegramDone, webPage?.close(), deferServer?.close()])
 		.then(() => human.close())
 		.then(() => harness.close(context))
 		.then(() => Promise.all(mcpClients.map(({ client }) => client.close())))

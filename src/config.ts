@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { BlockList, isIP } from "node:net";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type AuthContext, defaultProviderAuthContext } from "@earendil-works/pi-ai";
 import { z } from "zod";
@@ -38,6 +38,7 @@ const FileConfig = z
 		herdrSocket: z.string().min(1),
 		mcpConfig: z.string().min(1),
 		db: z.string().min(1),
+		deferSocket: z.string().min(1),
 		model: z.string().min(1),
 		language: z.string().refine((tag) => canonicalLanguage(tag) !== undefined, "Expected a BCP 47 language tag"),
 		hangarCap: z.number().int().positive(),
@@ -78,6 +79,8 @@ export interface Config {
 	readonly rex?: RexConfig;
 	readonly mcpConfig: string;
 	readonly db: string;
+	/** The unix socket `soma defer` reaches soma on; absolute, since agents run it from their own directories. */
+	readonly deferSocket: string;
 	readonly model: string;
 	/** The BCP 47 tag of the language soma answers the human in. */
 	readonly language: string;
@@ -203,6 +206,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		) ??
 		file?.agentAdapter ??
 		"herdr";
+	const db = fromEnv("SOMA_DB") ?? file?.db ?? "soma.sqlite";
 	return {
 		agentAdapter,
 		// The hangar session, never $HERDR_SOCKET_PATH: that names whichever session soma itself runs in.
@@ -210,7 +214,9 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 			fromEnv("SOMA_HERDR_SOCKET") ?? file?.herdrSocket ?? join(home, ".config/herdr/sessions/fleet/herdr.sock"),
 		// Outside the repo: each server's entry names where its own OAuth credentials live.
 		mcpConfig: fromEnv("SOMA_MCP_CONFIG") ?? file?.mcpConfig ?? join(home, ".config/soma/mcp.json"),
-		db: fromEnv("SOMA_DB") ?? file?.db ?? "soma.sqlite",
+		db,
+		// Next to the db by default: one soma per db (acquireDbLock), so prod and a dev instance never share a socket.
+		deferSocket: resolve(fromEnv("SOMA_DEFER_SOCKET") ?? file?.deferSocket ?? `${db}.defer.sock`),
 		model: fromEnv("SOMA_MODEL") ?? file?.model ?? "claude-opus-5-5",
 		language:
 			parseEnv("SOMA_LANGUAGE", canonicalLanguage, "a BCP 47 language tag") ??

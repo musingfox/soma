@@ -206,6 +206,9 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	let queue = Promise.resolve();
 	// Set while the watch runs: schedules the re-check of a block whose read replyMs cut short.
 	let recheck: ((blockId: string) => void) | undefined;
+	// By window name, the session id its block was labelled with when last seen, and the cwd readResult last found, so
+	// the transcript of a window closed since, as a reclaim closes one, can still be read. This process's only.
+	const sessions = new Map<string, { readonly id: string; readonly cwd?: string }>();
 
 	/** Every pane of the hangar, by window name; a name can be on more than one window. */
 	async function panes(): Promise<Map<string, Pane[]>> {
@@ -215,6 +218,11 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		for (const window of view.windows ?? []) {
 			const pane = paneOf(window);
 			if (pane !== undefined) byName.set(pane.name, [...(byName.get(pane.name) ?? []), pane]);
+		}
+		for (const [name, [pane, ...others]] of byName) {
+			const label = pane?.label;
+			if (others.length > 0 || label === undefined || !SESSION_ID.test(label)) continue;
+			if (sessions.get(name)?.id !== label) sessions.set(name, { id: label });
 		}
 		return byName;
 	}
@@ -661,13 +669,23 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		 * as the turn before or as its prompt. Such a read schedules a re-check of the block recheckMs later (`again`),
 		 * which reports its end once more, so the turn written since is read and recorded. Without a turn end the watch
 		 * saw (`track`), as at the startup reconcile, for a re-stamp of an end, or after a working the watch missed, it
-		 * is read at once, so a re-stamp reads the last record the core already holds.
+		 * is read at once, so a re-stamp reads the last record the core already holds. An agent with no window, as one
+		 * soma stopped, is read off the transcript of the session its window last showed this process, and is undefined
+		 * when this process never saw one, as after a restart.
 		 */
 		async readResult(agent: string): Promise<AgentResult | undefined> {
-			const { blockId, label } = only(await panes(), agent);
+			const byName = await panes();
+			if (!byName.has(agent)) {
+				// No window to wait on: its transcript, when this process saw its session, is read as it is.
+				const session = sessions.get(agent);
+				const path = session && (await resolveTranscriptPath(session.id, session.cwd, options.projectsDir));
+				return path === undefined ? undefined : readLastRecord(path);
+			}
+			const { blockId, label } = only(byName, agent);
 			if (label === undefined || !SESSION_ID.test(label)) return undefined;
 			const { foreground, child } = await blockCall("process", blockId, ProcessResultSchema);
 			const cwd = foreground?.cwd ?? child?.cwd;
+			if (cwd !== undefined) sessions.set(agent, { id: label, cwd });
 			// Taken after the watch's work queued so far, so a working queued behind the resync that reported this turn's end
 			// is tracked; the client's one connection queued it before rex answered the calls above.
 			await queue;

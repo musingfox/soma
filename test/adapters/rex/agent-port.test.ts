@@ -444,6 +444,26 @@ test("readResult reads the last reply off the transcript of the session id the b
 	expect(result).toEqual({ id: "a-1", text: "結果：完成" });
 });
 
+test("readResult of a closed window reads the transcript its session left, and is undefined for one never seen", async () => {
+	const { cwd } = transcript([user("go"), reply("msg_1", "結果：完成")]);
+	const blocks: Block[] = [{ name: "card-k", block: "block:k", label: SESSION, argv0: "claude", cwd }];
+	const fake = rex(blocks);
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+	});
+	expect(await port.readResult("card-k")).toEqual({ id: "a-msg_1", text: "結果：完成" });
+
+	// A reclaim closes the window once its turn was read; the digest reads the turn again later.
+	blocks.splice(0);
+	expect(await port.readResult("card-k")).toEqual({ id: "a-msg_1", text: "結果：完成" });
+	// As after a restart: this process never saw the window.
+	const fresh = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
+	expect(await fresh.readResult("card-k")).toBeUndefined();
+});
+
 /**
  * Feeds the watch a turn of `block` that ended at `at`: a working, then the done rex has on record from then on.
  * Returns the watch's unsubscribe.

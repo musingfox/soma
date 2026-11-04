@@ -1,4 +1,4 @@
-import { mkdirSync, unlinkSync } from "node:fs";
+import { lstatSync, mkdirSync, unlinkSync } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
 import { z } from "zod";
@@ -50,7 +50,7 @@ function listen(server: Server, path: string): Promise<void> {
 
 /**
  * Serves `soma defer` on the unix socket `path`, mode 0600, so only the user soma runs as can connect. A socket file
- * nobody answers on, as a killed soma leaves, is replaced; one another process serves is not.
+ * nobody answers on, as a killed soma leaves, is replaced; one another process serves, or any file not a socket, is not.
  */
 export async function serveDefer(options: {
 	readonly path: string;
@@ -117,6 +117,9 @@ export async function serveDefer(options: {
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
 		if (await answers(path)) throw new Error(`another process already serves ${path}`);
+		// Only a socket can be one a killed soma left; anything else at the path is someone's file.
+		if (!lstatSync(path).isSocket())
+			throw new Error(`${path} is not a socket, so soma leaves it alone; soma defer is not served`);
 		unlinkSync(path);
 		await listen(server, path);
 	}

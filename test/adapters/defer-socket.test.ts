@@ -1,5 +1,14 @@
 import { execFile } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -106,9 +115,20 @@ test("close ends a connection still waiting for its request instead of waiting f
 	await client;
 });
 
+/** Leaves a socket file nobody answers on at `path`, as a killed soma does. */
+async function staleSocket(path: string): Promise<void> {
+	const killed = promisify(execFile)(process.execPath, [
+		"-e",
+		"require('node:net').createServer().listen(process.argv[1], () => process.kill(process.pid, 'SIGKILL'))",
+		path,
+	]);
+	await expect(killed).rejects.toMatchObject({ signal: "SIGKILL" });
+	expect(lstatSync(path).isSocket()).toBe(true);
+}
+
 test("a socket file a killed soma left is replaced; one another process serves is not", async () => {
 	const stale = socketPath();
-	writeFileSync(stale, "");
+	await staleSocket(stale);
 	const replaced = await serveDefer({ path: stale, defer: async () => ({ accepted: false, reason: "r" }) });
 	expect(await requestDefer(stale, { agent: "a", at: "PT1M", instruction: "i" })).toEqual({
 		accepted: false,
@@ -123,6 +143,17 @@ test("a socket file a killed soma left is replaced; one another process serves i
 	);
 	await new Promise((done) => other.close(done));
 	await replaced.close();
+});
+
+test("a file at the socket path that is not a socket is left alone, and soma defer is not served there", async () => {
+	const path = socketPath();
+	writeFileSync(path, "not soma's");
+
+	await expect(serveDefer({ path, defer: async () => ({ accepted: false, reason: "" }) })).rejects.toThrow(
+		`${path} is not a socket, so soma leaves it alone; soma defer is not served`,
+	);
+
+	expect(readFileSync(path, "utf8")).toBe("not soma's");
 });
 
 test("bin/soma defer runs the CLI with the agent's SOMA_AGENT against SOMA_SOCKET", async () => {

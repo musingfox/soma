@@ -13,6 +13,7 @@ import { eventBridge, reconcileDispatches } from "../src/core/extensions/dispatc
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { NOTICE } from "../src/core/notice.ts";
+import { PromptRefused } from "../src/ports/agent.ts";
 
 const context = BACKGROUND_CONTEXT;
 const jobOf = (card: string): Job => ({
@@ -389,4 +390,62 @@ test("a stop that fails tells the human once and is not tried again; a stop that
 	expect(tried).toEqual(["card-a", "card-b"]);
 	expect(await again.job("card-b")).toMatchObject({ reclaim: { phase: "stopped" } });
 	expect(await again.notices()).toHaveLength(1);
+});
+
+test("an idle reported after the deferred prompt was typed does not stop the agent; a deferral still pending re-arms it", {
+	timeout: 20_000,
+}, async () => {
+	// The prompt is typed, then the agent's last idle is reported, and the listing still shows it idle: a reclaim that
+	// ran now would close the window over the instruction.
+	const agents = new (class extends FakeAgentPort {
+		override async prompt(agent: string, text: string): Promise<void> {
+			this.prompts.push({ agent, text });
+			this.emit(agent, { state: "idle" });
+			await new Promise((resolve) => setTimeout(resolve, 300));
+		}
+	})();
+	agents.emit("card-a", { state: "working" });
+	const soma = await core(await database(), agents);
+	const id = await accepted(await soma.defer("PT1S"));
+	await accepted(await soma.defer("PT1H"));
+
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "sent" });
+	await soma.settle();
+	expect(agents.prompts).toHaveLength(1);
+	expect(agents.stopped).toEqual([]);
+	expect(await soma.notices()).toEqual([]);
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "due" } });
+
+	// The turn the instruction started ends: the deferral still pending stops it then.
+	agents.finish("card-a", "結果：完成");
+	await soma.settle();
+	expect(agents.stopped).toEqual(["card-a"]);
+});
+
+test("a deferred prompt refused before it typed holds the job no longer: an idle while it waits stops the agent", {
+	timeout: 20_000,
+}, async () => {
+	const agents = new (class extends FakeAgentPort {
+		tried = 0;
+		override async prompt(): Promise<void> {
+			this.tried++;
+			throw new PromptRefused("rex agent card-a is working: a prompt goes only to idle or done");
+		}
+	})();
+	agents.emit("card-a", { state: "working" });
+	const soma = await core(await database(), agents, { retryMs: 1_000 });
+	const id = await accepted(await soma.defer("PT1S"));
+	for (
+		const deadline = Date.now() + 5_000;
+		(await soma.job("card-a"))?.reclaim?.phase !== "due" || agents.tried === 0;
+	) {
+		expect(Date.now()).toBeLessThan(deadline);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+
+	agents.emit("card-a", { state: "idle" });
+	await soma.settle();
+	expect(agents.stopped).toEqual(["card-a"]);
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "gone" });
+	expect(agents.tried).toBe(1);
 });

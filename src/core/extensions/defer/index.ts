@@ -7,8 +7,11 @@ import { noticeEntry } from "../../notice.ts";
 import { Dispatches } from "../dispatch/index.ts";
 import { reclaimer } from "../dispatch/reclaim.ts";
 
-/** Pending deferrals by task id; one leaves in the commit that ends its task. */
-export const Deferrals = defineDoc<{ items: Record<string, Deferred> }>({
+/**
+ * Pending deferrals by task id; one leaves in the commit that ends its task. `sending` is set in the commit before its
+ * prompt, while its job's reclaim waits.
+ */
+export const Deferrals = defineDoc<{ items: Record<string, Deferred & { sending?: boolean }> }>({
 	kind: "soma.defer.items",
 	version: 1,
 	scope: "conversation",
@@ -27,18 +30,37 @@ type Checkpoint =
 	| { phase: "sending"; tries: number };
 
 /**
+ * Marks deferral `id` of `agent` as no longer being sent. Its job, held `sending` while a prompt may go out, is due again
+ * once no deferral of the agent is being sent.
+ */
+async function release(tx: Tx, conversation: Conversation["id"], id: string, agent: string): Promise<void> {
+	const { items } = await tx.doc(Deferrals, conversation);
+	const item = items[id];
+	if (item?.sending) {
+		const { sending: _sent, ...rest } = item;
+		items[id] = rest;
+	}
+	if (Object.values(items).some((each) => each.agent === agent && each.sending)) return;
+	const doc = await tx.doc(Dispatches, conversation);
+	const index = doc.jobs.findIndex((job) => job.agent === agent);
+	const current = doc.jobs[index];
+	if (current?.reclaim?.phase === "sending") doc.jobs[index] = { ...current, reclaim: { phase: "due" } };
+}
+
+/**
  * Takes deferral `id` of `agent` off the pending ones. With none of the agent's left, its job is no longer due to be
  * stopped, so an agent that got its instruction while still open is not stopped when that turn ends, and a failed stop
- * is forgotten; a stopped one stays stopped.
+ * is forgotten; a stopped one stays stopped. With some left, it is due again unless one is being sent.
  */
 async function settle(tx: Tx, conversation: Conversation["id"], id: string, agent: string): Promise<void> {
 	const { items } = await tx.doc(Deferrals, conversation);
 	delete items[id];
-	if (Object.values(items).some((item) => item.agent === agent)) return;
+	if (Object.values(items).some((item) => item.agent === agent)) return release(tx, conversation, id, agent);
 	const doc = await tx.doc(Dispatches, conversation);
 	const index = doc.jobs.findIndex((job) => job.agent === agent);
 	const current = doc.jobs[index];
-	if (current?.reclaim?.phase !== "due" && current?.reclaim?.phase !== "failed") return;
+	const phase = current?.reclaim?.phase;
+	if (current === undefined || (phase !== "due" && phase !== "sending" && phase !== "failed")) return;
 	const { reclaim: _disarmed, ...rest } = current;
 	doc.jobs[index] = rest;
 }
@@ -56,7 +78,9 @@ export interface DeferOptions {
  * submitting nothing to the conversation. The prompt goes out at most once: the task commits `sending` before it, so a
  * crash between the prompt and the terminal commit ends the rerun with a notice instead of a second prompt. An accepted
  * defer arms its job's reclaim, and stops an agent already at rest; one soma stopped, or is stopping, takes the gone
- * path at fire time, until resuming it is built (`agent-defer-resume`).
+ * path at fire time, until resuming it is built (`agent-defer-resume`). The `sending` commit also moves a due job to
+ * `sending`, after checking its phase in the same commit, so a reclaim and a prompt never both go ahead: an idle the
+ * agent reports between the prompt and its end stops nothing.
  */
 export function deferExtension(agents: Pick<AgentPort, "list" | "prompt" | "stop">, options: DeferOptions = {}) {
 	const retryMs = options.retryMs ?? 30_000;
@@ -71,25 +95,27 @@ export function deferExtension(agents: Pick<AgentPort, "list" | "prompt" | "stop
 				const checkpoint = task.state.checkpoint;
 				if (runtime.now() < checkpoint.at) return runtime.sleepUntil(checkpoint.at, checkpoint, context);
 				const id = String(task.id);
+				const ending = async (tx: Tx, outcome: DeferOutcome, notice?: string) => {
+					await settle(tx, runtime.conversationId, id, task.input.agent);
+					if (notice !== undefined) await tx.appendEntry(runtime.conversationId, noticeEntry("report", notice));
+					return { status: "terminal" as const, outcome: { status: "completed" as const, result: outcome } };
+				};
 				const end = (outcome: DeferOutcome, notice?: string) =>
-					runtime.commit(async (tx) => {
-						await settle(tx, runtime.conversationId, id, task.input.agent);
-						if (notice !== undefined) await tx.appendEntry(runtime.conversationId, noticeEntry("report", notice));
-						return { status: "terminal", outcome: { status: "completed", result: outcome } };
-					}, context);
+					runtime.commit((tx) => ending(tx, outcome, notice), context);
 				const retry = (error: unknown) => {
 					const message = error instanceof Error ? error.message : String(error);
 					const tried = checkpoint.tries + 1;
 					if (tried >= tries) return end("failed", deferNotice.failed(id, task.input, tried, message));
 					const until = runtime.now() + retryMs;
-					return runtime.commit(
-						() => ({
+					return runtime.commit(async (tx) => {
+						// A prompt refused before it typed holds the job no longer: it may be stopped while this waits.
+						await release(tx, runtime.conversationId, id, task.input.agent);
+						return {
 							status: "sleeping",
 							until,
 							checkpoint: { phase: "wait", at: until, tries: tried, error: message },
-						}),
-						context,
-					);
+						};
+					}, context);
 				};
 
 				const job = (await runtime.snapshot(Dispatches, runtime.conversationId, context))?.jobs.find(
@@ -104,10 +130,22 @@ export function deferExtension(agents: Pick<AgentPort, "list" | "prompt" | "stop
 					return retry(error);
 				}
 				if (!listed) return end("gone", deferNotice.gone(id, task.input));
-				await runtime.commit(
-					() => ({ status: "running", checkpoint: { phase: "sending", tries: checkpoint.tries } }),
-					context,
-				);
+				// The phase read above may be stale: a reclaim that committed `stopping` since wins, and nothing is sent.
+				let sending = false;
+				await runtime.commit(async (tx) => {
+					const doc = await tx.doc(Dispatches, runtime.conversationId);
+					const index = doc.jobs.findIndex((each) => each.agent === task.input.agent);
+					const current = doc.jobs[index];
+					const phase = current?.reclaim?.phase;
+					if (phase === "stopping" || phase === "stopped") return ending(tx, "gone", deferNotice.gone(id, task.input));
+					if (current !== undefined && phase === "due") doc.jobs[index] = { ...current, reclaim: { phase: "sending" } };
+					const { items } = await tx.doc(Deferrals, runtime.conversationId);
+					const item = items[id];
+					if (item !== undefined) items[id] = { ...item, sending: true };
+					sending = true;
+					return { status: "running", checkpoint: { phase: "sending", tries: checkpoint.tries } };
+				}, context);
+				if (!sending) return;
 				try {
 					await agents.prompt(task.input.agent, deferredPrompt(id, task.input));
 				} catch (error) {

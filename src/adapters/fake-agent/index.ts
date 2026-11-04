@@ -13,7 +13,8 @@ export class FakeAgentPort implements AgentPort {
 	readonly prompts: { readonly agent: string; readonly text: string }[] = [];
 	readonly responses: { readonly agent: string; readonly answer: Answer }[] = [];
 	readonly started: StartRequest[] = [];
-	readonly stopped = new Set<string>();
+	// One entry per call, so a second stop of the same agent shows.
+	readonly stopped: string[] = [];
 	readonly #listeners = new Set<(event: AgentStatusEvent) => void>();
 	readonly #results = new Map<string, AgentResult>();
 	readonly #states = new Map<string, { status: AgentState; seq: number }>();
@@ -55,7 +56,7 @@ export class FakeAgentPort implements AgentPort {
 	}
 
 	async stop(agent: string): Promise<void> {
-		this.stopped.add(agent);
+		this.stopped.push(agent);
 		this.#states.delete(agent);
 	}
 

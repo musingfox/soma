@@ -71,7 +71,13 @@ await reconcileDispatches(root, agents, context);
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[smoke] event bridge:", error));
 const server = await serveDefer({ path: socket, defer: (request) => defers.defer(root, request, context) });
 const pending = Object.keys((await harness.snapshot(Deferrals, root.id, context))?.items ?? {});
-emit({ event: "started", pid: process.pid, socket, pending });
+emit({
+	event: "started",
+	pid: process.pid,
+	socket,
+	pending,
+	jobs: (await harness.snapshot(Dispatches, root.id, context))?.jobs ?? [],
+});
 
 if (mode === "dispatch") {
 	if (card === undefined || repo === undefined) throw new Error("dispatch needs <card> <repo>");

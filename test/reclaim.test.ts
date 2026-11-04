@@ -36,7 +36,9 @@ test("an agent already idle when its defer is accepted is stopped once, before t
 	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
 
 	await accepted(await soma.defer("PT2H"));
+	// The closed window's last report, which rex no longer lists: no second stop.
 	agents.emit("card-a", { state: "idle" });
+	agents.close("card-a");
 	await soma.settle();
 	expect(agents.stopped).toEqual(["card-a"]);
 });

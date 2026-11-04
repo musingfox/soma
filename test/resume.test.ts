@@ -748,3 +748,64 @@ test("a resumed window that closes before the instruction goes is not prompted, 
 	]);
 	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
 });
+
+test("an agent whose start timed out but whose window came up after is reclaimed once it defers again and rests", {
+	timeout: 20_000,
+}, async () => {
+	// rex's `session.new_window` outlasts soma's wait, and makes the window only after the listing that checks for it.
+	const agents = new (class extends FakeAgentPort {
+		override async resume(request: ResumeRequest): Promise<void> {
+			this.resumed.push(request);
+			throw new Error("rex call session.new_window timed out after 10000 ms");
+		}
+	})();
+	agents.emit("card-a", { state: "idle" });
+	const soma = await core(await database(), agents);
+	const id = await accepted(await soma.defer("PT1S"));
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "unresumed" });
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
+
+	// The window is up after all, and the agent in it, set to work by the human, defers again: it is open.
+	agents.emit("card-a", { state: "idle" });
+	agents.emit("card-a", { state: "working" });
+	await soma.settle();
+	await accepted(await soma.defer("PT1H"));
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "due" } });
+	expect(agents.stopped).toEqual(["card-a"]);
+	agents.finish("card-a", "結果：完成");
+	await soma.settle();
+	expect(agents.stopped).toEqual(["card-a", "card-a"]);
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" }, outcome: "完成" });
+	const entries = (await soma.root.entries({ order: "ascending" }, 1000, undefined, context)).items;
+	expect(entries.filter((entry) => entry.kind === JOB_DONE).map((entry) => entry.data)).toEqual([
+		expect.objectContaining({ agent: "card-a", outcome: "完成" }),
+	]);
+});
+
+test("an agent whose window the human reopened after a deferral ended gone is reclaimed once it defers again and rests", {
+	timeout: 20_000,
+}, async () => {
+	const agents = new (class extends FakeAgentPort {
+		override async resume(request: ResumeRequest): Promise<void> {
+			this.resumed.push(request);
+			this.emit(request.name, { state: "working" });
+			setTimeout(() => this.close(request.name), 200);
+		}
+	})();
+	agents.emit("card-a", { state: "idle" });
+	const soma = await core(await database(), agents, { pollMs: 50 });
+	const id = await accepted(await soma.defer("PT1S"));
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "gone" });
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
+
+	// The human reopens the window and sets the agent to work, and it defers again.
+	agents.emit("card-a", { state: "working" });
+	await soma.settle();
+	await accepted(await soma.defer("PT1H"));
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "due" } });
+	expect(agents.stopped).toEqual(["card-a"]);
+	agents.finish("card-a", "結果：完成");
+	await soma.settle();
+	expect(agents.stopped).toEqual(["card-a", "card-a"]);
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" }, outcome: "完成" });
+});

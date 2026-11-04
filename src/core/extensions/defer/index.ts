@@ -415,10 +415,13 @@ export function deferExtension(
 			const item: Deferred = { agent: job.agent, card: job.card, instruction, at, setAt };
 			const id = await tx.createTask(Deferral, item, { ownership: { kind: "conversation" }, background: true });
 			(await tx.doc(Deferrals, conversation.id)).items[String(id)] = item;
-			// A failed stop is tried once more for a new deferral; one stopped or under way is left as it is.
+			// A failed stop is tried once more for a new deferral, and a stopped agent that defers is open again, its window
+			// reopened since; one under way is left as it is.
 			const current = doc.jobs[index] ?? job;
 			const phase = current.reclaim?.phase;
-			if (phase === undefined || phase === "failed") doc.jobs[index] = { ...current, reclaim: { phase: "due" } };
+			if (phase === undefined || phase === "failed" || phase === "stopped") {
+				doc.jobs[index] = { ...current, reclaim: { phase: "due" } };
+			}
 			const reply: DeferReply = { accepted: true, id: String(id), at: new Date(at).toISOString() };
 			return { reply, agent: job.agent };
 		}, context);

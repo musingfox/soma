@@ -38,8 +38,9 @@ const named = (id: string, { agent, card }: Deferred) => `Deferred instruction $
 export const deferNotice = {
 	gone: (id: string, item: Deferred) =>
 		`${named(id, item)} was not sent: the agent was no longer listed when it fell due at ${iso(item.at)}. The instruction was: ${item.instruction}`,
-	unsure: (id: string, item: Deferred) =>
-		`${named(id, item)} may not have reached the agent: soma stopped while sending it, and does not send it twice. The instruction was: ${item.instruction}`,
+	// Without `error`, soma stopped while sending it.
+	unsure: (id: string, item: Deferred, error?: string) =>
+		`${named(id, item)} may not have reached the agent: ${error === undefined ? "soma stopped while sending it" : `sending it failed after it may have begun (${error})`}, and soma does not send it twice. The instruction was: ${item.instruction}`,
 	failed: (id: string, item: Deferred, tries: number, error: string) =>
 		`${named(id, item)} was not sent after ${tries} tries: ${error}. The instruction was: ${item.instruction}`,
 };

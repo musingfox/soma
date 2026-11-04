@@ -11,16 +11,17 @@ import {
 } from "../../agent-cli/permission/blocked-screen.ts";
 import { awaitingReply, readLastRecord, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
 import { type Git, mainCheckout, openWorktree, runGit } from "../../agent-cli/worktree.ts";
-import type {
-	AgentListing,
-	AgentPort,
-	AgentResult,
-	AgentState,
-	AgentStatusEvent,
-	Answer,
-	AnswerOutcome,
-	BlockedKind,
-	StartRequest,
+import {
+	type AgentListing,
+	type AgentPort,
+	type AgentResult,
+	type AgentState,
+	type AgentStatusEvent,
+	type Answer,
+	type AnswerOutcome,
+	type BlockedKind,
+	PromptRefused,
+	type StartRequest,
 } from "../../ports/agent.ts";
 import type { RexClient } from "./client.ts";
 import { type ProcessStart, readProcessStart } from "./process-start.ts";
@@ -608,14 +609,20 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		},
 
 		async prompt(agent: string, text: string): Promise<void> {
-			const { blockId } = only(await panes(), agent);
-			// Typed into a prompt, the text's `\r` would choose the highlighted option.
-			const { records } = await blockCall("program_status", blockId, ProgramStatusResultSchema);
-			const state = records.find(isRoot)?.state;
-			if (state !== "idle" && state !== "done") {
-				throw new Error(
-					`rex agent ${agent} is ${state ?? "without a status record"}: a prompt goes only to idle or done`,
-				);
+			let blockId: string;
+			// Nothing is typed until the paste, so whatever fails before it is a refusal the caller may try again.
+			try {
+				({ blockId } = only(await panes(), agent));
+				// Typed into a prompt, the text's `\r` would choose the highlighted option.
+				const { records } = await blockCall("program_status", blockId, ProgramStatusResultSchema);
+				const state = records.find(isRoot)?.state;
+				if (state !== "idle" && state !== "done") {
+					throw new Error(
+						`rex agent ${agent} is ${state ?? "without a status record"}: a prompt goes only to idle or done`,
+					);
+				}
+			} catch (error) {
+				throw new PromptRefused(error instanceof Error ? error.message : String(error));
 			}
 			const working = turnsWorking(blockId, confirmMs);
 			try {

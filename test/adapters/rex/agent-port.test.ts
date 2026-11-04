@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterAll, expect, test } from "vitest";
 import { createRexAgentPort, launchCommand, seqOf, stateOf } from "../../../src/adapters/rex/agent-port.ts";
 import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
-import type { AgentPort, AgentResult, AgentStatusEvent } from "../../../src/ports/agent.ts";
+import { type AgentPort, type AgentResult, type AgentStatusEvent, PromptRefused } from "../../../src/ports/agent.ts";
 import { AT, AT_US, type Block, fixture, git, HANGAR, rex, SESSION } from "./fake.ts";
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -384,17 +384,42 @@ test.each([
 	["blocked", [{ state: "blocked", kind: "permission", updated_at: AT }]],
 	["working", [{ state: "working", updated_at: AT }]],
 	["without a status record", []],
-])("prompt throws without typing anything when claude is %s", async (state, records) => {
+])("prompt refuses without typing anything when claude is %s", async (state, records) => {
 	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude", records }]);
 
-	await expect(
-		createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt(
-			"card-a",
-			"go",
-		),
-	).rejects.toThrow(`rex agent card-a is ${state}`);
+	const prompted = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		confirmMs: 10,
+	}).prompt("card-a", "go");
+
+	await expect(prompted).rejects.toThrow(`rex agent card-a is ${state}`);
+	await expect(prompted).rejects.toBeInstanceOf(PromptRefused);
 
 	expect(fake.methods().filter((method) => method === "block.event" || method.endsWith(".write"))).toEqual([]);
+});
+
+test("prompt that fails after the paste does not call it a refusal", async () => {
+	const fake = rex([
+		{ name: "card-a", block: "block:a", argv0: "claude", records: [{ state: "idle", updated_at: AT }] },
+	]);
+	const original = fake.client.call.bind(fake.client);
+	fake.client.call = async (method, payload, schema) => {
+		if (method === "com.superlogical.terminal.write") throw new Error("rex connection lost");
+		return original(method, payload, schema);
+	};
+
+	const prompted = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		confirmMs: 10,
+	}).prompt("card-a", "go");
+
+	await expect(prompted).rejects.toThrow("rex connection lost");
+	await expect(prompted).rejects.not.toBeInstanceOf(PromptRefused);
+	expect(fake.methods().filter((method) => method === "block.event")).toHaveLength(1);
 });
 
 const projects = mkdtempSync(join(tmpdir(), "soma-rex-projects-"));

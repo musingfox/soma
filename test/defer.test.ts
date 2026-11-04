@@ -13,7 +13,7 @@ import { openHarness } from "../src/core/harness.ts";
 import { openHumanPort } from "../src/core/human-port.ts";
 import { NOTICE } from "../src/core/notice.ts";
 import { startCore } from "../src/core/startup.ts";
-import type { AgentPort } from "../src/ports/agent.ts";
+import { type AgentPort, PromptRefused } from "../src/ports/agent.ts";
 import type { SomaEvent } from "../src/ports/human.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -238,7 +238,7 @@ test("a prompt the agent side refuses, as for a busy agent, is tried again; one 
 	const busy: Pick<AgentPort, "list" | "prompt"> = {
 		list: async () => [{ name: "card-a" }],
 		prompt: async (_agent, text) => {
-			if (refusals-- > 0) throw new Error("rex agent card-a is working: a prompt goes only to idle or done");
+			if (refusals-- > 0) throw new PromptRefused("rex agent card-a is working: a prompt goes only to idle or done");
 			prompts.push(text);
 		},
 	};
@@ -257,6 +257,30 @@ test("a prompt the agent side refuses, as for a busy agent, is tried again; one 
 	expect((await entries(root)).map((entry) => entry.data)).toEqual([
 		{ kind: "report", content: expect.stringMatching(/was not sent after 3 tries: rex agent card-a is working/) },
 	]);
+});
+
+test("an adapter error that may come after typing is not tried again, and tells the human once", {
+	timeout: 20_000,
+}, async () => {
+	const prompts: string[] = [];
+	// As rex's prompt can: the paste went out, then pressing Enter failed.
+	const typedThenFailed: Pick<AgentPort, "list" | "prompt"> = {
+		list: async () => [{ name: "card-a" }],
+		prompt: async (_agent, text) => {
+			prompts.push(text);
+			throw new Error("rex connection lost");
+		},
+	};
+	const { harness, root, defer } = await core(await database(), typedThenFailed, { retryMs: 200, tries: 3 });
+	const reply = await defer("PT1S");
+	if (!reply.accepted) throw new Error(reply.reason);
+
+	expect(await outcome(harness, reply.id)).toEqual({ status: "completed", result: "unsure" });
+	expect(prompts.length).toBe(1);
+	expect((await entries(root)).map((entry) => entry.data)).toEqual([
+		{ kind: "report", content: expect.stringMatching(/may not have reached the agent: .*rex connection lost/) },
+	]);
+	expect(await pending(harness, root)).toEqual([]);
 });
 
 test("a deferral that ends as soma starts reaches the human through the HumanPort, however long the other starts take", {

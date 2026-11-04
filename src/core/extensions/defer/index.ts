@@ -1,6 +1,6 @@
 import type { Context } from "@earendil-works/chord/context";
 import { type Conversation, defineDoc, defineExtension, defineTask } from "@earendil-works/pi-durable";
-import type { AgentPort } from "../../../ports/agent.ts";
+import { type AgentPort, PromptRefused } from "../../../ports/agent.ts";
 import type { DeferReply, DeferRequest } from "../../../ports/defer.ts";
 import { type Deferred, deferAt, deferNotice, deferredPrompt } from "../../domain/defer.ts";
 import { noticeEntry } from "../../notice.ts";
@@ -86,8 +86,13 @@ export function deferExtension(agents: Pick<AgentPort, "list" | "prompt">, optio
 				try {
 					await agents.prompt(task.input.agent, deferredPrompt(id, task.input));
 				} catch (error) {
-					// The adapter refused before it typed, as rex does for a busy agent, or failed while typing.
-					return retry(error);
+					// Tried again only when the adapter refused before it typed, as rex does for a busy agent: any other
+					// failure may come after the text reached the agent, and the prompt goes out at most once.
+					if (error instanceof PromptRefused) return retry(error);
+					return end(
+						"unsure",
+						deferNotice.unsure(id, task.input, error instanceof Error ? error.message : String(error)),
+					);
 				}
 				await end("sent");
 			},

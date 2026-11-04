@@ -64,9 +64,16 @@ export type AnswerOutcome = { readonly sent: true } | { readonly sent: false; re
  */
 export type AgentResult = { readonly id: string; readonly text?: string };
 
+/**
+ * What `prompt` throws when it refused before typing anything, as for an agent busy with a turn: trying again later
+ * cannot send the text twice. Any other error may come after some of the text reached the agent.
+ */
+export class PromptRefused extends Error {}
+
 export interface AgentPort {
 	start(request: StartRequest): Promise<void>;
 	list(): Promise<readonly AgentListing[]>;
+	// Throws PromptRefused when it typed nothing.
 	prompt(agent: string, text: string): Promise<void>;
 	onStatus(listener: (event: AgentStatusEvent) => void): () => void;
 	// Undefined only when no transcript, or no record in it with an id, can be read.

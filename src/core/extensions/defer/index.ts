@@ -1,5 +1,12 @@
 import type { Context } from "@earendil-works/chord/context";
-import { type Conversation, defineExtension, defineTask, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
+import {
+	type Conversation,
+	defineExtension,
+	defineTask,
+	type TaskId,
+	type TaskRuntime,
+	type Tx,
+} from "@earendil-works/pi-durable";
 import { type AgentPort, NotImplemented, PromptRefused } from "../../../ports/agent.ts";
 import type { DeferReply, DeferRequest } from "../../../ports/defer.ts";
 import { type Deferred, deferAt, deferNotice, deferredPrompt } from "../../domain/defer.ts";
@@ -68,6 +75,28 @@ async function release(tx: Tx, conversation: Conversation["id"], id: string, age
 function unheld(job: Job, before: Reclaim | undefined): Job {
 	const { reclaim: _held, ...rest } = job;
 	return before === undefined ? rest : { ...rest, reclaim: before };
+}
+
+/**
+ * Gives `agent`'s job back the reclaim it had before a deferral held it `resuming`, when no deferral that holds it is
+ * live: one whose task ended without settling, as one faulted or rolled back to a release without the phase, never
+ * releases it. Such a deferral's item, left pending, goes too.
+ */
+async function unhold(tx: Tx, conversation: Conversation["id"], agent: string): Promise<void> {
+	const doc = await tx.doc(Dispatches, conversation);
+	const index = doc.jobs.findIndex((job) => job.agent === agent);
+	const current = doc.jobs[index];
+	if (current?.reclaim?.phase !== "resuming") return;
+	const { items } = await tx.doc(Deferrals, conversation);
+	let before: Reclaim | undefined;
+	for (const [id, item] of Object.entries(items)) {
+		if (item.agent !== agent || item.resuming !== true) continue;
+		const status = (await tx.task(Number(id) as TaskId))?.state.status;
+		if (status !== undefined && status !== "completing" && status !== "terminal") return;
+		before = item.before && { ...item.before };
+		delete items[id];
+	}
+	doc.jobs[index] = unheld(current, before);
 }
 
 /**
@@ -350,7 +379,8 @@ export function deferExtension(
 	 * Accepts `request` when its agent names a job of the conversation's dispatch list, and creates its task in the same
 	 * commit, with the job due to be stopped; refuses it with a reason the agent can read otherwise. An agent the listing
 	 * shows idle or done already is stopped before the reply, as one at work is when its turn ends; one that runs
-	 * `soma defer` itself is at work, so it is not stopped under its own command.
+	 * `soma defer` itself is at work, so it is not stopped under its own command. A job held `resuming` by a deferral
+	 * no longer live is released first, so the new one is not held back by it for good.
 	 */
 	async function defer(conversation: Conversation, request: DeferRequest, context: Context): Promise<DeferReply> {
 		const setAt = Date.now();
@@ -373,12 +403,14 @@ export function deferExtension(
 				};
 				return { reply, agent: undefined };
 			}
+			await unhold(tx, conversation.id, job.agent);
 			const item: Deferred = { agent: job.agent, card: job.card, instruction, at, setAt };
 			const id = await tx.createTask(Deferral, item, { ownership: { kind: "conversation" }, background: true });
 			(await tx.doc(Deferrals, conversation.id)).items[String(id)] = item;
 			// A failed stop is tried once more for a new deferral; one stopped or under way is left as it is.
-			const phase = job.reclaim?.phase;
-			if (phase === undefined || phase === "failed") doc.jobs[index] = { ...job, reclaim: { phase: "due" } };
+			const current = doc.jobs[index] ?? job;
+			const phase = current.reclaim?.phase;
+			if (phase === undefined || phase === "failed") doc.jobs[index] = { ...current, reclaim: { phase: "due" } };
 			const reply: DeferReply = { accepted: true, id: String(id), at: new Date(at).toISOString() };
 			return { reply, agent: job.agent };
 		}, context);

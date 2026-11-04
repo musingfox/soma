@@ -1,7 +1,9 @@
-import type { TaskId } from "@earendil-works/pi-durable";
+import { defineExtension, defineTask, type TaskId } from "@earendil-works/pi-durable";
 import { expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { JOB_DONE } from "../src/core/extensions/dispatch/bridge.ts";
+import { dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
+import { openHarness } from "../src/core/harness.ts";
 import { NotImplemented, type ResumeRequest } from "../src/ports/agent.ts";
 import { accepted, type Core, context, core, database } from "./defer-core.ts";
 
@@ -233,6 +235,53 @@ test("a crash in the start, after its window was made, starts nothing at restart
 	}
 	expect(dead.resumed).toEqual([session]);
 	expect(dead.prompts).toEqual([]);
+});
+
+test("a deferral that faulted while it held its job resuming holds back no later deferral of the agent", {
+	timeout: 20_000,
+}, async () => {
+	const db = await database();
+	const death = dying();
+	const dead = new (class extends FakeAgentPort {
+		override resume(request: ResumeRequest): Promise<void> {
+			this.resumed.push(request);
+			death.reach();
+			return death.dead;
+		}
+	})();
+	dead.emit("card-a", { state: "idle" });
+	const first = await core(db, dead);
+	const faulted = await accepted(await first.defer("PT1S"));
+	await death.reached;
+	await crash(first, death);
+
+	// A rollback to a release whose deferral has no `resuming` phase: the task faults, holding the job.
+	const old = defineTask<object, { phase: "wait" | "sending" }, string>({
+		name: "soma.defer",
+		version: 1,
+		initial: () => ({ phase: "wait" }),
+		phases: { wait: async () => {}, sending: async () => {} },
+		abort: async () => {},
+	});
+	const rolledBack = await openHarness(
+		db,
+		[dispatchExtension(new FakeAgentPort(), async () => ""), defineExtension({ name: "soma.defer", tasks: [old] })],
+		context,
+	);
+	rolledBack.resume();
+	expect((await rolledBack.waitForTask(Number(faulted) as TaskId, context)).state.outcome).toMatchObject({
+		status: "faulted",
+	});
+	await rolledBack.close(context);
+
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents, { retryMs: 100, tries: 3 });
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "resuming" } });
+	const id = await accepted(await soma.defer("PT1S"));
+	expect(await soma.outcome(id)).toEqual(sent);
+	expect(agents.resumed).toEqual([session]);
+	expect(agents.prompts).toEqual([instruction(id)]);
+	expect((await soma.job("card-a"))?.reclaim).toBeUndefined();
 });
 
 test("a crash while the resumed agent is not ready yet starts nothing at restart and sends once it is", {

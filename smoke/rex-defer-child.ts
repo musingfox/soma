@@ -2,7 +2,8 @@
 // and the faux model standing in for one that calls `dispatch`. Dispatches into the rex session $SOMA_REX_SESSION_ID
 // on the server at $SOMA_REX_SOCKET, and serves `soma defer` on <db>.defer.sock.
 //   dispatch <db> <card> <repo>   start up, submit 「派 <card> <repo>」, then serve until killed
-//   reopen <db>                   start up and serve; on SIGTERM print what the root conversation holds and exit
+//   reopen <db>                   start up and serve; on SIGTERM print what the root conversation and the dispatch list
+//                                 hold and exit
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +19,7 @@ import { Deferrals, deferExtension } from "../src/core/extensions/defer/index.ts
 import { eventBridge, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
+import { NOTICE } from "../src/core/notice.ts";
 
 const context = BACKGROUND_CONTEXT;
 const [mode, db, card, repo] = process.argv.slice(2);
@@ -97,6 +99,10 @@ if (mode === "dispatch") {
 				kind: entry.kind,
 				roles: (entry.model ?? []).map((message) => message.role),
 			})),
+			notices: entries
+				.filter((entry) => entry.kind === NOTICE)
+				.map((entry) => (entry.data as { content: string }).content),
+			jobs: (await harness.snapshot(Dispatches, root.id, context))?.jobs ?? [],
 		});
 		unlisten();
 		await server.close();

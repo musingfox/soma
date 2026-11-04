@@ -4,9 +4,13 @@
 //   3. claude's environment, which its shell tools inherit, must hold SOMA_AGENT=<card>, the core's socket, and soma's
 //      bin first on PATH;
 //   4. `soma defer --at PT2M ...` runs from this process with that environment, found through that PATH;
-//   5. the core is killed with SIGKILL during the wait and reopened;
-//   6. the deferral must fire once: the agent's transcript holds the instruction in exactly one user record, the
-//      reopened core called no model, and the root conversation holds no input but the dispatch.
+//   5. the agent is idle when the defer is accepted, so the core stops it at once: its window must leave the hangar;
+//   6. the core is killed with SIGKILL during the wait and reopened;
+//   7. the reopened core must take the stopped agent for reclaimed, not vanished: its job is recorded stopped and no
+//      notice says it is gone (不見了);
+//   8. at fire time the agent is gone, and resuming it is not built yet, so the deferral must end `gone` with exactly
+//      one notice to the human, the instruction must never reach the agent's transcript, the reopened core called no
+//      model, and the root conversation holds no input but the dispatch.
 // It destroys its rex session and removes the card's worktree and branch at the end, also on failure.
 //   node smoke/rex-defer.ts [repo]    (default the current directory, which claude must already trust: a repo it does
 //                                      not stops at the trust dialog, which this smoke does not answer)
@@ -154,6 +158,14 @@ try {
 	const [, deferral, at] = accepted as RegExpExecArray;
 	log("deferred", { stdout: asked.stdout.trim(), stderr: asked.stderr });
 
+	// The launch turn is over, so the agent is idle at the defer and is stopped at once, through block.close.
+	await until("the agent's window to leave the hangar", 30_000, async () =>
+		(await named()).length === 0 ? true : undefined,
+	).catch(async (error: Error) => {
+		throw new Error(`${error.message}; the screen ends:\n${await screen(id).catch(() => "(unreadable)")}`);
+	});
+	log("reclaimed", { windows: await named(), at: new Date().toISOString() });
+
 	await delay(10_000);
 	first.process.kill("SIGKILL");
 	await first.exited;
@@ -168,30 +180,35 @@ try {
 	check(JSON.stringify(reopened.pending) === JSON.stringify([deferral]), `pending after reopen: ${reopened.pending}`);
 	const settled = await second.next("settled");
 	check(
-		JSON.stringify(settled.outcome) === JSON.stringify({ status: "completed", result: "sent" }),
+		JSON.stringify(settled.outcome) === JSON.stringify({ status: "completed", result: "gone" }),
 		`deferral ended ${JSON.stringify(settled.outcome)}`,
 	);
 	check(Number(settled.at) >= Date.parse(at as string), "the deferral fired early");
 	log("fired", { id: settled.id, outcome: settled.outcome, late: Number(settled.at) - Date.parse(at as string) });
 
-	const answered = await until("the deferred turn to finish", 180_000, async () => {
-		if ((await promptedWith(transcript, marker)) === 0) return undefined;
-		const done = await finished(id, transcript);
-		return done?.reply.includes(marker) ? done : undefined;
-	});
-	// Long enough for a second prompt, had one been sent, to show up.
+	// Long enough for a second notice, had one been written, to show up.
 	await delay(10_000);
+	check((await named()).length === 0, "the agent's window came back");
 	const prompts = await promptedWith(transcript, marker);
-	check(prompts === 1, `the agent was prompted with the instruction ${prompts} times`);
+	check(prompts === 0, `the stopped agent's transcript holds the instruction ${prompts} times`);
 	second.process.kill("SIGTERM");
 	const report = await second.next("report");
 	check((await second.exited) === 0, "reopened core failed");
 	const entries = report.entries as { kind: string; roles: string[] }[];
 	const inputs = entries.filter((entry) => entry.roles.includes("user"));
+	const notices = report.notices as string[];
+	const reclaimed = (report.jobs as Job[]).find((each) => each.card === card);
 	check(report.modelCalls === 0, `the reopened core called the model ${report.modelCalls} times`);
 	check(inputs.length === 1, `the root conversation holds ${inputs.length} inputs`);
-	log("agent", { promptedWithInstruction: prompts, reply: answered.reply, state: answered.state });
-	log("root", { modelCallsAfterReopen: report.modelCalls, inputs: inputs.length, entries: entries.length });
+	check(reclaimed?.reclaim?.phase === "stopped", `the job's reclaim is ${JSON.stringify(reclaimed?.reclaim)}`);
+	check(!notices.some((notice) => notice.includes("不見了")), `a notice says the agent vanished: ${notices}`);
+	check(notices.length === 1, `the human got ${notices.length} notices: ${JSON.stringify(notices)}`);
+	check(
+		notices[0]?.startsWith(`Deferred instruction ${deferral} `) === true && notices[0].includes("was not sent"),
+		`the notice is ${JSON.stringify(notices[0])}`,
+	);
+	log("agent", { windows: 0, promptedWithInstruction: prompts, reclaim: reclaimed?.reclaim });
+	log("root", { modelCallsAfterReopen: report.modelCalls, inputs: inputs.length, notices });
 	console.log("PASS");
 } finally {
 	for (const child of children)

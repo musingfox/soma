@@ -13,7 +13,7 @@ import { openHarness } from "../src/core/harness.ts";
 import { openHumanPort } from "../src/core/human-port.ts";
 import { NOTICE } from "../src/core/notice.ts";
 import { startCore } from "../src/core/startup.ts";
-import { type AgentPort, PromptRefused } from "../src/ports/agent.ts";
+import { type AgentPort, PromptRefused, type ResumeRequest } from "../src/ports/agent.ts";
 import type { SomaEvent } from "../src/ports/human.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -32,7 +32,11 @@ async function database() {
 }
 
 /** A core on `db` with the dispatch list holding `job`; the model is never set up, so a turn it ran would fail. */
-async function core(db: string, agents: Pick<AgentPort, "list" | "prompt" | "stop">, options: DeferOptions = {}) {
+async function core(
+	db: string,
+	agents: Pick<AgentPort, "list" | "prompt" | "resume" | "stop">,
+	options: DeferOptions = {},
+) {
 	const defers = deferExtension(agents, options);
 	const harness = await openHarness(
 		db,
@@ -59,6 +63,14 @@ const entries = async (root: Conversation) =>
 	(await root.entries({ order: "ascending" }, 1000, undefined, context)).items;
 const outcome = async (harness: Harness, id: string) =>
 	(await harness.waitForTask(Number(id) as TaskId, context)).state.outcome;
+
+/** An agent side whose agents, once gone, cannot be started again, as when the session's worktree was removed. */
+class NotResumable extends FakeAgentPort {
+	override async resume(request: ResumeRequest): Promise<void> {
+		this.resumed.push(request);
+		throw new Error(`the worktree of claude session ${request.sessionId} no longer exists`);
+	}
+}
 
 test("a defer at or after now: an offset date-time or a duration; anything else is refused in words for the agent", () => {
 	const now = Date.parse("2026-11-04T10:00:00Z");
@@ -136,14 +148,15 @@ test("at fire time a listed agent gets one prompt, and the root conversation get
 	expect(await pending(harness, root)).toEqual([]);
 });
 
-test("an agent not listed at fire time is not prompted, and the human gets one notice", async () => {
-	const agents = new FakeAgentPort();
+test("an agent not listed at fire time that cannot be started again is not prompted, and the human gets one notice", async () => {
+	const agents = new NotResumable();
 	const { harness, root, defer } = await core(await database(), agents);
 
 	const reply = await defer("PT1S");
 	if (!reply.accepted) throw new Error(reply.reason);
 
-	expect(await outcome(harness, reply.id)).toEqual({ status: "completed", result: "gone" });
+	expect(await outcome(harness, reply.id)).toEqual({ status: "completed", result: "unresumed" });
+	expect(agents.resumed).toEqual([{ name: "card-a", card: "card-a", sessionId: "s-1" }]);
 	expect(agents.prompts).toEqual([]);
 	const notices = await entries(root);
 	expect(notices.map((entry) => [entry.kind, entry.data])).toEqual([
@@ -198,8 +211,9 @@ test("a core stopped while the prompt was going out does not prompt again, and t
 	const reached = new Promise<void>((resolve) => {
 		sent = resolve;
 	});
-	const hanging: Pick<AgentPort, "list" | "prompt" | "stop"> = {
+	const hanging: Pick<AgentPort, "list" | "prompt" | "resume" | "stop"> = {
 		list: async () => [{ name: "card-a" }],
+		resume: async () => {},
 		stop: async () => {},
 		prompt: (_agent, text) => {
 			prompts.push(text);
@@ -238,8 +252,9 @@ test("a prompt the agent side refuses, as for a busy agent, is tried again; one 
 }, async () => {
 	let refusals = 1;
 	const prompts: string[] = [];
-	const busy: Pick<AgentPort, "list" | "prompt" | "stop"> = {
+	const busy: Pick<AgentPort, "list" | "prompt" | "resume" | "stop"> = {
 		list: async () => [{ name: "card-a" }],
+		resume: async () => {},
 		stop: async () => {},
 		prompt: async (_agent, text) => {
 			if (refusals-- > 0) throw new PromptRefused("rex agent card-a is working: a prompt goes only to idle or done");
@@ -268,8 +283,9 @@ test("an adapter error that may come after typing is not tried again, and tells 
 }, async () => {
 	const prompts: string[] = [];
 	// As rex's prompt can: the paste went out, then pressing Enter failed.
-	const typedThenFailed: Pick<AgentPort, "list" | "prompt" | "stop"> = {
+	const typedThenFailed: Pick<AgentPort, "list" | "prompt" | "resume" | "stop"> = {
 		list: async () => [{ name: "card-a" }],
+		resume: async () => {},
 		stop: async () => {},
 		prompt: async (_agent, text) => {
 			prompts.push(text);
@@ -298,8 +314,8 @@ test("a deferral that ends as soma starts reaches the human through the HumanPor
 	await first.harness.close(context);
 	open.splice(open.indexOf(first.harness), 1);
 	await new Promise((resolve) => setTimeout(resolve, 1_100));
-	// The agent left while soma was down, so the deferral ends at once with a notice.
-	const agents = new FakeAgentPort();
+	// The agent left while soma was down, and its worktree with it, so the deferral ends at once with a notice.
+	const agents = new NotResumable();
 	const harness = await openHarness(
 		db,
 		[dispatchExtension(agents, async () => ""), deferExtension(agents).extension],
@@ -315,7 +331,7 @@ test("a deferral that ends as soma starts reaches the human through the HumanPor
 	human.subscribe((event) => seen.push(event));
 
 	try {
-		expect(await outcome(harness, reply.id)).toEqual({ status: "completed", result: "gone" });
+		expect(await outcome(harness, reply.id)).toEqual({ status: "completed", result: "unresumed" });
 		const notices = () => seen.filter((event) => event.type === "notice");
 		await vi.waitFor(() => expect(notices()).toHaveLength(1));
 		expect(notices()).toEqual([

@@ -42,6 +42,14 @@ export const reclaimFailedNotice = (agent: string, card: string, error: string) 
 export const deferNotice = {
 	gone: (id: string, item: Deferred) =>
 		`${named(id, item)} was not sent: the agent was no longer listed when it fell due at ${iso(item.at)}. The instruction was: ${item.instruction}`,
+	// The agent was gone at `at`, and starting it again in its session failed.
+	unresumed: (id: string, item: Deferred, error: string) =>
+		`${named(id, item)} was not sent: the agent was gone when it fell due at ${iso(item.at)}, and soma could not start it again: ${error}. The instruction was: ${item.instruction}`,
+	// soma started the agent again, and its window was gone before it could take the instruction.
+	closed: (id: string, item: Deferred) =>
+		`${named(id, item)} was not sent: soma started the agent again when it fell due at ${iso(item.at)}, but its window closed before the instruction went out. The instruction was: ${item.instruction}`,
+	unready: (id: string, item: Deferred, seconds: number, state: string) =>
+		`${named(id, item)} was not sent: soma started the agent again when it fell due at ${iso(item.at)}, but it was not ready for the instruction within ${seconds} s (it was ${state}); it is left open. The instruction was: ${item.instruction}`,
 	// soma had committed to stopping the agent, and a crash may have kept the stop from going out.
 	stopping: (id: string, item: Deferred) =>
 		`${named(id, item)} was not sent: soma was stopping the agent when it fell due at ${iso(item.at)}, and cannot tell whether that stop went out, so the agent may still be open. The instruction was: ${item.instruction}`,

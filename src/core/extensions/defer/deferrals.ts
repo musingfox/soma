@@ -3,9 +3,10 @@ import type { Deferred } from "../../domain/defer.ts";
 
 /**
  * Pending deferrals by task id; one leaves in the commit that ends its task. `sending` is set in the commit before its
- * prompt, while its job's reclaim waits. Its own module, so the reclaim can read it without importing the extension.
+ * prompt, while its job's reclaim waits; `resuming` while it holds its job `resuming`, starting the agent again. Its own
+ * module, so the reclaim can read it without importing the extension.
  */
-export const Deferrals = defineDoc<{ items: Record<string, Deferred & { sending?: boolean }> }>({
+export const Deferrals = defineDoc<{ items: Record<string, Deferred & { sending?: boolean; resuming?: boolean }> }>({
 	kind: "soma.defer.items",
 	version: 1,
 	scope: "conversation",

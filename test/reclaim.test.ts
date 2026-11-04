@@ -221,25 +221,6 @@ test("a reclaimed agent is no vanished agent, live or after a restart", { timeou
 	}
 });
 
-test("a deferral that falls due after its agent was stopped tells the human once", { timeout: 20_000 }, async () => {
-	const db = await database();
-	const agents = new FakeAgentPort();
-	agents.emit("card-a", { state: "idle" });
-	const soma = await core(db, agents);
-
-	const id = await accepted(await soma.defer("PT1S"));
-	expect(agents.stopped).toEqual(["card-a"]);
-	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "gone" });
-	expect(agents.prompts).toEqual([]);
-	expect(await soma.notices()).toEqual([expect.stringMatching(new RegExp(`^Deferred instruction ${id} .*not sent`))]);
-	await soma.close();
-
-	const again = await core(db, agents);
-	await again.settle();
-	expect(await again.notices()).toHaveLength(1);
-	expect(agents.stopped).toEqual(["card-a"]);
-});
-
 test("an agent that got its deferred instruction while still open is not stopped when that turn ends", {
 	timeout: 20_000,
 }, async () => {
@@ -324,7 +305,7 @@ test("an idle reported after the deferred prompt was typed does not stop the age
 	expect(agents.stopped).toEqual(["card-a"]);
 });
 
-test("a deferred prompt refused before it typed holds the job no longer: an idle while it waits stops the agent", {
+test("a deferred prompt refused before it typed holds the job no longer: an idle while it waits stops the agent, and the next try starts it again", {
 	timeout: 20_000,
 }, async () => {
 	const agents = new (class extends FakeAgentPort {
@@ -335,7 +316,7 @@ test("a deferred prompt refused before it typed holds the job no longer: an idle
 		}
 	})();
 	agents.emit("card-a", { state: "working" });
-	const soma = await core(await database(), agents, { retryMs: 1_000 });
+	const soma = await core(await database(), agents, { retryMs: 1_000, tries: 2 });
 	const id = await accepted(await soma.defer("PT1S"));
 	for (
 		const deadline = Date.now() + 5_000;
@@ -348,8 +329,14 @@ test("a deferred prompt refused before it typed holds the job no longer: an idle
 	agents.emit("card-a", { state: "idle" });
 	await soma.settle();
 	expect(agents.stopped).toEqual(["card-a"]);
-	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "gone" });
-	expect(agents.tried).toBe(1);
+	// The resumed agent refuses too, and the tries are used up.
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "failed" });
+	expect(agents.resumed).toEqual([{ name: "card-a", card: "card-a", sessionId: "s-card-a" }]);
+	expect(agents.tried).toBe(2);
+	expect(agents.stopped).toEqual(["card-a"]);
+	expect(await soma.notices()).toEqual([
+		expect.stringMatching(/was not sent after 2 tries: rex agent card-a is working/),
+	]);
 });
 
 test("a deferral that falls due while soma is down mid-stop tells what is known, and leaves no stop for later", {

@@ -10,7 +10,8 @@ import type { DispatchList } from "./dispatch.ts";
  * than blocked forgets the block last handed over, as an observed one does, so the
  * same prompt asked again is handed over again. A job whose agent soma set out to stop is
  * stopped, not failed, once the agent is no longer listed: the stop went through, perhaps
- * before a restart could record it.
+ * before a restart could record it. One a deferral is starting again is left to that deferral,
+ * whose start may not have gone out yet.
  */
 export function reconcile(jobs: DispatchList, listed: readonly AgentListing[]): DispatchList {
 	const byName = new Map(listed.map((agent) => [agent.name, agent]));
@@ -18,6 +19,7 @@ export function reconcile(jobs: DispatchList, listed: readonly AgentListing[]): 
 		const agent = byName.get(job.agent);
 		if (agent === undefined) {
 			const phase = job.reclaim?.phase;
+			if (phase === "resuming") return job;
 			if (phase === "stopping" || phase === "stopped" || phase === "failed") {
 				return phase === "stopped" ? job : { ...job, reclaim: { phase: "stopped" } };
 			}

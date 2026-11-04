@@ -25,9 +25,11 @@ export type HandedOver = { readonly fingerprint?: string; readonly msg?: string 
  * before `stop`, so a restart knows a stop may have gone out. stopped: the agent is gone because soma stopped it, so
  * its absence is no failure. failed: `stop` failed and the human was told; not tried again for the deferrals pending.
  * sending: a deferral's prompt may be going out, so the agent is not stopped; due again after it if one is pending.
+ * resuming: a deferral that fell due with its agent gone is starting it again, until its prompt goes out; the agent may
+ * not be listed yet, which is no failure either, and it is not stopped meanwhile.
  */
 export type Reclaim = {
-	readonly phase: "due" | "sending" | "stopping" | "stopped" | "failed";
+	readonly phase: "due" | "sending" | "resuming" | "stopping" | "stopped" | "failed";
 	readonly error?: string;
 };
 

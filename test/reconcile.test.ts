@@ -56,3 +56,12 @@ test("an unlisted agent fails its job unless the job already ended", () => {
 test("agents soma did not dispatch never become jobs", () => {
 	expect(reconcile([], [{ name: "someone-else", status: { state: "idle" } }])).toEqual([]);
 });
+
+test("an unlisted agent a deferral is starting again is left to that deferral, not failed nor taken for stopped", () => {
+	const jobs: Job[] = [{ ...job("a", { state: "idle" }), reclaim: { phase: "resuming" } }];
+
+	expect(reconcile(jobs, [])).toEqual(jobs);
+	expect(reconcile(jobs, [{ name: "a", status: { state: "working" } }])).toEqual([
+		{ ...jobs[0], status: { state: "working" } },
+	]);
+});

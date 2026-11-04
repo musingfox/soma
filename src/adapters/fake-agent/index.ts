@@ -68,6 +68,11 @@ export class FakeAgentPort implements AgentPort {
 		this.#states.delete(agent);
 	}
 
+	/** The agent's window closed by hand: no longer listed, and no stop recorded. */
+	close(agent: string): void {
+		this.#states.delete(agent);
+	}
+
 	/** `seq` defaults to the next one; passing the last one again replays an observation. */
 	emit(agent: string, status: AgentState, seq = ++this.#seq): void {
 		this.#states.set(agent, { status, seq });

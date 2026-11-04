@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -141,6 +141,25 @@ test("bin/soma defer runs the CLI with the agent's SOMA_AGENT against SOMA_SOCKE
 			"soma defer: accepted as 42; soma will send this instruction to agent card-a as a new prompt at at PT2M. You can end your turn now.\n",
 		);
 		expect(served.seen).toEqual([{ agent: "card-a", at: "PT2M", instruction: "run the tests" }]);
+	} finally {
+		await server?.close();
+	}
+});
+
+test("bin/soma defer works through a symlinked release directory, as releases/current is", async () => {
+	let server: DeferServer | undefined;
+	try {
+		const served = await serving((request) => ({ accepted: true, id: "43", at: `at ${request.at}` }));
+		server = served.server;
+		const current = join(dir, "current");
+		symlinkSync(resolve(import.meta.dirname, "../.."), current);
+		const run = await promisify(execFile)(join(current, "bin/soma"), ["defer", "--at", "PT2M", "run", "it"], {
+			encoding: "utf8",
+			env: { PATH: process.env.PATH, SOMA_AGENT: "card-a", SOMA_SOCKET: served.path, SOMA_NODE: process.execPath },
+		});
+
+		expect(run.stdout).toMatch(/^soma defer: accepted as 43;/);
+		expect(served.seen).toEqual([{ agent: "card-a", at: "PT2M", instruction: "run it" }]);
 	} finally {
 		await server?.close();
 	}

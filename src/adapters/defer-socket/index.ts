@@ -130,18 +130,28 @@ export async function serveDefer(options: {
 	};
 }
 
-/** Sends one request to the soma serving `path`; rejects when none answers or the reply is not one. */
+/** What `requestDefer` rejects with when it could not connect: the request never went out, so nothing was deferred. */
+export class DeferUnreachable extends Error {}
+
+/**
+ * Sends one request to the soma serving `path`; rejects when none answers or the reply is not one. Only a rejection
+ * before the request went out is a DeferUnreachable: after it, soma may have recorded the request whatever the error.
+ */
 export function requestDefer(path: string, request: DeferRequest, timeoutMs = 10_000): Promise<DeferReply> {
 	return new Promise((resolve, reject) => {
 		const socket = connect(path);
 		let buffered = "";
+		let sent = false;
 		socket.setEncoding("utf8");
 		socket.setTimeout(timeoutMs, () => socket.destroy(new Error(`no reply from ${path} in ${timeoutMs} ms`)));
-		socket.once("connect", () => socket.write(`${JSON.stringify(request)}\n`));
+		socket.once("connect", () => {
+			sent = true;
+			socket.write(`${JSON.stringify(request)}\n`);
+		});
 		socket.on("data", (chunk: string) => {
 			buffered += chunk;
 		});
-		socket.once("error", reject);
+		socket.once("error", (error) => reject(sent ? error : new DeferUnreachable(error.message)));
 		socket.once("end", () => {
 			const reply = ReplySchema.safeParse(
 				(() => {

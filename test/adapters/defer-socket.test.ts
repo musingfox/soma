@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, expect, test } from "vitest";
 import { type DeferServer, requestDefer, serveDefer } from "../../src/adapters/defer-socket/index.ts";
+import { runDefer } from "../../src/defer-cli.ts";
 import type { DeferReply, DeferRequest } from "../../src/ports/defer.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "soma-defer-socket-"));
@@ -163,4 +164,41 @@ test("bin/soma defer works through a symlinked release directory, as releases/cu
 	} finally {
 		await server?.close();
 	}
+});
+
+test("soma defer calls the outcome unknown once the request went out, and says nothing was deferred only when it could not connect", async () => {
+	const defer = async (path: string) => {
+		const err: string[] = [];
+		const status = await runDefer(
+			["--at", "PT2M", "run the tests"],
+			{ SOMA_AGENT: "card-a", SOMA_SOCKET: path },
+			{ out: () => {}, err: (line) => err.push(line) },
+			(socket, request) => requestDefer(socket, request, 200),
+		);
+		return { status, err };
+	};
+	// As a soma that recorded the request and then stopped before its reply: one stays silent, one drops the connection.
+	const silent = socketPath();
+	const dropping = socketPath();
+	const servers = [
+		createServer((socket) => socket.resume()),
+		createServer((socket) => socket.once("data", () => socket.destroy())),
+	];
+	await new Promise<void>((done) => servers[0]?.listen(silent, done));
+	await new Promise<void>((done) => servers[1]?.listen(dropping, done));
+	try {
+		for (const path of [silent, dropping]) {
+			const lost = await defer(path);
+			expect(lost.status).toBe(1);
+			expect(lost.err).toEqual([expect.stringMatching(/whether it was deferred is unknown/)]);
+			expect(lost.err[0]).toMatch(/Do not run soma defer again for it/);
+			expect(lost.err[0]).not.toMatch(/nothing was deferred/);
+		}
+	} finally {
+		for (const server of servers) await new Promise((done) => server.close(done));
+	}
+
+	const down = await defer(join(dir, "nobody.sock"));
+	expect(down.status).toBe(1);
+	expect(down.err).toEqual([expect.stringMatching(/^soma defer: soma is not answering on .*; nothing was deferred$/)]);
 });

@@ -1,4 +1,5 @@
 import { expect, test } from "vitest";
+import { DeferUnreachable } from "../src/adapters/defer-socket/index.ts";
 import { parseDeferArgs, runDefer } from "../src/defer-cli.ts";
 import type { DeferReply, DeferRequest } from "../src/ports/defer.ts";
 
@@ -73,7 +74,7 @@ test("outside a dispatched agent's shell, or with soma down, nothing is deferred
 		[],
 	]);
 
-	const down = await cli(["--at", "PT2M", "x"], AGENT_ENV, new Error("connect ENOENT /run/soma.sock"));
+	const down = await cli(["--at", "PT2M", "x"], AGENT_ENV, new DeferUnreachable("connect ENOENT /run/soma.sock"));
 	expect([down.status, down.err]).toEqual([
 		1,
 		["soma defer: soma is not answering on /run/soma.sock (connect ENOENT /run/soma.sock); nothing was deferred"],

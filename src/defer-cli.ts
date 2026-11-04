@@ -3,7 +3,7 @@
 // SOMA_AGENT and SOMA_SOCKET soma put in the agent's environment when it started it.
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { requestDefer } from "./adapters/defer-socket/index.ts";
+import { DeferUnreachable, requestDefer } from "./adapters/defer-socket/index.ts";
 import { deferAt } from "./core/domain/defer.ts";
 import type { DeferReply, DeferRequest } from "./ports/defer.ts";
 
@@ -34,7 +34,7 @@ export function parseDeferArgs(args: readonly string[]): { at: string; instructi
 	return { at, instruction };
 }
 
-/** Runs one `soma defer`; returns the exit status: 0 accepted, 1 refused or unreachable, 2 a usage error. */
+/** Runs one `soma defer`; returns the exit status: 0 accepted, 1 refused, unreachable or unknown, 2 a usage error. */
 export async function runDefer(
 	args: readonly string[],
 	env: Env,
@@ -64,7 +64,15 @@ export async function runDefer(
 	try {
 		reply = await send(socket, { agent, ...parsed });
 	} catch (error) {
-		io.err(`soma defer: soma is not answering on ${socket} (${(error as Error).message}); nothing was deferred`);
+		const message = (error as Error).message;
+		if (error instanceof DeferUnreachable) {
+			io.err(`soma defer: soma is not answering on ${socket} (${message}); nothing was deferred`);
+		} else {
+			// The request went out: soma may have accepted it, and a second defer would then prompt the agent twice.
+			io.err(
+				`soma defer: the request went out to ${socket} but no reply came back (${message}); whether it was deferred is unknown. Do not run soma defer again for it: if soma accepted it, a second one sends the instruction twice. Tell the human instead.`,
+			);
+		}
 		return 1;
 	}
 	if (!reply.accepted) {

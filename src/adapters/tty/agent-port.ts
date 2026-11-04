@@ -11,16 +11,17 @@ import {
 } from "../../agent-cli/permission/blocked-screen.ts";
 import { awaitingReply, readLastRecord, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
 import { type Git, mainCheckout, openWorktree, runGit } from "../../agent-cli/worktree.ts";
-import type {
-	AgentListing,
-	AgentPort,
-	AgentResult,
-	AgentState,
-	AgentStatusEvent,
-	Answer,
-	AnswerOutcome,
-	BlockedKind,
-	StartRequest,
+import {
+	type AgentListing,
+	type AgentPort,
+	type AgentResult,
+	type AgentState,
+	type AgentStatusEvent,
+	type Answer,
+	type AnswerOutcome,
+	type BlockedKind,
+	NotImplemented,
+	type StartRequest,
 } from "../../ports/agent.ts";
 
 type Disposable = { dispose(): void };
@@ -340,7 +341,7 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 		},
 
 		// Only rex resumes an agent for now (ARCHITECTURE.md "Agent-deferred instructions").
-		resume: () => Promise.reject(new Error("tty AgentPort: resume is not implemented")),
+		resume: () => Promise.reject(new NotImplemented("tty AgentPort: resume is not implemented")),
 
 		async list(): Promise<readonly AgentListing[]> {
 			return [...agents.values()].map((agent) => ({

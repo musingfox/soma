@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "vitest";
 import { createTtyAgentPort, type Pty, type SpawnPty } from "../../../src/adapters/tty/agent-port.ts";
-import type { AgentPort, AgentStatusEvent } from "../../../src/ports/agent.ts";
+import { type AgentPort, type AgentStatusEvent, NotImplemented } from "../../../src/ports/agent.ts";
 import { git } from "../rex/fake.ts";
 
 const SESSION = "0e9d6c1f-4a3b-4a52-9c85-2f6d3f6f2f10";
@@ -103,6 +103,12 @@ test("start runs claude with its session id in fleet/<card>, without the marks o
 			env: { PATH: "/bin", HOME: "/home" },
 		},
 	]);
+});
+
+test("resume is not implemented, which it says with its own error, having spawned nothing", async () => {
+	const { port, spawns } = harness();
+	await expect(port.resume(request)).rejects.toBeInstanceOf(NotImplemented);
+	expect(spawns).toEqual([]);
 });
 
 test("the 7501 probe is answered, so claude reports its status", async () => {

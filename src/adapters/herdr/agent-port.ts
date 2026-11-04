@@ -4,15 +4,16 @@ import { join } from "node:path";
 import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "../../agent-cli/hangar-cap.ts";
 import { answerKeys, readBlockedScreen } from "../../agent-cli/permission/blocked-screen.ts";
 import { readLastRecord, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
-import type {
-	AgentListing,
-	AgentPort,
-	AgentResult,
-	AgentState,
-	AgentStatusEvent,
-	Answer,
-	AnswerOutcome,
-	StartRequest,
+import {
+	type AgentListing,
+	type AgentPort,
+	type AgentResult,
+	type AgentState,
+	type AgentStatusEvent,
+	type Answer,
+	type AnswerOutcome,
+	NotImplemented,
+	type StartRequest,
 } from "../../ports/agent.ts";
 import { STATE_BY_AGENT_STATUS } from "./agent-state.ts";
 import type { HerdrClient } from "./client.ts";
@@ -81,7 +82,8 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 		}
 	}
 
-	const notYet = (what: string) => () => Promise.reject(new Error(`herdr AgentPort: ${what} is not implemented`));
+	const notYet = (what: string) => () =>
+		Promise.reject(new NotImplemented(`herdr AgentPort: ${what} is not implemented`));
 
 	// One watch for every listener, open while there is one.
 	const listeners = new Set<(event: AgentStatusEvent) => void>();

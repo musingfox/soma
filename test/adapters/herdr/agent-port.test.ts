@@ -7,6 +7,7 @@ import { createHerdrClient } from "../../../src/adapters/herdr/client.ts";
 import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
 import { complete, observe } from "../../../src/core/domain/bridge.ts";
 import type { Job } from "../../../src/core/domain/dispatch.ts";
+import { NotImplemented } from "../../../src/ports/agent.ts";
 
 const agent = (name: string | null, agent_status: string) => ({
 	terminal_id: "t",
@@ -82,6 +83,12 @@ test("start reopens a worktree an earlier attempt left behind", async () => {
 
 	expect(calls.map((c) => c.method)).toContain("worktree.open");
 	expect(calls.map((c) => c.method)).not.toContain("worktree.create");
+});
+
+test("resume is not implemented, which it says with its own error, having called herdr for nothing", async () => {
+	const { client, calls } = herdr([]);
+	await expect(createHerdrAgentPort({ client, cap: 1 }).resume(request)).rejects.toBeInstanceOf(NotImplemented);
+	expect(calls).toEqual([]);
 });
 
 test("start refuses when the hangar already runs cap agents, counting agents soma did not start", async () => {

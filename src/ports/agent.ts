@@ -78,10 +78,14 @@ export type AgentResult = { readonly id: string; readonly text?: string };
  */
 export class PromptRefused extends Error {}
 
+/** What an adapter throws, having done nothing, for a call it does not implement. */
+export class NotImplemented extends Error {}
+
 export interface AgentPort {
 	start(request: StartRequest): Promise<void>;
 	// Keeps the session's conversation; makes no worktree, and is not held to the hangar cap that start is, since only a
-	// due deferred instruction resumes an agent. Refuses a name already listed.
+	// due deferred instruction resumes an agent. Refuses a name already listed. Throws NotImplemented where the agent
+	// side cannot resume an agent.
 	resume(request: ResumeRequest): Promise<void>;
 	list(): Promise<readonly AgentListing[]>;
 	// Throws PromptRefused when it typed nothing.

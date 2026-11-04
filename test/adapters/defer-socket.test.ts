@@ -13,7 +13,10 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }));
 let sockets = 0;
 const socketPath = () => join(dir, `d${sockets++}.sock`);
 
-async function serving(reply: (request: DeferRequest) => DeferReply = () => ({ accepted: true, id: "1", at: "x" })) {
+async function serving(
+	reply: (request: DeferRequest) => DeferReply = () => ({ accepted: true, id: "1", at: "x" }),
+	readTimeoutMs?: number,
+) {
 	const path = socketPath();
 	const seen: DeferRequest[] = [];
 	const server = await serveDefer({
@@ -23,6 +26,7 @@ async function serving(reply: (request: DeferRequest) => DeferReply = () => ({ a
 			return reply(request);
 		},
 		onError: () => {},
+		...(readTimeoutMs === undefined ? {} : { readTimeoutMs }),
 	});
 	return { path, seen, server };
 }
@@ -64,6 +68,41 @@ test("a malformed request is refused without reaching the core", async () => {
 	});
 	expect(seen).toEqual([]);
 	await server.close();
+});
+
+/** A client that connects and sends nothing; resolves when the server ends or drops the connection. */
+function idle(path: string): Promise<void> {
+	return new Promise((done, fail) => {
+		const socket = connect(path);
+		socket.once("connect", () => socket.resume());
+		socket.once("close", () => done());
+		socket.once("error", fail);
+	});
+}
+
+test("a client that sends no request in time is dropped", async () => {
+	const { path, seen, server } = await serving(undefined, 100);
+	const started = Date.now();
+
+	await idle(path);
+
+	expect(Date.now() - started).toBeLessThan(2_000);
+	expect(seen).toEqual([]);
+	await server.close();
+});
+
+test("close ends a connection still waiting for its request instead of waiting for it", async () => {
+	const { path, server } = await serving();
+	const client = idle(path);
+	await new Promise((done) => setTimeout(done, 50));
+
+	const closed = await Promise.race([
+		server.close().then(() => "closed"),
+		new Promise((done) => setTimeout(() => done("still open"), 2_000)),
+	]);
+
+	expect(closed).toBe("closed");
+	await client;
 });
 
 test("a socket file a killed soma left is replaced; one another process serves is not", async () => {

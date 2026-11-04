@@ -12,6 +12,8 @@ const ReplySchema = z.union([
 ]);
 // Far above any instruction an agent types; a client that sends more is not one of soma's.
 const MAX_REQUEST_BYTES = 64 * 1024;
+// The CLI writes its request as soon as it connects; a connection silent this long is not one of soma's.
+const READ_TIMEOUT_MS = 5_000;
 
 export interface DeferServer {
 	close(): Promise<void>;
@@ -54,23 +56,42 @@ export async function serveDefer(options: {
 	readonly path: string;
 	readonly defer: (request: DeferRequest) => Promise<DeferReply>;
 	readonly onError?: (error: Error) => void;
+	/** How long a connection may sit idle, before its request or after its reply, before it is dropped. */
+	readonly readTimeoutMs?: number;
 }): Promise<DeferServer> {
 	const { path, defer } = options;
 	const onError = options.onError ?? ((error: Error) => console.error(`[soma] defer socket: ${error.message}`));
+	const readTimeoutMs = options.readTimeoutMs ?? READ_TIMEOUT_MS;
+	// Connections whose request is not read yet, which close drops; one being answered ends with its reply.
+	const reading = new Set<Socket>();
 	const handle = (socket: Socket) => {
 		let buffered = "";
-		const reply = (value: DeferReply) => socket.end(`${JSON.stringify(value)}\n`);
+		// The timeout is off only while the core records the request; a client that never closes after the reply is
+		// dropped as one that never sends is.
+		const reply = (value: DeferReply) => {
+			socket.setTimeout(readTimeoutMs);
+			socket.end(`${JSON.stringify(value)}\n`);
+		};
+		const read = () => {
+			reading.delete(socket);
+			socket.setTimeout(0);
+			socket.removeAllListeners("data");
+		};
+		reading.add(socket);
+		socket.once("close", () => reading.delete(socket));
+		socket.on("timeout", () => socket.destroy());
+		socket.setTimeout(readTimeoutMs);
 		socket.setEncoding("utf8");
 		socket.on("error", onError);
 		socket.on("data", (chunk: string) => {
 			buffered += chunk;
 			if (buffered.length > MAX_REQUEST_BYTES) {
-				socket.removeAllListeners("data");
+				read();
 				return reply({ accepted: false, reason: `the request is over ${MAX_REQUEST_BYTES} bytes` });
 			}
 			const newline = buffered.indexOf("\n");
 			if (newline === -1) return;
-			socket.removeAllListeners("data");
+			read();
 			let json: unknown;
 			try {
 				json = JSON.parse(buffered.slice(0, newline));
@@ -102,8 +123,9 @@ export async function serveDefer(options: {
 	return {
 		close: () =>
 			new Promise<void>((resolve) => {
-				// Closing a unix-socket server removes its file.
+				// Closing a unix-socket server removes its file; it calls back once every connection has ended.
 				server.close(() => resolve());
+				for (const socket of reading) socket.destroy();
 			}),
 	};
 }

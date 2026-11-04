@@ -1,0 +1,45 @@
+import { resolveAt } from "./schedule.ts";
+
+// A date-time without an offset would be read in whichever zone soma runs in, not the one the agent meant.
+const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/;
+
+/**
+ * When a deferral falls, in epoch ms: an ISO 8601 date-time with an offset, or an ISO 8601 duration from `now` such as
+ * `PT2M`. Throws a RangeError an agent can read for anything else.
+ */
+export function deferAt(at: string, now: number): number {
+	if (!at.startsWith("P") && !DATE_TIME.test(at)) {
+		throw new RangeError(
+			`--at must be an ISO 8601 date-time with an offset, such as 2026-11-04T18:00:00+08:00, or an ISO 8601 duration, such as PT2M; got "${at}"`,
+		);
+	}
+	return resolveAt(at, now);
+}
+
+export type Deferred = {
+	readonly agent: string;
+	readonly card: string;
+	readonly instruction: string;
+	readonly at: number;
+	// When the agent asked, so the prompt can tell it which of its own requests this is.
+	readonly setAt: number;
+};
+
+const iso = (ms: number) => new Date(ms).toISOString();
+
+/** The words the agent gets at `at`: one paragraph, so an adapter that types it sends it as one message. */
+export function deferredPrompt(id: string, { instruction, setAt }: Deferred): string {
+	return `[soma deferred instruction ${id}] You asked soma with \`soma defer\` at ${iso(setAt)} to send you this instruction now: ${instruction}`;
+}
+
+const named = (id: string, { agent, card }: Deferred) => `Deferred instruction ${id} for agent ${agent} (card ${card})`;
+
+/** The one notice for a deferral that ended unsent, or perhaps unsent. */
+export const deferNotice = {
+	gone: (id: string, item: Deferred) =>
+		`${named(id, item)} was not sent: the agent was no longer listed when it fell due at ${iso(item.at)}. The instruction was: ${item.instruction}`,
+	unsure: (id: string, item: Deferred) =>
+		`${named(id, item)} may not have reached the agent: soma stopped while sending it, and does not send it twice. The instruction was: ${item.instruction}`,
+	failed: (id: string, item: Deferred, tries: number, error: string) =>
+		`${named(id, item)} was not sent after ${tries} tries: ${error}. The instruction was: ${item.instruction}`,
+};

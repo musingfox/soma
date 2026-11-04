@@ -152,7 +152,7 @@ test("a resumed agent that defers again is reclaimed again once its turn ends", 
 	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
 });
 
-test("two deferrals that fall due together start the agent once, and each instruction goes once", {
+test("two deferrals that fall due together each send their instruction once, the second waiting out the first's start", {
 	timeout: 20_000,
 }, async () => {
 	const agents = new FakeAgentPort();
@@ -162,6 +162,8 @@ test("two deferrals that fall due together start the agent once, and each instru
 	const second = await accepted(await soma.defer("PT1S"));
 
 	expect([await soma.outcome(first), await soma.outcome(second)]).toEqual([sent, sent]);
+	// No second start while the first holds the job. One start in all only because this agent never ends the turn the
+	// first instruction began: one that does is at rest with the second pending, so it is reclaimed and started again.
 	expect(agents.resumed).toEqual([session]);
 	expect(agents.prompts).toEqual(expect.arrayContaining([instruction(first), instruction(second)]));
 	expect(agents.prompts).toHaveLength(2);

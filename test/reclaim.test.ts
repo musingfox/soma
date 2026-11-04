@@ -11,6 +11,7 @@ import type { Job } from "../src/core/domain/dispatch.ts";
 import { type DeferOptions, Deferrals, deferExtension } from "../src/core/extensions/defer/index.ts";
 import { eventBridge, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
+import { reclaimer } from "../src/core/extensions/dispatch/reclaim.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { NOTICE } from "../src/core/notice.ts";
 import { PromptRefused } from "../src/ports/agent.ts";
@@ -39,14 +40,21 @@ async function database() {
 /**
  * One core process as main.ts starts it: tasks resumed, the dispatch list (seeded with a job for each agent listed
  * that has none yet) reconciled with the agents listed, then the event bridge fed every status. A faux model answers
- * a woken block.
+ * a woken block. With `resume` "late", the tasks resume only after the reconcile, as an unawaited resume may.
  */
-async function core(db: string, agents: FakeAgentPort, options: DeferOptions = {}) {
+async function core(db: string, agents: FakeAgentPort, options: DeferOptions = {}, resume: "first" | "late" = "first") {
 	const faux = fauxProvider();
 	faux.setResponses(Array.from({ length: 20 }, () => fauxAssistantMessage("好。")));
 	const models = createModels();
 	models.setProvider(faux.provider);
-	const defers = deferExtension(agents, options);
+	let reconciled: () => void = () => {};
+	const ready = new Promise<void>((resolve) => {
+		reconciled = resolve;
+	});
+	const defers = deferExtension(agents, {
+		...options,
+		reclaim: (agent) => ready.then(() => reclaimer(root, agents, context)(agent)),
+	});
 	const harness: Harness = await openHarness(
 		db,
 		[dispatchExtension(agents, async () => ""), defers.extension],
@@ -54,7 +62,7 @@ async function core(db: string, agents: FakeAgentPort, options: DeferOptions = {
 		{ models },
 	);
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
-	harness.resume();
+	if (resume === "first") harness.resume();
 	const listed = (await agents.list()).map((each) => each.name);
 	await root.commit(async (tx) => {
 		const doc = await tx.doc(Dispatches, root.id);
@@ -63,6 +71,8 @@ async function core(db: string, agents: FakeAgentPort, options: DeferOptions = {
 		}
 	}, context);
 	await reconcileDispatches(root, agents, context);
+	reconciled();
+	if (resume === "late") harness.resume();
 	const bridge = eventBridge(root, agents, context);
 	const handled: Promise<void>[] = [];
 	const off = agents.onStatus((event) => handled.push(bridge.handle(event)));
@@ -497,4 +507,62 @@ test("a deferral that falls due while soma is down mid-stop tells what is known,
 	await soma.settle();
 	expect(agents.stopped).toEqual([]);
 	expect(agents.prompts).toEqual([]);
+});
+
+test("a restart after soma died sending one deferral, with another pending, stops the idle agent once, the rerun before the reconcile or after", {
+	timeout: 30_000,
+}, async () => {
+	for (const resume of ["first", "late"] as const) {
+		const db = await database();
+		let reached: () => void = () => {};
+		const typing = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		let died: () => void = () => {};
+		const dead = new Promise<void>((resolve) => {
+			died = resolve;
+		});
+		// soma dies while the deferred prompt goes out: it returns only once soma is closing, too late to commit its end.
+		const dying = new (class extends FakeAgentPort {
+			override prompt(): Promise<void> {
+				reached();
+				return dead;
+			}
+		})();
+		dying.emit("card-a", { state: "working" });
+		const first = await core(db, dying);
+		const id = await accepted(await first.defer("PT1S"));
+		await accepted(await first.defer("PT1H"));
+		await typing;
+		expect(await first.job("card-a")).toMatchObject({ reclaim: { phase: "sending" } });
+		const closed = first.close();
+		died();
+		await closed;
+
+		// The agent is at rest by the restart. With the tasks resumed first, the late listing lets the rerun settle before
+		// the reconcile; resumed late, it settles after the reconcile has skipped the job it found `sending`.
+		const agents = new (class extends FakeAgentPort {
+			late = resume === "first";
+			override async list() {
+				if (this.late) await new Promise((resolve) => setTimeout(resolve, 500));
+				this.late = false;
+				return super.list();
+			}
+		})();
+		agents.emit("card-a", { state: "idle" });
+		const soma = await core(db, agents, {}, resume);
+		expect(await soma.outcome(id)).toEqual({ status: "completed", result: "unsure" });
+		await soma.settle();
+		for (const deadline = Date.now() + 3_000; (await soma.job("card-a"))?.reclaim?.phase !== "stopped"; ) {
+			expect(Date.now(), `resume ${resume}: ${JSON.stringify(await soma.job("card-a"))}`).toBeLessThan(deadline);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(agents.stopped).toEqual(["card-a"]);
+		expect(agents.prompts).toEqual([]);
+		expect(await soma.notices()).toEqual([
+			expect.stringMatching(new RegExp(`^Deferred instruction ${id} .*may not have reached`)),
+		]);
+		await soma.close();
+	}
 });

@@ -22,6 +22,7 @@ import { deferExtension } from "./core/extensions/defer/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
 import { dispatchExtension } from "./core/extensions/dispatch/index.ts";
+import { reclaimer } from "./core/extensions/dispatch/reclaim.ts";
 import { inspectExtension } from "./core/extensions/inspect/index.ts";
 import { language } from "./core/extensions/language/index.ts";
 import { connectStdio, loadMcpConfig, mcpExtension } from "./core/extensions/mcp/index.ts";
@@ -77,7 +78,15 @@ function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, deferSocket 
 }
 const agents = openAgentPort(config);
 const digests = digest(agents);
-const defers = deferExtension(agents);
+// A job a deferral's rerun makes due again is reclaimed after the reconcile, which may otherwise skip it while the
+// rerun still has it `sending`, or take that reclaim's `stopping` for one a crash cut short and stop the agent twice.
+let reconciled: () => void = () => {};
+const ready = new Promise<void>((resolve) => {
+	reconciled = resolve;
+});
+const defers = deferExtension(agents, {
+	reclaim: (agent) => ready.then(() => reclaimer(root, agents, context)(agent)),
+});
 const reflections = reflection({
 	repo: config.repo,
 	createCard,
@@ -132,6 +141,7 @@ const human = await startCore(
 	],
 );
 await reconcileDispatches(root, agents, context);
+reconciled();
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 // Served after the reconcile, so a defer is checked against a dispatch list caught up with the hangar. A socket that
 // cannot be served leaves soma running without `soma defer`, as the web page does.

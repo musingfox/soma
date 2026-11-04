@@ -21,28 +21,31 @@ type Checkpoint =
 
 /**
  * Marks deferral `id` of `agent` as no longer being sent. Its job, held `sending` while a prompt may go out, is due again
- * once no deferral of the agent is being sent.
+ * once no deferral of the agent is being sent. True when this moved it to `due`.
  */
-async function release(tx: Tx, conversation: Conversation["id"], id: string, agent: string): Promise<void> {
+async function release(tx: Tx, conversation: Conversation["id"], id: string, agent: string): Promise<boolean> {
 	const { items } = await tx.doc(Deferrals, conversation);
 	const item = items[id];
 	if (item?.sending) {
 		const { sending: _sent, ...rest } = item;
 		items[id] = rest;
 	}
-	if (Object.values(items).some((each) => each.agent === agent && each.sending)) return;
+	if (Object.values(items).some((each) => each.agent === agent && each.sending)) return false;
 	const doc = await tx.doc(Dispatches, conversation);
 	const index = doc.jobs.findIndex((job) => job.agent === agent);
 	const current = doc.jobs[index];
-	if (current?.reclaim?.phase === "sending") doc.jobs[index] = { ...current, reclaim: { phase: "due" } };
+	if (current?.reclaim?.phase !== "sending") return false;
+	doc.jobs[index] = { ...current, reclaim: { phase: "due" } };
+	return true;
 }
 
 /**
  * Takes deferral `id` of `agent` off the pending ones. With none of the agent's left, its job is no longer due to be
  * stopped, so an agent that got its instruction while still open is not stopped when that turn ends, and a failed stop
- * is forgotten; a stopped one stays stopped. With some left, it is due again unless one is being sent.
+ * is forgotten; a stopped one stays stopped. With some left, it is due again unless one is being sent: true when this
+ * made it due.
  */
-async function settle(tx: Tx, conversation: Conversation["id"], id: string, agent: string): Promise<void> {
+async function settle(tx: Tx, conversation: Conversation["id"], id: string, agent: string): Promise<boolean> {
 	const { items } = await tx.doc(Deferrals, conversation);
 	delete items[id];
 	if (Object.values(items).some((item) => item.agent === agent)) return release(tx, conversation, id, agent);
@@ -50,9 +53,10 @@ async function settle(tx: Tx, conversation: Conversation["id"], id: string, agen
 	const index = doc.jobs.findIndex((job) => job.agent === agent);
 	const current = doc.jobs[index];
 	const phase = current?.reclaim?.phase;
-	if (current === undefined || (phase !== "due" && phase !== "sending" && phase !== "failed")) return;
+	if (current === undefined || (phase !== "due" && phase !== "sending" && phase !== "failed")) return false;
 	const { reclaim: _disarmed, ...rest } = current;
 	doc.jobs[index] = rest;
+	return false;
 }
 
 export interface DeferOptions {
@@ -60,6 +64,12 @@ export interface DeferOptions {
 	readonly retryMs?: number;
 	/** Prompts tried, the first included, before the human is told it was not sent. */
 	readonly tries?: number;
+	/**
+	 * Stops `agent` if its job is due and it is listed at rest, as `reclaimer` does; called when a rerun has made a job
+	 * due again, which no status event may follow. The host runs it only after its reconcile, so it never takes a stop
+	 * the reconcile has under way for one a crash cut short, nor the other way round.
+	 */
+	readonly reclaim?: (agent: string) => Promise<void>;
 }
 
 /**
@@ -155,11 +165,15 @@ export function deferExtension(agents: Pick<AgentPort, "list" | "prompt" | "stop
 			// Reached only by a rerun: the run that committed `sending` went on to prompt without ending.
 			sending: async (task, runtime, context) => {
 				const id = String(task.id);
+				let due = false;
 				await runtime.commit(async (tx) => {
-					await settle(tx, runtime.conversationId, id, task.input.agent);
+					due = await settle(tx, runtime.conversationId, id, task.input.agent);
 					await tx.appendEntry(runtime.conversationId, noticeEntry("report", deferNotice.unsure(id, task.input)));
 					return { status: "terminal", outcome: { status: "completed", result: "unsure" } };
 				}, context);
+				// The process that typed the prompt, if it did, is dead: an agent the listing shows at rest now is not one
+				// just pasted to. Not awaited: the task has ended, and a stop that hangs must not hold it.
+				if (due) void options.reclaim?.(task.input.agent).catch(() => {});
 			},
 		},
 		abort: async (task, runtime, context) => {

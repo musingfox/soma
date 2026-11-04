@@ -286,6 +286,58 @@ test("a deferral that faulted while it held its job resuming holds back no later
 	expect((await soma.job("card-a"))?.reclaim).toBeUndefined();
 });
 
+test("a reclaimed agent whose resume faulted after its window was made is reclaimed once it defers again and rests", {
+	timeout: 20_000,
+}, async () => {
+	const db = await database();
+	const death = dying();
+	// rex made the window, and soma died before the start returned.
+	const dead = new (class extends FakeAgentPort {
+		override resume(request: ResumeRequest): Promise<void> {
+			this.resumed.push(request);
+			this.emit(request.name, { state: "idle" });
+			death.reach();
+			return death.dead;
+		}
+	})();
+	dead.emit("card-a", { state: "idle" });
+	const first = await core(db, dead);
+	const faulted = await accepted(await first.defer("PT1S"));
+	expect(await first.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
+	await death.reached;
+	await crash(first, death);
+
+	// A rollback to a release whose deferral has no `resuming` phase: the task faults, holding the job.
+	const old = defineTask<object, { phase: "wait" | "sending" }, string>({
+		name: "soma.defer",
+		version: 1,
+		initial: () => ({ phase: "wait" }),
+		phases: { wait: async () => {}, sending: async () => {} },
+		abort: async () => {},
+	});
+	const rolledBack = await openHarness(
+		db,
+		[dispatchExtension(new FakeAgentPort(), async () => ""), defineExtension({ name: "soma.defer", tasks: [old] })],
+		context,
+	);
+	rolledBack.resume();
+	expect((await rolledBack.waitForTask(Number(faulted) as TaskId, context)).state.outcome).toMatchObject({
+		status: "faulted",
+	});
+	await rolledBack.close(context);
+
+	// The window the start made is up, and the agent in it defers again: it is open, whatever the job held before.
+	const agents = new FakeAgentPort();
+	agents.emit("card-a", { state: "working" });
+	const soma = await core(db, agents);
+	await accepted(await soma.defer("PT1H"));
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "due" } });
+	agents.finish("card-a", "結果：完成");
+	await soma.settle();
+	expect(agents.stopped).toEqual(["card-a"]);
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
+});
+
 test("a crash while the resumed agent is not ready yet starts nothing at restart and sends once it is", {
 	timeout: 20_000,
 }, async () => {

@@ -78,9 +78,10 @@ function unheld(job: Job, before: Reclaim | undefined): Job {
 }
 
 /**
- * Gives `agent`'s job back the reclaim it had before a deferral held it `resuming`, when no deferral that holds it is
- * live: one whose task ended without settling, as one faulted or rolled back to a release without the phase, never
- * releases it. Such a deferral's item, left pending, goes too.
+ * Releases `agent`'s job from a hold `resuming` when no deferral that holds it is live: one whose task ended without
+ * settling, as one faulted or rolled back to a release without the phase, never releases it. Such a deferral's item,
+ * left pending, goes too. Called as the agent runs `soma defer`, so it is open: the job is left with no reclaim, not
+ * the one it had before the hold, which may be `stopped`.
  */
 async function unhold(tx: Tx, conversation: Conversation["id"], agent: string): Promise<void> {
 	const doc = await tx.doc(Dispatches, conversation);
@@ -88,15 +89,13 @@ async function unhold(tx: Tx, conversation: Conversation["id"], agent: string): 
 	const current = doc.jobs[index];
 	if (current?.reclaim?.phase !== "resuming") return;
 	const { items } = await tx.doc(Deferrals, conversation);
-	let before: Reclaim | undefined;
 	for (const [id, item] of Object.entries(items)) {
 		if (item.agent !== agent || item.resuming !== true) continue;
 		const status = (await tx.task(Number(id) as TaskId))?.state.status;
 		if (status !== undefined && status !== "completing" && status !== "terminal") return;
-		before = item.before && { ...item.before };
 		delete items[id];
 	}
-	doc.jobs[index] = unheld(current, before);
+	doc.jobs[index] = unheld(current, undefined);
 }
 
 /**

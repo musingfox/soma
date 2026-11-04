@@ -42,6 +42,9 @@ export const reclaimFailedNotice = (agent: string, card: string, error: string) 
 export const deferNotice = {
 	gone: (id: string, item: Deferred) =>
 		`${named(id, item)} was not sent: the agent was no longer listed when it fell due at ${iso(item.at)}. The instruction was: ${item.instruction}`,
+	// soma had committed to stopping the agent, and a crash may have kept the stop from going out.
+	stopping: (id: string, item: Deferred) =>
+		`${named(id, item)} was not sent: soma was stopping the agent when it fell due at ${iso(item.at)}, and cannot tell whether that stop went out, so the agent may still be open. The instruction was: ${item.instruction}`,
 	// Without `error`, soma stopped while sending it.
 	unsure: (id: string, item: Deferred, error?: string) =>
 		`${named(id, item)} may not have reached the agent: ${error === undefined ? "soma stopped while sending it" : `sending it failed after it may have begun (${error})`}, and soma does not send it twice. The instruction was: ${item.instruction}`,

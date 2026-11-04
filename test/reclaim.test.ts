@@ -8,7 +8,7 @@ import type { Harness, TaskId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import type { Job } from "../src/core/domain/dispatch.ts";
-import { type DeferOptions, deferExtension } from "../src/core/extensions/defer/index.ts";
+import { type DeferOptions, Deferrals, deferExtension } from "../src/core/extensions/defer/index.ts";
 import { eventBridge, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
@@ -448,4 +448,53 @@ test("a deferred prompt refused before it typed holds the job no longer: an idle
 	expect(agents.stopped).toEqual(["card-a"]);
 	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "gone" });
 	expect(agents.tried).toBe(1);
+});
+
+test("a deferral that falls due while soma is down mid-stop tells what is known, and leaves no stop for later", {
+	timeout: 20_000,
+}, async () => {
+	const db = await database();
+	let reached: () => void = () => {};
+	const stopping = new Promise<void>((resolve) => {
+		reached = resolve;
+	});
+	// soma dies after committing `stopping`, before the stop reaches rex.
+	const dying = new (class extends FakeAgentPort {
+		override stop(): Promise<void> {
+			reached();
+			return new Promise(() => {});
+		}
+	})();
+	dying.emit("card-a", { state: "idle" });
+	const first = await core(db, dying);
+	// The reply never comes: the defer waits on that stop.
+	void first.defer("PT1S");
+	await stopping;
+	const [id = ""] = Object.keys((await first.harness.snapshot(Deferrals, first.root.id, context))?.items ?? {});
+	await first.close();
+	await new Promise((resolve) => setTimeout(resolve, 1_200));
+
+	// The agent was never stopped and is at work again. Its listing comes late, so the deferral, due already, runs
+	// before the reconcile, as it may at any start.
+	const agents = new (class extends FakeAgentPort {
+		late = true;
+		override async list() {
+			if (this.late) await new Promise((resolve) => setTimeout(resolve, 500));
+			this.late = false;
+			return super.list();
+		}
+	})();
+	agents.emit("card-a", { state: "working" });
+	const soma = await core(db, agents);
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "gone" });
+	await soma.settle();
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringMatching(new RegExp(`^Deferred instruction ${id} .*not sent.*stopping`))]);
+	expect(notices[0]).not.toMatch(/no longer listed/);
+	expect((await soma.job("card-a"))?.reclaim).toBeUndefined();
+
+	agents.finish("card-a", "結果：完成");
+	await soma.settle();
+	expect(agents.stopped).toEqual([]);
+	expect(agents.prompts).toEqual([]);
 });

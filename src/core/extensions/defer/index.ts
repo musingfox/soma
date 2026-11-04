@@ -1,25 +1,15 @@
 import type { Context } from "@earendil-works/chord/context";
-import { type Conversation, defineDoc, defineExtension, defineTask, type Tx } from "@earendil-works/pi-durable";
+import { type Conversation, defineExtension, defineTask, type Tx } from "@earendil-works/pi-durable";
 import { type AgentPort, PromptRefused } from "../../../ports/agent.ts";
 import type { DeferReply, DeferRequest } from "../../../ports/defer.ts";
 import { type Deferred, deferAt, deferNotice, deferredPrompt } from "../../domain/defer.ts";
+import type { Reclaim } from "../../domain/dispatch.ts";
 import { noticeEntry } from "../../notice.ts";
 import { Dispatches } from "../dispatch/index.ts";
 import { reclaimer } from "../dispatch/reclaim.ts";
+import { Deferrals } from "./deferrals.ts";
 
-/**
- * Pending deferrals by task id; one leaves in the commit that ends its task. `sending` is set in the commit before its
- * prompt, while its job's reclaim waits.
- */
-export const Deferrals = defineDoc<{ items: Record<string, Deferred & { sending?: boolean }> }>({
-	kind: "soma.defer.items",
-	version: 1,
-	scope: "conversation",
-	history: "latest",
-	fork: "initial",
-	initial: () => ({ items: {} }),
-	checkpointWhen: () => false,
-});
+export { Deferrals };
 
 /** How a deferral ended: sent, or why it was not, each but `sent` told to the human in one notice. */
 export type DeferOutcome = "sent" | "gone" | "unsure" | "failed";
@@ -121,8 +111,11 @@ export function deferExtension(agents: Pick<AgentPort, "list" | "prompt" | "stop
 				const job = (await runtime.snapshot(Dispatches, runtime.conversationId, context))?.jobs.find(
 					(each) => each.agent === task.input.agent,
 				);
+				// soma stopped the agent, or was stopping it: the listing cannot tell a stop that never went out.
+				const reclaimed = (phase: Reclaim["phase"] | undefined) =>
+					phase === "stopping" ? deferNotice.stopping(id, task.input) : deferNotice.gone(id, task.input);
 				const reclaim = job?.reclaim?.phase;
-				if (reclaim === "stopping" || reclaim === "stopped") return end("gone", deferNotice.gone(id, task.input));
+				if (reclaim === "stopping" || reclaim === "stopped") return end("gone", reclaimed(reclaim));
 				let listed: boolean;
 				try {
 					listed = (await agents.list()).some((agent) => agent.name === task.input.agent);
@@ -137,7 +130,7 @@ export function deferExtension(agents: Pick<AgentPort, "list" | "prompt" | "stop
 					const index = doc.jobs.findIndex((each) => each.agent === task.input.agent);
 					const current = doc.jobs[index];
 					const phase = current?.reclaim?.phase;
-					if (phase === "stopping" || phase === "stopped") return ending(tx, "gone", deferNotice.gone(id, task.input));
+					if (phase === "stopping" || phase === "stopped") return ending(tx, "gone", reclaimed(phase));
 					if (current !== undefined && phase === "due") doc.jobs[index] = { ...current, reclaim: { phase: "sending" } };
 					const { items } = await tx.doc(Deferrals, runtime.conversationId);
 					const item = items[id];

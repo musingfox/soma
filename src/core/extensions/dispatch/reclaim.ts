@@ -4,6 +4,7 @@ import type { AgentListing, AgentPort } from "../../../ports/agent.ts";
 import { reclaimFailedNotice } from "../../domain/defer.ts";
 import type { Job, Reclaim } from "../../domain/dispatch.ts";
 import { noticeEntry } from "../../notice.ts";
+import { Deferrals } from "../defer/deferrals.ts";
 import { Dispatches } from "./index.ts";
 
 /**
@@ -37,10 +38,33 @@ export function reclaimer(conversation: Conversation, agents: Pick<AgentPort, "l
 		(await agents.list()).find((each) => each.name === agent);
 
 	/**
+	 * Settles a job left `stopping` whose agent is still listed, so no stop landed: with a deferral of the agent still
+	 * pending, it stays `stopping` for the stop to go out now when `atRest`, and is `due` again otherwise. With none, as
+	 * when the deferral fell due while soma was down and ended then, the job is no longer due to be stopped at all.
+	 * True when the stop is to go out.
+	 */
+	const settleStopping = (agent: string, atRest: boolean) =>
+		conversation.commit(async (tx) => {
+			const doc = await tx.doc(Dispatches, conversation.id);
+			const index = doc.jobs.findIndex((job) => job.agent === agent);
+			const current = doc.jobs[index];
+			if (current?.reclaim?.phase !== "stopping") return false;
+			const { items } = await tx.doc(Deferrals, conversation.id);
+			if (Object.values(items).some((item) => item.agent === agent)) {
+				if (atRest) return true;
+				doc.jobs[index] = { ...current, reclaim: { phase: "due" } };
+				return false;
+			}
+			const { reclaim: _disarmed, ...rest } = current;
+			doc.jobs[index] = rest;
+			return false;
+		}, context);
+
+	/**
 	 * Stops `agent` when its job is `due` and the agent is listed idle or done. With `recover`, as a restart calls it, a
-	 * job left `stopping` is settled too: stopped when the agent is gone, stopped now when it is still at rest, and back
-	 * to `due` when it is busy, since its window is open and so no stop landed. A `stop` that fails ends `failed` with
-	 * one notice, unless the agent is no longer listed after it; it is not tried again.
+	 * job left `stopping` is settled too: stopped when the agent is gone, and otherwise, its window being open so no stop
+	 * landed, as `settleStopping` says. A `stop` that fails ends `failed` with one notice, unless the agent is no longer
+	 * listed after it; it is not tried again.
 	 */
 	return async function reclaim(agent: string, recover = false): Promise<void> {
 		const phase = (await read(agent))?.reclaim?.phase;
@@ -58,10 +82,9 @@ export function reclaimer(conversation: Conversation, agents: Pick<AgentPort, "l
 			return;
 		}
 		const state = listed.status?.state;
-		if (state !== "idle" && state !== "done") {
-			if (phase === "stopping") await move(agent, "stopping", { phase: "due" });
-			return;
-		}
+		const atRest = state === "idle" || state === "done";
+		if (phase === "stopping" && !(await settleStopping(agent, atRest))) return;
+		if (!atRest) return;
 		if (phase === "due" && !(await move(agent, "due", { phase: "stopping" }))) return;
 		try {
 			await agents.stop(agent);

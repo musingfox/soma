@@ -32,6 +32,7 @@ import { sleeper } from "./core/extensions/sleeper/index.ts";
 import { web } from "./core/extensions/web/index.ts";
 import { acquireDbLock, DbLockedError, openHarness, openStorage } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
+import { startCore } from "./core/startup.ts";
 import type { AgentPort } from "./ports/agent.ts";
 import { vaultExtensions } from "./vault.ts";
 
@@ -118,19 +119,17 @@ const harness: Harness = await openHarness(storage, extensions, context, { model
 const root = await harness.root(context, {
 	agent: { model: { provider: "anthropic", modelId: config.model } },
 });
-harness.resume();
-await digests.startDigest(root, DIGEST_PERIOD_MS, context);
-if (config.reflection) await reflections.startReflection(root, REFLECTION_PERIOD_MS, context);
-// Opened before the reconcile, which may tell the human of an agent gone while soma was down: the HumanPort passes
-// on only the notices appended after it began to watch. Telegram polls after it, so no message queued while soma was
-// down dispatches a job the reconcile's listing has not seen.
+// Opened before the tasks resume and before the reconcile, either of which may tell the human of an agent gone while
+// soma was down: the HumanPort passes on only the notices appended after it began to watch. Telegram polls after the
+// reconcile, so no message queued while soma was down dispatches a job the reconcile's listing has not seen.
 // Telegram is the default channel a push goes to when the human typed nowhere lately; without it, every client rings.
-const human = await openHumanPort(
+const human = await startCore(
 	harness,
-	root,
-	agents,
-	context,
-	config.telegram && { defaultTarget: "chat.telegram" },
+	() => openHumanPort(harness, root, agents, context, config.telegram && { defaultTarget: "chat.telegram" }),
+	[
+		() => digests.startDigest(root, DIGEST_PERIOD_MS, context),
+		...(config.reflection ? [() => reflections.startReflection(root, REFLECTION_PERIOD_MS, context)] : []),
+	],
 );
 await reconcileDispatches(root, agents, context);
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));

@@ -3,15 +3,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Conversation, Harness, TaskId } from "@earendil-works/pi-durable";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { deferAt, deferredPrompt } from "../src/core/domain/defer.ts";
 import type { Job } from "../src/core/domain/dispatch.ts";
 import { type DeferOptions, Deferrals, deferExtension } from "../src/core/extensions/defer/index.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
+import { openHumanPort } from "../src/core/human-port.ts";
 import { NOTICE } from "../src/core/notice.ts";
+import { startCore } from "../src/core/startup.ts";
 import type { AgentPort } from "../src/ports/agent.ts";
+import type { SomaEvent } from "../src/ports/human.ts";
 
 const context = BACKGROUND_CONTEXT;
 const job: Job = { card: "card-a", agent: "card-a", sessionId: "s-1", status: { state: "idle" }, decisions: [] };
@@ -254,4 +257,42 @@ test("a prompt the agent side refuses, as for a busy agent, is tried again; one 
 	expect((await entries(root)).map((entry) => entry.data)).toEqual([
 		{ kind: "report", content: expect.stringMatching(/was not sent after 3 tries: rex agent card-a is working/) },
 	]);
+});
+
+test("a deferral that ends as soma starts reaches the human through the HumanPort, however long the other starts take", {
+	timeout: 20_000,
+}, async () => {
+	const db = await database();
+	const first = await core(db, new FakeAgentPort());
+	const reply = await first.defer("PT1S");
+	if (!reply.accepted) throw new Error(reply.reason);
+	await first.harness.close(context);
+	open.splice(open.indexOf(first.harness), 1);
+	await new Promise((resolve) => setTimeout(resolve, 1_100));
+	// The agent left while soma was down, so the deferral ends at once with a notice.
+	const agents = new FakeAgentPort();
+	const harness = await openHarness(
+		db,
+		[dispatchExtension(agents, async () => ""), deferExtension(agents).extension],
+		context,
+	);
+	open.push(harness);
+	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+	// Stands in for main's digest and reflection starts, each a commit that may take a while.
+	const slowStart = () => new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+	const human = await startCore(harness, () => openHumanPort(harness, root, agents, context), [slowStart]);
+	const seen: SomaEvent[] = [];
+	human.subscribe((event) => seen.push(event));
+
+	try {
+		expect(await outcome(harness, reply.id)).toEqual({ status: "completed", result: "gone" });
+		const notices = () => seen.filter((event) => event.type === "notice");
+		await vi.waitFor(() => expect(notices()).toHaveLength(1));
+		expect(notices()).toEqual([
+			{ type: "notice", kind: "report", content: expect.stringMatching(`^Deferred instruction ${reply.id} `) },
+		]);
+	} finally {
+		await human.close();
+	}
 });

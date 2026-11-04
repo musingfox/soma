@@ -16,7 +16,7 @@ export type DeferOutcome = "sent" | "gone" | "unresumed" | "unsure" | "failed";
 type Checkpoint =
 	| { phase: "wait"; at: number; tries: number; error?: string }
 	// Committed before the agent, gone when this fell due, is started again in `session`, its job held `resuming`.
-	// `until` bounds the tries to list the agent before it is started.
+	// `until` bounds the tries to list the agent before it is started; past it, the agent is waited for unstarted.
 	| { phase: "resuming"; tries: number; session: string; until: number }
 	// Committed once the start went out, or a window of the agent's name was found: a rerun starts nothing. `until`
 	// bounds the wait for the agent to be listed at rest.
@@ -254,7 +254,8 @@ export function deferExtension(
 				// Gone, as soma stopped it or the human closed its window: it is started again in its session first.
 				return listed ? send() : resume();
 			},
-			// Listed first, so a rerun never starts an agent again that a start a crash cut short has started already.
+			// Listed first, so a rerun never starts an agent again that a start a crash cut short has started already. A
+			// listing that fails is no sign the agent is gone: past `until` it is left to `ready`, which starts nothing.
 			resuming: async (task, runtime, context) => {
 				const { tries: tried, session, until } = task.state.checkpoint;
 				const id = String(task.id);
@@ -265,8 +266,8 @@ export function deferExtension(
 					let listed: boolean;
 					try {
 						listed = (await listing(task.input.agent)) !== undefined;
-					} catch (error) {
-						if (runtime.now() >= until) return unresumed(error);
+					} catch {
+						if (runtime.now() >= until) break;
 						await pause(runtime, pollMs);
 						continue;
 					}
@@ -274,16 +275,22 @@ export function deferExtension(
 						try {
 							await agents.resume({ name: task.input.agent, card: task.input.card, sessionId: session });
 						} catch (error) {
-							// A window of the name made since, by the human or by this start before it failed, is the agent.
-							if ((await listing(task.input.agent).catch(() => undefined)) === undefined) return unresumed(error);
+							// A window of the name made since, by the human or by this start before it failed, is the agent; one
+							// a listing that fails cannot rule out is looked for by `ready`.
+							const after = await listing(task.input.agent).then(
+								(found) => found !== undefined,
+								() => undefined,
+							);
+							if (after === false) return unresumed(error);
 						}
 					}
-					// Timed from the start, so a start a crash cut short long ago still gets the whole wait.
-					return runtime.commit(
-						() => ({ status: "running", checkpoint: { phase: "ready", tries: tried, until: runtime.now() + readyMs } }),
-						context,
-					);
+					break;
 				}
+				// Timed from the start, so a start a crash cut short long ago still gets the whole wait.
+				return runtime.commit(
+					() => ({ status: "running", checkpoint: { phase: "ready", tries: tried, until: runtime.now() + readyMs } }),
+					context,
+				);
 			},
 			// The agent's window is up: it is prompted once it is listed idle or done, which is when claude takes a prompt.
 			ready: async (task, runtime, context) => {

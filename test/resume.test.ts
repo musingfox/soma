@@ -350,6 +350,66 @@ test.each([
 	},
 );
 
+test("a start that made the window and lost its connection, the listing after it failing too, prompts that window", {
+	timeout: 20_000,
+}, async () => {
+	// rex made the window, then the connection dropped, and the next listing met the same dropped connection.
+	const agents = new (class extends FakeAgentPort {
+		failing = 0;
+		override async list() {
+			if (this.failing > 0) {
+				this.failing--;
+				throw new Error("rex connection lost");
+			}
+			return super.list();
+		}
+		override async resume(request: ResumeRequest): Promise<void> {
+			this.resumed.push(request);
+			this.emit(request.name, { state: "idle" });
+			this.failing = 1;
+			throw new Error("rex connection lost");
+		}
+	})();
+	agents.emit("card-a", { state: "idle" });
+	const soma = await core(await database(), agents, { pollMs: 50 });
+	const id = await accepted(await soma.defer("PT1S"));
+
+	expect(await soma.outcome(id)).toEqual(sent);
+	expect(agents.resumed).toEqual([session]);
+	expect(agents.prompts).toEqual([instruction(id)]);
+	expect(await soma.notices()).toEqual([]);
+	// Not left `stopped`, which would have the bridge drop the statuses of the window that is open.
+	expect((await soma.job("card-a"))?.reclaim).toBeUndefined();
+});
+
+test("listings that fail past the start's deadline do not take an open window for none", {
+	timeout: 20_000,
+}, async () => {
+	// The fire-time listing finds the agent gone; the human reopens its window just after it, and rex stops answering
+	// past the deadline the start has to list the agent.
+	const agents = new (class extends FakeAgentPort {
+		failUntil = 0;
+		override async list() {
+			if (Date.now() < this.failUntil) throw new Error("rex connection lost");
+			const listed = await super.list();
+			if (this.stopped.length > 0 && this.failUntil === 0) {
+				this.emit("card-a", { state: "idle" });
+				this.failUntil = Date.now() + 600;
+			}
+			return listed;
+		}
+	})();
+	agents.emit("card-a", { state: "idle" });
+	const soma = await core(await database(), agents, { readyMs: 400, pollMs: 50 });
+	const id = await accepted(await soma.defer("PT1S"));
+
+	expect(await soma.outcome(id)).toEqual(sent);
+	expect(agents.resumed).toEqual([]);
+	expect(agents.prompts).toEqual([instruction(id)]);
+	expect(await soma.notices()).toEqual([]);
+	expect((await soma.job("card-a"))?.reclaim).toBeUndefined();
+});
+
 test("a window of the agent's name the human reopened is prompted in place, and nothing is started", {
 	timeout: 20_000,
 }, async () => {

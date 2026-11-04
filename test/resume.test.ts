@@ -2,7 +2,7 @@ import type { TaskId } from "@earendil-works/pi-durable";
 import { expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { JOB_DONE } from "../src/core/extensions/dispatch/bridge.ts";
-import type { ResumeRequest } from "../src/ports/agent.ts";
+import { NotImplemented, type ResumeRequest } from "../src/ports/agent.ts";
 import { accepted, type Core, context, core, database } from "./defer-core.ts";
 
 // The job the core helper seeds for card-a, and the session id it holds.
@@ -347,6 +347,61 @@ test.each([
 		await again.settle();
 		expect(await again.notices()).toEqual(told);
 		expect(agents.resumed).toHaveLength(1);
+	},
+);
+
+test("an agent closed by hand that cannot be started again is no longer due, and a window reopened later is seen", {
+	timeout: 20_000,
+}, async () => {
+	const agents = new (class extends FakeAgentPort {
+		override async resume(request: ResumeRequest): Promise<void> {
+			this.resumed.push(request);
+			throw new Error("rex connection lost");
+		}
+	})();
+	agents.emit("card-a", { state: "working" });
+	const soma = await core(await database(), agents);
+	const id = await accepted(await soma.defer("PT1S"));
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "due" } });
+	agents.close("card-a");
+
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "unresumed" });
+	expect(await soma.notices()).toEqual([
+		expect.stringMatching(new RegExp(`^Deferred instruction ${id} .* was not sent: .*could not start it again`)),
+	]);
+	// soma never stopped it, so it is not taken for one soma stopped.
+	expect((await soma.job("card-a"))?.reclaim).toBeUndefined();
+	agents.emit("card-a", { state: "working" });
+	agents.finish("card-a", "結果：完成");
+	await soma.settle();
+	expect(await soma.job("card-a")).toMatchObject({ status: { state: "done" }, outcome: "完成" });
+});
+
+test.each([
+	["closed by hand", "working", undefined],
+	["reclaimed", "idle", { phase: "stopped" }],
+])(
+	"an agent %s on a side that cannot resume one takes the gone path, as before resuming was built",
+	{
+		timeout: 20_000,
+	},
+	async (_case, state, reclaim) => {
+		const agents = new (class extends FakeAgentPort {
+			override async resume(): Promise<void> {
+				throw new NotImplemented("tty AgentPort: resume is not implemented");
+			}
+		})();
+		agents.emit("card-a", { state: state as "idle" | "working" });
+		const soma = await core(await database(), agents);
+		const id = await accepted(await soma.defer("PT1S"));
+		agents.close("card-a");
+
+		expect(await soma.outcome(id)).toEqual({ status: "completed", result: "gone" });
+		expect(agents.prompts).toEqual([]);
+		expect(await soma.notices()).toEqual([
+			expect.stringMatching(new RegExp(`^Deferred instruction ${id} .* was not sent: the agent was no longer listed`)),
+		]);
+		expect((await soma.job("card-a"))?.reclaim).toEqual(reclaim);
 	},
 );
 

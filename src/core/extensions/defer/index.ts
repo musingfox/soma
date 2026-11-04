@@ -1,8 +1,9 @@
 import type { Context } from "@earendil-works/chord/context";
 import { type Conversation, defineExtension, defineTask, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
-import { type AgentPort, PromptRefused } from "../../../ports/agent.ts";
+import { type AgentPort, NotImplemented, PromptRefused } from "../../../ports/agent.ts";
 import type { DeferReply, DeferRequest } from "../../../ports/defer.ts";
 import { type Deferred, deferAt, deferNotice, deferredPrompt } from "../../domain/defer.ts";
+import type { Job, Reclaim } from "../../domain/dispatch.ts";
 import { noticeEntry } from "../../notice.ts";
 import { Dispatches } from "../dispatch/index.ts";
 import { reclaimer } from "../dispatch/reclaim.ts";
@@ -63,12 +64,18 @@ async function release(tx: Tx, conversation: Conversation["id"], id: string, age
 	return true;
 }
 
+/** `job` with `before`, the reclaim it had before a deferral held it `resuming`, absent when it had none. */
+function unheld(job: Job, before: Reclaim | undefined): Job {
+	const { reclaim: _held, ...rest } = job;
+	return before === undefined ? rest : { ...rest, reclaim: before };
+}
+
 /**
  * Takes deferral `id` of `agent` off the pending ones. With none of the agent's left, its job is no longer due to be
  * stopped, so an agent that got its instruction while still open is not stopped when that turn ends, and a failed stop
  * is forgotten; a stopped one stays stopped. With some left, it is due again unless one is being sent: true when this
- * made it due. A job this deferral held `resuming` is `stopped` when the agent is `gone` again, as one soma stopped,
- * and otherwise taken as one a prompt went to.
+ * made it due. A job this deferral held `resuming` gets back the reclaim it had before when the agent is `gone` again,
+ * so it is `stopped` only if soma had stopped it, and is otherwise taken as one a prompt went to.
  */
 async function settle(
 	tx: Tx,
@@ -78,14 +85,14 @@ async function settle(
 	gone = false,
 ): Promise<boolean> {
 	const { items } = await tx.doc(Deferrals, conversation);
-	const resumed = items[id]?.resuming === true;
+	const own = items[id];
+	const before = own?.before && { ...own.before };
 	delete items[id];
 	const doc = await tx.doc(Dispatches, conversation);
 	const index = doc.jobs.findIndex((job) => job.agent === agent);
 	const held = doc.jobs[index];
-	if (resumed && held?.reclaim?.phase === "resuming") {
-		doc.jobs[index] = { ...held, reclaim: { phase: gone ? "stopped" : "sending" } };
-		if (gone) return false;
+	if (own?.resuming === true && held?.reclaim?.phase === "resuming") {
+		doc.jobs[index] = gone ? unheld(held, before) : { ...held, reclaim: { phase: "sending" } };
 	}
 	if (Object.values(items).some((item) => item.agent === agent)) return release(tx, conversation, id, agent);
 	const current = doc.jobs[index];
@@ -123,7 +130,8 @@ export interface DeferOptions {
  * agent reports between the prompt and its end stops nothing. An agent gone at fire time, stopped by soma or closed by
  * hand, is started again in its session (`resume`, past the hangar cap) under the `resuming` checkpoint, and prompted
  * once it is listed at rest, as a dispatched agent's launch prompt waits for its first idle; one soma was stopping
- * takes the gone path, since the listing cannot tell a stop that never went out.
+ * takes the gone path, since the listing cannot tell a stop that never went out, and so does one on an agent side
+ * whose `resume` throws NotImplemented.
  */
 export function deferExtension(
 	agents: Pick<AgentPort, "list" | "prompt" | "resume" | "stop">,
@@ -181,7 +189,7 @@ export function deferExtension(
 					doc.jobs[index] = { ...current, reclaim: { phase: "sending" } };
 				}
 				if (own !== undefined) {
-					const { resuming: _started, ...rest } = own;
+					const { resuming: _started, before: _held, ...rest } = own;
 					items[id] = { ...rest, sending: true };
 				}
 				sending = true;
@@ -217,7 +225,10 @@ export function deferExtension(
 				doc.jobs[index] = { ...current, reclaim: { phase: "resuming" } };
 				const { items } = await tx.doc(Deferrals, runtime.conversationId);
 				const own = items[id];
-				if (own !== undefined) items[id] = { ...own, resuming: true };
+				if (own !== undefined) {
+					const before = current.reclaim && { ...current.reclaim };
+					items[id] = { ...own, resuming: true, ...(before && { before }) };
+				}
 				const until = runtime.now() + readyMs;
 				return {
 					status: "running",
@@ -275,6 +286,8 @@ export function deferExtension(
 						try {
 							await agents.resume({ name: task.input.agent, card: task.input.card, sessionId: session });
 						} catch (error) {
+							// A side that cannot start an agent again ends this as it did before it could.
+							if (error instanceof NotImplemented) return end("gone", deferNotice.gone(id, task.input), true);
 							// A window of the name made since, by the human or by this start before it failed, is the agent; one
 							// a listing that fails cannot rule out is looked for by `ready`.
 							const after = await listing(task.input.agent).then(

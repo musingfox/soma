@@ -8,7 +8,7 @@ import {
 	type ToolExecutionApi,
 	type Tx,
 } from "@earendil-works/pi-durable";
-import { obj, str } from "@earendil-works/pi-schema";
+import { obj, opt, str } from "@earendil-works/pi-schema";
 import type { AgentPort, Answer } from "../../../ports/agent.ts";
 import type { Choices, HumanAnswerOutcome } from "../../../ports/human.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
@@ -138,21 +138,34 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 	const respond = defineTool({
 		name: "respond",
 		description:
-			"Answer a blocked agent's prompt by choosing one of its options. The agent's screen is read again first: " +
-			"if it no longer shows the prompt the fingerprint names, nothing is sent and the refusal is returned. " +
-			"Never for kind=auth.",
+			"Answer a blocked agent's prompt by choosing one of its options: a job's, named by its card, or a foreign " +
+			"agent's, named by its id. The agent's screen is read again first: if it no longer shows the prompt the " +
+			"fingerprint names, nothing is sent and the refusal is returned. Never for kind=auth.",
 		parameters: obj({
-			card,
+			card: opt(card),
+			foreign: opt(
+				str({ description: "The foreign agent's id, as its wake or foreign_agents gave it, instead of card" }),
+			),
 			option: str({ description: "The option's number as the wake listed it" }),
 			fingerprint: str({ description: "The fingerprint the wake gave for this prompt" }),
 			reason,
 		}),
 		// Not replayed: a crash mid-call reports it interrupted rather than pressing keys a second time.
 		replay: "unsafe",
-		execute: async ({ card, option, fingerprint, reason }, api, context) => {
+		execute: async ({ card, foreign, option, fingerprint, reason }, api, context) => {
+			const answer = { option, fingerprint };
+			if ((card === undefined) === (foreign === undefined)) {
+				return text({ sent: false, error: "name either card, for a job, or foreign, for a foreign agent" });
+			}
+			// A foreign agent has no job, so the reason stays in this call only.
+			if (foreign !== undefined) {
+				return text(
+					await agents.respondForeign(foreign, answer).catch((error: Error) => ({ sent: false, error: error.message })),
+				);
+			}
 			const outcome = await answerJob(agents, (change) => api.commit(change, context), api.conversationId, {
-				card,
-				answer: { option, fingerprint },
+				card: card as string,
+				answer,
 				reason,
 			});
 			return text(
@@ -239,8 +252,9 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 			"List every claude agent running now that soma did not dispatch: each terminal pane, in any session, " +
 			"with claude in the foreground and no job of soma's in it, the human's own sessions included. " +
 			"Each has an id, its session's label, the pane's label, its state (idle, working, blocked, done or error; " +
-			"absent when it cannot be told) and its cwd. Read only: soma cannot answer, prompt or stop these. " +
-			"The jobs soma dispatched are listed by jobs, not here.",
+			"absent when it cannot be told; a blocked one with its prompt's options and fingerprint when its screen could be " +
+			"read) and its cwd. A blocked one's prompt can be answered with respond, by its id as foreign, never for " +
+			"kind=auth; soma never prompts, stops or resumes these. The jobs soma dispatched are listed by jobs, not here.",
 		parameters: obj({}),
 		replay: "safe",
 		execute: async () => text(await agents.listForeign()),

@@ -577,18 +577,50 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	}
 
 	/** A press and a release, as `rex send-key` sends them, straight to the block so no key binding takes it. */
-	async function press(blockId: string, key: NonNullable<ReturnType<typeof keyOf>>): Promise<void> {
+	async function press(session: string, blockId: string, key: NonNullable<ReturnType<typeof keyOf>>): Promise<void> {
 		for (const action of ["press", "release"]) {
 			await client.call(
 				"block.event",
 				{
-					session_id: sessionId,
+					session_id: session,
 					block_id: blockId,
 					event: { type: "key", payload: { ...key, mods: "", composing: false, action } },
 				},
 				EmptyResultSchema,
 			);
 		}
+	}
+
+	/**
+	 * Answers the prompt on a block of `session`, as herdr's adapter does: fresh status, fresh screen, then the keys read
+	 * off that screen. An auth prompt is refused whether the record or the screen names it. With `trust`, a block with
+	 * no record is answered when its screen shows claude's trust dialog, the one block claude reports nothing for.
+	 */
+	async function answerOn(session: string, blockId: string, answer: Answer, trust: boolean): Promise<AnswerOutcome> {
+		const [{ records }, { foreground }] = await Promise.all([
+			blockCall("program_status", blockId, ProgramStatusResultSchema, {}, session),
+			blockCall("process", blockId, ProcessResultSchema, {}, session),
+		]);
+		const root = records.find(isRoot);
+		const dialog = root === undefined && trust && foreground?.argv0 === "claude";
+		if (!dialog && root?.state !== "blocked") return { sent: false, refusal: "not_blocked" };
+		if (root?.kind === "auth") return { sent: false, refusal: "auth" };
+		const screen = await readScreen(blockId, session);
+		if (dialog && !isTrustDialog(screen)) return { sent: false, refusal: "not_blocked" };
+		const { kind, prompt } = screen;
+		if (kind === "auth") return { sent: false, refusal: "auth" };
+		if (prompt === undefined) return { sent: false, refusal: "unreadable" };
+		if (prompt.fingerprint !== answer.fingerprint) return { sent: false, refusal: "stale" };
+		if (!prompt.options.some((option) => option.id === answer.option)) {
+			return { sent: false, refusal: "unknown_option" };
+		}
+		const keys = answerKeys(prompt, answer.option)?.map(keyOf);
+		if (keys === undefined || keys.some((key) => key === undefined)) return { sent: false, refusal: "unreadable" };
+		for (const [index, key] of keys.entries()) {
+			if (index > 0) await new Promise((resolve) => setTimeout(resolve, keyGapMs));
+			await press(session, blockId, key as NonNullable<typeof key>);
+		}
+		return { sent: true };
 	}
 
 	/** Resolves true once the block's root record turns working, false when `ms` passes first. */
@@ -952,32 +984,9 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			}
 		},
 
-		// As herdr's: fresh status, fresh screen, then the keys read off that screen.
 		async respond(agent: string, answer: Answer): Promise<AnswerOutcome> {
 			const { blockId } = only(await panes(), agent);
-			const [{ records }, claude] = await Promise.all([
-				blockCall("program_status", blockId, ProgramStatusResultSchema),
-				isClaude(blockId),
-			]);
-			const root = records.find(isRoot);
-			// Without a record, the trust dialog is the one block claude can be in.
-			if (root === undefined ? !claude : root.state !== "blocked") return { sent: false, refusal: "not_blocked" };
-			const screen = await readScreen(blockId);
-			if (root === undefined && !isTrustDialog(screen)) return { sent: false, refusal: "not_blocked" };
-			const { kind, prompt } = screen;
-			if (kind === "auth") return { sent: false, refusal: "auth" };
-			if (prompt === undefined) return { sent: false, refusal: "unreadable" };
-			if (prompt.fingerprint !== answer.fingerprint) return { sent: false, refusal: "stale" };
-			if (!prompt.options.some((option) => option.id === answer.option)) {
-				return { sent: false, refusal: "unknown_option" };
-			}
-			const keys = answerKeys(prompt, answer.option)?.map(keyOf);
-			if (keys === undefined || keys.some((key) => key === undefined)) return { sent: false, refusal: "unreadable" };
-			for (const [index, key] of keys.entries()) {
-				if (index > 0) await new Promise((resolve) => setTimeout(resolve, keyGapMs));
-				await press(blockId, key as NonNullable<typeof key>);
-			}
-			return { sent: true };
+			return answerOn(sessionId, blockId, answer, true);
 		},
 
 		async stop(agent: string): Promise<void> {
@@ -988,6 +997,16 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		/** By block id, which rex keeps for the block's life. Read only: no block of another session is written to. */
 		async listForeign(): Promise<readonly ForeignAgent[]> {
 			return (await foreign()).map(({ agent }) => agent);
+		},
+
+		/**
+		 * As respond, on the foreign agent's block in its own session. Its root record must be blocked: soma looks for the
+		 * trust dialog only of a claude it started.
+		 */
+		async respondForeign(id: string, answer: Answer): Promise<AnswerOutcome> {
+			const found = (await foreign()).find((each) => each.agent.id === id);
+			if (found === undefined) throw new Error(`no foreign agent ${id}: no block of that id runs claude outside soma`);
+			return answerOn(found.sessionId, id, answer, false);
 		},
 
 		onForeignStatus(listener: (event: ForeignStatusEvent) => void): () => void {

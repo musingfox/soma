@@ -32,6 +32,7 @@ const agents: AgentPort = {
 	listForeign: async () => [],
 	readForeignResult: async () => undefined,
 	onForeignStatus: () => () => {},
+	respondForeign: async () => ({ sent: false, refusal: "not_blocked" }),
 };
 
 const faux = fauxProvider();

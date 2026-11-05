@@ -132,4 +132,6 @@ export interface AgentPort {
 	// written. Undefined when no transcript, or no record in it with an id, can be read; throws for an id that names no
 	// foreign agent now.
 	readForeignResult(id: string): Promise<AgentResult | undefined>;
+	// As respond, for a foreign agent by its id, and never for kind=auth; throws for an id that names no foreign agent now.
+	respondForeign(id: string, answer: Answer): Promise<AnswerOutcome>;
 }

@@ -149,6 +149,46 @@ test("foreign_result reads a foreign agent's last result, and says so when it ca
 	expect(await call("foreign_result", { id: "pane-9" }, "r3")).toEqual({ error: "no foreign agent pane-9" });
 });
 
+test("respond answers a foreign agent's prompt by its id, checking the fingerprint, and never an auth one", async () => {
+	const { agents, call } = await setup();
+	const where = { session: "work", label: "Window 1" };
+	const fingerprint = "f00d";
+	const blocked = {
+		state: "blocked" as const,
+		kind: "permission" as const,
+		fingerprint,
+		options: [{ id: "1", label: "Yes" }],
+	};
+	agents.foreign.push(
+		{ agent: { id: "pane-1", ...where, status: blocked } },
+		{ agent: { id: "pane-2", ...where, status: { ...blocked, kind: "auth" } } },
+	);
+	const answer = (id: string, print: string, requestId: string) =>
+		call("respond", { foreign: id, option: "1", fingerprint: print, reason: "無害的指令" }, requestId);
+
+	expect(await answer("pane-1", "beef", "r1")).toEqual({ sent: false, refusal: "stale" });
+	expect(await answer("pane-2", fingerprint, "r2")).toEqual({ sent: false, refusal: "auth" });
+	expect(await answer("pane-9", fingerprint, "r3")).toEqual({ sent: false, error: "no foreign agent pane-9" });
+	expect(agents.foreignResponses).toEqual([]);
+
+	expect(await answer("pane-1", fingerprint, "r4")).toEqual({ sent: true });
+	expect(agents.foreignResponses).toEqual([{ id: "pane-1", answer: { option: "1", fingerprint } }]);
+	expect(agents.responses).toEqual([]);
+});
+
+test("respond names a job or a foreign agent, not both and not neither", async () => {
+	const { agents, call, dispatch } = await setup();
+	await dispatch("card-a", "r1");
+	const error = { sent: false, error: "name either card, for a job, or foreign, for a foreign agent" };
+
+	expect(await call("respond", { option: "1", fingerprint: "f", reason: "r" }, "r2")).toEqual(error);
+	expect(
+		await call("respond", { card: "card-a", foreign: "pane-1", option: "1", fingerprint: "f", reason: "r" }, "r3"),
+	).toEqual(error);
+	expect(agents.responses).toEqual([]);
+	expect(agents.foreignResponses).toEqual([]);
+});
+
 test("a card that cannot be read starts nothing", async () => {
 	const { agents, dispatch, jobs } = await setup();
 

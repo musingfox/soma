@@ -65,6 +65,7 @@ function port(fake: ReturnType<typeof rex>, foreignMs = 60_000) {
 		projectsDir: projects,
 		sessionsDir,
 		redrawMs: 0,
+		keyGapMs: 0,
 		foreignMs,
 	});
 }
@@ -303,4 +304,67 @@ test("onForeignStatus reports a new seq, and a status that is not blocked withou
 	} finally {
 		vi.useRealTimers();
 	}
+});
+
+const blockedRecord = [{ state: "blocked", kind: "permission", updated_at: AT }];
+
+/** soma's own agent blocked in the hangar, and a foreign one in the session `work` with `block` set on it. */
+function blockedForeign(block: Partial<Block> = {}) {
+	return rex(
+		[{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: blockedRecord, screen: BASH }],
+		[
+			{
+				id: "session:work",
+				label: "work",
+				blocks: [{ name: "w", block: "block:w1", argv0: "claude", records: blockedRecord, screen: BASH, ...block }],
+			},
+		],
+	);
+}
+
+const pressed = (fake: ReturnType<typeof rex>) =>
+	fake.calls
+		.filter((call) => call.method === "block.event")
+		.map((call) => {
+			const { session_id, block_id, event } = call.payload as {
+				session_id: string;
+				block_id: string;
+				event: { payload: { key: string; action: string } };
+			};
+			return `${session_id} ${block_id} ${event.payload.key}:${event.payload.action}`;
+		});
+
+test("respondForeign presses the option's key on the foreign agent's own block, in its own session", async () => {
+	const fake = blockedForeign();
+
+	const outcome = await port(fake).respondForeign("block:w1", { option: "1", fingerprint: prompt?.fingerprint ?? "" });
+
+	expect(outcome).toEqual({ sent: true });
+	expect(pressed(fake)).toEqual(["session:work block:w1 digit_1:press", "session:work block:w1 digit_1:release"]);
+});
+
+test("respondForeign refuses auth whether the record or the screen names it, and any other refusal, pressing nothing", async () => {
+	const cases: [Partial<Block>, string | undefined, string][] = [
+		[{ records: [{ state: "blocked", kind: "auth", updated_at: AT }] }, prompt?.fingerprint, "auth"],
+		[{ screen: fixture("claude-custom-api-key-2.1.302.txt") }, "f", "auth"],
+		[{}, "0123456789abcdef", "stale"],
+		[{ records: [{ state: "working", updated_at: AT }] }, prompt?.fingerprint, "not_blocked"],
+		// No record: soma does not answer the trust dialog of a claude it did not start.
+		[{ records: [], screen: fixture("claude-trust-dialog-2.1.302.txt") }, "1", "not_blocked"],
+	];
+	for (const [block, fingerprint, refusal] of cases) {
+		const fake = blockedForeign(block);
+		const outcome = await port(fake).respondForeign("block:w1", { option: "1", fingerprint: fingerprint ?? "" });
+		expect(outcome).toEqual({ sent: false, refusal });
+		expect(pressed(fake)).toEqual([]);
+	}
+});
+
+test("respondForeign throws for an id that names no foreign agent: soma's own agent, or none", async () => {
+	const fake = blockedForeign();
+	const answer = { option: "1", fingerprint: prompt?.fingerprint ?? "" };
+
+	await expect(port(fake).respondForeign("block:a", answer)).rejects.toThrow("no foreign agent block:a");
+	await expect(port(fake).respondForeign("block:gone", answer)).rejects.toThrow("no foreign agent block:gone");
+	expect(pressed(fake)).toEqual([]);
 });

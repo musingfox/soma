@@ -15,6 +15,8 @@ import type {
 export class FakeAgentPort implements AgentPort {
 	readonly prompts: { readonly agent: string; readonly text: string }[] = [];
 	readonly responses: { readonly agent: string; readonly answer: Answer }[] = [];
+	/** Answers sent to foreign agents, by id. */
+	readonly foreignResponses: { readonly id: string; readonly answer: Answer }[] = [];
 	readonly started: StartRequest[] = [];
 	readonly resumed: ResumeRequest[] = [];
 	// One entry per call, so a second stop of the same agent shows.
@@ -81,6 +83,19 @@ export class FakeAgentPort implements AgentPort {
 		const found = this.foreign.find(({ agent }) => agent.id === id);
 		if (found === undefined) throw new Error(`no foreign agent ${id}`);
 		return found.result;
+	}
+
+	/** As respond, against the foreign agent's listed status; it turns working once answered. */
+	async respondForeign(id: string, answer: Answer): Promise<AnswerOutcome> {
+		const found = this.foreign.find(({ agent }) => agent.id === id);
+		if (found === undefined) throw new Error(`no foreign agent ${id}`);
+		const { status } = found.agent;
+		if (status?.state !== "blocked") return { sent: false, refusal: "not_blocked" };
+		if (status.kind === "auth") return { sent: false, refusal: "auth" };
+		if (status.fingerprint !== answer.fingerprint) return { sent: false, refusal: "stale" };
+		this.foreignResponses.push({ id, answer });
+		found.agent = { ...found.agent, status: { state: "working" } };
+		return { sent: true };
 	}
 
 	onForeignStatus(listener: (event: ForeignStatusEvent) => void): () => void {

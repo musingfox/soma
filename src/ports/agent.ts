@@ -41,6 +41,22 @@ export interface AgentListing {
 	readonly seq?: number;
 }
 
+/**
+ * An agent soma did not dispatch: a pane, in any session of the agent side, whose foreground is claude and which is
+ * none of the agents `list` names. soma only reads it for now (ARCHITECTURE.md "Foreign agents").
+ */
+export interface ForeignAgent {
+	// Opaque to the core, and the same for the pane as long as it lives, whatever runs in it.
+	readonly id: string;
+	// The label of the session the pane is in.
+	readonly session: string;
+	// What the human sees the pane by: its window's label, or its own.
+	readonly label: string;
+	// Absent when the agent side cannot tell, which is no claim either way.
+	readonly status?: AgentState;
+	readonly cwd?: string;
+}
+
 export interface AgentStatusEvent {
 	readonly agent: string;
 	readonly status: AgentState;
@@ -96,4 +112,10 @@ export interface AgentPort {
 	// Re-reads the screen before sending: a stored status is never trusted to still be on it.
 	respond(agent: string, answer: Answer): Promise<AnswerOutcome>;
 	stop(agent: string): Promise<void>;
+	// Every foreign agent running now; none where the agent side has no panes but its own.
+	listForeign(): Promise<readonly ForeignAgent[]>;
+	// What the foreign agent's current claude transcript ends on, as readResult reads it, without waiting for a turn to be
+	// written. Undefined when no transcript, or no record in it with an id, can be read; throws for an id that names no
+	// foreign agent now.
+	readForeignResult(id: string): Promise<AgentResult | undefined>;
 }

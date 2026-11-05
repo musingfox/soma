@@ -430,5 +430,9 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 			if (!target.exited) target.pty.kill();
 			target.term.dispose();
 		},
+
+		// Every pty soma holds is one of its own agents.
+		listForeign: async () => [],
+		readForeignResult: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: tty runs none`)),
 	};
 }

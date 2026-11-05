@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { copyFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import type { ZodType } from "zod";
+import type { ZodType, z } from "zod";
 import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "../../agent-cli/hangar-cap.ts";
 import {
 	answerKeys,
@@ -9,6 +9,7 @@ import {
 	isTrustDialog,
 	readBlockedScreen,
 } from "../../agent-cli/permission/blocked-screen.ts";
+import { readProcessSession } from "../../agent-cli/process-session.ts";
 import { awaitingReply, readLastRecord, readSessionCwd, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
 import { type Git, mainCheckout, openWorktree, runGit } from "../../agent-cli/worktree.ts";
 import {
@@ -20,6 +21,7 @@ import {
 	type Answer,
 	type AnswerOutcome,
 	type BlockedKind,
+	type ForeignAgent,
 	PromptRefused,
 	type ResumeRequest,
 	type StartRequest,
@@ -27,9 +29,11 @@ import {
 import type { RexClient } from "./client.ts";
 import { type ProcessStart, readProcessStart } from "./process-start.ts";
 import {
+	AttachAllResultSchema,
 	BlobReadResultSchema,
 	BlockClosedResultSchema,
 	BlockEventSchema,
+	BlockListSchema,
 	EmptyResultSchema,
 	FormatResultSchema,
 	NewWindowResultSchema,
@@ -51,6 +55,8 @@ export interface RexAgentPortOptions {
 	readonly cap?: number;
 	/** Where claude keeps its transcripts; defaults to ~/.claude/projects. */
 	readonly projectsDir?: string;
+	/** Where claude records the session each of its processes is in; defaults to ~/.claude/sessions. */
+	readonly sessionsDir?: string;
 	readonly git?: Git;
 	/** How long a sent prompt may take to turn the agent working before `\r` is sent once more. */
 	readonly confirmMs?: number;
@@ -77,6 +83,9 @@ type Seen = { readonly status: AgentState; readonly seq: number };
 
 /** One agent: a window named after it, holding the block its claude runs in. */
 type Pane = { readonly name: string; readonly blockId: string; readonly label?: string };
+
+/** A foreign agent as found, its id the block's, with the session the block is in and its claude's pid. */
+type Foreign = { readonly agent: ForeignAgent; readonly sessionId: string; readonly pid: number };
 
 const BLOCKED_KINDS: readonly string[] = ["permission", "question", "auth"] satisfies BlockedKind[];
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -254,6 +263,77 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		);
 		const claude = await Promise.all(blockIds.map(isClaude));
 		return claude.filter(Boolean).length;
+	}
+
+	/**
+	 * Every terminal block of every session whose foreground is claude, but for the agents' blocks `list` names: the
+	 * hangar's other blocks, as one a human split off, are foreign too. attach_all lets the connection call any session's
+	 * methods without joining it, so no session lists soma among its clients, and with its `session` scope no block
+	 * events of other sessions arrive; it is asked again on every read, since a reconnect drops it. A session or block
+	 * that went away while it was read is left out.
+	 */
+	async function foreign(): Promise<Foreign[]> {
+		const own = new Set([...(await panes()).values()].flat().map((pane) => pane.blockId));
+		const { sessions } = await client.call("session.attach_all", { event_scope: "session" }, AttachAllResultSchema);
+		const found = await Promise.all(
+			(sessions ?? []).map(async (session): Promise<Foreign[]> => {
+				const where = { session_id: session.session_id };
+				let blocks: z.infer<typeof BlockListSchema>["blocks"];
+				let view: z.infer<typeof ViewSchema>;
+				try {
+					[{ blocks }, view] = await Promise.all([
+						client.call("session.list_blocks", where, BlockListSchema),
+						client.call("session.view", where, ViewSchema),
+					]);
+				} catch (error) {
+					onError(error as Error);
+					return [];
+				}
+				const windows = new Map((view.windows ?? []).map((window) => [window.window_id, window.label]));
+				const shared = new Map<string, number>();
+				for (const { window_id: window } of blocks ?? []) {
+					if (window != null) shared.set(window, (shared.get(window) ?? 0) + 1);
+				}
+				const each = await Promise.all(
+					(blocks ?? []).map(async (block): Promise<Foreign[]> => {
+						const blockId = block.block_id;
+						if (blockId === null || own.has(blockId)) return [];
+						if (block.creator_name !== undefined && block.creator_name !== TERMINAL) return [];
+						const call = <T>(method: string, schema: ZodType<T>) =>
+							client.call(`${TERMINAL}.${method}`, { ...where, block_id: blockId, args: {} }, schema);
+						try {
+							const { foreground, child } = await call("process", ProcessResultSchema);
+							if (foreground?.argv0 !== "claude") return [];
+							const { records } = await call("program_status", ProgramStatusResultSchema);
+							const root = records.find(isRoot);
+							const window = block.window_id == null ? undefined : windows.get(block.window_id);
+							const name = block.label ?? blockId;
+							// A window of one block is the block; in a split, the block's own label tells it from the others.
+							const label =
+								window === undefined
+									? name
+									: (shared.get(block.window_id ?? "") ?? 0) > 1
+										? `${window} / ${name}`
+										: window;
+							const cwd = foreground.cwd ?? child?.cwd;
+							const agent: ForeignAgent = {
+								id: blockId,
+								session: session.label,
+								label,
+								...(root === undefined ? {} : { status: stateOf(root) }),
+								...(cwd === undefined ? {} : { cwd }),
+							};
+							return [{ agent, sessionId: session.session_id, pid: foreground.pid }];
+						} catch (error) {
+							onError(error as Error);
+							return [];
+						}
+					}),
+				);
+				return each.flat();
+			}),
+		);
+		return found.flat();
 	}
 
 	/**
@@ -769,6 +849,24 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		async stop(agent: string): Promise<void> {
 			const { blockId } = only(await panes(), agent);
 			await client.call("block.close", { session_id: sessionId, block_id: blockId }, BlockClosedResultSchema);
+		},
+
+		/** By block id, which rex keeps for the block's life. Read only: no block of another session is written to. */
+		async listForeign(): Promise<readonly ForeignAgent[]> {
+			return (await foreign()).map(({ agent }) => agent);
+		},
+
+		/**
+		 * The transcript of the session the block's claude is in now, which claude names in its per-process session file
+		 * and moves on `/clear`, read as it is: no turn end is known for a block the watch does not follow.
+		 */
+		async readForeignResult(id: string): Promise<AgentResult | undefined> {
+			const found = (await foreign()).find((each) => each.agent.id === id);
+			if (found === undefined) throw new Error(`no foreign agent ${id}: no block of that id runs claude outside soma`);
+			const session = await readProcessSession(found.pid, options.sessionsDir);
+			if (session === undefined) return undefined;
+			const path = await resolveTranscriptPath(session.sessionId, session.cwd ?? found.agent.cwd, options.projectsDir);
+			return path === undefined ? undefined : readLastRecord(path);
 		},
 	};
 }

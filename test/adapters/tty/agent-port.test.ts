@@ -111,6 +111,14 @@ test("resume is not implemented, which it says with its own error, having spawne
 	expect(spawns).toEqual([]);
 });
 
+test("tty lists no foreign agents and reads none, every pty being one of its own", async () => {
+	const { port, spawns } = harness();
+	await port.start(request);
+	expect(await port.listForeign()).toEqual([]);
+	await expect(port.readForeignResult("card-a")).rejects.toThrow("no foreign agent card-a");
+	expect(spawns).toHaveLength(1);
+});
+
 test("the 7501 probe is answered, so claude reports its status", async () => {
 	const { port, ptys } = harness();
 	const pty = await started(port, ptys);

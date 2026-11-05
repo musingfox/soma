@@ -80,6 +80,28 @@ export const ViewSchema = z
 
 export const AttachResultSchema = z.object({ client_id: z.string(), view: ViewSchema }).passthrough();
 
+// session.attach_all and session.list_blocks, checked 2026-11-05 against rex 0.0.1793645657-gd018d2 over revision 7.
+export const AttachAllResultSchema = z
+	.object({ sessions: z.array(z.object({ session_id: z.string(), label: z.string() }).passthrough()).nullable() })
+	.passthrough();
+
+export const BlockListSchema = z
+	.object({
+		blocks: z
+			.array(
+				z
+					.object({
+						block_id: z.string().nullable(),
+						label: z.string().optional(),
+						creator_name: z.string().optional(),
+						window_id: z.string().nullish(),
+					})
+					.passthrough(),
+			)
+			.nullable(),
+	})
+	.passthrough();
+
 export const NewWindowResultSchema = z
 	.object({ window_id: z.string().nullable(), block_ids: z.array(z.string().nullable()).nullable() })
 	.passthrough();

@@ -6,6 +6,7 @@ import type {
 	AgentStatusEvent,
 	Answer,
 	AnswerOutcome,
+	ForeignAgent,
 	ResumeRequest,
 	StartRequest,
 } from "../../ports/agent.ts";
@@ -20,6 +21,8 @@ export class FakeAgentPort implements AgentPort {
 	readonly #listeners = new Set<(event: AgentStatusEvent) => void>();
 	readonly #results = new Map<string, AgentResult>();
 	readonly #states = new Map<string, { status: AgentState; seq: number }>();
+	/** Agents running beside the dispatched ones, with what each one's transcript ends on. */
+	readonly foreign: { agent: ForeignAgent; result?: AgentResult }[] = [];
 	#seq = 0;
 	#turn = 0;
 
@@ -66,6 +69,16 @@ export class FakeAgentPort implements AgentPort {
 	async stop(agent: string): Promise<void> {
 		this.stopped.push(agent);
 		this.#states.delete(agent);
+	}
+
+	async listForeign(): Promise<readonly ForeignAgent[]> {
+		return this.foreign.map(({ agent }) => agent);
+	}
+
+	async readForeignResult(id: string): Promise<AgentResult | undefined> {
+		const found = this.foreign.find(({ agent }) => agent.id === id);
+		if (found === undefined) throw new Error(`no foreign agent ${id}`);
+		return found.result;
 	}
 
 	/** The agent's window closed by hand: no longer listed, and no stop recorded. */

@@ -91,6 +91,14 @@ test("resume is not implemented, which it says with its own error, having called
 	expect(calls).toEqual([]);
 });
 
+test("herdr lists no foreign agents and reads none, having called herdr for nothing", async () => {
+	const { client, calls } = herdr([agent(null, "working"), agent("other", "idle")]);
+	const port = createHerdrAgentPort({ client, cap: 1 });
+	expect(await port.listForeign()).toEqual([]);
+	await expect(port.readForeignResult("w1:p1")).rejects.toThrow("no foreign agent w1:p1");
+	expect(calls).toEqual([]);
+});
+
 test("start refuses when the hangar already runs cap agents, counting agents soma did not start", async () => {
 	const { client, calls } = herdr([agent(null, "working"), agent("other", "idle")]);
 

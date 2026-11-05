@@ -11,6 +11,7 @@ export const AT = "2026-10-27T01:02:03.456789+08:00";
 export const AT_US = Date.parse("2026-10-27T01:02:03+08:00") * 1000 + 456_789;
 
 export type Block = {
+	/** The label of the block's window. */
 	name: string;
 	block: string;
 	label?: string;
@@ -18,26 +19,63 @@ export type Block = {
 	cwd?: string;
 	records?: object[];
 	screen?: string;
+	/** The foreground's pid; 9 by default. */
+	pid?: number;
+	/** The window the block is in, shared by the blocks of a split; its own window by default. */
+	window?: string;
+	/** Placed in no window. */
+	detached?: boolean;
+	/** The creator that made the block; rex's terminal by default. */
+	creator?: string;
 };
+
+/** A session other than the hangar. */
+export type Session = { id: string; label: string; blocks: Block[] };
 
 export const fixture = (name: string) =>
 	readFileSync(join(import.meta.dirname, "../../agent-cli/permission/fixtures", name), "utf8");
 
-/** An in-memory rex: the hangar's windows, each with one block, and every call made on it. */
-export function rex(blocks: Block[]) {
+/** An in-memory rex: the hangar's windows, each with one block, any other sessions, and every call made on it. */
+export function rex(blocks: Block[], others: Session[] = []) {
 	const calls: { method: string; payload: Record<string, unknown> }[] = [];
 	const events = new Set<(event: SessionEvent) => void>();
 	const connected = new Set<() => void>();
 	const attached: string[] = [];
-	const byId = (payload: Record<string, unknown>) => blocks.find((each) => each.block === payload.block_id);
+	const sessions = () => [{ id: HANGAR, label: "hangar", blocks }, ...others];
+	const of = (payload: Record<string, unknown>) =>
+		sessions().find((session) => session.id === payload.session_id)?.blocks ?? [];
+	const byId = (payload: Record<string, unknown>) => of(payload).find((each) => each.block === payload.block_id);
+	const windowOf = (block: Block) => block.window ?? `window:${block.block}`;
 	const replies: Record<string, (payload: Record<string, unknown>) => unknown> = {
-		"session.view": () => ({
-			revision: 1,
-			session_id: HANGAR,
-			windows: blocks.map(({ name, block, label }) => ({
-				window_id: `window:${block}`,
-				label: name,
-				layers: [{ kind: "tiled", blocks: [{ block_id: block, ...(label === undefined ? {} : { label }) }] }],
+		"session.view": (payload) => {
+			const windows = new Map<string, { label: string; blocks: object[] }>();
+			for (const each of of(payload)) {
+				if (each.detached) continue;
+				const window = windows.get(windowOf(each)) ?? { label: each.name, blocks: [] };
+				const { block, label } = each;
+				window.blocks.push({ block_id: block, ...(label === undefined ? {} : { label }) });
+				windows.set(windowOf(each), window);
+			}
+			return {
+				revision: 1,
+				session_id: payload.session_id,
+				windows: [...windows].map(([id, window]) => ({
+					window_id: id,
+					label: window.label,
+					layers: [{ kind: "tiled", blocks: window.blocks }],
+				})),
+			};
+		},
+		"session.attach_all": () => ({
+			sessions: sessions().map(({ id, label }) => ({ session_id: id, label })),
+		}),
+		"session.list_blocks": (payload) => ({
+			blocks: of(payload).map((block) => ({
+				block_id: block.block,
+				label: block.label ?? "shell",
+				creator_name: block.creator ?? "com.superlogical.terminal",
+				placement: block.detached ? "detached" : "placed",
+				...(block.detached ? {} : { window_id: windowOf(block) }),
 			})),
 		}),
 		"session.new_window": () => ({ window_id: "window:new", block_ids: ["block:new"], revision: 2 }),
@@ -52,7 +90,13 @@ export function rex(blocks: Block[]) {
 			const found = byId(payload);
 			return {
 				last_exit: null,
-				foreground: { pid: 9, user_id: 501, name: "2.1.310", argv0: found?.argv0 ?? "-fish", cwd: found?.cwd },
+				foreground: {
+					pid: found?.pid ?? 9,
+					user_id: 501,
+					name: "2.1.310",
+					argv0: found?.argv0 ?? "-fish",
+					cwd: found?.cwd,
+				},
 			};
 		},
 	};

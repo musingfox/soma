@@ -7,6 +7,7 @@ import { FakeHumanPort } from "../../../src/adapters/fake-human/index.ts";
 import {
 	checkHost,
 	MAX_MESSAGE_BYTES,
+	PAGE_MODULES,
 	startWeb,
 	THREE_PATH,
 	type WebMessage,
@@ -74,19 +75,54 @@ function upgradeStatus(port: number, headers: Record<string, string>): Promise<n
 	});
 }
 
-test("serves the page and the placeholder character, and nothing else", async () => {
+test("serves the page, its stylesheet and its modules, and nothing else", async () => {
 	const { base } = await serve();
 	const page = await fetch(`${base}/`);
 	expect(page.status).toBe(200);
 	expect(page.headers.get("content-type")).toBe("text/html; charset=utf-8");
 	const html = await page.text();
 	expect(html).toContain('name="viewport"');
-	expect(html).toContain("/character.svg");
-	const image = await fetch(`${base}/character.svg`);
-	expect(image.headers.get("content-type")).toBe("image/svg+xml");
-	expect(await image.text()).toContain("<svg");
+	const css = await fetch(`${base}/house.css`);
+	expect(css.headers.get("content-type")).toBe("text/css; charset=utf-8");
+	for (const name of PAGE_MODULES) {
+		const module = await fetch(`${base}/${name}`);
+		expect([name, module.status, module.headers.get("content-type")]).toEqual([
+			name,
+			200,
+			"text/javascript; charset=utf-8",
+		]);
+	}
 	expect((await fetch(`${base}/secret`)).status).toBe(404);
 	expect((await fetch(`${base}/`, { method: "POST", body: "x" })).status).toBe(405);
+});
+
+test("the page loads everything from soma itself: no external host, and every import is served", async () => {
+	const { base } = await serve();
+	const html = await (await fetch(`${base}/`)).text();
+	const own = [html, await (await fetch(`${base}/house.css`)).text()];
+	for (const name of PAGE_MODULES) own.push(await (await fetch(`${base}/${name}`)).text());
+	for (const text of own) expect(text).not.toMatch(/https?:\/\/|(?:^|["'(\s])\/\/[a-z0-9]/i);
+
+	const importMap = JSON.parse(html.match(/<script type="importmap">([\s\S]*?)<\/script>/)?.[1] ?? "{}");
+	const urls = [
+		...Object.values<string>(importMap.imports),
+		...[...html.matchAll(/(?:src|href)="([^"]*)"/g)].map((match) => match[1] as string),
+	];
+	expect(urls).toContain(`${THREE_PATH}three.module.js`);
+	for (const url of urls) {
+		if (url.startsWith("data:")) continue;
+		expect(url).toMatch(/^\/[^/]/);
+		expect([url, (await fetch(`${base}${url}`)).status]).toEqual([url, 200]);
+	}
+	// Every module a page module imports is either three, through the import map, or one of the page's own.
+	const specifiers = own.slice(2).flatMap((text) => [...text.matchAll(/^import [^;]*?"([^"]+)";/gm)].map((m) => m[1]));
+	expect(specifiers).toContain("three");
+	for (const specifier of specifiers) {
+		expect([specifier, specifier === "three" || PAGE_MODULES.includes(specifier?.replace(/^\.\//, "") ?? "")]).toEqual([
+			specifier,
+			true,
+		]);
+	}
 });
 
 /** The status of a GET for `path` sent exactly as written, where fetch would resolve its dot segments first. */

@@ -67,6 +67,8 @@ const staticFile = (type: string, body: Buffer): StaticFile => ({
 	etag: `"${createHash("sha256").update(body).digest("base64url")}"`,
 });
 const JS = "text/javascript; charset=utf-8";
+/** The page's own ES modules, each served at its name. */
+export const PAGE_MODULES = ["page.js", "scene.js", "fox.js", "room.js", "shapes.js"];
 const page = (name: string) => readFileSync(new URL(`./page/${name}`, import.meta.url));
 // The package's own published ES modules, served as they are; three.module.js imports ./three.core.js beside it.
 const threeBuild = dirname(createRequire(import.meta.url).resolve("three"));
@@ -76,7 +78,8 @@ export const THREE_PATH = "/vendor/three/";
 /** Every path the server answers, and nothing else: a URL is looked up whole, never joined onto a directory. */
 const FILES = new Map<string, StaticFile>([
 	["/", staticFile("text/html; charset=utf-8", page("index.html"))],
-	["/character.svg", staticFile("image/svg+xml", page("character.svg"))],
+	["/house.css", staticFile("text/css; charset=utf-8", page("house.css"))],
+	...PAGE_MODULES.map((name): [string, StaticFile] => [`/${name}`, staticFile(JS, page(name))]),
 	...["three.module.js", "three.core.js"].map((name): [string, StaticFile] => [
 		THREE_PATH + name,
 		staticFile(JS, readFileSync(join(threeBuild, name))),

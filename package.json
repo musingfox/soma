@@ -19,6 +19,7 @@
 		"smoke:rex-defer": "node smoke/rex-defer.ts",
 		"smoke:tty": "node smoke/tty.ts",
 		"smoke:push": "node smoke/push.ts",
+		"smoke:push-summary": "node smoke/push-summary.ts",
 		"smoke:terminal": "node smoke/terminal.ts",
 		"smoke:bridge": "node smoke/bridge.ts",
 		"smoke:digest": "node smoke/digest.ts",

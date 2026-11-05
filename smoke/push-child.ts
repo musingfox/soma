@@ -1,14 +1,15 @@
 // main.ts's human side with two interfaces, Telegram at $TELEGRAM_API_BASE and the terminal on stdin, a push target
 // whose windows are $SOMA_SMOKE_WINDOW_MS, the fake agent side, and the faux model standing in for one that calls
 // `dispatch` on 「派 <card> <repo>」, hands every blocked agent to the human with `escalate`, and answers the last
-// prompt with option 1 when the human says 「選 1」.
+// prompt with option 1 when the human says 「選 1」, and writes a summary of what was held as 「摘要：」 and its lines.
 //   node smoke/push-child.ts <db>
 // A stdin line starting with "!" drives the core instead of the terminal: "!report <text>" pushes an ambient report
 // and "!question <text>" an action, "!block <card> <fingerprint> <seq>" blocks the card's agent on a two-option
 // prompt, and "!finish <card> <reply>" ends its turn with that reply, "\n" for a line break. What the terminal prints,
 // OSC 7501 included, comes out as {event: "terminal"} lines. $SOMA_SMOKE_BLOCKED, the arguments of one "!block",
 // stands for an agent that outlived a killed core: it is blocked before the startup reconcile. $SOMA_SMOKE_PUSH is the
-// config file's `push` setting as JSON, read as main.ts reads it; unset, every interface is instant.
+// config file's `push` setting as JSON, read as main.ts reads it, `push.summary.idleMinutes` included; unset, every
+// interface is instant.
 import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
@@ -23,14 +24,14 @@ import { ENTRY_KIND as WEB_KIND } from "../src/adapters/web/index.ts";
 import { resolveConfig } from "../src/config.ts";
 import { eventBridge, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
-import { openHarness } from "../src/core/harness.ts";
+import { openHarness, openStorage } from "../src/core/harness.ts";
 import { openHumanPort } from "../src/core/human-port.ts";
 
 const context = BACKGROUND_CONTEXT;
 const [db] = process.argv.slice(2);
 if (db === undefined) throw new Error("usage: push-child.ts <db>");
 const file = process.env.SOMA_SMOKE_PUSH ? { push: JSON.parse(process.env.SOMA_SMOKE_PUSH) as unknown } : undefined;
-const { telegram, push } = resolveConfig(file, process.env, homedir());
+const { telegram, push, summaryIdleMs } = resolveConfig(file, process.env, homedir());
 if (telegram === undefined) throw new Error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set");
 const windowMs = Number(process.env.SOMA_SMOKE_WINDOW_MS ?? 4_000);
 const emit = (record: object) => console.log(JSON.stringify(record));
@@ -41,6 +42,12 @@ faux.setResponses(
 		const last = transcript.messages.at(-1);
 		if (last?.role === "toolResult") return fauxAssistantMessage("好。");
 		const text = JSON.stringify(last?.content ?? "");
+		if (text.includes("[summary]")) {
+			const parts =
+				typeof last?.content === "string" ? [{ text: last.content }] : (last?.content as { text?: string }[]);
+			const lines = parts.flatMap((part) => (part.text ?? "").split("\n")).filter((line) => line.startsWith("- "));
+			return fauxAssistantMessage(`摘要：\n${lines.join("\n")}`);
+		}
 		const call = (name: string, args: Record<string, string>) =>
 			fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" }) as AssistantMessage;
 		const [, blocked] = /\[bridge\] agent \S+?（卡片 (\S+?)）卡住了/.exec(text) ?? [];
@@ -72,7 +79,8 @@ const options = [
 const block = (card = "", fingerprint = "", seq = "") =>
 	agents.emit(card, { state: "blocked", kind: "permission", msg: "Run it?", fingerprint, options }, Number(seq));
 if (process.env.SOMA_SMOKE_BLOCKED) block(...process.env.SOMA_SMOKE_BLOCKED.split(" "));
-const harness = await openHarness(db, [dispatchExtension(agents, async (_repo, card) => `# ${card}`)], context, {
+const storage = await openStorage(db);
+const harness = await openHarness(storage, [dispatchExtension(agents, async (_repo, card) => `# ${card}`)], context, {
 	models,
 });
 const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
@@ -83,6 +91,8 @@ const human = await openHumanPort(harness, root, agents, context, {
 	presenceMs: windowMs,
 	escalateMs: windowMs,
 	checkMs: 200,
+	summaryIdleMs,
+	storage,
 });
 await reconcileDispatches(root, agents, context);
 eventBridge(root, agents, context).listen((error) => emit({ event: "bridge_error", error: String(error) }));

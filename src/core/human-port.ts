@@ -10,6 +10,7 @@ import {
 	LiveDoc,
 	type LiveRun,
 	type LiveState,
+	type Storage,
 	type SubmissionId,
 	type SubmissionRecord,
 } from "@earendil-works/pi-durable";
@@ -31,6 +32,7 @@ import {
 	deliveries,
 	escalates,
 	escalation,
+	holdsAny,
 	type PendingPush,
 	type Policies,
 	type Presence,
@@ -40,6 +42,7 @@ import { turnSignal } from "./domain/signal.ts";
 import { ForeignPrompts } from "./extensions/dispatch/foreign.ts";
 import { answerJob, Dispatches } from "./extensions/dispatch/index.ts";
 import { recordFact } from "./extensions/memory/index.ts";
+import { forgetHolding, Holds, holding, type Push } from "./hold.ts";
 import { isForwarded, NOTICE, noticeEntry } from "./notice.ts";
 
 const textOf = (entry: EntryRecord) =>
@@ -102,11 +105,39 @@ export interface PushOptions {
 	/** How often pending pushes are checked for escalation. */
 	readonly checkMs?: number;
 	readonly now?: () => number;
+	/** The Harness's own storage, read at start for a pushed round a crash left unheld. */
+	readonly storage?: Pick<Storage, "scanSubmissions">;
 }
 
 const FIFTEEN_MINUTES = 15 * 60_000;
 
 type Delivered = { delivery?: Record<string, Delivery> };
+
+type NoticeData = {
+	kind: NoticeKind;
+	content: string;
+	choices?: Choices;
+	foreign?: PendingPush["foreign"];
+	target?: string;
+	delivery?: Record<string, Delivery>;
+};
+
+/** What a notice entry pushes, when the policies decide on it: an escalation and a summary carry their own delivery. */
+function pushOf(entry: EntryRecord): Push | undefined {
+	if (entry.kind !== NOTICE) return undefined;
+	const { kind, content, choices, foreign, target, delivery } = entry.data as NoticeData;
+	if (target !== undefined || delivery !== undefined) return undefined;
+	const messageClass = classOf(entry.data as { class?: unknown });
+	return { kind, class: messageClass, content, ...(choices && { choices }), ...(foreign && { foreign }) };
+}
+
+const failureContent = (requestId: string, reason: string) => `${requestId} 那一輪失敗：${reason}`;
+const pushedFailure = (requestId: string, reason: string): Push => ({
+	kind: "report",
+	class: "outcome",
+	content: failureContent(requestId, reason),
+});
+const pushedAnswer = (content: string): Push => ({ kind: "report", class: "outcome", content });
 
 /**
  * The in-process HumanPort over the root conversation. A new subscriber first gets the current run state and every
@@ -125,13 +156,37 @@ export async function openHumanPort(
 	const escalateMs = push?.escalateMs ?? FIFTEEN_MINUTES;
 	const policies = push?.policies ?? {};
 	const defaultTarget = push?.defaultTarget;
-	const presence: Presence =
-		defaultTarget !== undefined
-			? await root.commit(
-					async (tx) => JSON.parse(JSON.stringify((await tx.doc(Pushes, root.id)).presence)) as Presence,
-					context,
-				)
-			: {};
+	const holds = holdsAny(policies);
+	if (!holds && (await harness.snapshot(Holds, root.id, context))?.entry !== undefined)
+		await forgetHolding(root, context);
+	const hold = holds
+		? holding({
+				root,
+				context,
+				policies,
+				now,
+				...(push?.storage && { storage: push.storage }),
+				ofEntry: pushOf,
+				async ofRound(record, tx) {
+					const { requestId = "" } = record;
+					if (record.status === "unanswered")
+						return PUSHED_FAILURES.some((source) => requestId.startsWith(source))
+							? pushedFailure(requestId, failureReason(record.reason, record.detail))
+							: undefined;
+					if (!PUSHED_ANSWERS.some((source) => requestId.startsWith(source))) return undefined;
+					const range = { conversationId: root.id, minEntryId: record.answer, maxEntryId: record.answer };
+					const [answer] = (await tx.scanEntries(range, 1)).items;
+					return pushedAnswer(answer === undefined ? "" : textOf(answer));
+				},
+			})
+		: undefined;
+	const tracksPresence = defaultTarget !== undefined || holds;
+	const presence: Presence = tracksPresence
+		? await root.commit(
+				async (tx) => JSON.parse(JSON.stringify((await tx.doc(Pushes, root.id)).presence)) as Presence,
+				context,
+			)
+		: {};
 	/**
 	 * What each interface does with a push the core starts. One that may escalate is kept as pending first, under the
 	 * key of what it came from, so a crash before it reaches anyone leaves it pending rather than lost; it may only when
@@ -207,25 +262,22 @@ export async function openHumanPort(
 			);
 			if (forwarded) for (const requestId of placed.values()) emit({ type: "notice", kind: "forwarded", requestId });
 			if (entry.kind !== NOTICE) continue;
-			const { kind, content, choices, foreign, target } = entry.data as {
-				kind: NoticeKind;
-				content: string;
-				choices?: Choices;
-				foreign?: PendingPush["foreign"];
-				target?: string;
-			};
+			const { kind, content, choices, foreign, target, delivery } = entry.data as NoticeData;
 			const messageClass = classOf(entry.data as { class?: unknown });
-			// An escalation names its target; reports never escalate.
+			// An escalation names its target and a summary its delivery; reports never escalate.
 			const pushed =
-				target !== undefined
-					? { delivery: deliveries(policies, messageClass, target) }
-					: await deliveryOf(
-							`notice:${entry.id}`,
-							messageClass,
-							kind === "question"
-								? { kind, content, ...(choices && { choices }), ...(foreign && { foreign }) }
-								: undefined,
-						);
+				delivery !== undefined
+					? { delivery }
+					: target !== undefined
+						? { delivery: deliveries(policies, messageClass, target) }
+						: await deliveryOf(
+								`notice:${entry.id}`,
+								messageClass,
+								kind === "question"
+									? { kind, content, ...(choices && { choices }), ...(foreign && { foreign }) }
+									: undefined,
+							);
+			await hold?.notice(entry.id, pushOf(entry)).catch((error: unknown) => console.error("[soma] held push:", error));
 			emit({ type: "notice", kind, class: messageClass, content, ...(choices && { choices }), ...pushed });
 		}
 		for (const record of submissions) {
@@ -236,7 +288,10 @@ export async function openHumanPort(
 			if (record.status === "unanswered") {
 				const reason = failureReason(record.reason, record.detail);
 				if (requestId !== undefined && PUSHED_FAILURES.some((source) => requestId.startsWith(source))) {
-					const content = `${requestId} 那一輪失敗：${reason}`;
+					const content = failureContent(requestId, reason);
+					await hold
+						?.round(record, pushedFailure(requestId, reason))
+						.catch((error: unknown) => console.error("[soma] held push:", error));
 					emit({
 						type: "failure",
 						requestId,
@@ -251,7 +306,12 @@ export async function openHumanPort(
 					.catch((error: unknown) => console.error("[soma] outcome signal:", error));
 			} else if (record.status === "done" && requestId !== undefined) {
 				const content = answers.get(record.answer) ?? "";
-				const pushed = PUSHED_ANSWERS.some((source) => requestId.startsWith(source))
+				const answered = PUSHED_ANSWERS.some((source) => requestId.startsWith(source));
+				if (answered)
+					await hold
+						?.round(record, pushedAnswer(content))
+						.catch((error: unknown) => console.error("[soma] held push:", error));
+				const pushed = answered
 					? { class: "outcome" as const, ...(await deliveryOf(`answer:${record.id}`, "outcome")) }
 					: {};
 				emit({ type: "answer", requestId, content, ...pushed });
@@ -268,6 +328,9 @@ export async function openHumanPort(
 		},
 		end() {},
 	});
+	// Before any commit is handled, so a push it holds is never held again by the commit's handling.
+	if (hold !== undefined)
+		handled = handled.then(() => hold.catchUp()).catch((error: unknown) => console.error("[soma] held push:", error));
 	run = await root.commit(
 		async (tx) => JSON.parse(JSON.stringify((await tx.doc(LiveDoc, root.id)).run ?? null)) ?? undefined,
 		context,
@@ -330,7 +393,7 @@ export async function openHumanPort(
 		async submit(input) {
 			const { kind, data } = input.entry;
 			const entry = data === undefined ? { kind } : { kind, data: data as JsonValue };
-			if (defaultTarget !== undefined) {
+			if (tracksPresence) {
 				const at = now();
 				presence[kind] = at;
 				await root.commit(async (tx) => {

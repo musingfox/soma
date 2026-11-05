@@ -132,7 +132,7 @@ export function escalation(
 export type HeldPush = Omit<PendingPush, "class"> & {
 	readonly class: MessageClass;
 	/** The entry kinds of the interfaces holding it. */
-	readonly to: readonly string[];
+	readonly to: string[];
 };
 
 /** A summary is due once something is held and the human has typed on no interface for `idleMs`. */

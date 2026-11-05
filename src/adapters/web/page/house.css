@@ -142,7 +142,9 @@ body {
 .md ol {
 	padding-left: 1.4em;
 }
-.md li > p {
+.md li > p,
+.md li > ul,
+.md li > ol {
 	margin: 0.25em 0;
 }
 .md blockquote {

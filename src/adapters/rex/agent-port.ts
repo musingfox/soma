@@ -661,11 +661,16 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		return { done, stop: () => stop() };
 	}
 
+	const refused = (error: unknown) => new PromptRefused(error instanceof Error ? error.message : String(error));
+	// By session and block, the send under way, so that two prompts to one claude at once cannot both find it idle: the
+	// later one reads the state once the earlier one is over.
+	const sending = new Map<string, Promise<void>>();
+
 	/**
 	 * Types `text` into the claude on a block of `session`, found by `find`, once its root record, read again here just
-	 * before the paste, is idle or done: typed into a prompt, the text's `\r` would choose the highlighted option.
-	 * Nothing is typed until the paste, so whatever fails before it, `find` included, is a PromptRefused the caller may
-	 * try again. `what` names the agent in a refusal.
+	 * before the paste and after any send to that block under way, is idle or done: typed into a prompt, the text's `\r`
+	 * would choose the highlighted option. Nothing is typed until the paste, so whatever fails before it, `find`
+	 * included, is a PromptRefused the caller may try again. `what` names the agent in a refusal.
 	 */
 	async function promptOn(
 		what: string,
@@ -675,21 +680,37 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		let where: { readonly session: string; readonly blockId: string };
 		try {
 			where = await find();
-			const { records } = await blockCall(
-				"program_status",
-				where.blockId,
-				ProgramStatusResultSchema,
-				{},
-				where.session,
-			);
+		} catch (error) {
+			throw refused(error);
+		}
+		const key = `${where.session} ${where.blockId}`;
+		const sent = (sending.get(key) ?? Promise.resolve()).then(() => sendOn(what, text, where));
+		const settled = sent.then(
+			() => {},
+			() => {},
+		);
+		sending.set(key, settled);
+		try {
+			await sent;
+		} finally {
+			if (sending.get(key) === settled) sending.delete(key);
+		}
+	}
+
+	async function sendOn(
+		what: string,
+		text: string,
+		{ session, blockId }: { readonly session: string; readonly blockId: string },
+	): Promise<void> {
+		try {
+			const { records } = await blockCall("program_status", blockId, ProgramStatusResultSchema, {}, session);
 			const state = records.find(isRoot)?.state;
 			if (state !== "idle" && state !== "done") {
 				throw new Error(`${what} is ${state ?? "without a status record"}: a prompt goes only to idle or done`);
 			}
 		} catch (error) {
-			throw new PromptRefused(error instanceof Error ? error.message : String(error));
+			throw refused(error);
 		}
-		const { session, blockId } = where;
 		const working = turnsWorking(blockId, confirmMs, session);
 		try {
 			// A paste keeps a multi-line prompt one message; claude takes `\r` as Enter where a typed key may not.

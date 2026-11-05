@@ -429,6 +429,31 @@ test("promptForeign re-reads the state just before sending: one that turned work
 	expect(typed(fake)).toEqual([]);
 });
 
+test("two prompts to one foreign agent at once go one after the other: the second finds it working and is refused", async () => {
+	const fake = blockedForeign({ records: [{ state: "idle", updated_at: AT }] });
+	// claude turns working once a \r reaches it.
+	let entered = false;
+	const write = fake.original("com.superlogical.terminal.write");
+	const status = fake.original("com.superlogical.terminal.program_status");
+	fake.replace("com.superlogical.terminal.write", (payload) => {
+		entered = true;
+		return write(payload);
+	});
+	fake.replace("com.superlogical.terminal.program_status", (payload) =>
+		entered && payload.block_id === "block:w1" ? { records: [{ state: "working", updated_at: AT }] } : status(payload),
+	);
+	const sender = port(fake);
+
+	const [first, second] = await Promise.allSettled([
+		sender.promptForeign("block:w1", "first"),
+		sender.promptForeign("block:w1", "second"),
+	]);
+
+	expect(first.status).toBe("fulfilled");
+	expect(second).toMatchObject({ status: "rejected", reason: expect.any(PromptRefused) });
+	expect(typed(fake)).toEqual(["session:work block:w1 paste:first", 'session:work block:w1 write:"\\r"']);
+});
+
 test("promptForeign refuses an id that names no foreign agent: soma's own agent, or none", async () => {
 	const fake = blockedForeign({ records: [{ state: "idle", updated_at: AT }] });
 

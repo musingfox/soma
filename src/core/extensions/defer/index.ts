@@ -405,6 +405,7 @@ export function deferExtension(
 			(listed) => new Set(listed.map((each) => each.name)),
 			() => new Set<string>(),
 		);
+		let rearmed = false;
 		const { reply, agent } = await conversation.commit(async (tx) => {
 			const doc = await tx.doc(Dispatches, conversation.id);
 			const index = doc.jobs.findIndex((each) => each.card === request.agent);
@@ -422,19 +423,42 @@ export function deferExtension(
 			(await tx.doc(Deferrals, conversation.id)).items[String(id)] = item;
 			// A failed stop is tried once more for a new deferral, and a stopped agent that defers is open again, its window
 			// reopened since, when rex lists it; one rex does not, as a forged SOMA_AGENT or a child that outlived the
-			// window, stays stopped, so no reconcile takes it for a vanished agent. One under way is left as it is.
+			// window, stays stopped, so no reconcile takes it for a vanished agent. One under way is left as it is. A stop
+			// that commits after that listing is caught by the listing after this commit.
 			const current = doc.jobs[index] ?? job;
 			const phase = current.reclaim?.phase;
 			if (phase === undefined || phase === "failed" || (phase === "stopped" && shown.has(job.agent))) {
 				doc.jobs[index] = { ...current, reclaim: { phase: "due" } };
+				rearmed = phase === "stopped";
 			}
 			const reply: DeferReply = { accepted: true, id: String(id), at: new Date(at).toISOString() };
 			return { reply, agent: job.agent };
 		}, context);
+		// A stop may have committed between the first listing and the commit above, and left a stopped job armed with no
+		// window open. Only a listing that answers and lacks the agent says so; a failed one is doubt, not absence.
+		if (agent !== undefined && rearmed) {
+			const gone = await agents.list().then(
+				(listed) => !listed.some((each) => each.name === agent),
+				() => false,
+			);
+			if (gone) await restop(conversation, request.agent, context);
+		}
 		// The defer is committed whatever the reclaim meets: a job left due is stopped at its next idle or done, or by the
 		// next restart's reconcile.
 		if (agent !== undefined) await reclaimer(conversation, agents, context)(agent).catch(() => {});
 		return reply;
+	}
+
+	/** Moves the job of `card` from `due` back to `stopped`; a job in any other phase by now is left to whoever changed it. */
+	async function restop(conversation: Conversation, card: string, context: Context): Promise<void> {
+		await conversation
+			.commit(async (tx) => {
+				const doc = await tx.doc(Dispatches, conversation.id);
+				const index = doc.jobs.findIndex((each) => each.card === card);
+				const job = doc.jobs[index];
+				if (job?.reclaim?.phase === "due") doc.jobs[index] = { ...job, reclaim: { phase: "stopped" } };
+			}, context)
+			.catch(() => {});
 	}
 
 	return { extension: defineExtension({ name: "soma.defer", tasks: [Deferral] }), defer };

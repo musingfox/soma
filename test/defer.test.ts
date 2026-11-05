@@ -15,6 +15,7 @@ import { NOTICE } from "../src/core/notice.ts";
 import { startCore } from "../src/core/startup.ts";
 import { type AgentPort, PromptRefused, type ResumeRequest } from "../src/ports/agent.ts";
 import type { SomaEvent } from "../src/ports/human.ts";
+import * as shared from "./defer-core.ts";
 
 const context = BACKGROUND_CONTEXT;
 const job: Job = { card: "card-a", agent: "card-a", sessionId: "s-1", status: { state: "idle" }, decisions: [] };
@@ -340,4 +341,109 @@ test("a deferral that ends as soma starts reaches the human through the HumanPor
 	} finally {
 		await human.close();
 	}
+});
+
+/** An agent side whose listings, in order, each run the next of `afters` once taken; a throw is a listing that failed. */
+class ListingHook extends FakeAgentPort {
+	readonly afters: (() => Promise<void>)[] = [];
+	override async list() {
+		const listed = await super.list();
+		await this.afters.shift()?.();
+		return listed;
+	}
+}
+
+/** The agent's turn ends and the reclaim's stop commits, as when it lands between a defer's listing and its commit. */
+const stopCommits = (soma: shared.Core, agents: ListingHook) => async () => {
+	agents.finish("card-a", "結果：完成");
+	await soma.settle();
+};
+
+test("a stop that commits between an agent's listing and its defer's commit leaves the job stopped, and a restart tells of no vanished agent", {
+	timeout: 20_000,
+}, async () => {
+	const db = await shared.database();
+	const agents = new ListingHook();
+	agents.emit("card-a", { state: "working" });
+	const first = await shared.core(db, agents);
+	// Deferred mid-turn, the job is due and the agent still open.
+	await shared.accepted(await first.defer("PT1H"));
+	expect(await first.job("card-a")).toMatchObject({ reclaim: { phase: "due" } });
+
+	// The agent defers again and the defer lists it; before the defer commits, its turn ends and the reclaim's stop commits.
+	agents.afters.push(stopCommits(first, agents));
+	await shared.accepted(await first.defer("PT2H"));
+	expect(agents.afters).toEqual([]);
+	expect(agents.stopped).toEqual(["card-a"]);
+	expect(await agents.list()).toEqual([]);
+	expect(await first.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
+	await first.close();
+
+	const soma = await shared.core(db, agents);
+	await soma.settle();
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
+	expect(await soma.notices()).toEqual([]);
+});
+
+/** A stopped job whose agent is open again, as when its window reopened: the next defer lists it and arms the job due. */
+async function stoppedThenReopened(agents: ListingHook) {
+	agents.emit("card-a", { state: "idle" });
+	const soma = await shared.core(await shared.database(), agents);
+	await shared.accepted(await soma.defer("PT1H"));
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "stopped" } });
+	expect(agents.stopped).toEqual(["card-a"]);
+	agents.emit("card-a", { state: "working" });
+	return soma;
+}
+
+test("an agent still listed after the defer's commit leaves the re-armed job due", async () => {
+	const agents = new ListingHook();
+	const soma = await stoppedThenReopened(agents);
+
+	agents.afters.push(
+		async () => {},
+		async () => {},
+	);
+	await shared.accepted(await soma.defer("PT2H"));
+	expect(agents.afters).toEqual([]);
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "due" } });
+	expect(agents.stopped).toEqual(["card-a"]);
+});
+
+test("a listing that fails after the defer's commit leaves the re-armed job as it is", async () => {
+	const agents = new ListingHook();
+	const soma = await stoppedThenReopened(agents);
+
+	agents.afters.push(
+		async () => {},
+		async () => {
+			throw new Error("rex call block.list failed");
+		},
+	);
+	await shared.accepted(await soma.defer("PT2H"));
+	expect(agents.afters).toEqual([]);
+	expect(await soma.job("card-a")).toMatchObject({ reclaim: { phase: "due" } });
+	expect(await soma.notices()).toEqual([]);
+});
+
+test("a job that is no longer due when the agent is found gone is left to whatever changed it", async () => {
+	const agents = new ListingHook();
+	const soma = await stoppedThenReopened(agents);
+
+	agents.afters.push(
+		async () => {},
+		async () => {
+			// The window closes, and a later change to the job lands before the back-move: a stop that failed.
+			agents.close("card-a");
+			await soma.root.commit(async (tx) => {
+				const doc = await tx.doc(Dispatches, soma.root.id);
+				doc.jobs[0] = { ...job, reclaim: { phase: "failed", error: "rex call block.close failed" } };
+			}, context);
+		},
+	);
+	await shared.accepted(await soma.defer("PT2H"));
+	expect(agents.afters).toEqual([]);
+	expect(await soma.job("card-a")).toMatchObject({
+		reclaim: { phase: "failed", error: "rex call block.close failed" },
+	});
 });

@@ -21,6 +21,7 @@ import { clock } from "./core/extensions/clock/index.ts";
 import { deferExtension } from "./core/extensions/defer/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
+import { foreignBridge } from "./core/extensions/dispatch/foreign.ts";
 import { dispatchExtension } from "./core/extensions/dispatch/index.ts";
 import { reclaimer } from "./core/extensions/dispatch/reclaim.ts";
 import { inspectExtension } from "./core/extensions/inspect/index.ts";
@@ -143,6 +144,10 @@ const human = await startCore(
 await reconcileDispatches(root, agents, context);
 reconciled();
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
+// Its first look at the foreign agents is at once, so a prompt that appeared while soma was down is pushed now.
+const unlistenForeign = foreignBridge(root, agents, context).listen((error) =>
+	console.error("[soma] foreign bridge:", error),
+);
 // Served after the reconcile, so a defer is checked against a dispatch list caught up with the hangar. A socket that
 // cannot be served leaves soma running without `soma defer`, as the web page does.
 const deferServer = await serveDefer({
@@ -177,6 +182,7 @@ const webPage =
 	));
 const shutdown = () => {
 	unlisten();
+	unlistenForeign();
 	stopTelegram.abort();
 	void Promise.all([telegramDone, webPage?.close(), deferServer?.close()])
 		.then(() => human.close())

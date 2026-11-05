@@ -15,10 +15,11 @@ export type Choices = { readonly card: string; readonly fingerprint: string; rea
 export type HumanAnswerOutcome = AnswerOutcome | { readonly sent: false; readonly refusal: "no_job" };
 
 /**
- * requestId prefixes of rounds the core starts itself (schedule, event bridge) whose failure no client owns, so every
- * client pushes it. A digest round is not among them: on failure the digest task writes a notice with the reason.
+ * requestId prefixes of rounds the core starts itself (schedule, the event bridge for a job, the foreign bridge for a
+ * foreign agent) whose failure no client owns, so every client pushes it. A digest round is not among them: on failure
+ * the digest task writes a notice with the reason.
  */
-export const PUSHED_FAILURES = ["schedule:", "agent:"] as const;
+export const PUSHED_FAILURES = ["schedule:", "agent:", "foreign:"] as const;
 
 /**
  * On a push the core starts itself, the entry kind of the one client that rings for it; every other client shows it

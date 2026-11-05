@@ -101,7 +101,8 @@ test("the page loads everything from soma itself: no external host, and every im
 	const html = await (await fetch(`${base}/`)).text();
 	const own = [html, await (await fetch(`${base}/house.css`)).text()];
 	for (const name of PAGE_MODULES) own.push(await (await fetch(`${base}/${name}`)).text());
-	for (const text of own) expect(text).not.toMatch(/https?:\/\/|(?:^|["'(\s])\/\/[a-z0-9]/i);
+	// No fixed scheme either: a page served over https (serve mode) may open only a wss socket.
+	for (const text of own) expect(text).not.toMatch(/(?:https?|wss?):\/\/|(?:^|["'(\s])\/\/[a-z0-9]/i);
 
 	const importMap = JSON.parse(html.match(/<script type="importmap">([\s\S]*?)<\/script>/)?.[1] ?? "{}");
 	const urls = [

@@ -222,7 +222,7 @@ function receive(message) {
 }
 
 function connect() {
-	socket = new WebSocket(`ws://${location.host}/socket`);
+	socket = new WebSocket(new URL("/socket", location.href.replace(/^http/, "ws")));
 	socket.onopen = () => {
 		connected = true;
 		retryMs = 500;

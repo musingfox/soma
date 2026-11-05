@@ -1,3 +1,4 @@
+import type { MessageClass, NoticeKind } from "../../ports/human.ts";
 import { type Decision, HUMAN_CHOSEN } from "./dispatch.ts";
 
 // The first line of a worker's final reply: 結果：完成／需要你／失敗.
@@ -76,5 +77,28 @@ export function digestPrompt(report: Report): string {
 	return (
 		`[digest ${report.since} ~ ${report.until}] 這段時間做完的工作：\n${lines.join("\n")}\n\n` +
 		"寫一份給人看的短報告：每件工作一行，寫出卡片、結果和要人注意的事。結果是「未知」的也要列出。"
+	);
+}
+
+const CLASS_LABELS: Record<MessageClass, string> = {
+	action: "等人處理",
+	outcome: "工作結果",
+	ambient: "soma 自己做的事",
+};
+
+/**
+ * The input that wakes the model for a summary of the pushes interfaces held (ARCHITECTURE.md "Whom to push to"),
+ * questions first, each with its class. The model never sees an entry's kind, so the source is stated in the text.
+ */
+export function summaryPrompt(held: readonly { kind: NoticeKind; class: MessageClass; content: string }[]): string {
+	const list = (pushes: typeof held) =>
+		pushes.map((push) => `- （${CLASS_LABELS[push.class]}）${clip(push.content.trim())}`).join("\n");
+	const questions = held.filter((push) => push.kind === "question");
+	const rest = held.filter((push) => push.kind !== "question");
+	return (
+		"[summary] 人沒有在看的這段時間，先收著沒送出的訊息：\n" +
+		(questions.length > 0 ? `等人回答的問題：\n${list(questions)}\n` : "") +
+		(rest.length > 0 ? `其他：\n${list(rest)}\n` : "") +
+		"\n寫一份給人看的摘要：先寫等人回答的問題，再寫其他的事，每件一行。每個問題在摘要之後會帶著它的按鈕再送一次。"
 	);
 }

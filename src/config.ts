@@ -27,15 +27,16 @@ export type AgentAdapter = (typeof AGENT_ADAPTERS)[number];
 export const INTERFACES = ["telegram", "terminal", "web"] as const;
 export type Interface = (typeof INTERFACES)[number];
 
-const PUSH_VALUE = `a preset (${Object.keys(PRESETS)
-	.map((name) => `"${name}"`)
-	.join(", ")}) or a table setting each of ${MESSAGE_CLASSES.join(", ")}`;
-const POLICY_VALUE = POLICIES.map((policy) => `"${policy}"`).join(", ");
+// `hold` and `summary` are refused until the core summarizes what is held.
+const BUILT_PRESETS = Object.keys(PRESETS).filter((name) => name !== "summary");
+const BUILT_POLICIES: readonly string[] = POLICIES.filter((policy) => policy !== "hold");
+const PUSH_VALUE = `a preset (${BUILT_PRESETS.map((name) => `"${name}"`).join(", ")}) or a table setting each of ${MESSAGE_CLASSES.join(", ")}`;
+const POLICY_VALUE = BUILT_POLICIES.map((policy) => `"${policy}"`).join(", ");
 
 const PolicyFile = z
 	.string({ required_error: `Required: a table sets ${MESSAGE_CLASSES.join(", ")}` })
 	.superRefine((value, ctx) => {
-		if ((POLICIES as readonly string[]).includes(value)) return;
+		if (BUILT_POLICIES.includes(value)) return;
 		ctx.addIssue({
 			code: z.ZodIssueCode.custom,
 			message:
@@ -295,7 +296,7 @@ function resolvePush(push: unknown, path: string): Record<Interface, PolicyTable
 		const value = set[name];
 		if (value === undefined) return PRESETS.instant;
 		if (typeof value === "string") {
-			if (value in PRESETS) return PRESETS[value as keyof typeof PRESETS];
+			if (BUILT_PRESETS.includes(value)) return PRESETS[value as keyof typeof PRESETS];
 			throw new ConfigError(
 				value === "summary"
 					? `${path}: push.${name}: "summary" needs hold, which is not built yet (push-levels milestone 2); expected ${PUSH_VALUE}`

@@ -1,5 +1,19 @@
 import { expect, test } from "vitest";
-import { deliveries, escalates, escalation, type PendingPush, PRESETS, pushTarget } from "../src/core/domain/push.ts";
+import {
+	deliveries,
+	escalates,
+	escalation,
+	type HeldPush,
+	holders,
+	holdsAny,
+	type PendingPush,
+	PRESETS,
+	promptGone,
+	pushTarget,
+	summaryDue,
+	summaryRings,
+} from "../src/core/domain/push.ts";
+import { summaryPrompt } from "../src/core/domain/report.ts";
 
 const MIN = 60_000;
 
@@ -67,9 +81,10 @@ const TELEGRAM = "chat.telegram";
 const TERMINAL = "chat.terminal";
 const WEB = "chat.web";
 
-test("instant rings every class, ask rings only an action and logs the rest", () => {
+test("instant rings every class, ask rings only an action and logs the rest, summary holds every class", () => {
 	expect(PRESETS.instant).toEqual({ action: "ring", outcome: "ring", ambient: "ring" });
 	expect(PRESETS.ask).toEqual({ action: "ring", outcome: "log", ambient: "log" });
+	expect(PRESETS.summary).toEqual({ action: "hold", outcome: "hold", ambient: "hold" });
 });
 
 test("instant everywhere is the push rule as before: the target rings, every other interface shows it quietly", () => {
@@ -124,4 +139,67 @@ test("an unheeded push escalates to the default interface only when its policy s
 	expect(escalates({ [TELEGRAM]: quiet }, TELEGRAM, "action")).toBe(true);
 	const muted = { action: "log", outcome: "log", ambient: "log" } as const;
 	expect(escalates({ [TELEGRAM]: muted }, TELEGRAM, "action")).toBe(false);
+});
+
+test("an interface that holds a class does not show it now; the others apply their own policies", () => {
+	const policies = { [TELEGRAM]: PRESETS.summary, [TERMINAL]: PRESETS.instant, [WEB]: PRESETS.ask };
+	// Telegram, the target, holds: nobody rings, and the ring does not fall through.
+	expect(deliveries(policies, "action", TELEGRAM)).toEqual({ [TELEGRAM]: "log", [TERMINAL]: "quiet", [WEB]: "quiet" });
+	expect(deliveries(policies, "outcome", TERMINAL)).toEqual({ [TELEGRAM]: "log", [TERMINAL]: "ring", [WEB]: "log" });
+	expect(deliveries(policies, "ambient", undefined)).toEqual({ [TELEGRAM]: "log", [TERMINAL]: "ring", [WEB]: "log" });
+	expect(holders(policies, "action")).toEqual([TELEGRAM]);
+	const custom = { action: "ring", outcome: "hold", ambient: "log" } as const;
+	expect(holders({ [TELEGRAM]: custom, [WEB]: PRESETS.summary }, "outcome")).toEqual([TELEGRAM, WEB]);
+	expect(holders({ [TELEGRAM]: custom, [WEB]: PRESETS.summary }, "action")).toEqual([WEB]);
+	expect(holdsAny({ [TELEGRAM]: custom })).toBe(true);
+	expect(holdsAny({ [TELEGRAM]: PRESETS.ask, [TERMINAL]: PRESETS.instant })).toBe(false);
+	expect(holdsAny({})).toBe(false);
+});
+
+test("a push Telegram holds never escalates", () => {
+	expect(escalates({ [TELEGRAM]: PRESETS.summary }, TELEGRAM, "action")).toBe(false);
+	const custom = { action: "ring", outcome: "hold", ambient: "log" } as const;
+	expect(escalates({ [TELEGRAM]: custom }, TELEGRAM, "action")).toBe(true);
+	expect(escalates({ [TELEGRAM]: custom }, TELEGRAM, "outcome")).toBe(false);
+});
+
+test("a question's prompt is gone once its job or foreign agent is past it; a report's never is", () => {
+	expect(promptGone(question, blocked, {})).toBe(false);
+	expect(promptGone(question, [{ card: "c", status: { state: "working" } }], {})).toBe(true);
+	const at = { "pane-1": { fingerprint: "fp", msg: "approve Bash" } };
+	expect(promptGone(foreignQuestion, [], at)).toBe(false);
+	expect(promptGone(foreignQuestion, [], {})).toBe(true);
+	expect(promptGone({}, [], {})).toBe(false);
+});
+
+const held: HeldPush = { key: "notice:3", at: 0, kind: "report", class: "outcome", content: "done", to: [TELEGRAM] };
+
+test("a summary is due once something is held and nobody typed anywhere for the idle time", () => {
+	const presence = { [TERMINAL]: 10 * MIN, [TELEGRAM]: 5 * MIN };
+	expect(summaryDue([held], presence, 39 * MIN, 30 * MIN)).toBe(false);
+	expect(summaryDue([held], presence, 40 * MIN, 30 * MIN)).toBe(true);
+	expect(summaryDue([], presence, 90 * MIN, 30 * MIN)).toBe(false);
+	// Input restarts the wait.
+	expect(summaryDue([held], { ...presence, [TELEGRAM]: 35 * MIN }, 40 * MIN, 30 * MIN)).toBe(false);
+	// Nobody ever typed: idle already.
+	expect(summaryDue([held], {}, 0, 30 * MIN)).toBe(true);
+});
+
+test("a summary rings once per idle stretch: again only after the human typed since the last that rang", () => {
+	expect(summaryRings({ [TERMINAL]: 10 * MIN }, undefined)).toBe(true);
+	expect(summaryRings({ [TERMINAL]: 10 * MIN }, 40 * MIN)).toBe(false);
+	expect(summaryRings({ [TERMINAL]: 10 * MIN, [TELEGRAM]: 41 * MIN }, 40 * MIN)).toBe(true);
+});
+
+test("the summary's input lists the questions first, each push with its class", () => {
+	const prompt = summaryPrompt([
+		{ kind: "report", class: "outcome", content: "card a 完成" },
+		{ kind: "question", class: "action", content: "要讓 b 執行嗎？" },
+		{ kind: "report", class: "ambient", content: "記憶改了" },
+	]);
+	expect(prompt.indexOf("要讓 b 執行嗎？")).toBeLessThan(prompt.indexOf("card a 完成"));
+	expect(prompt).toContain("（工作結果）card a 完成");
+	expect(prompt).toContain("（soma 自己做的事）記憶改了");
+	expect(prompt).toMatch(/^\[summary\]/);
+	expect(summaryPrompt([{ kind: "report", class: "outcome", content: "x" }])).not.toContain("等人回答的問題：");
 });

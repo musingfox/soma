@@ -43,7 +43,8 @@ export interface AgentListing {
 
 /**
  * An agent soma did not dispatch: a pane, in any session of the agent side, whose foreground is claude and which is
- * none of the agents `list` names. soma only reads it for now (ARCHITECTURE.md "Foreign agents").
+ * none of the agents `list` names. soma may read it and answer its prompts, but never starts, prompts, stops or
+ * resumes one (ARCHITECTURE.md "Foreign agents").
  */
 export interface ForeignAgent {
 	// Opaque to the core, and the same for the pane as long as it lives, whatever runs in it.
@@ -52,9 +53,19 @@ export interface ForeignAgent {
 	readonly session: string;
 	// What the human sees the pane by: its window's label, or its own.
 	readonly label: string;
-	// Absent when the agent side cannot tell, which is no claim either way.
+	// Absent when the agent side cannot tell, which is no claim either way. A blocked one carries the prompt's
+	// fingerprint and options when its screen could be read, as an agent's status does.
 	readonly status?: AgentState;
 	readonly cwd?: string;
+}
+
+/** A foreign agent as the agent side last saw it, with a status; see `onForeignStatus`. */
+export interface ForeignStatusEvent {
+	readonly agent: ForeignAgent & { readonly status: AgentState };
+	// Names the observation of the status, as on AgentStatusEvent: the same value is the same observation.
+	readonly seq: number;
+	// Whether the human is looking at the agent's pane now, as the agent side can tell; false when it cannot tell.
+	readonly watched: boolean;
 }
 
 export interface AgentStatusEvent {
@@ -114,6 +125,9 @@ export interface AgentPort {
 	stop(agent: string): Promise<void>;
 	// Every foreign agent running now; none where the agent side has no panes but its own.
 	listForeign(): Promise<readonly ForeignAgent[]>;
+	// Each foreign agent's status when it is first seen with one and whenever its seq changes, and a blocked one's again
+	// whenever `watched` changes. Never emits where the agent side has no panes but its own.
+	onForeignStatus(listener: (event: ForeignStatusEvent) => void): () => void;
 	// What the foreign agent's current claude transcript ends on, as readResult reads it, without waiting for a turn to be
 	// written. Undefined when no transcript, or no record in it with an id, can be read; throws for an id that names no
 	// foreign agent now.

@@ -434,5 +434,6 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 		// Every pty soma holds is one of its own agents.
 		listForeign: async () => [],
 		readForeignResult: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: tty runs none`)),
+		onForeignStatus: () => () => {},
 	};
 }

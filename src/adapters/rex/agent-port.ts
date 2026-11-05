@@ -22,6 +22,7 @@ import {
 	type AnswerOutcome,
 	type BlockedKind,
 	type ForeignAgent,
+	type ForeignStatusEvent,
 	PromptRefused,
 	type ResumeRequest,
 	type StartRequest,
@@ -34,6 +35,7 @@ import {
 	BlockClosedResultSchema,
 	BlockEventSchema,
 	BlockListSchema,
+	ClientListSchema,
 	EmptyResultSchema,
 	FormatResultSchema,
 	NewWindowResultSchema,
@@ -42,6 +44,7 @@ import {
 	ProgramStatusResultSchema,
 	type RexWindow,
 	SHELL_FLAVOR,
+	SizeResultSchema,
 	type StatusRecord,
 	TERMINAL,
 	ViewSchema,
@@ -71,6 +74,8 @@ export interface RexAgentPortOptions {
 	readonly recheckMs?: number;
 	/** Pause between reads of a blocked screen that did not parse yet; claude may still be drawing it. */
 	readonly redrawMs?: number;
+	/** How often the foreign agents are looked at, for a status that changed or a pane a rex app began or ceased to show. */
+	readonly foreignMs?: number;
 	readonly now?: () => number;
 	readonly onError?: (error: Error) => void;
 	/** Set in every agent's environment, next to `SOMA_AGENT`, which names the agent's card. */
@@ -84,8 +89,16 @@ type Seen = { readonly status: AgentState; readonly seq: number };
 /** One agent: a window named after it, holding the block its claude runs in. */
 type Pane = { readonly name: string; readonly blockId: string; readonly label?: string };
 
-/** A foreign agent as found, its id the block's, with the session the block is in and its claude's pid. */
-type Foreign = { readonly agent: ForeignAgent; readonly sessionId: string; readonly pid: number };
+/**
+ * A foreign agent as found, its id the block's, with the session the block is in, its claude's pid, and the seq of the
+ * root record its status was read from.
+ */
+type Foreign = {
+	readonly agent: ForeignAgent;
+	readonly sessionId: string;
+	readonly pid: number;
+	readonly seq?: number;
+};
 
 const BLOCKED_KINDS: readonly string[] = ["permission", "question", "auth"] satisfies BlockedKind[];
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -157,17 +170,22 @@ export function stateOf(record: StatusRecord): AgentState {
 // An RFC 3339 time split at its fraction of a second, which rex sends to the microsecond.
 const TIMESTAMP = /^(.+T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/i;
 
+/** An RFC 3339 time rex sent, in microseconds since the epoch; undefined when it does not parse. */
+function microsOf(timestamp: string): number | undefined {
+	const [, whole, fraction = "", zone] = TIMESTAMP.exec(timestamp) ?? [];
+	const seconds = whole === undefined ? Number.NaN : Date.parse(`${whole}${zone}`);
+	if (Number.isNaN(seconds)) return undefined;
+	const micros = seconds * 1000 + Number(fraction.slice(0, 6).padEnd(6, "0"));
+	return Number.isSafeInteger(micros) ? micros : undefined;
+}
+
 /**
  * Names an observation: rex re-sends a record whenever anything in it changed, updated_at included, so one report is
  * one value, and a new value promises no transition (src/ports/agent.ts). It is updated_at in microseconds since the
  * epoch, since Date.parse keeps milliseconds and two reports within one would then read as one observation.
  */
 export function seqOf(record: StatusRecord): number | undefined {
-	const [, whole, fraction = "", zone] = TIMESTAMP.exec(record.updated_at) ?? [];
-	const seconds = whole === undefined ? Number.NaN : Date.parse(`${whole}${zone}`);
-	if (Number.isNaN(seconds)) return undefined;
-	const seq = seconds * 1000 + Number(fraction.slice(0, 6).padEnd(6, "0"));
-	return Number.isSafeInteger(seq) ? seq : undefined;
+	return microsOf(record.updated_at);
 }
 
 /** The block claude runs in: the window's first tiled block, the only one start() makes. */
@@ -193,11 +211,13 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	const replyMs = options.replyMs ?? 2_000;
 	const recheckMs = options.recheckMs ?? 10_000;
 	const redrawMs = options.redrawMs ?? 500;
+	const foreignMs = options.foreignMs ?? 15_000;
 	const onError = options.onError ?? ((error: Error) => console.warn(`[rex] ${error.message}`));
 	const cap = options.cap ?? resolveHangarCapWithSource(undefined, readPerfCoresViaSysctl).cap;
 
-	const blockCall = <T>(method: string, blockId: string, schema: ZodType<T>, args = {}) =>
-		client.call(`${TERMINAL}.${method}`, { session_id: sessionId, block_id: blockId, args }, schema);
+	// A block of the hangar unless `session` names another.
+	const blockCall = <T>(method: string, blockId: string, schema: ZodType<T>, args = {}, session = sessionId) =>
+		client.call(`${TERMINAL}.${method}`, { session_id: session, block_id: blockId, args }, schema);
 
 	// By block, the seq of the done, idle or error the watch last reported, when it saw a working before it: when the
 	// turn readResult waits for ended. Absent when the watch cannot tell that report ended a turn: a re-stamp of an end,
@@ -270,7 +290,8 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	 * hangar's other blocks, as one a human split off, are foreign too. attach_all lets the connection call any session's
 	 * methods without joining it, so no session lists soma among its clients, and with its `session` scope no block
 	 * events of other sessions arrive; it is asked again on every read, since a reconnect drops it. A session or block
-	 * that went away while it was read is left out.
+	 * that went away while it was read is left out. A blocked one's status is read off its screen, as `statusOf` reads
+	 * an agent's, so it carries the prompt's fingerprint and options.
 	 */
 	async function foreign(): Promise<Foreign[]> {
 		const own = new Set([...(await panes()).values()].flat().map((pane) => pane.blockId));
@@ -306,6 +327,8 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 							if (foreground?.argv0 !== "claude") return [];
 							const { records } = await call("program_status", ProgramStatusResultSchema);
 							const root = records.find(isRoot);
+							const status = root && (await statusOf(blockId, root, session.session_id));
+							const seq = root && seqOf(root);
 							const window = block.window_id == null ? undefined : windows.get(block.window_id);
 							const name = block.label ?? blockId;
 							// A window of one block is the block; in a split, the block's own label tells it from the others.
@@ -320,10 +343,12 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 								id: blockId,
 								session: session.label,
 								label,
-								...(root === undefined ? {} : { status: stateOf(root) }),
+								...(status === undefined ? {} : { status }),
 								...(cwd === undefined ? {} : { cwd }),
 							};
-							return [{ agent, sessionId: session.session_id, pid: foreground.pid }];
+							return [
+								{ agent, sessionId: session.session_id, pid: foreground.pid, ...(seq === undefined ? {} : { seq }) },
+							];
 						} catch (error) {
 							onError(error as Error);
 							return [];
@@ -334,6 +359,115 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			}),
 		);
 		return found.flat();
+	}
+
+	/**
+	 * The terminal blocks a rex app shows now, in any session. rex keeps no view per app: a session's active window and
+	 * focused block are the session's, and an app showing another session, or a phone browsing the session's tabs,
+	 * leaves them as they were. But an app asks for a block's size each time it shows the block, and the block keeps
+	 * when each client last asked. So an app connected now shows the window holding the block it last asked a size for:
+	 * every block of that window, or that block alone when it is in no window. ARCHITECTURE.md "Foreign agents" has the
+	 * evidence. A session or block that went away while it was read is left out.
+	 */
+	async function shown(): Promise<Set<string>> {
+		const [{ clients }, { sessions }] = await Promise.all([
+			client.call("client.list", {}, ClientListSchema),
+			client.call("session.attach_all", { event_scope: "session" }, AttachAllResultSchema),
+		]);
+		const apps = new Set(
+			(clients ?? [])
+				.filter((each) => each.info?.kind === "app" && each.connection_state !== "lost")
+				.map((each) => each.client_id),
+		);
+		if (apps.size === 0) return new Set();
+		// By window, its terminal blocks; by app, the block it last asked a size for, when, and the window it is in.
+		const windows = new Map<string, string[]>();
+		const last = new Map<string, { at: number; blockId: string; window?: string }>();
+		await Promise.all(
+			(sessions ?? []).map(async ({ session_id: session }) => {
+				let blocks: z.infer<typeof BlockListSchema>["blocks"];
+				try {
+					({ blocks } = await client.call("session.list_blocks", { session_id: session }, BlockListSchema));
+				} catch (error) {
+					onError(error as Error);
+					return;
+				}
+				await Promise.all(
+					(blocks ?? []).map(async (block) => {
+						const blockId = block.block_id;
+						if (blockId === null) return;
+						if (block.creator_name !== undefined && block.creator_name !== TERMINAL) return;
+						const window = block.window_id == null ? undefined : `${session} ${block.window_id}`;
+						if (window !== undefined) windows.set(window, [...(windows.get(window) ?? []), blockId]);
+						let desired: z.infer<typeof SizeResultSchema>["desired"];
+						try {
+							({ desired } = await blockCall("size", blockId, SizeResultSchema, {}, session));
+						} catch (error) {
+							onError(error as Error);
+							return;
+						}
+						for (const asked of desired ?? []) {
+							const at = microsOf(asked.updated_at);
+							const before = last.get(asked.client_id);
+							if (!apps.has(asked.client_id) || at === undefined || (before !== undefined && before.at >= at)) continue;
+							last.set(asked.client_id, { at, blockId, ...(window === undefined ? {} : { window }) });
+						}
+					}),
+				);
+			}),
+		);
+		return new Set(
+			[...last.values()].flatMap(({ blockId, window }) =>
+				window === undefined ? [blockId] : (windows.get(window) ?? [blockId]),
+			),
+		);
+	}
+
+	const foreignListeners = new Set<(event: ForeignStatusEvent) => void>();
+	let unwatchForeign: (() => void) | undefined;
+
+	/**
+	 * Looks at the foreign agents at once and then every foreignMs, and emits each one's status that is new or whose seq
+	 * changed, and a blocked one's again when a rex app begins or ceases to show its pane (`shown`, read only while one
+	 * is blocked). Polled, not streamed: no event tells that an app shows another block, so presence needs a poll anyway,
+	 * and the block events of other sessions would need the connection's attach_all scope widened to every block event
+	 * of the server, which the hangar watch's listener would then take in too, and which a reconnect drops.
+	 */
+	function watchForeign(): () => void {
+		const emitted = new Map<string, { readonly seq: number; readonly watched: boolean }>();
+		let polling = false;
+		async function poll(): Promise<void> {
+			if (polling) return;
+			polling = true;
+			try {
+				const found = await foreign();
+				const looked = found.some(({ agent }) => agent.status?.state === "blocked")
+					? await shown().catch((error: Error) => {
+							onError(error);
+							return new Set<string>();
+						})
+					: new Set<string>();
+				const ids = new Set(found.map(({ agent }) => agent.id));
+				for (const id of emitted.keys()) if (!ids.has(id)) emitted.delete(id);
+				for (const { agent, seq } of found) {
+					const { status } = agent;
+					if (status === undefined || seq === undefined) continue;
+					const watched = status.state === "blocked" && looked.has(agent.id);
+					const last = emitted.get(agent.id);
+					if (last?.seq === seq && last.watched === watched) continue;
+					emitted.set(agent.id, { seq, watched });
+					for (const listener of foreignListeners) listener({ agent: { ...agent, status }, seq, watched });
+				}
+			} catch (error) {
+				onError(error as Error);
+			} finally {
+				polling = false;
+			}
+		}
+		void poll();
+		const timer = setInterval(() => void poll(), foreignMs);
+		timer.unref();
+		return () => clearInterval(timer);
 	}
 
 	/**
@@ -365,14 +499,14 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	 * before it has drawn the prompt, so a screen that does not parse is read again, as herdr's is; one that still does
 	 * not, or cannot be read, leaves the record's own status, a block nobody can answer.
 	 */
-	async function statusOf(blockId: string, record: StatusRecord): Promise<AgentState> {
+	async function statusOf(blockId: string, record: StatusRecord, session = sessionId): Promise<AgentState> {
 		const status = stateOf(record);
 		if (status.state !== "blocked") return status;
 		try {
-			let screen = await readScreen(blockId);
+			let screen = await readScreen(blockId, session);
 			for (let read = 1; read < BLOCKED_READS && screen.prompt === undefined; read++) {
 				await new Promise((resolve) => setTimeout(resolve, redrawMs));
-				screen = await readScreen(blockId);
+				screen = await readScreen(blockId, session);
 			}
 			return screen.prompt === undefined ? status : blockedOf(screen);
 		} catch (error) {
@@ -427,15 +561,15 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	const write = (blockId: string, data: string) => blockCall("write", blockId, WriteResultSchema, { data });
 
 	/** The block's screen as plain text, cut to its last SCREEN_BYTES: the whole scrollback can outgrow one reply. */
-	async function readScreen(blockId: string): Promise<BlockedScreen> {
+	async function readScreen(blockId: string, session = sessionId): Promise<BlockedScreen> {
 		const args = { format: "text", trim: true, max_bytes: SCREEN_BYTES };
-		const first = await blockCall("format", blockId, FormatResultSchema, args);
+		const first = await blockCall("format", blockId, FormatResultSchema, args, session);
 		if (first.id === undefined || first.total === undefined || first.eof === true) {
 			return readBlockedScreen(first.content);
 		}
 		let text = "";
 		for (let offset = Math.max(0, first.total - SCREEN_BYTES); ; ) {
-			const part = await blockCall("blob_read", blockId, BlobReadResultSchema, { id: first.id, offset });
+			const part = await blockCall("blob_read", blockId, BlobReadResultSchema, { id: first.id, offset }, session);
 			text += part.data;
 			offset += Buffer.byteLength(part.data);
 			if (part.eof || part.data === "") return readBlockedScreen(text);
@@ -854,6 +988,17 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		/** By block id, which rex keeps for the block's life. Read only: no block of another session is written to. */
 		async listForeign(): Promise<readonly ForeignAgent[]> {
 			return (await foreign()).map(({ agent }) => agent);
+		},
+
+		onForeignStatus(listener: (event: ForeignStatusEvent) => void): () => void {
+			foreignListeners.add(listener);
+			unwatchForeign ??= watchForeign();
+			return () => {
+				foreignListeners.delete(listener);
+				if (foreignListeners.size > 0) return;
+				unwatchForeign?.();
+				unwatchForeign = undefined;
+			};
 		},
 
 		/**

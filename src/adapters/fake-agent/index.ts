@@ -7,6 +7,7 @@ import type {
 	Answer,
 	AnswerOutcome,
 	ForeignAgent,
+	ForeignStatusEvent,
 	ResumeRequest,
 	StartRequest,
 } from "../../ports/agent.ts";
@@ -19,6 +20,7 @@ export class FakeAgentPort implements AgentPort {
 	// One entry per call, so a second stop of the same agent shows.
 	readonly stopped: string[] = [];
 	readonly #listeners = new Set<(event: AgentStatusEvent) => void>();
+	readonly #foreignListeners = new Set<(event: ForeignStatusEvent) => void>();
 	readonly #results = new Map<string, AgentResult>();
 	readonly #states = new Map<string, { status: AgentState; seq: number }>();
 	/** Agents running beside the dispatched ones, with what each one's transcript ends on. */
@@ -79,6 +81,21 @@ export class FakeAgentPort implements AgentPort {
 		const found = this.foreign.find(({ agent }) => agent.id === id);
 		if (found === undefined) throw new Error(`no foreign agent ${id}`);
 		return found.result;
+	}
+
+	onForeignStatus(listener: (event: ForeignStatusEvent) => void): () => void {
+		this.#foreignListeners.add(listener);
+		return () => this.#foreignListeners.delete(listener);
+	}
+
+	/** Lists the foreign agent with `status` and reports it, under `seq`, with whether the human is looking at it. */
+	emitForeign(agent: Omit<ForeignAgent, "status">, status: AgentState, seq: number, watched = false): void {
+		const listed = { ...agent, status };
+		const index = this.foreign.findIndex((each) => each.agent.id === agent.id);
+		if (index === -1) this.foreign.push({ agent: listed });
+		else this.foreign[index] = { ...this.foreign[index], agent: listed };
+		const event = { agent: listed, seq, watched };
+		for (const listener of this.#foreignListeners) listener(event);
 	}
 
 	/** The agent's window closed by hand: no longer listed, and no stop recorded. */

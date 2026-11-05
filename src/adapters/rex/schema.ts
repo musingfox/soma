@@ -102,6 +102,31 @@ export const BlockListSchema = z
 	})
 	.passthrough();
 
+// client.list and the terminal's size, checked 2026-11-05 against rex 0.0.1793645657-gd018d2 over revision 7.
+/** `connection_state` is connected or lost; the server says to read one missing or unknown as connected. */
+export const ClientListSchema = z
+	.object({
+		clients: z
+			.array(
+				z
+					.object({
+						client_id: z.string(),
+						info: z.object({ kind: z.string().optional() }).passthrough().optional(),
+						connection_state: z.string().optional(),
+					})
+					.passthrough(),
+			)
+			.nullable(),
+	})
+	.passthrough();
+
+/** `desired` holds the size each client last asked for, and when it asked. */
+export const SizeResultSchema = z
+	.object({
+		desired: z.array(z.object({ client_id: z.string(), updated_at: z.string() }).passthrough()).nullish(),
+	})
+	.passthrough();
+
 export const NewWindowResultSchema = z
 	.object({ window_id: z.string().nullable(), block_ids: z.array(z.string().nullable()).nullable() })
 	.passthrough();

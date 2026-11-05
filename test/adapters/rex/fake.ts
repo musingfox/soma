@@ -27,7 +27,12 @@ export type Block = {
 	detached?: boolean;
 	/** The creator that made the block; rex's terminal by default. */
 	creator?: string;
+	/** When each client last asked for the block's size, by client id. */
+	desired?: Record<string, string>;
 };
+
+/** A client connected to rex, as client.list reports it. */
+export type Client = { id: string; kind?: string; state?: string };
 
 /** A session other than the hangar. */
 export type Session = { id: string; label: string; blocks: Block[] };
@@ -35,8 +40,11 @@ export type Session = { id: string; label: string; blocks: Block[] };
 export const fixture = (name: string) =>
 	readFileSync(join(import.meta.dirname, "../../agent-cli/permission/fixtures", name), "utf8");
 
-/** An in-memory rex: the hangar's windows, each with one block, any other sessions, and every call made on it. */
-export function rex(blocks: Block[], others: Session[] = []) {
+/**
+ * An in-memory rex: the hangar's windows, each with one block, any other sessions, the clients connected, and every
+ * call made on it. Each reply reads the arrays and blocks as they are then, so a test may change them between calls.
+ */
+export function rex(blocks: Block[], others: Session[] = [], clients: Client[] = []) {
 	const calls: { method: string; payload: Record<string, unknown> }[] = [];
 	const events = new Set<(event: SessionEvent) => void>();
 	const connected = new Set<() => void>();
@@ -76,6 +84,23 @@ export function rex(blocks: Block[], others: Session[] = []) {
 				creator_name: block.creator ?? "com.superlogical.terminal",
 				placement: block.detached ? "detached" : "placed",
 				...(block.detached ? {} : { window_id: windowOf(block) }),
+			})),
+		}),
+		"client.list": () => ({
+			clients: clients.map(({ id, kind, state }) => ({
+				client_id: id,
+				...(kind === undefined ? {} : { info: { kind } }),
+				...(state === undefined ? {} : { connection_state: state }),
+			})),
+		}),
+		"com.superlogical.terminal.size": (payload) => ({
+			columns: 80,
+			rows: 24,
+			desired: Object.entries(byId(payload)?.desired ?? {}).map(([client_id, updated_at]) => ({
+				client_id,
+				columns: 80,
+				rows: 24,
+				updated_at,
 			})),
 		}),
 		"session.new_window": () => ({ window_id: "window:new", block_ids: ["block:new"], revision: 2 }),

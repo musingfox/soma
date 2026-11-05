@@ -1,9 +1,11 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, expect, test } from "vitest";
+import { afterAll, expect, test, vi } from "vitest";
 import { createRexAgentPort } from "../../../src/adapters/rex/agent-port.ts";
-import { AT, HANGAR, rex, SESSION, type Session } from "./fake.ts";
+import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
+import type { ForeignStatusEvent } from "../../../src/ports/agent.ts";
+import { AT, AT_US, type Block, type Client, fixture, HANGAR, rex, SESSION, type Session } from "./fake.ts";
 
 const root = mkdtempSync(join(tmpdir(), "soma-rex-foreign-"));
 const projects = join(root, "projects");
@@ -55,13 +57,15 @@ const home: Session = {
 	],
 };
 
-function port(fake: ReturnType<typeof rex>) {
+function port(fake: ReturnType<typeof rex>, foreignMs = 60_000) {
 	return createRexAgentPort({
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
 		projectsDir: projects,
 		sessionsDir,
+		redrawMs: 0,
+		foreignMs,
 	});
 }
 
@@ -112,6 +116,8 @@ test("listForeign names every claude block outside soma's agents, across session
 			"session.list_blocks",
 			"com.superlogical.terminal.process",
 			"com.superlogical.terminal.program_status",
+			// The blocked one's screen, which shows no prompt that parses.
+			"com.superlogical.terminal.format",
 		]),
 	);
 	expect(fake.attached).toEqual([HANGAR]);
@@ -162,4 +168,139 @@ test("readForeignResult refuses a block that is no foreign agent: soma's own, on
 	await expect(reader.readForeignResult("block:a")).rejects.toThrow("no foreign agent block:a");
 	await expect(reader.readForeignResult("block:w2")).rejects.toThrow("no foreign agent block:w2");
 	await expect(reader.readForeignResult("block:gone")).rejects.toThrow("no foreign agent block:gone");
+});
+
+const BASH = fixture("claude-bash-prompt-2.1.302.txt");
+const prompt = readBlockedScreen(BASH).prompt;
+
+test("a blocked foreign agent's status carries the prompt read off its screen, in its own session", async () => {
+	const fake = rex(
+		[],
+		[
+			{
+				id: "session:work",
+				label: "work",
+				blocks: [
+					{
+						name: "w",
+						block: "block:w1",
+						argv0: "claude",
+						records: [{ state: "blocked", kind: "permission", updated_at: AT }],
+						screen: BASH,
+					},
+				],
+			},
+		],
+	);
+
+	const [listed] = await port(fake).listForeign();
+
+	expect(listed?.status).toMatchObject({
+		state: "blocked",
+		kind: "permission",
+		fingerprint: prompt?.fingerprint,
+		options: prompt?.options.map(({ id, label }) => ({ id, label })),
+	});
+	expect(fake.calls.find((call) => call.method.endsWith(".format"))?.payload).toMatchObject({
+		session_id: "session:work",
+		block_id: "block:w1",
+	});
+});
+
+/** A session whose window "Window 1" holds a claude blocked at a Bash prompt and a shell beside it. */
+function blockedWork(): { session: Session; claude: Block; shell: Block; other: Block } {
+	const claude: Block = {
+		name: "Window 1",
+		block: "block:w1",
+		window: "window:1",
+		argv0: "claude",
+		records: [{ state: "blocked", kind: "permission", updated_at: AT }],
+		screen: BASH,
+	};
+	const shell: Block = { name: "Window 1", block: "block:w1b", window: "window:1", argv0: "-fish" };
+	const other: Block = { name: "Window 2", block: "block:w2", argv0: "-fish" };
+	return { session: { id: "session:work", label: "work", blocks: [claude, shell, other] }, claude, shell, other };
+}
+
+async function watching(fake: ReturnType<typeof rex>) {
+	const events: ForeignStatusEvent[] = [];
+	const off = port(fake, 1_000).onForeignStatus((event) => events.push(event));
+	await vi.waitFor(() => expect(events.length).toBeGreaterThan(0));
+	return { events, off };
+}
+
+test("onForeignStatus reports a blocked foreign agent unwatched while no rex app shows its pane", async () => {
+	const { session, other } = blockedWork();
+	// The app last showed another window; the phone is gone; a command line client asked last of all.
+	other.desired = { "client:mac": "2026-10-27T01:05:00.000001+08:00", "client:cli": "2026-10-27T01:09:00+08:00" };
+	session.blocks[0] = { ...session.blocks[0], desired: { "client:phone": "2026-10-27T01:08:00+08:00" } } as Block;
+	const clients: Client[] = [
+		{ id: "client:mac", kind: "app" },
+		{ id: "client:phone", kind: "app", state: "lost" },
+		{ id: "client:cli", kind: "cli" },
+	];
+	const { events, off } = await watching(rex([], [session], clients));
+	off();
+
+	expect(events).toEqual([
+		{
+			agent: expect.objectContaining({
+				id: "block:w1",
+				session: "work",
+				status: expect.objectContaining({ state: "blocked", fingerprint: prompt?.fingerprint }),
+			}),
+			seq: AT_US,
+			watched: false,
+		},
+	]);
+});
+
+test("onForeignStatus reports a blocked foreign agent watched while an app shows its window, and again once not", async () => {
+	vi.useFakeTimers({ shouldAdvanceTime: true });
+	try {
+		const { session, shell, other } = blockedWork();
+		// The app last asked the size of the shell beside claude, so it shows the window both are in.
+		shell.desired = { "client:mac": "2026-10-27T01:05:00.000002+08:00" };
+		other.desired = { "client:mac": "2026-10-27T01:05:00.000001+08:00" };
+		const fake = rex([], [session], [{ id: "client:mac", kind: "app", state: "connected" }]);
+		const { events, off } = await watching(fake);
+		expect(events.map(({ seq, watched }) => ({ seq, watched }))).toEqual([{ seq: AT_US, watched: true }]);
+
+		// Looked at again with nothing changed: nothing new.
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(events).toHaveLength(1);
+
+		// The human went to the other window.
+		other.desired = { "client:mac": "2026-10-27T01:06:00+08:00" };
+		await vi.advanceTimersByTimeAsync(1_000);
+		await vi.waitFor(() => expect(events).toHaveLength(2));
+		expect(events[1]).toMatchObject({ seq: AT_US, watched: false });
+		off();
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("onForeignStatus reports a new seq, and a status that is not blocked without reading who looks", async () => {
+	vi.useFakeTimers({ shouldAdvanceTime: true });
+	try {
+		const { session, claude } = blockedWork();
+		claude.records = [{ state: "working", updated_at: AT }];
+		const fake = rex([], [session], [{ id: "client:mac", kind: "app" }]);
+		const { events, off } = await watching(fake);
+
+		claude.records = [{ state: "idle", updated_at: "2026-10-27T01:02:04+08:00" }];
+		await vi.advanceTimersByTimeAsync(1_000);
+		await vi.waitFor(() => expect(events).toHaveLength(2));
+		off();
+
+		expect(events.map(({ agent, watched }) => [agent.status.state, watched])).toEqual([
+			["working", false],
+			["idle", false],
+		]);
+		expect(fake.methods()).not.toContain("client.list");
+		expect(fake.methods()).not.toContain("com.superlogical.terminal.size");
+	} finally {
+		vi.useRealTimers();
+	}
 });

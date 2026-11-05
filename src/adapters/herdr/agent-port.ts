@@ -192,5 +192,6 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 		// soma's herdr adapter looks only at the hangar's agents.
 		listForeign: async () => [],
 		readForeignResult: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: herdr lists none`)),
+		onForeignStatus: () => () => {},
 	};
 }

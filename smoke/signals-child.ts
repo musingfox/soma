@@ -31,6 +31,7 @@ const agents: AgentPort = {
 	stop: async () => {},
 	listForeign: async () => [],
 	readForeignResult: async () => undefined,
+	onForeignStatus: () => () => {},
 };
 
 const faux = fauxProvider();

@@ -8,6 +8,7 @@ import {
 	type NoticeKind,
 	PUSHED_FAILURES,
 } from "../../ports/human.ts";
+import { escapeHtml, htmlToPlain, markdownToHtml, splitHtml } from "./html.ts";
 
 export interface TelegramConfig {
 	readonly token: string;
@@ -32,6 +33,9 @@ const ENTRY_KIND = "chat.telegram";
 const PUSHED_SOURCES = ["schedule:"];
 // sendMessage takes 1-4096 characters; JavaScript string length counts the same UTF-16 units.
 export const MESSAGE_LIMIT = 4096;
+const EMPTY_ANSWER = "（這一輪沒有文字回答）";
+// What Telegram answers a message whose entities it cannot place: https://core.telegram.org/bots/api#formatting-options
+const ENTITY_REFUSAL = /can't parse entities|can't find end tag|unsupported start tag|entity/i;
 
 // The one reaction a message from the human carries, replaced as the round moves on; a bot without premium gets one.
 // Each is in ReactionTypeEmoji's list: https://core.telegram.org/bots/api#reactiontypeemoji
@@ -80,7 +84,7 @@ const ResponseSchema = z.union([
 /** Cut text into sendMessage-sized parts, at a line break when one is near, never inside a surrogate pair. */
 export function splitMessage(text: string, limit = MESSAGE_LIMIT): string[] {
 	const parts: string[] = [];
-	let rest = text.trim() === "" ? "（這一輪沒有文字回答）" : text;
+	let rest = text.trim() === "" ? EMPTY_ANSWER : text;
 	while (rest.length > limit) {
 		let cut = rest.lastIndexOf("\n", limit);
 		if (cut < limit / 2) cut = limit;
@@ -90,6 +94,22 @@ export function splitMessage(text: string, limit = MESSAGE_LIMIT): string[] {
 	}
 	parts.push(rest);
 	return parts;
+}
+
+/**
+ * What the model wrote as the HTML parts sendMessage takes: converted from markdown and cut so that no part holds an
+ * unclosed tag. Text that cannot be converted goes as plain text, escaped. The limit counts the markup, which is
+ * more than Telegram counts, so a part never passes it.
+ */
+export function messageParts(text: string): string[] {
+	const source = text.trim() === "" ? EMPTY_ANSWER : text;
+	try {
+		const parts = splitHtml(markdownToHtml(source), MESSAGE_LIMIT);
+		if (parts.length > 0) return parts;
+	} catch {
+		// Falls through to plain text.
+	}
+	return splitMessage(source).map(escapeHtml);
 }
 
 const REFUSALS: Record<Extract<HumanAnswerOutcome, { sent: false }>["refusal"], string> = {
@@ -147,6 +167,15 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	const settled = new Set<number>();
 	// By card and fingerprint, the messages here showing that prompt's buttons; lost on a restart.
 	const shown = new Map<string, { card: string; fingerprint: string; messageIds: number[] }>();
+	// A part Telegram refuses for its entities goes again as the text it shows, so formatting never loses a message.
+	const sendPart = async (html: string, extra: object): Promise<unknown> => {
+		try {
+			return await call("sendMessage", { chat_id: chatId, text: html, parse_mode: "HTML", ...extra });
+		} catch (error) {
+			if (!(error instanceof Error) || !ENTITY_REFUSAL.test(error.message)) throw error;
+			return call("sendMessage", { chat_id: chatId, text: htmlToPlain(html), ...extra });
+		}
+	};
 	// One at a time, so a long answer's parts and the messages after it arrive in order.
 	let sending = Promise.resolve();
 	const send = (
@@ -155,13 +184,11 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		{ silent = false, prompt }: { silent?: boolean; prompt?: Choices } = {},
 	) => {
 		sending = sending.then(async () => {
-			const parts = splitMessage(text);
+			const parts = messageParts(text);
 			for (const [index, part] of parts.entries()) {
 				const last = index === parts.length - 1 && markup !== undefined;
 				try {
-					const sent = await call("sendMessage", {
-						chat_id: chatId,
-						text: part,
+					const sent = await sendPart(part, {
 						...(last ? { reply_markup: markup } : {}),
 						...(silent ? { disable_notification: true } : {}),
 					});

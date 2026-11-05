@@ -29,8 +29,63 @@ export interface SentMessage {
 	readonly chat_id: number;
 	readonly text: string;
 	readonly reply_markup?: InlineKeyboard;
+	/** Present only when the message was sent with a parse mode. */
+	readonly parse_mode?: string;
 	/** Present only when the message was sent without a sound. */
 	readonly disable_notification?: true;
+}
+
+// The tags parse_mode HTML takes: https://core.telegram.org/bots/api#html-style
+const HTML_TAGS = new Set([
+	"b",
+	"strong",
+	"i",
+	"em",
+	"u",
+	"ins",
+	"s",
+	"strike",
+	"del",
+	"a",
+	"code",
+	"pre",
+	"blockquote",
+	"tg-spoiler",
+	"span",
+	"tg-emoji",
+]);
+const HTML_ENTITIES = /^&(?:lt|gt|amp|quot|#\d+|#x[\da-f]+);/i;
+
+/** What Telegram would refuse in HTML text: a stray `<` or `&`, an unknown tag, or tags that do not nest. */
+function htmlProblem(html: string): string | undefined {
+	const open: string[] = [];
+	for (let at = 0; at < html.length; ) {
+		const char = html[at];
+		if (char === "&") {
+			const entity = HTML_ENTITIES.exec(html.slice(at, at + 12));
+			if (entity === null) return `unescaped & at byte offset ${at}`;
+			at += entity[0].length;
+		} else if (char === "<") {
+			const tag = /^<(\/?)([a-z-]+)(?:\s+[a-z-]+="[^"<>]*")*>/.exec(html.slice(at));
+			if (tag === null) return `unsupported start tag at byte offset ${at}`;
+			const [whole, closing, name = ""] = tag;
+			if (!HTML_TAGS.has(name)) return `unsupported start tag "${name}" at byte offset ${at}`;
+			if (closing === "") open.push(name);
+			else if (open.pop() !== name) return `unmatched end tag at byte offset ${at}`;
+			at += whole.length;
+		} else at += 1;
+	}
+	return open.length > 0 ? `can't find end tag corresponding to start tag "${open.at(-1)}"` : undefined;
+}
+
+/** The text Telegram shows for valid HTML: tags dropped, entities decoded. */
+function htmlToText(html: string): string {
+	return html
+		.replace(/<[^>]*>/g, "")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&quot;/g, '"')
+		.replace(/&amp;/g, "&");
 }
 
 /**
@@ -45,6 +100,8 @@ export class FakeBotApi {
 	readonly calls: { readonly method: string; readonly params: Record<string, unknown> }[] = [];
 	/** Each setMessageReaction as the message and its one emoji, in the order they came. */
 	readonly reactions: { readonly message_id: number; readonly emoji: string }[] = [];
+	/** Refuse every message that asks for a parse mode, as Telegram does for entities it cannot place. */
+	refuseEntities = false;
 	/** Methods answered with a 400, as Telegram answers a callback query that is too old. */
 	readonly failing = new Set<string>();
 	readonly #markups = new Map<number, InlineKeyboard>();
@@ -76,7 +133,21 @@ export class FakeBotApi {
 			if (method === "sendMessage") {
 				const markup = params.reply_markup as InlineKeyboard | undefined;
 				const message = { chat_id: params.chat_id as number, text: params.text as string };
-				if (typeof message.text !== "string" || message.text.length < 1 || message.text.length > 4096)
+				const parseMode = params.parse_mode as string | undefined;
+				if (typeof message.text !== "string")
+					return reply(400, { ok: false, error_code: 400, description: "Bad Request: message text is invalid" });
+				if (parseMode !== undefined) {
+					const problem = this.refuseEntities ? "refused by the fake" : htmlProblem(message.text);
+					if (problem !== undefined)
+						return reply(400, {
+							ok: false,
+							error_code: 400,
+							description: `Bad Request: can't parse entities: ${problem}`,
+						});
+				}
+				// The limit counts the text after its entities are parsed.
+				const shown = parseMode === undefined ? message.text : htmlToText(message.text);
+				if (shown.length < 1 || shown.length > 4096)
 					return reply(400, { ok: false, error_code: 400, description: "Bad Request: message text is invalid" });
 				const tooLong = markup?.inline_keyboard.flat().some((button) => {
 					const bytes = Buffer.byteLength(button.callback_data ?? "");
@@ -84,8 +155,11 @@ export class FakeBotApi {
 				});
 				if (tooLong) return reply(400, { ok: false, error_code: 400, description: "Bad Request: BUTTON_DATA_INVALID" });
 				const silent = params.disable_notification === true ? { disable_notification: true as const } : {};
+				const mode = parseMode === undefined ? {} : { parse_mode: parseMode };
 				this.sent.push(
-					markup === undefined ? { ...message, ...silent } : { ...message, reply_markup: markup, ...silent },
+					markup === undefined
+						? { ...message, ...mode, ...silent }
+						: { ...message, reply_markup: markup, ...mode, ...silent },
 				);
 				const messageId = this.#nextMessage++;
 				if (markup !== undefined) this.#markups.set(messageId, markup);

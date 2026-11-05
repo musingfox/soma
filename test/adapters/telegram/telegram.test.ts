@@ -65,7 +65,7 @@ test("a message is answered in its chat, and Telegram delivering it again after 
 	const first = start(human, apiBase);
 
 	const update = api.deliver("派 a", CHAT);
-	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "已派工 a。" }]));
+	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "已派工 a。", parse_mode: "HTML" }]));
 	await first.stop();
 
 	api.redeliver(update);
@@ -101,7 +101,7 @@ test("this client's failed round goes back to its chat; another client's failure
 
 	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
 	await new Promise((resolve) => setTimeout(resolve, 100));
-	expect(api.sent).toEqual([{ chat_id: CHAT, text: "[失敗] 模型出錯：401 invalid x-api-key" }]);
+	expect(api.sent).toEqual([{ chat_id: CHAT, text: "[失敗] 模型出錯：401 invalid x-api-key", parse_mode: "HTML" }]);
 	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👎"]));
 });
 
@@ -287,6 +287,7 @@ test("a question with choices arrives with a button per option; a press answers 
 	expect(api.sent[0]).toEqual({
 		chat_id: CHAT,
 		text: "[問題] 要讓它執行嗎？",
+		parse_mode: "HTML",
 		reply_markup: {
 			inline_keyboard: [
 				[{ text: "Yes", callback_data: "1:f00d:card-a" }],
@@ -345,7 +346,7 @@ test("choices whose button data would pass 64 bytes arrive as plain text", async
 	start(human, apiBase);
 
 	human.emit({ type: "notice", kind: "question", content: "q", choices: { ...choices, card: "c".repeat(60) } });
-	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "[問題] q" }]));
+	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "[問題] q", parse_mode: "HTML" }]));
 });
 
 test("a callback Telegram no longer accepts an answer for does not hold the polling back", async () => {
@@ -427,4 +428,102 @@ test("a prompt's buttons go once its job leaves that prompt, unless a press here
 	human.emit({ type: "job", card: "card-a", agent: "card-a", status: { state: "idle" } });
 	await new Promise((resolve) => setTimeout(resolve, 100));
 	expect(api.calls).toHaveLength(4);
+});
+
+test("a markdown answer arrives as Telegram HTML: formatting converted, markup characters escaped", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const { onError } = start(human, apiBase);
+	const answer =
+		"# Plan\n\n- **one** & `a<b`\n- two\n\n| k | v |\n|---|--:|\n| x | 1 |\n\n```ts\nconst a = 1 < 2;\n```";
+
+	human.emit({ type: "answer", requestId: "telegram:1", content: answer });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	expect(api.sent[0]).toEqual({
+		chat_id: CHAT,
+		parse_mode: "HTML",
+		text: [
+			"<b>Plan</b>",
+			"",
+			"• <b>one</b> &amp; <code>a&lt;b</code>",
+			"• two",
+			"",
+			"<pre>k | v",
+			"--+--",
+			"x | 1</pre>",
+			"",
+			'<pre><code class="language-ts">const a = 1 &lt; 2;</code></pre>',
+		].join("\n"),
+	});
+	expect(onError).not.toHaveBeenCalled();
+});
+
+test("notices, prompts with buttons and pushed failures are converted too, and the buttons still go once answered", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	human.emit({ type: "notice", kind: "report", content: "**done** <3" });
+	human.emit({ type: "notice", kind: "question", content: "run `rm x`?", choices });
+	human.emit({ type: "failure", requestId: "schedule:1", reason: "bad *thing* & <more>" });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(3));
+	expect(api.sent.map((message) => [message.parse_mode, message.text])).toEqual([
+		["HTML", "[通知] <b>done</b> &lt;3"],
+		["HTML", "[問題] run <code>rm x</code>?"],
+		["HTML", "[失敗] schedule:1 那一輪：bad <i>thing</i> &amp; &lt;more&gt;"],
+	]);
+	expect(api.sent[1]?.reply_markup).toBeDefined();
+
+	api.press("1:f00d:card-a", CHAT);
+	await vi.waitFor(() =>
+		expect(api.calls.map(({ method }) => method)).toEqual(["answerCallbackQuery", "editMessageReplyMarkup"]),
+	);
+	expect(human.answers).toEqual([{ card: "card-a", answer: { option: "1", fingerprint: "f00d" } }]);
+});
+
+test("a long markdown answer is split into parts that each parse, with the buttons on the last", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const { onError } = start(human, apiBase);
+	const answer = `**${"bold words here ".repeat(600)}**\n\n\`\`\`py\n${"print('a < b')\n".repeat(300)}\`\`\``;
+
+	human.emit({ type: "notice", kind: "question", content: answer, choices });
+	await vi.waitFor(() => expect(api.sent.length).toBeGreaterThan(3));
+	expect(onError).not.toHaveBeenCalled();
+	for (const message of api.sent) {
+		expect(message.text.length).toBeLessThanOrEqual(4096);
+		expect(message.parse_mode).toBe("HTML");
+	}
+	expect(api.sent.slice(0, -1).every((message) => message.reply_markup === undefined)).toBe(true);
+	expect(api.sent.at(-1)?.reply_markup).toBeDefined();
+	expect(api.sent.at(-1)?.text).toContain('<pre><code class="language-py">');
+});
+
+test("a part Telegram refuses for its entities is resent as plain text, and nothing after it is lost", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const { onError } = start(human, apiBase);
+	api.refuseEntities = true;
+
+	human.emit({ type: "notice", kind: "question", content: "**sure** about `a<b`?", choices });
+	human.emit({ type: "answer", requestId: "telegram:1", content: "*next*" });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	expect(api.sent[0]).toEqual({
+		chat_id: CHAT,
+		text: "[問題] sure about a<b?",
+		reply_markup: expect.objectContaining({ inline_keyboard: expect.any(Array) }),
+	});
+	expect(api.sent[1]).toEqual({ chat_id: CHAT, text: "next" });
+	expect(onError).not.toHaveBeenCalled();
+});
+
+test("a refusal that is not about entities is reported and not resent", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const { onError } = start(human, apiBase);
+	api.failing.add("sendMessage");
+
+	human.emit({ type: "answer", requestId: "telegram:1", content: "**x**" });
+	await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+	expect(api.sent).toEqual([]);
 });

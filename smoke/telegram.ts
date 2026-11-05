@@ -85,7 +85,10 @@ try {
 	await until("the confirmation", () => (api.sent.length > 0 ? true : undefined), 30_000);
 	await delay(3_000);
 	const confirmed = lastReport(second) as Report;
-	check(JSON.stringify(api.sent) === JSON.stringify([{ chat_id: CHAT, text: "已派工。" }]), "wrong confirmation");
+	check(
+		JSON.stringify(api.sent) === JSON.stringify([{ chat_id: CHAT, text: "已派工。", parse_mode: "HTML" }]),
+		"wrong confirmation",
+	);
 	check(confirmed.telegramInputs === 1, `${confirmed.telegramInputs} Telegram inputs after the redelivery`);
 	check(JSON.stringify(confirmed.jobs) === JSON.stringify([card]), `jobs ${JSON.stringify(confirmed.jobs)}`);
 	check((await named()).length === 1, `herdr holds ${(await named()).length} agents named ${card}`);

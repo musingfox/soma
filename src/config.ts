@@ -6,7 +6,7 @@ import { type AuthContext, defaultProviderAuthContext } from "@earendil-works/pi
 import { z } from "zod";
 import { defaultRexSocket } from "./adapters/rex/client.ts";
 import type { TelegramConfig } from "./adapters/telegram/index.ts";
-import type { WebConfig } from "./adapters/web/index.ts";
+import { SERVE_HOST, type WebConfig } from "./adapters/web/index.ts";
 
 /** The canonical form of a BCP 47 language tag, or undefined when it is not one. */
 function canonicalLanguage(tag: string): string | undefined {
@@ -60,7 +60,12 @@ const FileConfig = z
 			.partial()
 			.strict(),
 		web: z
-			.object({ host: z.string().min(1), port: z.number().int().min(1).max(65535) })
+			.object({
+				host: z.string().min(1),
+				port: z.number().int().min(1).max(65535),
+				origin: z.string().min(1),
+				login: z.string().min(1),
+			})
 			.partial()
 			.strict(),
 		vault: z
@@ -95,7 +100,7 @@ export interface Config {
 	readonly exaApiKey?: string;
 	/** Set only when both a bot token and a chat id are. */
 	readonly telegram?: TelegramConfig;
-	/** Set only when both a host and a port are; the host is a tailnet address. */
+	/** Set only when a port is and either a tailnet host or, in serve mode, an origin and a login are. */
 	readonly web?: WebConfig;
 	/** The Obsidian vault soma may read, by the name the obsidian CLI knows; set only when a name is. */
 	readonly vault?: VaultConfig;
@@ -126,6 +131,18 @@ tailnet.addSubnet("fd7a:115c:a1e0::", 48, "ipv6");
 export function isTailnetAddress(host: string): boolean {
 	const family = isIP(host);
 	return family !== 0 && tailnet.check(host, family === 4 ? "ipv4" : "ipv6");
+}
+
+/**
+ * The canonical origin of `value` when it is `https://` with a host and no path, else undefined. The port is the
+ * default or explicit; the canonical form drops a default one, as a browser's Origin and Host do.
+ */
+export function serveOrigin(value: string): string | undefined {
+	const url = URL.canParse(value) ? new URL(value) : undefined;
+	if (url === undefined || url.protocol !== "https:" || url.hostname === "") return undefined;
+	if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") return undefined;
+	// `new URL` adds the slash of an empty path, so only the origin itself, with or without the default port, is no path.
+	return value.toLowerCase().replace(/:443$/, "") === url.origin ? url.origin : undefined;
 }
 
 /** `value` parsed, else a ConfigError naming the config path and each field at fault, under `prefix`. */
@@ -198,6 +215,9 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 			`${path}: web.host: Expected one tailnet IP address (100.64.0.0/10 or fd7a:115c:a1e0::/48, see tailscale ip), got "${webHost}"`,
 		);
 	}
+	const webOrigin = fromEnv("SOMA_WEB_ORIGIN") ?? file?.web?.origin;
+	const webLogin = fromEnv("SOMA_WEB_LOGIN") ?? file?.web?.login;
+	const web = resolveWeb(webHost, webPort, webOrigin, webLogin, path);
 	const agentAdapter =
 		parseEnv(
 			"SOMA_AGENT_ADAPTER",
@@ -231,9 +251,39 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		...(anthropicApiKey !== undefined && { anthropicApiKey }),
 		...(exaApiKey !== undefined && { exaApiKey }),
 		...(token !== undefined && chatId !== undefined && { telegram: { token, chatId, apiBase } }),
-		...(webHost !== undefined && webPort !== undefined && { web: { host: webHost, port: webPort } }),
+		...(web !== undefined && { web }),
 		...(file?.vault?.name !== undefined && { vault: { name: file.vault.name, deny: file.vault.deny ?? [] } }),
 	};
+}
+
+/**
+ * The web page's settings: the tailnet-IP mode (`host`) or serve mode (`origin` and `login`, listening on loopback),
+ * never both and never half of serve mode. Off, as before, without a port.
+ */
+function resolveWeb(
+	host: string | undefined,
+	port: number | undefined,
+	origin: string | undefined,
+	login: string | undefined,
+	path: string,
+): WebConfig | undefined {
+	if (origin === undefined && login === undefined) {
+		return host !== undefined && port !== undefined ? { host, port } : undefined;
+	}
+	if (host !== undefined) {
+		throw new ConfigError(
+			`${path}: web.host: Not allowed with ${origin === undefined ? "web.login" : "web.origin"}: serve mode listens on 127.0.0.1, the tailnet-IP mode on its own address`,
+		);
+	}
+	if (origin === undefined) throw new ConfigError(`${path}: web.origin: Required with web.login`);
+	if (login === undefined) throw new ConfigError(`${path}: web.login: Required with web.origin`);
+	const canonical = serveOrigin(origin);
+	if (canonical === undefined) {
+		throw new ConfigError(
+			`${path}: web.origin: Expected an https:// origin with a host and no path, such as https://my-mac.tail1234.ts.net:8445, got "${origin}"`,
+		);
+	}
+	return port === undefined ? undefined : { host: SERVE_HOST, port, serve: { origin: canonical, login } };
 }
 
 /** Read only when rex is selected, so a herdr setup never trips over them. */

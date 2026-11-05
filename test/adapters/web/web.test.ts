@@ -402,3 +402,138 @@ test("listens on the configured address only", async () => {
 	});
 	expect(refused).toBe("ECONNREFUSED");
 });
+
+// Serve mode: loopback behind `tailscale serve`, which sets the login header and keeps the public Host.
+const ORIGIN = "https://nick-mac-mini.tail361ef.ts.net:8445";
+const AUTHORITY = "nick-mac-mini.tail361ef.ts.net:8445";
+const LOGIN = "musingfox@github";
+const SERVED = { Host: AUTHORITY, "Tailscale-User-Login": LOGIN };
+
+async function serveBehind(human = new FakeHumanPort(), heartbeatMs?: number) {
+	const server = await startWeb({ host: HOST, port: 0, human, heartbeatMs, serve: { origin: ORIGIN, login: LOGIN } });
+	servers.push(server);
+	return { human, server };
+}
+
+/** The status of a GET for `path` with exactly the given headers, Host included, which fetch would not let us set. */
+function getStatus(port: number, path: string, headers: Record<string, string>): Promise<number | undefined> {
+	return new Promise((resolve, reject) => {
+		const req = request({ host: HOST, port, path, headers }, (response) => {
+			response.resume();
+			resolve(response.statusCode);
+		});
+		req.once("error", reject);
+		req.end();
+	});
+}
+
+test("serve mode: a request needs the configured login, else 403, whatever the path or method", async () => {
+	const { server } = await serveBehind();
+	const { port } = server;
+	expect(await getStatus(port, "/", SERVED)).toBe(200);
+	expect(await getStatus(port, "/house.css", SERVED)).toBe(200);
+	expect(await getStatus(port, "/", { Host: AUTHORITY })).toBe(403);
+	expect(await getStatus(port, "/", { Host: AUTHORITY, "Tailscale-User-Login": "someone@github" })).toBe(403);
+	expect(await getStatus(port, "/", { Host: AUTHORITY, "Tailscale-User-Login": "" })).toBe(403);
+	expect(await getStatus(port, "/", { Host: AUTHORITY, "Tailscale-User-Login": `${LOGIN}, ${LOGIN}` })).toBe(403);
+	// The 403 comes before the allowlist's 404.
+	expect(await getStatus(port, "/secret", { Host: AUTHORITY })).toBe(403);
+	expect(await getStatus(port, "/secret", SERVED)).toBe(404);
+	const post = await new Promise<number | undefined>((resolve, reject) => {
+		const req = request({ host: HOST, port, path: "/", method: "POST", headers: { Host: AUTHORITY } }, (response) => {
+			response.resume();
+			resolve(response.statusCode);
+		});
+		req.once("error", reject);
+		req.end("x");
+	});
+	expect(post).toBe(403);
+});
+
+test("serve mode: the Host must be the origin's, whatever the login", async () => {
+	const { server } = await serveBehind();
+	const login = { "Tailscale-User-Login": LOGIN };
+	expect(await getStatus(server.port, "/", { ...login, Host: `${HOST}:${server.port}` })).toBe(403);
+	expect(await getStatus(server.port, "/", { ...login, Host: "nick-mac-mini.tail361ef.ts.net" })).toBe(403);
+	expect(await getStatus(server.port, "/", { ...login, Host: `evil.example:8445` })).toBe(403);
+});
+
+test("serve mode: the upgrade needs the login, the origin's Host and, when sent, the origin, before any handshake", async () => {
+	const { server } = await serveBehind();
+	const { port } = server;
+	expect(await upgradeStatus(port, SERVED)).toBe(101);
+	expect(await upgradeStatus(port, { ...SERVED, Origin: ORIGIN })).toBe(101);
+	expect(await upgradeStatus(port, { Host: AUTHORITY })).toBe(403);
+	expect(await upgradeStatus(port, { Host: AUTHORITY, Origin: ORIGIN })).toBe(403);
+	expect(await upgradeStatus(port, { Host: AUTHORITY, "Tailscale-User-Login": "someone@github" })).toBe(403);
+	expect(await upgradeStatus(port, { ...SERVED, Origin: "http://evil.example" })).toBe(403);
+	// Neither the plain-http form of the origin nor the loopback page's own origin is the page serve publishes.
+	expect(await upgradeStatus(port, { ...SERVED, Origin: `http://${AUTHORITY}` })).toBe(403);
+	expect(await upgradeStatus(port, { ...SERVED, Origin: `http://${HOST}:${port}` })).toBe(403);
+	expect(await upgradeStatus(port, { ...SERVED, Origin: "https://nick-mac-mini.tail361ef.ts.net" })).toBe(403);
+	expect(await upgradeStatus(port, { ...SERVED, Host: `${HOST}:${port}` })).toBe(403);
+});
+
+test("serve mode: a refused upgrade never reaches the WebSocket server", async () => {
+	const human = new FakeHumanPort();
+	const { server } = await serveBehind(human);
+	const refused = new WsClient(`ws://${HOST}:${server.port}/socket`, { headers: { Host: AUTHORITY } });
+	const status = await new Promise<number | undefined>((resolve) => {
+		refused.once("unexpected-response", (_request, response) => resolve(response.statusCode));
+		refused.once("error", () => {});
+	});
+	expect(status).toBe(403);
+	expect(human.inputs).toEqual([]);
+});
+
+test("serve mode: a page with the login and the origin talks over the socket, and the limits hold", async () => {
+	const human = new FakeHumanPort();
+	const { server } = await serveBehind(human);
+	const headers = { ...SERVED, Origin: ORIGIN };
+	const open = new WsClient(`ws://${HOST}:${server.port}/socket`, { headers });
+	const received: WebMessage[] = [];
+	open.on("message", (data) => received.push(JSON.parse(String(data)) as WebMessage));
+	await new Promise((resolve, reject) => {
+		open.once("open", resolve);
+		open.once("error", reject);
+	});
+	open.send(JSON.stringify({ type: "input", id: ID, text: "hello" }));
+	await vi.waitFor(() => expect(received).toContainEqual({ type: "accepted", id: ID }));
+	expect(human.inputs).toHaveLength(1);
+
+	const closed = new Promise<number>((resolve) => open.once("close", resolve));
+	open.send("x".repeat(MAX_MESSAGE_BYTES + 1));
+	expect(await closed).toBe(1009);
+	expect(human.inputs).toHaveLength(1);
+});
+
+test("serve mode: closing completes while a page is open, and pings drop a page that does not answer", async () => {
+	const { server } = await serveBehind(new FakeHumanPort(), 20);
+	const page = new WsClient(`ws://${HOST}:${server.port}/socket`, { headers: SERVED });
+	await new Promise((resolve, reject) => {
+		page.once("open", resolve);
+		page.once("error", reject);
+	});
+	const pings: number[] = [];
+	page.on("ping", () => pings.push(Date.now()));
+	await vi.waitFor(() => expect(pings.length).toBeGreaterThan(0));
+	const left = new Promise((resolve) => page.once("close", resolve));
+	await server.close();
+	await left;
+});
+
+test("serve mode listens on 127.0.0.1 only", async () => {
+	for (const host of ["100.101.102.103", "::1", "192.168.1.10"]) {
+		await expect(
+			startWeb({ host, port: 0, human: new FakeHumanPort(), serve: { origin: ORIGIN, login: LOGIN } }),
+		).rejects.toThrow(/web serve mode must listen on 127\.0\.0\.1/);
+	}
+});
+
+test("without serve, a login header is neither required nor consulted", async () => {
+	const { server, base } = await serve();
+	expect((await fetch(`${base}/`)).status).toBe(200);
+	expect((await fetch(`${base}/`, { headers: { "Tailscale-User-Login": "anyone@github" } })).status).toBe(200);
+	const authority = `${HOST}:${server.port}`;
+	expect(await upgradeStatus(server.port, { Host: authority, "Tailscale-User-Login": "anyone@github" })).toBe(101);
+});

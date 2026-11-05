@@ -15,7 +15,7 @@ import { runTelegram } from "./adapters/telegram/index.ts";
 import { runTerminal } from "./adapters/terminal/index.ts";
 import { createTtyAgentPort } from "./adapters/tty/agent-port.ts";
 import { spawnPty } from "./adapters/tty/pty.ts";
-import { startWeb } from "./adapters/web/index.ts";
+import { SERVE_HOST, startWeb } from "./adapters/web/index.ts";
 import { anthropicAuthContext, type Config, ConfigError, configPath, loadConfig } from "./config.ts";
 import { clock } from "./core/extensions/clock/index.ts";
 import { deferExtension } from "./core/extensions/defer/index.ts";
@@ -162,7 +162,12 @@ const webPage =
 	config.web &&
 	(await startWeb({ ...config.web, human }).then(
 		(server) => {
-			console.error(`[soma] web page on http://${config.web?.host}:${server.port}/`);
+			const { serve, host } = config.web ?? {};
+			console.error(
+				serve
+					? `[soma] web page on ${SERVE_HOST}:${server.port}, for ${serve.origin} (tailscale serve is not managed by soma)`
+					: `[soma] web page on http://${host}:${server.port}/`,
+			);
 			return server;
 		},
 		(error: unknown) => {

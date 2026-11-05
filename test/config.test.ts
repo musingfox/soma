@@ -264,6 +264,88 @@ describe("the web page", () => {
 	});
 });
 
+describe("the web page in serve mode", () => {
+	const SERVE = { origin: "https://nick-mac-mini.tail361ef.ts.net:8445", login: "musingfox@github" };
+	test("listens on loopback with the origin and the login, from either source", () => {
+		const expected = { host: "127.0.0.1", port: 8790, serve: SERVE };
+		expect(resolveConfig({ web: { port: 8790, ...SERVE } }, {}, HOME).web).toEqual(expected);
+		expect(
+			resolveConfig(
+				undefined,
+				{ SOMA_WEB_PORT: "8790", SOMA_WEB_ORIGIN: SERVE.origin, SOMA_WEB_LOGIN: SERVE.login },
+				HOME,
+			).web,
+		).toEqual(expected);
+	});
+	test("the environment beats the file for the origin and the login", () => {
+		const file = { web: { port: 8790, origin: "https://file.ts.net:8445", login: "file@github" } };
+		const env = { SOMA_WEB_ORIGIN: "https://env.ts.net:8445", SOMA_WEB_LOGIN: "env@github" };
+		expect(resolveConfig(file, {}, HOME).web?.serve).toEqual({ origin: file.web.origin, login: file.web.login });
+		expect(resolveConfig(file, env, HOME).web?.serve).toEqual({
+			origin: env.SOMA_WEB_ORIGIN,
+			login: env.SOMA_WEB_LOGIN,
+		});
+	});
+	test("is off without a port, as the tailnet-IP mode is", () => {
+		expect(resolveConfig({ web: SERVE }, {}, HOME).web).toBeUndefined();
+	});
+	test("takes the origin in its canonical form: the default port is dropped, the case folded", () => {
+		for (const origin of ["https://My-Mac.ts.net:443", "https://my-mac.ts.net", "HTTPS://MY-MAC.TS.NET"]) {
+			expect(resolveConfig({ web: { port: 8790, origin, login: "a@b" } }, {}, HOME).web?.serve?.origin).toBe(
+				"https://my-mac.ts.net",
+			);
+		}
+	});
+	test("refuses an origin with no login, and a login with no origin, naming the missing field", () => {
+		expect(() => resolveConfig({ web: { port: 8790, origin: SERVE.origin } }, {}, HOME, "/c.json")).toThrow(
+			"/c.json: web.login: Required with web.origin",
+		);
+		expect(() => resolveConfig({ web: { port: 8790, login: SERVE.login } }, {}, HOME, "/c.json")).toThrow(
+			"/c.json: web.origin: Required with web.login",
+		);
+		expect(() => resolveConfig(undefined, { SOMA_WEB_ORIGIN: SERVE.origin }, HOME)).toThrow(ConfigError);
+	});
+	test.each([
+		["web.origin", { origin: SERVE.origin }],
+		["web.login", { login: SERVE.login }],
+		["web.origin", SERVE],
+	])("refuses mixing the modes: web.host with %s set names web.host", (_, serve) => {
+		expect(() =>
+			resolveConfig({ web: { host: "100.101.102.103", port: 8790, ...serve } }, {}, HOME, "/c.json"),
+		).toThrow("/c.json: web.host: Not allowed with");
+		expect(() => resolveConfig({ web: { port: 8790, ...serve } }, { SOMA_WEB_HOST: "100.101.102.103" }, HOME)).toThrow(
+			"web.host: Not allowed with",
+		);
+	});
+	test.each(["127.0.0.1", "::1", "0.0.0.0", "192.168.1.10"])("still refuses web.host %s", (host) => {
+		expect(() => resolveConfig({ web: { host, port: 8790, ...SERVE } }, {}, HOME, "/c.json")).toThrow(
+			"/c.json: web.host:",
+		);
+		expect(() => resolveConfig({ web: { host, port: 8790 } }, {}, HOME, "/c.json")).toThrow("/c.json: web.host:");
+	});
+	test.each([
+		"http://my-mac.ts.net",
+		"my-mac.ts.net",
+		"https://",
+		"https://my-mac.ts.net/",
+		"https://my-mac.ts.net/soma",
+		"https://my-mac.ts.net:8445/soma",
+		"https://my-mac.ts.net?x=1",
+		"https://my-mac.ts.net#top",
+		"https://me@my-mac.ts.net",
+		"https://my-mac.ts.net:99999",
+		"wss://my-mac.ts.net",
+	])("refuses the origin %s", (origin) => {
+		expect(() => resolveConfig({ web: { port: 8790, origin, login: SERVE.login } }, {}, HOME, "/c.json")).toThrow(
+			"/c.json: web.origin: Expected an https:// origin",
+		);
+	});
+	test("an empty login in the file throws with the field", () => {
+		const path = write(JSON.stringify({ web: { port: 8790, origin: SERVE.origin, login: "" } }));
+		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: web.login:`);
+	});
+});
+
 describe("the vault", () => {
 	test("is on only with a name, and denies nothing unless told", () => {
 		expect(resolveConfig(undefined, {}, HOME).vault).toBeUndefined();

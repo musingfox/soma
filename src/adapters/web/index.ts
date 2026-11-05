@@ -10,10 +10,20 @@ import { type RawData, WebSocket, WebSocketServer } from "ws";
 import { z } from "zod";
 import { type HumanPort, PUSHED_FAILURES, type SomaEvent } from "../../ports/human.ts";
 
+/** Serve mode: soma is behind `tailscale serve`, which terminates HTTPS and says who the caller is. */
+export interface ServeConfig {
+	/** The page's public origin, such as `https://nick-mac-mini.tail361ef.ts.net:8445`: the only Host and Origin accepted. */
+	readonly origin: string;
+	/** The one `Tailscale-User-Login` allowed, such as `musingfox@github`. */
+	readonly login: string;
+}
+
 export interface WebConfig {
-	/** An IP literal: the server listens on this one address, never on every interface. */
+	/** An IP literal: the server listens on this one address, never on every interface. Loopback in serve mode. */
 	readonly host: string;
 	readonly port: number;
+	/** Set, the server trusts the login header `tailscale serve` adds, so `host` must be 127.0.0.1. */
+	readonly serve?: ServeConfig;
 }
 
 export interface WebOptions extends WebConfig {
@@ -39,6 +49,9 @@ export const SOCKET_PATH = "/socket";
 /** A larger message closes the connection: typed text is far smaller, and nothing else is buffered without bound. */
 export const MAX_MESSAGE_BYTES = 1 << 20;
 const HEARTBEAT_MS = 30_000;
+/** The header `tailscale serve` sets from the tailnet's own identity, replacing any the client sent. */
+export const LOGIN_HEADER = "tailscale-user-login";
+export const SERVE_HOST = "127.0.0.1";
 
 const wildcard = new BlockList();
 wildcard.addAddress("0.0.0.0", "ipv4");
@@ -109,8 +122,17 @@ export type WebMessage =
  * left open cannot hold shutdown. Resolves once listening.
  */
 export async function startWeb(options: WebOptions): Promise<WebServer> {
-	const { human, host } = options;
+	const { human, host, serve } = options;
 	checkHost(host);
+	// The login header is trusted only because `tailscale serve` strips the client's and sets its own, which holds when
+	// serve is the one connecting: serve mode listens on loopback and nowhere else.
+	if (serve !== undefined && host !== SERVE_HOST) {
+		throw new Error(`web serve mode must listen on ${SERVE_HOST}, got "${host}"`);
+	}
+	const serveAuthority = serve === undefined ? undefined : new URL(serve.origin).host;
+	/** In serve mode, whether the Host is the origin's and the login is the configured one; always true otherwise. */
+	const permitted = (request: IncomingMessage) =>
+		serve === undefined || (request.headers[LOGIN_HEADER] === serve.login && request.headers.host === serveAuthority);
 	const onError = options.onError ?? ((error) => console.error("[soma] web:", error));
 	const heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS;
 	// Binary frames are refused and extensions are not offered, so a page sends plain text frames only.
@@ -165,7 +187,9 @@ export async function startWeb(options: WebOptions): Promise<WebServer> {
 
 	const server = createServer((request, response) => {
 		const file = FILES.get(request.url ?? "");
-		if (request.method !== "GET" && request.method !== "HEAD") {
+		if (!permitted(request)) {
+			response.writeHead(403, { "content-type": "text/plain; charset=utf-8" }).end("forbidden\n");
+		} else if (request.method !== "GET" && request.method !== "HEAD") {
 			response.writeHead(405, { allow: "GET, HEAD" }).end();
 		} else if (file === undefined) {
 			response.writeHead(404, { "content-type": "text/plain; charset=utf-8" }).end("not found\n");
@@ -199,8 +223,9 @@ export async function startWeb(options: WebOptions): Promise<WebServer> {
 	// here, under the address configured, may open one. A client without an Origin is not a browser page.
 	const allowed = (request: IncomingMessage) =>
 		request.url === SOCKET_PATH &&
-		request.headers.host === authority &&
-		(request.headers.origin === undefined || request.headers.origin === `http://${authority}`);
+		permitted(request) &&
+		request.headers.host === (serveAuthority ?? authority) &&
+		(request.headers.origin === undefined || request.headers.origin === (serve?.origin ?? `http://${authority}`));
 	let closing = false;
 	server.on("upgrade", (request: IncomingMessage, raw: Duplex, head: Buffer) => {
 		if (closing) {

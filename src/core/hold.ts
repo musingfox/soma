@@ -4,13 +4,27 @@ import {
 	defineDoc,
 	type EntryId,
 	type EntryRecord,
+	type Harness,
 	type Storage,
 	type SubmissionId,
 	type SubmissionRecord,
 	type Tx,
 } from "@earendil-works/pi-durable";
-import { PUSHED_ANSWERS, PUSHED_FAILURES } from "../ports/human.ts";
-import { type HeldPush, holders, type Policies } from "./domain/push.ts";
+import { type Delivery, MESSAGE_CLASSES, PUSHED_ANSWERS, PUSHED_FAILURES } from "../ports/human.ts";
+import type { Told } from "./domain/foreign.ts";
+import {
+	type HeldPush,
+	holders,
+	type Policies,
+	type Presence,
+	promptGone,
+	summaryDue,
+	summaryRings,
+} from "./domain/push.ts";
+import { summaryPrompt } from "./domain/report.ts";
+import { ForeignPrompts } from "./extensions/dispatch/foreign.ts";
+import { Dispatches } from "./extensions/dispatch/index.ts";
+import { noticeEntry } from "./notice.ts";
 
 /** A push as an interface would hold it, before it is keyed, timed and given its holders. */
 export type Push = Omit<HeldPush, "key" | "at" | "to">;
@@ -30,6 +44,8 @@ type HoldState = {
 	rang?: number;
 	/** The summary under way: its input, admitted in the commit that pinned the pushes it covers. */
 	round?: { requestId: string; submission: number; keys: string[] };
+	/** Summaries begun so far, which numbers each one's requestId. */
+	begun?: number;
 };
 
 /** The pushes interfaces hold for their next summary (ARCHITECTURE.md "Whom to push to"). */
@@ -53,6 +69,12 @@ const settled = (record: SubmissionRecord): record is Settled =>
 	record.type === "input" && (record.status === "done" || record.status === "unanswered");
 
 export const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+
+export const textOf = (entry: EntryRecord) =>
+	(entry.model ?? [])
+		.flatMap((message) => (message.role === "assistant" ? message.content : []))
+		.flatMap((block) => (block.type === "text" ? [block.text] : []))
+		.join("");
 
 export interface HoldOptions {
 	readonly root: Conversation;
@@ -177,4 +199,119 @@ export async function forgetHolding(root: Conversation, context: Context) {
 		delete doc.entry;
 		delete doc.rounds;
 	}, context);
+}
+
+/** Entry kind of the input that wakes the model for a summary. */
+export const SUMMARY = "soma.summary";
+
+export interface SummaryOptions {
+	readonly harness: Harness;
+	readonly root: Conversation;
+	readonly context: Context;
+	readonly policies: Policies;
+	readonly now: () => number;
+	/** When the human last typed on each interface. */
+	readonly presence: () => Presence;
+	/** How long the human types nowhere before what is held is summarized. */
+	readonly idleMs: number;
+}
+
+const delivered = (entry: ReturnType<typeof noticeEntry>, delivery: Record<string, Delivery>) => ({
+	kind: entry.kind,
+	data: { ...entry.data, delivery },
+});
+
+/**
+ * The summary of what interfaces hold (ARCHITECTURE.md "Whom to push to"). Once one is due, one commit drops the held
+ * questions whose prompt is gone, pins the rest and admits the input that asks the model for the summary, so a restart
+ * waits on the same round. When the round answers, one commit writes the summary, ringing on the interfaces holding
+ * what it covers unless one rang since the human last typed, sends each question still waiting there again with its
+ * buttons and no sound, and stops holding what it covered. A round that fails keeps everything held for the next check.
+ */
+export function summaries({ harness, root, context, policies, now, presence, idleMs }: SummaryOptions) {
+	const prompts = async (tx: Tx) => ({
+		jobs: copy((await tx.doc(Dispatches, root.id)).jobs),
+		told: copy((await tx.doc(ForeignPrompts, root.id)).told) as Told,
+	});
+
+	const pin = () =>
+		root.commit(async (tx) => {
+			const doc = await tx.doc(Holds, root.id);
+			if (doc.round !== undefined) return copy(doc.round);
+			const held = copy(doc.held);
+			if (!summaryDue(held, presence(), now(), idleMs)) return undefined;
+			const { jobs, told } = await prompts(tx);
+			const live = held.filter((push) => !promptGone(push, jobs, told));
+			if (live.length !== held.length) doc.held = live;
+			if (live.length === 0) return undefined;
+			const begun = (doc.begun ?? 0) + 1;
+			const requestId = `summary:${begun}`;
+			const keys = live.map((push) => push.key);
+			const submission = await root.submit(tx, {
+				type: "input",
+				content: summaryPrompt(live),
+				entry: { kind: SUMMARY, data: { keys } },
+				requestId,
+				whenBusy: "followUp",
+			});
+			doc.begun = begun;
+			doc.round = { requestId, submission, keys };
+			return copy(doc.round);
+		}, context);
+
+	const send = (round: NonNullable<HoldState["round"]>, summary: string) =>
+		root.commit(async (tx) => {
+			const doc = await tx.doc(Holds, root.id);
+			if (doc.round?.requestId !== round.requestId) return;
+			const covered = copy(doc.held).filter((push) => round.keys.includes(push.key));
+			const to = [...new Set(covered.flatMap((push) => push.to))];
+			const kinds = [...new Set([...Object.keys(policies), ...to])];
+			const only = (shown: readonly string[], how: Delivery) =>
+				Object.fromEntries(kinds.map((kind) => [kind, shown.includes(kind) ? how : "log"]));
+			const rings = summaryRings(presence(), doc.rang);
+			const messageClass = MESSAGE_CLASSES.find((each) => covered.some((push) => push.class === each)) ?? "ambient";
+			await tx.appendEntry(
+				root.id,
+				delivered(noticeEntry("report", messageClass, summary), only(to, rings ? "ring" : "quiet")),
+			);
+			const { jobs, told } = await prompts(tx);
+			for (const push of covered) {
+				if (push.kind !== "question" || promptGone(push, jobs, told)) continue;
+				const question = noticeEntry("question", push.class, push.content, push.choices, push.foreign);
+				await tx.appendEntry(root.id, delivered(question, only(push.to, "quiet")));
+			}
+			doc.held = copy(doc.held).filter((push) => !round.keys.includes(push.key));
+			delete doc.round;
+			if (rings) doc.rang = now();
+		}, context);
+
+	let running = false;
+	return {
+		/** Summarizes what is held once that is due, or finishes a summary a restart cut short. */
+		async check() {
+			if (running) return;
+			running = true;
+			try {
+				const round = await pin();
+				if (round === undefined) return;
+				const settled = await (await harness.submission(round.submission as SubmissionId, context))?.wait(context);
+				if (settled?.type === "input" && settled.status === "done") {
+					const range = { minEntryId: settled.answer, maxEntryId: settled.answer };
+					const [answer] = (await root.entries(range, 1, undefined, context)).items;
+					await send(round, answer === undefined ? "" : textOf(answer));
+					return;
+				}
+				const reason = settled?.type === "input" && settled.status === "unanswered" ? settled.reason : "no round";
+				console.error(`[soma] summary ${round.requestId} failed (${reason}); what it covers stays held`);
+				await root.commit(async (tx) => {
+					const doc = await tx.doc(Holds, root.id);
+					if (doc.round?.requestId === round.requestId) delete doc.round;
+				}, context);
+			} catch (error) {
+				console.error("[soma] summary:", error);
+			} finally {
+				running = false;
+			}
+		},
+	};
 }

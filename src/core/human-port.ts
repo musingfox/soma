@@ -42,14 +42,8 @@ import { turnSignal } from "./domain/signal.ts";
 import { ForeignPrompts } from "./extensions/dispatch/foreign.ts";
 import { answerJob, Dispatches } from "./extensions/dispatch/index.ts";
 import { recordFact } from "./extensions/memory/index.ts";
-import { forgetHolding, Holds, holding, type Push } from "./hold.ts";
+import { forgetHolding, Holds, holding, type Push, summaries, textOf } from "./hold.ts";
 import { isForwarded, NOTICE, noticeEntry } from "./notice.ts";
-
-const textOf = (entry: EntryRecord) =>
-	(entry.model ?? [])
-		.flatMap((message) => (message.role === "assistant" ? message.content : []))
-		.flatMap((block) => (block.type === "text" ? [block.text] : []))
-		.join("");
 
 // Durable spec 8.3: the reasons an input settles unanswered with; model_error and faulted carry the error text.
 const REASONS: Record<string, string> = {
@@ -105,11 +99,14 @@ export interface PushOptions {
 	/** How often pending pushes are checked for escalation. */
 	readonly checkMs?: number;
 	readonly now?: () => number;
+	/** How long the human types nowhere before what interfaces hold is summarized; 30 minutes by default. */
+	readonly summaryIdleMs?: number;
 	/** The Harness's own storage, read at start for a pushed round a crash left unheld. */
 	readonly storage?: Pick<Storage, "scanSubmissions">;
 }
 
 const FIFTEEN_MINUTES = 15 * 60_000;
+const THIRTY_MINUTES = 30 * 60_000;
 
 type Delivered = { delivery?: Record<string, Delivery> };
 
@@ -157,8 +154,10 @@ export async function openHumanPort(
 	const policies = push?.policies ?? {};
 	const defaultTarget = push?.defaultTarget;
 	const holds = holdsAny(policies);
-	if (!holds && (await harness.snapshot(Holds, root.id, context))?.entry !== undefined)
-		await forgetHolding(root, context);
+	const held = await harness.snapshot(Holds, root.id, context);
+	if (!holds && held?.entry !== undefined) await forgetHolding(root, context);
+	// What is still held when no interface holds any more is summarized all the same.
+	const summarizes = holds || (held?.held.length ?? 0) > 0;
 	const hold = holds
 		? holding({
 				root,
@@ -180,7 +179,7 @@ export async function openHumanPort(
 				},
 			})
 		: undefined;
-	const tracksPresence = defaultTarget !== undefined || holds;
+	const tracksPresence = defaultTarget !== undefined || summarizes;
 	const presence: Presence = tracksPresence
 		? await root.commit(
 				async (tx) => JSON.parse(JSON.stringify((await tx.doc(Pushes, root.id)).presence)) as Presence,
@@ -388,6 +387,19 @@ export async function openHumanPort(
 	const checker =
 		defaultTarget === undefined ? undefined : setInterval(() => void check(defaultTarget), push?.checkMs ?? 30_000);
 	checker?.unref();
+	const summary = summarizes
+		? summaries({
+				harness,
+				root,
+				context,
+				policies,
+				now,
+				presence: () => presence,
+				idleMs: push?.summaryIdleMs ?? THIRTY_MINUTES,
+			})
+		: undefined;
+	const summarizer = summary && setInterval(() => void summary.check(), push?.checkMs ?? 30_000);
+	summarizer?.unref();
 
 	return {
 		async submit(input) {
@@ -426,6 +438,7 @@ export async function openHumanPort(
 		},
 		async close() {
 			clearInterval(checker);
+			clearInterval(summarizer);
 			commits.detach();
 			await watch.stop();
 		},

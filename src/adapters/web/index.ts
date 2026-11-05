@@ -1,7 +1,11 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
+import { createRequire } from "node:module";
 import { BlockList, isIP } from "node:net";
+import { dirname, join } from "node:path";
 import type { Duplex } from "node:stream";
+import { gzipSync } from "node:zlib";
 import { type RawData, WebSocket, WebSocketServer } from "ws";
 import { z } from "zod";
 import { type HumanPort, PUSHED_FAILURES, type SomaEvent } from "../../ports/human.ts";
@@ -49,11 +53,35 @@ export function checkHost(host: string): void {
 	}
 }
 
+interface StaticFile {
+	readonly type: string;
+	readonly body: Buffer;
+	readonly gzipped: Buffer;
+	readonly etag: string;
+}
+
+const staticFile = (type: string, body: Buffer): StaticFile => ({
+	type,
+	body,
+	gzipped: gzipSync(body),
+	etag: `"${createHash("sha256").update(body).digest("base64url")}"`,
+});
+const JS = "text/javascript; charset=utf-8";
 const page = (name: string) => readFileSync(new URL(`./page/${name}`, import.meta.url));
-const FILES: Record<string, { type: string; body: Buffer }> = {
-	"/": { type: "text/html; charset=utf-8", body: page("index.html") },
-	"/character.svg": { type: "image/svg+xml", body: page("character.svg") },
-};
+// The package's own published ES modules, served as they are; three.module.js imports ./three.core.js beside it.
+const threeBuild = dirname(createRequire(import.meta.url).resolve("three"));
+/** Where the page's import map finds three.js. */
+export const THREE_PATH = "/vendor/three/";
+
+/** Every path the server answers, and nothing else: a URL is looked up whole, never joined onto a directory. */
+const FILES = new Map<string, StaticFile>([
+	["/", staticFile("text/html; charset=utf-8", page("index.html"))],
+	["/character.svg", staticFile("image/svg+xml", page("character.svg"))],
+	...["three.module.js", "three.core.js"].map((name): [string, StaticFile] => [
+		THREE_PATH + name,
+		staticFile(JS, readFileSync(join(threeBuild, name))),
+	]),
+]);
 
 // The page names each message with 128 random bits in hex; a resend keeps the id, so the core admits it once.
 const InputSchema = z
@@ -133,19 +161,33 @@ export async function startWeb(options: WebOptions): Promise<WebServer> {
 	};
 
 	const server = createServer((request, response) => {
-		const file = FILES[request.url ?? ""];
+		const file = FILES.get(request.url ?? "");
 		if (request.method !== "GET" && request.method !== "HEAD") {
 			response.writeHead(405, { allow: "GET, HEAD" }).end();
 		} else if (file === undefined) {
 			response.writeHead(404, { "content-type": "text/plain; charset=utf-8" }).end("not found\n");
 		} else {
-			response.writeHead(200, {
-				"content-type": file.type,
-				"content-length": file.body.length,
-				"cache-control": "no-store",
+			// Revalidated on every load, so a release's new page is never mixed with an old one, while an unchanged
+			// three.js, two megabytes unzipped, is not sent to the phone again.
+			const headers = {
+				"cache-control": "no-cache",
+				etag: file.etag,
+				vary: "accept-encoding",
 				"x-content-type-options": "nosniff",
+			};
+			if (request.headers["if-none-match"] === file.etag) {
+				response.writeHead(304, headers).end();
+				return;
+			}
+			const gzip = /\bgzip\b/.test(request.headers["accept-encoding"] ?? "");
+			const body = gzip ? file.gzipped : file.body;
+			response.writeHead(200, {
+				...headers,
+				"content-type": file.type,
+				"content-length": body.length,
+				...(gzip && { "content-encoding": "gzip" }),
 			});
-			response.end(request.method === "HEAD" ? undefined : file.body);
+			response.end(request.method === "HEAD" ? undefined : body);
 		}
 	});
 

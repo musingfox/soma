@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { request } from "node:http";
 import { connect } from "node:net";
 import { afterEach, expect, test, vi } from "vitest";
@@ -7,6 +8,7 @@ import {
 	checkHost,
 	MAX_MESSAGE_BYTES,
 	startWeb,
+	THREE_PATH,
 	type WebMessage,
 	type WebServer,
 } from "../../../src/adapters/web/index.ts";
@@ -85,6 +87,83 @@ test("serves the page and the placeholder character, and nothing else", async ()
 	expect(await image.text()).toContain("<svg");
 	expect((await fetch(`${base}/secret`)).status).toBe(404);
 	expect((await fetch(`${base}/`, { method: "POST", body: "x" })).status).toBe(405);
+});
+
+/** The status of a GET for `path` sent exactly as written, where fetch would resolve its dot segments first. */
+function rawStatus(port: number, path: string): Promise<number | undefined> {
+	return new Promise((resolve, reject) => {
+		const req = request({ host: HOST, port, path }, (response) => {
+			response.resume();
+			resolve(response.statusCode);
+		});
+		req.once("error", reject);
+		req.end();
+	});
+}
+
+test("serves three.js from the pinned dependency, as a JavaScript module", async () => {
+	const pkg = JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8"));
+	const pinned: string = pkg.dependencies.three;
+	expect(pinned).toMatch(/^[0-9]+\.[0-9]+\.[0-9]+$/);
+	const installed = JSON.parse(
+		readFileSync(new URL("../../../node_modules/three/package.json", import.meta.url), "utf8"),
+	);
+	expect(installed.version).toBe(pinned);
+	const { base } = await serve();
+	for (const name of ["three.module.js", "three.core.js"]) {
+		const response = await fetch(`${base}${THREE_PATH}${name}`);
+		expect(response.status).toBe(200);
+		expect(response.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
+		const local = readFileSync(new URL(`../../../node_modules/three/build/${name}`, import.meta.url), "utf8");
+		expect(await response.text()).toBe(local);
+	}
+});
+
+test("a path that climbs out of the served files, or names an unlisted one, is not found", async () => {
+	const { server } = await serve();
+	for (const path of [
+		`${THREE_PATH}../../package.json`,
+		`${THREE_PATH}%2e%2e/%2e%2e/package.json`,
+		`${THREE_PATH}..%2f..%2fpackage.json`,
+		"/../package.json",
+		"/node_modules/three/package.json",
+		`${THREE_PATH}three.cjs`,
+		`${THREE_PATH}../three/package.json`,
+		THREE_PATH,
+		"//etc/passwd",
+	]) {
+		expect([path, await rawStatus(server.port, path)]).toEqual([path, 404]);
+	}
+});
+
+test("a file is sent gzipped to a browser that takes it, and not again while unchanged", async () => {
+	const { base } = await serve();
+	const plain = await new Promise<{ encoding?: string; etag?: string; length: number }>((resolve, reject) => {
+		const url = new URL(`${base}${THREE_PATH}three.core.js`);
+		const req = request({
+			host: url.hostname,
+			port: url.port,
+			path: url.pathname,
+			headers: { "accept-encoding": "gzip" },
+		});
+		req.once("response", (response) => {
+			const chunks: Buffer[] = [];
+			response.on("data", (chunk: Buffer) => chunks.push(chunk));
+			response.on("end", () =>
+				resolve({
+					encoding: response.headers["content-encoding"],
+					etag: response.headers.etag,
+					length: Buffer.concat(chunks).length,
+				}),
+			);
+		});
+		req.once("error", reject);
+		req.end();
+	});
+	expect(plain.encoding).toBe("gzip");
+	expect(plain.length).toBeLessThan(500_000);
+	const again = await fetch(`${base}${THREE_PATH}three.core.js`, { headers: { "if-none-match": plain.etag ?? "" } });
+	expect(again.status).toBe(304);
 });
 
 test("a message sent over the socket reaches HumanPort submit as a chat.web input", async () => {

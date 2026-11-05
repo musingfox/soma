@@ -6,6 +6,7 @@ import { WebSocket as WsClient } from "ws";
 import { FakeHumanPort } from "../../../src/adapters/fake-human/index.ts";
 import {
 	checkHost,
+	MARKED_PATH,
 	MAX_MESSAGE_BYTES,
 	PAGE_MODULES,
 	startWeb,
@@ -110,20 +111,24 @@ test("the page loads everything from soma itself: no external host, and every im
 		...[...html.matchAll(/(?:src|href)="([^"]*)"/g)].map((match) => match[1] as string),
 	];
 	expect(urls).toContain(`${THREE_PATH}three.module.js`);
+	expect(urls).toContain(`${MARKED_PATH}marked.esm.js`);
 	for (const url of urls) {
 		if (url.startsWith("data:")) continue;
 		expect(url).toMatch(/^\/[^/]/);
 		expect([url, (await fetch(`${base}${url}`)).status]).toEqual([url, 200]);
 	}
-	// Every module a page module imports is either three, through the import map, or one of the page's own.
+	// Every module a page module imports is either a vendored one, through the import map, or one of the page's own.
 	const specifiers = own.slice(2).flatMap((text) => [...text.matchAll(/^import [^;]*?"([^"]+)";/gm)].map((m) => m[1]));
 	expect(specifiers).toContain("three");
+	expect(specifiers).toContain("marked");
 	for (const specifier of specifiers) {
-		expect([specifier, specifier === "three" || PAGE_MODULES.includes(specifier?.replace(/^\.\//, "") ?? "")]).toEqual([
+		const known = specifier === "three" || specifier === "marked";
+		expect([specifier, known || PAGE_MODULES.includes(specifier?.replace(/^\.\//, "") ?? "")]).toEqual([
 			specifier,
 			true,
 		]);
 	}
+	expect(Object.keys(importMap.imports).sort()).toEqual(["marked", "three"]);
 });
 
 /** The status of a GET for `path` sent exactly as written, where fetch would resolve its dot segments first. */
@@ -156,6 +161,28 @@ test("serves three.js from the pinned dependency, as a JavaScript module", async
 	}
 });
 
+test("serves marked from the pinned dependency, as a JavaScript module, and it imports nothing", async () => {
+	const pkg = JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8"));
+	const pinned: string = pkg.dependencies.marked;
+	expect(pinned).toBe("18.1.1");
+	const installed = JSON.parse(
+		readFileSync(new URL("../../../node_modules/marked/package.json", import.meta.url), "utf8"),
+	);
+	expect(installed.version).toBe(pinned);
+	const { base } = await serve();
+	const response = await fetch(`${base}${MARKED_PATH}marked.esm.js`);
+	expect(response.status).toBe(200);
+	expect(response.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
+	const body = await response.text();
+	expect(body).toBe(readFileSync(new URL("../../../node_modules/marked/lib/marked.esm.js", import.meta.url), "utf8"));
+	// A module with no import of its own cannot pull anything from elsewhere.
+	expect(body).not.toMatch(/^\s*import\s/m);
+	expect(body).not.toMatch(/\bimport\(/);
+	// The markdown module is one of the page's own files.
+	expect(PAGE_MODULES).toContain("markdown.js");
+	expect((await fetch(`${base}/markdown.js`)).status).toBe(200);
+});
+
 test("a path that climbs out of the served files, or names an unlisted one, is not found", async () => {
 	const { server } = await serve();
 	for (const path of [
@@ -165,6 +192,12 @@ test("a path that climbs out of the served files, or names an unlisted one, is n
 		"/../package.json",
 		"/node_modules/three/package.json",
 		`${THREE_PATH}three.cjs`,
+		`${MARKED_PATH}../../package.json`,
+		`${MARKED_PATH}%2e%2e/%2e%2e/package.json`,
+		`${MARKED_PATH}marked.umd.js`,
+		`${MARKED_PATH}marked.esm.js.map`,
+		MARKED_PATH,
+		"/node_modules/marked/package.json",
 		`${THREE_PATH}../three/package.json`,
 		THREE_PATH,
 		"//etc/passwd",

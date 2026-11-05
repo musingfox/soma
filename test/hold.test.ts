@@ -507,6 +507,21 @@ describe("summary", () => {
 		expect(prompts.filter((each) => each.startsWith("[summary]"))).toHaveLength(1);
 	});
 
+	test("what is still held when the config stops holding is summarized all the same, and nothing new is held", async () => {
+		const port = await holdingPort();
+		const { open, advance, held } = port;
+		const first = await heldFour(port);
+		await first.human.close();
+		const instant = { [TELEGRAM]: PRESETS.instant, [TERMINAL]: PRESETS.instant };
+		const { human, seen } = await open(instant);
+		await human.notify("card g 完成", "report", "outcome");
+		advance(30 * MIN);
+
+		await vi.waitFor(() => expect(summariesOf(seen)).toHaveLength(1));
+		expect(summariesOf(seen)[0]?.delivery).toEqual({ [TELEGRAM]: "ring", [TERMINAL]: "log" });
+		expect(await held()).toEqual([]);
+	});
+
 	test("with no interface at hold, nothing is held and no summary runs", async () => {
 		const { open, advance, notices, held, prompts, settle } = await holdingPort();
 		const { human, seen } = await open({ [TELEGRAM]: PRESETS.instant, [TERMINAL]: PRESETS.instant });

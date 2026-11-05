@@ -5,7 +5,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import type { Conversation, Harness } from "@earendil-works/pi-durable";
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { observeForeign } from "../src/core/domain/foreign.ts";
 import {
@@ -101,6 +101,7 @@ test("a blocked foreign agent the human is away from is pushed once, with one wa
 			kind: "question",
 			content:
 				"外部 agent Window 1（session work）卡住了，kind=permission，你不在它的畫面前。\napprove Bash: touch probe.txt",
+			foreign: { id: "pane-1", told: { fingerprint: "f00d", msg: "approve Bash: touch probe.txt" } },
 		},
 	]);
 	const wakes = await entriesOf(soma.root, FOREIGN_BLOCKED);
@@ -188,7 +189,11 @@ test("an auth prompt of a foreign agent is told to the human and never wakes the
 	await soma.settle();
 
 	expect((await entriesOf(soma.root, NOTICE)).map((entry) => entry.data)).toEqual([
-		{ kind: "question", content: "外部 agent Window 1（session work）在等登入或憑證，需要你處理。\nlogin" },
+		{
+			kind: "question",
+			content: "外部 agent Window 1（session work）在等登入或憑證，需要你處理。\nlogin",
+			foreign: { id: "pane-1", told: { msg: "login" } },
+		},
 	]);
 	expect(await entriesOf(soma.root, FOREIGN_BLOCKED)).toEqual([]);
 	expect(soma.calls()).toBe(0);
@@ -230,5 +235,82 @@ test("observeForeign pushes a new prompt only while unwatched, and forgets the p
 	expect(observeForeign(told, bash, false)).toBe("none");
 	expect(observeForeign(told, { ...bash, fingerprint: "beef" }, false)).toBe("push");
 	expect(observeForeign(told, { state: "working" }, false)).toBe("forget");
+	// Another prompt, looked at: the agent is past the one told, so its pending push must not outlive it.
+	expect(observeForeign(told, { ...bash, fingerprint: "beef" }, true)).toBe("forget");
+	expect(observeForeign(told, bash, true)).toBe("none");
 	expect(observeForeign(undefined, { state: "idle" }, false)).toBe("none");
+});
+
+describe("a foreign push that escalates", () => {
+	const MIN = 60_000;
+	const TERMINAL = "chat.terminal";
+	const TELEGRAM = "chat.telegram";
+
+	/** The human typed at the terminal, so the notice goes there first, and a clock the test moves. */
+	async function escalating() {
+		const agents = new FakeAgentPort();
+		const soma = await core(await database(), agents);
+		let clock = 100 * MIN;
+		const human = await openHumanPort(soma.harness, soma.root, agents, context, {
+			defaultTarget: TELEGRAM,
+			now: () => clock,
+			checkMs: 10,
+		});
+		const seen: SomaEvent[] = [];
+		human.subscribe((event) => seen.push(event));
+		await human.submit({ content: "嗨", entry: { kind: TERMINAL }, requestId: "terminal:1" });
+		await soma.root.waitForIdle(context);
+		clock += MIN;
+		const questions = () =>
+			seen.flatMap((event) => (event.type === "notice" && event.kind === "question" ? [event.target] : []));
+		return {
+			agents,
+			soma,
+			human,
+			questions,
+			advance: (ms: number) => {
+				clock += ms;
+			},
+			settle: () => new Promise((resolve) => setTimeout(resolve, 60)),
+		};
+	}
+
+	test("one still at its prompt after 15 minutes is pushed to the default interface once", async () => {
+		const { agents, soma, human, questions, advance } = await escalating();
+		agents.emitForeign(PANE, bash, 10);
+		await soma.settle();
+		await vi.waitFor(() => expect(questions()).toEqual([TERMINAL]));
+
+		advance(16 * MIN);
+		await vi.waitFor(() => expect(questions()).toEqual([TERMINAL, TELEGRAM]));
+		await human.close();
+	});
+
+	test("one answered since, at its pane or by respond, is not pushed again", async () => {
+		const { agents, soma, human, questions, advance, settle } = await escalating();
+		agents.emitForeign(PANE, bash, 10);
+		await soma.settle();
+		await vi.waitFor(() => expect(questions()).toEqual([TERMINAL]));
+
+		agents.emitForeign(PANE, { state: "working" }, 11);
+		await soma.settle();
+		advance(16 * MIN);
+		await settle();
+		expect(questions()).toEqual([TERMINAL]);
+		await human.close();
+	});
+
+	test("one now at another prompt, looked at, is not pushed for the old one", async () => {
+		const { agents, soma, human, questions, advance, settle } = await escalating();
+		agents.emitForeign(PANE, bash, 10);
+		await soma.settle();
+		await vi.waitFor(() => expect(questions()).toEqual([TERMINAL]));
+
+		agents.emitForeign(PANE, { ...bash, fingerprint: "beef", msg: "approve Bash: rm probe.txt" }, 11, true);
+		await soma.settle();
+		advance(16 * MIN);
+		await settle();
+		expect(questions()).toEqual([TERMINAL]);
+		await human.close();
+	});
 });

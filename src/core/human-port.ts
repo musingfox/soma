@@ -16,8 +16,10 @@ import {
 import type { AgentPort, AgentState } from "../ports/agent.ts";
 import { type Choices, type HumanPort, type NoticeKind, PUSHED_FAILURES, type SomaEvent } from "../ports/human.ts";
 import { HUMAN_CHOSEN } from "./domain/dispatch.ts";
+import type { Told } from "./domain/foreign.ts";
 import { escalation, type PendingPush, type Presence, pushTarget } from "./domain/push.ts";
 import { turnSignal } from "./domain/signal.ts";
+import { ForeignPrompts } from "./extensions/dispatch/foreign.ts";
 import { answerJob, Dispatches } from "./extensions/dispatch/index.ts";
 import { recordFact } from "./extensions/memory/index.ts";
 import { isForwarded, NOTICE, noticeEntry } from "./notice.ts";
@@ -157,10 +159,11 @@ export async function openHumanPort(
 			);
 			if (forwarded) for (const requestId of placed.values()) emit({ type: "notice", kind: "forwarded", requestId });
 			if (entry.kind !== NOTICE) continue;
-			const { kind, content, choices, target } = entry.data as {
+			const { kind, content, choices, foreign, target } = entry.data as {
 				kind: NoticeKind;
 				content: string;
 				choices?: Choices;
+				foreign?: PendingPush["foreign"];
 				target?: string;
 			};
 			// An escalation names its target; reports never escalate.
@@ -169,7 +172,9 @@ export async function openHumanPort(
 					? { target }
 					: await targetOf(
 							`notice:${entry.id}`,
-							kind === "question" ? { kind, content, ...(choices && { choices }) } : undefined,
+							kind === "question"
+								? { kind, content, ...(choices && { choices }), ...(foreign && { foreign }) }
+								: undefined,
 						);
 			emit({ type: "notice", kind, content, ...(choices && { choices }), ...pushed });
 		}
@@ -240,10 +245,11 @@ export async function openHumanPort(
 			await root.commit(async (tx) => {
 				const doc = await tx.doc(Pushes, root.id);
 				const jobsNow = (await tx.doc(Dispatches, root.id)).jobs;
+				const told = JSON.parse(JSON.stringify((await tx.doc(ForeignPrompts, root.id)).told)) as Told;
 				const stored = JSON.parse(JSON.stringify(doc)) as { presence: Presence; pending: PendingPush[] };
 				const kept: PendingPush[] = [];
 				for (const pending of stored.pending) {
-					const verdict = escalation(pending, stored.presence, jobsNow, now(), escalateMs);
+					const verdict = escalation(pending, stored.presence, jobsNow, told, now(), escalateMs);
 					if (verdict === "wait") kept.push(pending);
 					if (verdict !== "due") continue;
 					const { kind, content, choices } = pending;

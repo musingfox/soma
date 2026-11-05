@@ -86,8 +86,12 @@ export function foreignBridge(conversation: Conversation, agents: AgentPort, con
 				return;
 			}
 			if (status.state !== "blocked") return;
-			doc.told = { ...others, [agent.id]: toldOf(status) };
-			await tx.appendEntry(conversation.id, noticeEntry("question", noticeContent(agent, status)));
+			const prompt = toldOf(status);
+			doc.told = { ...others, [agent.id]: prompt };
+			await tx.appendEntry(
+				conversation.id,
+				noticeEntry("question", noticeContent(agent, status), undefined, { id: agent.id, told: prompt }),
+			);
 		}, context);
 	}
 

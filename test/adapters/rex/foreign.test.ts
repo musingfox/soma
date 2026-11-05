@@ -368,3 +368,85 @@ test("respondForeign throws for an id that names no foreign agent: soma's own ag
 	await expect(port(fake).respondForeign("block:gone", answer)).rejects.toThrow("no foreign agent block:gone");
 	expect(pressed(fake)).toEqual([]);
 });
+
+test("a session whose label starts with soma- never holds a foreign agent, any other session does", async () => {
+	const claude = (block: string): Block => ({
+		name: "w",
+		block,
+		argv0: "claude",
+		records: blockedRecord,
+		screen: BASH,
+	});
+	const fake = rex(
+		[],
+		[
+			{ id: "session:prod", label: "soma-hangar", blocks: [claude("block:prod")] },
+			{ id: "session:smoke", label: "soma-smoke-edde1b", blocks: [claude("block:smoke")] },
+			{ id: "session:smoke-hangar", label: "soma-smoke-edde1b-hangar", blocks: [claude("block:smoke2")] },
+			{ id: "session:mine", label: "somatic", blocks: [claude("block:mine")] },
+			{ id: "session:work", label: "work", blocks: [claude("block:work")] },
+		],
+	);
+
+	const listed = await port(fake).listForeign();
+
+	expect(listed.map(({ id }) => id)).toEqual(["block:mine", "block:work"]);
+	// Their blocks are not even looked at, so no screen of theirs is read or typed on.
+	expect(fake.calls.filter((call) => call.method.endsWith(".process")).map((call) => call.payload.block_id)).toEqual([
+		"block:mine",
+		"block:work",
+	]);
+});
+
+/** A foreign agent blocked at the Bash prompt in a window of its own, and the app that showed another window last. */
+function looked(shows: "claude" | "other") {
+	const { session, claude, other } = blockedWork();
+	const asked = "2026-10-27T01:05:00.000001+08:00";
+	if (shows === "claude") claude.desired = { "client:mac": asked };
+	else other.desired = { "client:mac": asked };
+	return rex([], [session], [{ id: "client:mac", kind: "app" }]);
+}
+
+test("a null client_id in a size reply is ignored, and the other entries still count", async () => {
+	const fake = looked("claude");
+	const size = fake.original("com.superlogical.terminal.size");
+	fake.replace("com.superlogical.terminal.size", (payload) => {
+		const reply = size(payload) as { desired: object[] };
+		return { ...reply, desired: [{ client_id: null, updated_at: AT }, ...reply.desired] };
+	});
+
+	const { events, off } = await watching(fake);
+	off();
+
+	expect(events.map(({ watched }) => watched)).toEqual([true]);
+});
+
+test("a pane whose presence cannot be read counts as not looked at, and is pushed", async () => {
+	const unreadable = (): never => {
+		throw new Error("closed");
+	};
+	const failures: [string, () => unknown][] = [
+		["client.list", unreadable],
+		["client.list", () => ({ clients: [{ client_id: 7 }] })],
+		["session.list_blocks", unreadable],
+		["session.list_blocks", () => ({ blocks: "none" })],
+		["com.superlogical.terminal.size", unreadable],
+		["com.superlogical.terminal.size", () => ({ desired: [{ client_id: "client:mac", updated_at: 5 }] })],
+	];
+	for (const [method, reply] of failures) {
+		// The app is showing the pane's window, so a readable presence would say watched.
+		const fake = looked("claude");
+		const original = fake.original(method);
+		// The listing of foreign agents reads list_blocks and size's neighbours first; only presence follows client.list.
+		fake.replace(method, (payload) =>
+			method !== "session.list_blocks" || fake.methods().includes("client.list") ? reply() : original(payload),
+		);
+		const { events, off } = await watching(fake);
+		off();
+
+		expect(
+			events.map(({ watched }) => watched),
+			method,
+		).toEqual([false]);
+	}
+});

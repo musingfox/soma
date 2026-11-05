@@ -125,6 +125,7 @@ export function rex(blocks: Block[], others: Session[] = [], clients: Client[] =
 			};
 		},
 	};
+	const originals = { ...replies };
 	const client: RexClient = {
 		async call<T>(method: string, payload: unknown, schema: ZodType<T>): Promise<T> {
 			calls.push({ method, payload: payload as Record<string, unknown> });
@@ -170,6 +171,16 @@ export function rex(blocks: Block[], others: Session[] = [], clients: Client[] =
 			for (const listener of connected) listener();
 		},
 		methods: () => calls.map((call) => call.method),
+		/** Answers `method` from now on with `reply` instead, which may throw or return what the schema rejects. */
+		replace: (method: string, reply: (payload: Record<string, unknown>) => unknown) => {
+			replies[method] = reply;
+		},
+		/** What `method` answered before any replacement. */
+		original: (method: string) => {
+			const reply = originals[method];
+			if (reply === undefined) throw new Error(`unexpected ${method}`);
+			return reply;
+		},
 	};
 }
 

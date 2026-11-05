@@ -120,10 +120,13 @@ export const ClientListSchema = z
 	})
 	.passthrough();
 
-/** `desired` holds the size each client last asked for, and when it asked. */
+/**
+ * `desired` holds the size each client last asked for, and when it asked. rex documents `client_id` as "string or
+ * null" (`/llms.txt` on the server); an entry without a client is no app's ask.
+ */
 export const SizeResultSchema = z
 	.object({
-		desired: z.array(z.object({ client_id: z.string(), updated_at: z.string() }).passthrough()).nullish(),
+		desired: z.array(z.object({ client_id: z.string().nullable(), updated_at: z.string() }).passthrough()).nullish(),
 	})
 	.passthrough();
 

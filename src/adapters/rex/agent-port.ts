@@ -100,6 +100,13 @@ type Foreign = {
 	readonly seq?: number;
 };
 
+/**
+ * The label prefix of the sessions soma makes: prod's `soma-hangar` and every `soma-smoke-*`. Their panes are never
+ * foreign (ARCHITECTURE.md "Foreign agents"), so a dev instance, prod and the rex smokes do not take each other's for
+ * the human's.
+ */
+const SOMA_SESSION_PREFIX = "soma-";
+
 const BLOCKED_KINDS: readonly string[] = ["permission", "question", "auth"] satisfies BlockedKind[];
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Any of these can change which window a block is in, or what the window is called.
@@ -298,6 +305,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		const { sessions } = await client.call("session.attach_all", { event_scope: "session" }, AttachAllResultSchema);
 		const found = await Promise.all(
 			(sessions ?? []).map(async (session): Promise<Foreign[]> => {
+				if (session.label.startsWith(SOMA_SESSION_PREFIX)) return [];
 				const where = { session_id: session.session_id };
 				let blocks: z.infer<typeof BlockListSchema>["blocks"];
 				let view: z.infer<typeof ViewSchema>;
@@ -407,10 +415,12 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 							return;
 						}
 						for (const asked of desired ?? []) {
+							const app = asked.client_id;
+							if (app === null) continue;
 							const at = microsOf(asked.updated_at);
-							const before = last.get(asked.client_id);
-							if (!apps.has(asked.client_id) || at === undefined || (before !== undefined && before.at >= at)) continue;
-							last.set(asked.client_id, { at, blockId, ...(window === undefined ? {} : { window }) });
+							const before = last.get(app);
+							if (!apps.has(app) || at === undefined || (before !== undefined && before.at >= at)) continue;
+							last.set(app, { at, blockId, ...(window === undefined ? {} : { window }) });
 						}
 					}),
 				);
@@ -432,6 +442,10 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	 * is blocked). Polled, not streamed: no event tells that an app shows another block, so presence needs a poll anyway,
 	 * and the block events of other sessions would need the connection's attach_all scope widened to every block event
 	 * of the server, which the hangar watch's listener would then take in too, and which a reconnect drops.
+	 *
+	 * When presence cannot be read (client.list, list_blocks or size failing, or a reply off its schema) the pane counts
+	 * as not looked at, so the prompt is pushed: a deliberate choice of the human's, 2026-11-05, since a missed push costs
+	 * more than an extra one.
 	 */
 	function watchForeign(): () => void {
 		const emitted = new Map<string, { readonly seq: number; readonly watched: boolean }>();

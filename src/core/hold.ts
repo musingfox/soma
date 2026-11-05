@@ -42,6 +42,8 @@ type HoldState = {
 	rounds?: { floor: number; handled: number[] };
 	/** When the last summary that rang went out. */
 	rang?: number;
+	/** When the last summary attempt ended, sent or failed; the next waits the idle time from it. */
+	tried?: number;
 	/** The summary under way: its input, admitted in the commit that pinned the pushes it covers. */
 	round?: { requestId: string; submission: number; keys: string[] };
 	/** Summaries begun so far, which numbers each one's requestId. */
@@ -226,7 +228,8 @@ const delivered = (entry: ReturnType<typeof noticeEntry>, delivery: Record<strin
  * questions whose prompt is gone, pins the rest and admits the input that asks the model for the summary, so a restart
  * waits on the same round. When the round answers, one commit writes the summary, ringing on the interfaces holding
  * what it covers unless one rang since the human last typed, sends each question still waiting there again with its
- * buttons and no sound, and stops holding what it covered. A round that fails keeps everything held for the next check.
+ * buttons and no sound, and stops holding what it covered. A round that fails keeps everything held. Either way the
+ * end of the attempt is kept, and the next summary waits the idle time from it.
  */
 export function summaries({ harness, root, context, policies, now, presence, idleMs }: SummaryOptions) {
 	const prompts = async (tx: Tx) => ({
@@ -239,7 +242,7 @@ export function summaries({ harness, root, context, policies, now, presence, idl
 			const doc = await tx.doc(Holds, root.id);
 			if (doc.round !== undefined) return copy(doc.round);
 			const held = copy(doc.held);
-			if (!summaryDue(held, presence(), now(), idleMs)) return undefined;
+			if (!summaryDue(held, presence(), doc.tried, now(), idleMs)) return undefined;
 			const { jobs, told } = await prompts(tx);
 			const live = held.filter((push) => !promptGone(push, jobs, told));
 			if (live.length !== held.length) doc.held = live;
@@ -282,6 +285,7 @@ export function summaries({ harness, root, context, policies, now, presence, idl
 			}
 			doc.held = copy(doc.held).filter((push) => !round.keys.includes(push.key));
 			delete doc.round;
+			doc.tried = now();
 			if (rings) doc.rang = now();
 		}, context);
 
@@ -305,7 +309,9 @@ export function summaries({ harness, root, context, policies, now, presence, idl
 				console.error(`[soma] summary ${round.requestId} failed (${reason}); what it covers stays held`);
 				await root.commit(async (tx) => {
 					const doc = await tx.doc(Holds, root.id);
-					if (doc.round?.requestId === round.requestId) delete doc.round;
+					if (doc.round?.requestId !== round.requestId) return;
+					delete doc.round;
+					doc.tried = now();
 				}, context);
 			} catch (error) {
 				console.error("[soma] summary:", error);

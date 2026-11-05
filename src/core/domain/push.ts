@@ -135,9 +135,19 @@ export type HeldPush = Omit<PendingPush, "class"> & {
 	readonly to: string[];
 };
 
-/** A summary is due once something is held and the human has typed on no interface for `idleMs`. */
-export const summaryDue = (held: readonly HeldPush[], presence: Presence, now: number, idleMs: number): boolean =>
-	held.length > 0 && Object.values(presence).every((at) => now - at >= idleMs);
+/**
+ * A summary is due once something is held and `idleMs` passed since the later of the human's last input on any
+ * interface and the last summary attempt, sent or failed (`tried`): at most one summary every `idleMs`.
+ */
+export const summaryDue = (
+	held: readonly HeldPush[],
+	presence: Presence,
+	tried: number | undefined,
+	now: number,
+	idleMs: number,
+): boolean =>
+	held.length > 0 &&
+	[...Object.values(presence), ...(tried === undefined ? [] : [tried])].every((at) => now - at >= idleMs);
 
 /** A summary rings unless one already rang since the human last typed: at most once per idle stretch. */
 export const summaryRings = (presence: Presence, rang: number | undefined): boolean =>

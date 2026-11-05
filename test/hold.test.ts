@@ -350,6 +350,7 @@ describe("summary", () => {
 		await vi.waitFor(() => expect(summariesOf(seen)).toHaveLength(1));
 
 		await human.notify("card d 完成", "report", "outcome");
+		advance(30 * MIN);
 		await vi.waitFor(() => expect(summariesOf(seen)).toHaveLength(2));
 		advance(MIN);
 		await human.submit({ content: "回來了", entry: { kind: TERMINAL }, requestId: "terminal:9" });
@@ -410,13 +411,13 @@ describe("summary", () => {
 		expect(prompts.filter((each) => each.startsWith("[summary]"))).toEqual([]);
 	});
 
-	test("a failed round keeps what it covers held, pushes nothing, and the next check tries again", async () => {
+	test("a failed round keeps what it covers held, pushes nothing, and is tried again after the idle time", async () => {
 		let fail = true;
 		const port = await holdingPort((prompt) => {
 			if (prompt.startsWith("[summary]") && fail) throw new Error("401 invalid x-api-key");
 			return writes(prompt);
 		});
-		const { root, advance, held, notices, prompts } = port;
+		const { root, advance, held, notices, prompts, settle } = port;
 		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
 		cleanup.push(async () => errors.mockRestore());
 		const { seen } = await heldFour(port);
@@ -432,9 +433,14 @@ describe("summary", () => {
 		expect(seen.filter((event) => event.type === "failure" && event.class !== undefined)).toEqual([]);
 
 		fail = false;
+		advance(29 * MIN);
+		await settle();
+		expect(prompts.filter((each) => each.startsWith("[summary]"))).toHaveLength(1);
+		expect(summariesOf(seen)).toEqual([]);
+		advance(MIN);
 		await vi.waitFor(() => expect(summariesOf(seen)).toHaveLength(1));
 		expect(await held()).toEqual([]);
-		expect(prompts.filter((each) => each.startsWith("[summary]")).length).toBeGreaterThanOrEqual(2);
+		expect(prompts.filter((each) => each.startsWith("[summary]"))).toHaveLength(2);
 	});
 
 	test("what is held when the round begins is covered; what comes in while it runs waits for the next", async () => {
@@ -446,7 +452,7 @@ describe("summary", () => {
 			if (prompt.startsWith("[summary]")) await gate;
 			return writes(prompt);
 		});
-		const { root, advance, held, prompts } = port;
+		const { root, advance, held, prompts, settle } = port;
 		const { human, seen } = await heldFour(port);
 		advance(30 * MIN);
 		await vi.waitFor(async () =>
@@ -455,7 +461,13 @@ describe("summary", () => {
 		await human.notify("card f 完成", "report", "outcome");
 		await vi.waitFor(async () => expect(await held()).toHaveLength(5));
 		release();
-		// Still idle, so the next check summarizes what waited, without a sound.
+		await vi.waitFor(() => expect(summariesOf(seen)).toHaveLength(1));
+		// A push held right after a summary waits the idle time again; then it rings no more in this idle stretch.
+		advance(29 * MIN);
+		await settle();
+		expect(summariesOf(seen)).toHaveLength(1);
+		expect((await held()).map((push: { content: string }) => push.content)).toEqual(["card f 完成"]);
+		advance(MIN);
 		await vi.waitFor(() => expect(summariesOf(seen)).toHaveLength(2));
 		const [first, next] = prompts.filter((each) => each.startsWith("[summary]"));
 		expect(first).toContain("card b 完成");
@@ -480,6 +492,25 @@ describe("summary", () => {
 		await settle();
 		expect(summariesOf(third.seen)).toEqual([]);
 		expect(await held()).toEqual([]);
+	});
+
+	test("the last attempt's time survives a restart: a push held after it still waits the idle time", async () => {
+		const port = await holdingPort();
+		const { open, advance, held, settle } = port;
+		const first = await heldFour(port);
+		advance(30 * MIN);
+		await vi.waitFor(() => expect(summariesOf(first.seen)).toHaveLength(1));
+		await first.human.notify("card h 完成", "report", "outcome");
+		await vi.waitFor(async () => expect(await held()).toHaveLength(1));
+		await first.human.close();
+
+		const second = await open();
+		advance(29 * MIN);
+		await settle();
+		expect(summariesOf(second.seen)).toEqual([]);
+		advance(MIN);
+		await vi.waitFor(() => expect(summariesOf(second.seen)).toHaveLength(1));
+		expect(summariesOf(second.seen)[0]?.delivery?.[TELEGRAM]).toBe("quiet");
 	});
 
 	test("a summary cut short by a restart is finished by the next start, once", async () => {

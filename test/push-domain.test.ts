@@ -176,13 +176,22 @@ const held: HeldPush = { key: "notice:3", at: 0, kind: "report", class: "outcome
 
 test("a summary is due once something is held and nobody typed anywhere for the idle time", () => {
 	const presence = { [TERMINAL]: 10 * MIN, [TELEGRAM]: 5 * MIN };
-	expect(summaryDue([held], presence, 39 * MIN, 30 * MIN)).toBe(false);
-	expect(summaryDue([held], presence, 40 * MIN, 30 * MIN)).toBe(true);
-	expect(summaryDue([], presence, 90 * MIN, 30 * MIN)).toBe(false);
+	expect(summaryDue([held], presence, undefined, 39 * MIN, 30 * MIN)).toBe(false);
+	expect(summaryDue([held], presence, undefined, 40 * MIN, 30 * MIN)).toBe(true);
+	expect(summaryDue([], presence, undefined, 90 * MIN, 30 * MIN)).toBe(false);
 	// Input restarts the wait.
-	expect(summaryDue([held], { ...presence, [TELEGRAM]: 35 * MIN }, 40 * MIN, 30 * MIN)).toBe(false);
-	// Nobody ever typed: idle already.
-	expect(summaryDue([held], {}, 0, 30 * MIN)).toBe(true);
+	expect(summaryDue([held], { ...presence, [TELEGRAM]: 35 * MIN }, undefined, 40 * MIN, 30 * MIN)).toBe(false);
+	// Nobody ever typed and nothing was tried: idle already.
+	expect(summaryDue([held], {}, undefined, 0, 30 * MIN)).toBe(true);
+});
+
+test("a summary attempt, sent or failed, restarts the wait as input does", () => {
+	const presence = { [TERMINAL]: 10 * MIN };
+	expect(summaryDue([held], presence, 40 * MIN, 69 * MIN, 30 * MIN)).toBe(false);
+	expect(summaryDue([held], presence, 40 * MIN, 70 * MIN, 30 * MIN)).toBe(true);
+	expect(summaryDue([held], {}, 40 * MIN, 69 * MIN, 30 * MIN)).toBe(false);
+	// Input after the attempt is the later of the two.
+	expect(summaryDue([held], { [TERMINAL]: 50 * MIN }, 40 * MIN, 79 * MIN, 30 * MIN)).toBe(false);
 });
 
 test("a summary rings once per idle stretch: again only after the human typed since the last that rang", () => {

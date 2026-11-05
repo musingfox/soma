@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "vitest";
 import { createTtyAgentPort, type Pty, type SpawnPty } from "../../../src/adapters/tty/agent-port.ts";
-import { type AgentPort, type AgentStatusEvent, NotImplemented } from "../../../src/ports/agent.ts";
+import { type AgentPort, type AgentStatusEvent, NotImplemented, PromptRefused } from "../../../src/ports/agent.ts";
 import { git } from "../rex/fake.ts";
 
 const SESSION = "0e9d6c1f-4a3b-4a52-9c85-2f6d3f6f2f10";
@@ -111,11 +111,13 @@ test("resume is not implemented, which it says with its own error, having spawne
 	expect(spawns).toEqual([]);
 });
 
-test("tty lists no foreign agents and reads none, every pty being one of its own", async () => {
+test("tty lists no foreign agents, and reads and prompts none, every pty being one of its own", async () => {
 	const { port, spawns } = harness();
 	await port.start(request);
 	expect(await port.listForeign()).toEqual([]);
 	await expect(port.readForeignResult("card-a")).rejects.toThrow("no foreign agent card-a");
+	await expect(port.promptForeign("card-a", "go")).rejects.toThrow("no foreign agent card-a");
+	await expect(port.promptForeign("card-a", "go")).rejects.toBeInstanceOf(PromptRefused);
 	expect(spawns).toHaveLength(1);
 });
 

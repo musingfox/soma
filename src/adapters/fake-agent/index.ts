@@ -1,15 +1,16 @@
-import type {
-	AgentListing,
-	AgentPort,
-	AgentResult,
-	AgentState,
-	AgentStatusEvent,
-	Answer,
-	AnswerOutcome,
-	ForeignAgent,
-	ForeignStatusEvent,
-	ResumeRequest,
-	StartRequest,
+import {
+	type AgentListing,
+	type AgentPort,
+	type AgentResult,
+	type AgentState,
+	type AgentStatusEvent,
+	type Answer,
+	type AnswerOutcome,
+	type ForeignAgent,
+	type ForeignStatusEvent,
+	PromptRefused,
+	type ResumeRequest,
+	type StartRequest,
 } from "../../ports/agent.ts";
 
 export class FakeAgentPort implements AgentPort {
@@ -17,6 +18,8 @@ export class FakeAgentPort implements AgentPort {
 	readonly responses: { readonly agent: string; readonly answer: Answer }[] = [];
 	/** Answers sent to foreign agents, by id. */
 	readonly foreignResponses: { readonly id: string; readonly answer: Answer }[] = [];
+	/** Prompts sent to foreign agents, by id. */
+	readonly foreignPrompts: { readonly id: string; readonly text: string }[] = [];
 	readonly started: StartRequest[] = [];
 	readonly resumed: ResumeRequest[] = [];
 	// One entry per call, so a second stop of the same agent shows.
@@ -96,6 +99,20 @@ export class FakeAgentPort implements AgentPort {
 		this.foreignResponses.push({ id, answer });
 		found.agent = { ...found.agent, status: { state: "working" } };
 		return { sent: true };
+	}
+
+	/** As the rex adapter's, against the foreign agent's listed status; it turns working once sent. */
+	async promptForeign(id: string, text: string): Promise<void> {
+		const found = this.foreign.find(({ agent }) => agent.id === id);
+		if (found === undefined) throw new PromptRefused(`no foreign agent ${id}`);
+		const state = found.agent.status?.state;
+		if (state !== "idle" && state !== "done") {
+			throw new PromptRefused(
+				`foreign agent ${id} is ${state ?? "without a status"}: a prompt goes only to idle or done`,
+			);
+		}
+		this.foreignPrompts.push({ id, text });
+		found.agent = { ...found.agent, status: { state: "working" } };
 	}
 
 	onForeignStatus(listener: (event: ForeignStatusEvent) => void): () => void {

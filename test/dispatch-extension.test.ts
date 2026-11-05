@@ -176,6 +176,60 @@ test("respond answers a foreign agent's prompt by its id, checking the fingerpri
 	expect(agents.responses).toEqual([]);
 });
 
+test("foreign_prompt sends an idle or done foreign agent a prompt, and refuses a working or blocked one with the reason", async () => {
+	const { agents, call } = await setup();
+	const where = { session: "work", label: "Window 1" };
+	const blocked = { state: "blocked" as const, kind: "permission" as const, fingerprint: "f" };
+	agents.foreign.push(
+		{ agent: { id: "pane-1", ...where, status: { state: "idle" } } },
+		{ agent: { id: "pane-2", ...where, status: { state: "done" } } },
+		{ agent: { id: "pane-3", ...where, status: { state: "working" } } },
+		{ agent: { id: "pane-4", ...where, status: blocked } },
+	);
+	const send = (id: string, requestId: string) => call("foreign_prompt", { id, text: `go ${id}` }, requestId);
+
+	expect(await send("pane-3", "r1")).toEqual({
+		sent: false,
+		refused: "foreign agent pane-3 is working: a prompt goes only to idle or done",
+	});
+	expect(await send("pane-4", "r2")).toEqual({
+		sent: false,
+		refused: "foreign agent pane-4 is blocked: a prompt goes only to idle or done",
+	});
+	expect(await send("pane-9", "r3")).toEqual({ sent: false, refused: "no foreign agent pane-9" });
+	expect(agents.foreignPrompts).toEqual([]);
+
+	expect(await send("pane-1", "r4")).toEqual({ sent: true });
+	expect(await send("pane-2", "r5")).toEqual({ sent: true });
+	expect(agents.foreignPrompts).toEqual([
+		{ id: "pane-1", text: "go pane-1" },
+		{ id: "pane-2", text: "go pane-2" },
+	]);
+	expect(agents.prompts).toEqual([]);
+});
+
+test("foreign_prompt that fails after typing began does not call it a refusal", async () => {
+	const { agents, call } = await setup();
+	agents.foreign.push({ agent: { id: "pane-1", session: "work", label: "Window 1", status: { state: "idle" } } });
+	agents.promptForeign = async () => {
+		throw new Error("rex connection lost");
+	};
+
+	expect(await call("foreign_prompt", { id: "pane-1", text: "go" }, "r1")).toEqual({
+		sent: "unknown",
+		error: "rex connection lost",
+	});
+});
+
+test("foreign_prompt is not replayed after a crash, and foreign_agents no longer says soma never prompts", () => {
+	const tools = dispatchExtension(new FakeAgentPort(), async () => "").tools ?? [];
+	const byName = new Map(tools.map((tool) => [tool.name, tool]));
+
+	expect(byName.get("foreign_prompt")?.replay).toBe("unsafe");
+	expect(byName.get("foreign_agents")?.description).toContain("foreign_prompt");
+	expect(byName.get("foreign_agents")?.description).not.toMatch(/never prompts/);
+});
+
 test("respond names a job or a foreign agent, not both and not neither", async () => {
 	const { agents, call, dispatch } = await setup();
 	await dispatch("card-a", "r1");

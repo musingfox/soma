@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterAll, expect, test, vi } from "vitest";
 import { createRexAgentPort } from "../../../src/adapters/rex/agent-port.ts";
 import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
-import type { ForeignStatusEvent } from "../../../src/ports/agent.ts";
+import { type ForeignStatusEvent, PromptRefused } from "../../../src/ports/agent.ts";
 import { AT, AT_US, type Block, type Client, fixture, HANGAR, rex, SESSION, type Session } from "./fake.ts";
 
 const root = mkdtempSync(join(tmpdir(), "soma-rex-foreign-"));
@@ -66,6 +66,7 @@ function port(fake: ReturnType<typeof rex>, foreignMs = 60_000) {
 		sessionsDir,
 		redrawMs: 0,
 		keyGapMs: 0,
+		confirmMs: 10,
 		foreignMs,
 	});
 }
@@ -367,6 +368,74 @@ test("respondForeign throws for an id that names no foreign agent: soma's own ag
 	await expect(port(fake).respondForeign("block:a", answer)).rejects.toThrow("no foreign agent block:a");
 	await expect(port(fake).respondForeign("block:gone", answer)).rejects.toThrow("no foreign agent block:gone");
 	expect(pressed(fake)).toEqual([]);
+});
+
+/** What was pasted or written, on which block of which session. */
+const typed = (fake: ReturnType<typeof rex>) =>
+	fake.calls
+		.filter((call) => call.method === "block.event" || call.method.endsWith(".write"))
+		.map((call) => {
+			const { session_id, block_id, event, args } = call.payload as {
+				session_id: string;
+				block_id: string;
+				event?: { type: string; payload: { text?: string } };
+				args?: { data: string };
+			};
+			return `${session_id} ${block_id} ${event ? `${event.type}:${event.payload.text}` : `write:${JSON.stringify(args?.data)}`}`;
+		});
+
+test.each([
+	// Still idle once confirmMs passes, so \r is sent once more, as for a job.
+	[
+		"idle",
+		["session:work block:w1 paste:go on", 'session:work block:w1 write:"\\r"', 'session:work block:w1 write:"\\r"'],
+	],
+	["done", ["session:work block:w1 paste:go on", 'session:work block:w1 write:"\\r"']],
+])("promptForeign sends a %s foreign agent the prompt on its own block, in its own session", async (state, sent) => {
+	const fake = blockedForeign({ records: [{ state, updated_at: AT }] });
+
+	await port(fake).promptForeign("block:w1", "go on");
+
+	expect(typed(fake)).toEqual(sent);
+});
+
+test.each([
+	["working", [{ state: "working", updated_at: AT }]],
+	["blocked", blockedRecord],
+	["without a status record", []],
+])("promptForeign refuses a foreign agent that is %s, with the reason, typing nothing", async (state, records) => {
+	const fake = blockedForeign({ records });
+
+	const prompted = port(fake).promptForeign("block:w1", "go on");
+
+	await expect(prompted).rejects.toThrow(`rex foreign agent block:w1 is ${state}: a prompt goes only to idle or done`);
+	await expect(prompted).rejects.toBeInstanceOf(PromptRefused);
+	expect(typed(fake)).toEqual([]);
+});
+
+test("promptForeign re-reads the state just before sending: one that turned working since it was listed is refused", async () => {
+	const fake = blockedForeign({ records: [{ state: "idle", updated_at: AT }] });
+	let reads = 0;
+	fake.replace("com.superlogical.terminal.program_status", (payload) =>
+		payload.block_id === "block:w1" && ++reads > 1
+			? { records: [{ state: "working", updated_at: AT }] }
+			: fake.original("com.superlogical.terminal.program_status")(payload),
+	);
+
+	const prompted = port(fake).promptForeign("block:w1", "go on");
+
+	await expect(prompted).rejects.toThrow("rex foreign agent block:w1 is working");
+	expect(reads).toBe(2);
+	expect(typed(fake)).toEqual([]);
+});
+
+test("promptForeign refuses an id that names no foreign agent: soma's own agent, or none", async () => {
+	const fake = blockedForeign({ records: [{ state: "idle", updated_at: AT }] });
+
+	await expect(port(fake).promptForeign("block:a", "go")).rejects.toThrow("no foreign agent block:a");
+	await expect(port(fake).promptForeign("block:a", "go")).rejects.toBeInstanceOf(PromptRefused);
+	await expect(port(fake).promptForeign("block:gone", "go")).rejects.toThrow("no foreign agent block:gone");
+	expect(typed(fake)).toEqual([]);
 });
 
 test("a session whose label starts with soma- never holds a foreign agent, any other session does", async () => {

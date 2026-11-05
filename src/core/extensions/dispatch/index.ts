@@ -9,7 +9,7 @@ import {
 	type Tx,
 } from "@earendil-works/pi-durable";
 import { obj, opt, str } from "@earendil-works/pi-schema";
-import type { AgentPort, Answer } from "../../../ports/agent.ts";
+import { type AgentPort, type Answer, PromptRefused } from "../../../ports/agent.ts";
 import type { Choices, HumanAnswerOutcome } from "../../../ports/human.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
 import { composeLaunchPrompt } from "../../domain/launch-prompt.ts";
@@ -254,7 +254,8 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 			"Each has an id, its session's label, the pane's label, its state (idle, working, blocked, done or error; " +
 			"absent when it cannot be told; a blocked one with its prompt's options and fingerprint when its screen could be " +
 			"read) and its cwd. A blocked one's prompt can be answered with respond, by its id as foreign, never for " +
-			"kind=auth; soma never prompts, stops or resumes these. The jobs soma dispatched are listed by jobs, not here.",
+			"kind=auth; an idle or done one can be sent a new prompt with foreign_prompt. soma never stops or resumes " +
+			"these. The jobs soma dispatched are listed by jobs, not here.",
 		parameters: obj({}),
 		replay: "safe",
 		execute: async () => text(await agents.listForeign()),
@@ -279,8 +280,35 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 		},
 	});
 
+	const foreignPrompt = defineTool({
+		name: "foreign_prompt",
+		description:
+			"Send a foreign agent a new prompt, as if typed at its pane: only one that is idle or done. Its state is read " +
+			"again just before sending, and one that is working or blocked is refused with the reason, so the text never " +
+			"lands in the middle of a turn or answers a dialog. No notice comes when its turn ends: read its reply with " +
+			'foreign_result. sent: "unknown" means sending failed after some of the text may have reached the agent; ' +
+			"look with foreign_agents and foreign_result before sending again.",
+		parameters: obj({
+			id: str({ description: "The agent's id as foreign_agents listed it" }),
+			text: str({ description: "The prompt to send" }),
+		}),
+		// Not replayed: a crash mid-call reports it interrupted rather than sending the prompt a second time.
+		replay: "unsafe",
+		execute: async ({ id, text: prompt }) => {
+			try {
+				await agents.promptForeign(id, prompt);
+			} catch (error) {
+				const message = (error as Error).message;
+				return text(
+					error instanceof PromptRefused ? { sent: false, refused: message } : { sent: "unknown", error: message },
+				);
+			}
+			return { ...text({ sent: true }), details: FORWARDED };
+		},
+	});
+
 	return defineExtension({
 		name: "soma.dispatch",
-		tools: [dispatch, jobs, respond, escalate, reply, foreignAgents, foreignResult],
+		tools: [dispatch, jobs, respond, escalate, reply, foreignAgents, foreignResult, foreignPrompt],
 	});
 }

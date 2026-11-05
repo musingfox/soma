@@ -43,8 +43,8 @@ export interface AgentListing {
 
 /**
  * An agent soma did not dispatch: a pane, in any session of the agent side, whose foreground is claude and which is
- * none of the agents `list` names. soma may read it and answer its prompts, but never starts, prompts, stops or
- * resumes one (ARCHITECTURE.md "Foreign agents").
+ * none of the agents `list` names. soma may read it, answer its prompts and send an idle or done one a prompt, but
+ * never starts, stops or resumes one (ARCHITECTURE.md "Foreign agents").
  */
 export interface ForeignAgent {
 	// Opaque to the core, and the same for the pane as long as it lives, whatever runs in it.
@@ -134,4 +134,8 @@ export interface AgentPort {
 	readForeignResult(id: string): Promise<AgentResult | undefined>;
 	// As respond, for a foreign agent by its id, and never for kind=auth; throws for an id that names no foreign agent now.
 	respondForeign(id: string, answer: Answer): Promise<AnswerOutcome>;
+	// As prompt, for a foreign agent by its id: only an idle or done one, its state read again just before the text is
+	// typed. Throws PromptRefused when it typed nothing, as for a working or blocked one or an id that names no foreign
+	// agent now.
+	promptForeign(id: string, text: string): Promise<void>;
 }

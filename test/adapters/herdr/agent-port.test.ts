@@ -7,7 +7,7 @@ import { createHerdrClient } from "../../../src/adapters/herdr/client.ts";
 import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
 import { complete, observe } from "../../../src/core/domain/bridge.ts";
 import type { Job } from "../../../src/core/domain/dispatch.ts";
-import { NotImplemented } from "../../../src/ports/agent.ts";
+import { NotImplemented, PromptRefused } from "../../../src/ports/agent.ts";
 
 const agent = (name: string | null, agent_status: string) => ({
 	terminal_id: "t",
@@ -91,11 +91,13 @@ test("resume is not implemented, which it says with its own error, having called
 	expect(calls).toEqual([]);
 });
 
-test("herdr lists no foreign agents and reads none, having called herdr for nothing", async () => {
+test("herdr lists no foreign agents, and reads and prompts none, having called herdr for nothing", async () => {
 	const { client, calls } = herdr([agent(null, "working"), agent("other", "idle")]);
 	const port = createHerdrAgentPort({ client, cap: 1 });
 	expect(await port.listForeign()).toEqual([]);
 	await expect(port.readForeignResult("w1:p1")).rejects.toThrow("no foreign agent w1:p1");
+	await expect(port.promptForeign("w1:p1", "go")).rejects.toThrow("no foreign agent w1:p1");
+	await expect(port.promptForeign("w1:p1", "go")).rejects.toBeInstanceOf(PromptRefused);
 	expect(calls).toEqual([]);
 });
 

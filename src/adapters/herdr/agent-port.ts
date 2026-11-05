@@ -13,6 +13,7 @@ import {
 	type Answer,
 	type AnswerOutcome,
 	NotImplemented,
+	PromptRefused,
 	type StartRequest,
 } from "../../ports/agent.ts";
 import { STATE_BY_AGENT_STATUS } from "./agent-state.ts";
@@ -194,5 +195,6 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 		readForeignResult: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: herdr lists none`)),
 		onForeignStatus: () => () => {},
 		respondForeign: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: herdr lists none`)),
+		promptForeign: (id: string) => Promise.reject(new PromptRefused(`no foreign agent ${id}: herdr lists none`)),
 	};
 }

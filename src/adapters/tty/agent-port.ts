@@ -21,6 +21,7 @@ import {
 	type AnswerOutcome,
 	type BlockedKind,
 	NotImplemented,
+	PromptRefused,
 	type StartRequest,
 } from "../../ports/agent.ts";
 
@@ -436,5 +437,6 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 		readForeignResult: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: tty runs none`)),
 		onForeignStatus: () => () => {},
 		respondForeign: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: tty runs none`)),
+		promptForeign: (id: string) => Promise.reject(new PromptRefused(`no foreign agent ${id}: tty runs none`)),
 	};
 }

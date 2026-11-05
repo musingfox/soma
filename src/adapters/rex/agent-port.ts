@@ -562,9 +562,9 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	}
 
 	/** The root record's state as rex reports it, undefined when there is none or it cannot be read. */
-	async function rootState(blockId: string): Promise<string | undefined> {
+	async function rootState(blockId: string, session = sessionId): Promise<string | undefined> {
 		try {
-			const { records } = await blockCall("program_status", blockId, ProgramStatusResultSchema);
+			const { records } = await blockCall("program_status", blockId, ProgramStatusResultSchema, {}, session);
 			return records.find(isRoot)?.state;
 		} catch (error) {
 			onError(error as Error);
@@ -572,7 +572,8 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		}
 	}
 
-	const write = (blockId: string, data: string) => blockCall("write", blockId, WriteResultSchema, { data });
+	const write = (blockId: string, data: string, session = sessionId) =>
+		blockCall("write", blockId, WriteResultSchema, { data }, session);
 
 	/** The block's screen as plain text, cut to its last SCREEN_BYTES: the whole scrollback can outgrow one reply. */
 	async function readScreen(blockId: string, session = sessionId): Promise<BlockedScreen> {
@@ -637,13 +638,16 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		return { sent: true };
 	}
 
-	/** Resolves true once the block's root record turns working, false when `ms` passes first. */
-	function turnsWorking(blockId: string, ms: number) {
+	/**
+	 * Resolves true once the block's root record turns working, false when `ms` passes first. Only the hangar's block
+	 * events reach the connection (`foreign`), so a block of another session always waits out `ms`.
+	 */
+	function turnsWorking(blockId: string, ms: number, session = sessionId) {
 		let stop = () => {};
 		const done = new Promise<boolean>((resolve) => {
 			const timer = setTimeout(() => resolve(false), ms);
 			const off = client.onSessionEvent((event) => {
-				if (event.session_id !== sessionId || event.event.type !== "block_event") return;
+				if (event.session_id !== session || event.event.type !== "block_event") return;
 				const block = BlockEventSchema.safeParse(event.event.payload);
 				if (!block.success || block.data.block_id !== blockId || block.data.name !== "program_status_changed") return;
 				const changed = ProgramStatusChangedSchema.safeParse(block.data.payload);
@@ -655,6 +659,51 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			};
 		});
 		return { done, stop: () => stop() };
+	}
+
+	/**
+	 * Types `text` into the claude on a block of `session`, found by `find`, once its root record, read again here just
+	 * before the paste, is idle or done: typed into a prompt, the text's `\r` would choose the highlighted option.
+	 * Nothing is typed until the paste, so whatever fails before it, `find` included, is a PromptRefused the caller may
+	 * try again. `what` names the agent in a refusal.
+	 */
+	async function promptOn(
+		what: string,
+		text: string,
+		find: () => Promise<{ readonly session: string; readonly blockId: string }>,
+	): Promise<void> {
+		let where: { readonly session: string; readonly blockId: string };
+		try {
+			where = await find();
+			const { records } = await blockCall(
+				"program_status",
+				where.blockId,
+				ProgramStatusResultSchema,
+				{},
+				where.session,
+			);
+			const state = records.find(isRoot)?.state;
+			if (state !== "idle" && state !== "done") {
+				throw new Error(`${what} is ${state ?? "without a status record"}: a prompt goes only to idle or done`);
+			}
+		} catch (error) {
+			throw new PromptRefused(error instanceof Error ? error.message : String(error));
+		}
+		const { session, blockId } = where;
+		const working = turnsWorking(blockId, confirmMs, session);
+		try {
+			// A paste keeps a multi-line prompt one message; claude takes `\r` as Enter where a typed key may not.
+			await client.call(
+				"block.event",
+				{ session_id: session, block_id: blockId, event: { type: "paste", payload: { text } } },
+				EmptyResultSchema,
+			);
+			await write(blockId, "\r", session);
+			// Only an idle claude can still hold the text unsent; on any other screen `\r` would answer a prompt.
+			if (!(await working.done) && (await rootState(blockId, session)) === "idle") await write(blockId, "\r", session);
+		} finally {
+			working.stop();
+		}
 	}
 
 	/**
@@ -910,35 +959,10 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		},
 
 		async prompt(agent: string, text: string): Promise<void> {
-			let blockId: string;
-			// Nothing is typed until the paste, so whatever fails before it is a refusal the caller may try again.
-			try {
-				({ blockId } = only(await panes(), agent));
-				// Typed into a prompt, the text's `\r` would choose the highlighted option.
-				const { records } = await blockCall("program_status", blockId, ProgramStatusResultSchema);
-				const state = records.find(isRoot)?.state;
-				if (state !== "idle" && state !== "done") {
-					throw new Error(
-						`rex agent ${agent} is ${state ?? "without a status record"}: a prompt goes only to idle or done`,
-					);
-				}
-			} catch (error) {
-				throw new PromptRefused(error instanceof Error ? error.message : String(error));
-			}
-			const working = turnsWorking(blockId, confirmMs);
-			try {
-				// A paste keeps a multi-line prompt one message; claude takes `\r` as Enter where a typed key may not.
-				await client.call(
-					"block.event",
-					{ session_id: sessionId, block_id: blockId, event: { type: "paste", payload: { text } } },
-					EmptyResultSchema,
-				);
-				await write(blockId, "\r");
-				// Only an idle claude can still hold the text unsent; on any other screen `\r` would answer a prompt.
-				if (!(await working.done) && (await rootState(blockId)) === "idle") await write(blockId, "\r");
-			} finally {
-				working.stop();
-			}
+			return promptOn(`rex agent ${agent}`, text, async () => ({
+				session: sessionId,
+				blockId: only(await panes(), agent).blockId,
+			}));
 		},
 
 		onStatus(listener: (event: AgentStatusEvent) => void): () => void {
@@ -1008,7 +1032,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			await client.call("block.close", { session_id: sessionId, block_id: blockId }, BlockClosedResultSchema);
 		},
 
-		/** By block id, which rex keeps for the block's life. Read only: no block of another session is written to. */
+		/** By block id, which rex keeps for the block's life. Read only: nothing is written to any block. */
 		async listForeign(): Promise<readonly ForeignAgent[]> {
 			return (await foreign()).map(({ agent }) => agent);
 		},
@@ -1021,6 +1045,21 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			const found = (await foreign()).find((each) => each.agent.id === id);
 			if (found === undefined) throw new Error(`no foreign agent ${id}: no block of that id runs claude outside soma`);
 			return answerOn(found.sessionId, id, answer, false);
+		},
+
+		/**
+		 * As prompt, on the foreign agent's block in its own session. Its state is read again after the listing found it,
+		 * just before the paste, so a claude that began a turn or a dialog since is refused. Its \r is confirmed only by the
+		 * state read once confirmMs passed (`turnsWorking`), so the prompt always takes that long.
+		 */
+		async promptForeign(id: string, text: string): Promise<void> {
+			return promptOn(`rex foreign agent ${id}`, text, async () => {
+				const found = (await foreign()).find((each) => each.agent.id === id);
+				if (found === undefined) {
+					throw new Error(`no foreign agent ${id}: no block of that id runs claude outside soma`);
+				}
+				return { session: found.sessionId, blockId: id };
+			});
 		},
 
 		onForeignStatus(listener: (event: ForeignStatusEvent) => void): () => void {

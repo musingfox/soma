@@ -48,44 +48,48 @@ function wakeContent(agent: ForeignAgent, { kind, msg, fingerprint }: Blocked): 
  * is not looking at its pane, and once per prompt: the prompt told is kept in `ForeignPrompts`, in the commit of the
  * notice, and forgotten when the agent is seen past it. Only that push wakes the model, with a `foreign:<id>:<seq>`
  * input that offers respond, and not for kind=auth, which is never answered, nor for a prompt whose screen gave no
- * fingerprint to answer by. soma never stops, prompts, defers for or resumes a foreign agent.
+ * fingerprint to answer by. A handling that failed is retried until the agent reports again or is gone. soma never
+ * stops, prompts, defers for or resumes a foreign agent.
  */
 export function foreignBridge(conversation: Conversation, agents: AgentPort, context: Context) {
 	// One event at a time: each reads what was told, acts, then commits it.
 	let queue = Promise.resolve();
+	// By agent id, the last event whose handling failed; the adapter has recorded its seq as reported, so it will not come
+	// again until something changes.
+	const failed = new Map<string, ForeignStatusEvent>();
 
 	async function apply({ agent, seq, watched }: ForeignStatusEvent): Promise<void> {
 		const { status } = agent;
-		const told = await conversation.commit(async (tx) => {
-			const found = (await tx.doc(ForeignPrompts, conversation.id)).told[agent.id];
-			// Copied out as JSON: a doc is a live proxy only valid inside its commit.
-			return found && (JSON.parse(JSON.stringify(found)) as Told[string]);
-		}, context);
-		const action: ForeignAction = observeForeign(told, status, watched);
-		if (action === "none") return;
-
-		// The wake precedes the commit of the notice, so a crash in between redoes both on restart, the adapter naming
-		// the same observation by the same seq: the requestId makes the second submit return the first.
-		if (action === "push" && status.state === "blocked" && status.kind !== "auth" && status.fingerprint !== undefined) {
-			await conversation.submit(
-				{
-					type: "input",
-					content: wakeContent(agent, status),
-					whenBusy: "followUp",
-					entry: { kind: FOREIGN_BLOCKED, data: { id: agent.id, kind: status.kind, seq } },
-					requestId: foreignRequestId(agent.id, seq),
-				},
-				context,
-			);
-		}
+		// WHY one commit: the wake, the notice and the prompt told are stored together or not at all. Two commits, wake
+		// first, left a crash between them with a model told "the human was notified" and no notice, which a human who went
+		// back to the pane before the restart would never be sent (the restart then sees the pane watched and pushes
+		// nothing); notice first would lose the wake instead. In one commit a crash or a throw leaves nothing, so the
+		// retry or the restart is the first and only push; the requestId still makes a wake submitted some other way
+		// return the first.
 		await conversation.commit(async (tx) => {
 			const doc = await tx.doc(ForeignPrompts, conversation.id);
-			const { [agent.id]: _past, ...others } = JSON.parse(JSON.stringify(doc.told)) as Told;
+			// Copied out as JSON: a doc is a live proxy, and it is read before the admission, written after it.
+			const found = doc.told[agent.id];
+			const told = found && (JSON.parse(JSON.stringify(found)) as Told[string]);
+			const others = JSON.parse(JSON.stringify(doc.told)) as Told;
+			delete others[agent.id];
+			const action: ForeignAction = observeForeign(told, status, watched);
+			if (action === "none") return;
 			if (action === "forget") {
 				doc.told = others;
 				return;
 			}
 			if (status.state !== "blocked") return;
+			// The admission goes before this commit's other table writes, once.
+			if (status.kind !== "auth" && status.fingerprint !== undefined) {
+				await conversation.submit(tx, {
+					type: "input",
+					content: wakeContent(agent, status),
+					whenBusy: "followUp",
+					entry: { kind: FOREIGN_BLOCKED, data: { id: agent.id, kind: status.kind, seq } },
+					requestId: foreignRequestId(agent.id, seq),
+				});
+			}
 			const prompt = toldOf(status);
 			doc.told = { ...others, [agent.id]: prompt };
 			await tx.appendEntry(
@@ -96,16 +100,48 @@ export function foreignBridge(conversation: Conversation, agents: AgentPort, con
 	}
 
 	function handle(event: ForeignStatusEvent): Promise<void> {
-		const run = queue.then(() => apply(event));
+		// A newer report of the agent replaces a failed one, whether or not it succeeds itself.
+		failed.delete(event.agent.id);
+		const run = queue.then(() =>
+			apply(event).catch((error: unknown) => {
+				failed.set(event.agent.id, event);
+				throw error;
+			}),
+		);
 		queue = run.catch(() => {});
 		return run;
 	}
 
+	/**
+	 * Handles again each event whose handling failed and whose agent is still listed; its status is the last the agent
+	 * side reported, as it reports again on any change. Returns the errors of those that failed once more.
+	 */
+	async function retry(): Promise<unknown[]> {
+		if (failed.size === 0) return [];
+		const listed = new Set((await agents.listForeign()).map(({ id }) => id));
+		const errors: unknown[] = [];
+		for (const [id, event] of [...failed]) {
+			if (!listed.has(id)) failed.delete(id);
+			else await handle(event).catch((error: unknown) => errors.push(error));
+		}
+		return errors;
+	}
+
 	return {
 		handle,
-		/** Feeds every foreign status the agent side reports from now on; returns the unsubscribe. */
-		listen(onError: (error: unknown) => void): () => void {
-			return agents.onForeignStatus((event) => void handle(event).catch(onError));
+		retry,
+		/**
+		 * Feeds every foreign status the agent side reports from now on, and every `retryMs` handles again the ones that
+		 * failed; returns the unsubscribe.
+		 */
+		listen(onError: (error: unknown) => void, retryMs = 15_000): () => void {
+			const off = agents.onForeignStatus((event) => void handle(event).catch(onError));
+			const timer = setInterval(() => void retry().then((errors) => errors.forEach(onError), onError), retryMs);
+			timer.unref();
+			return () => {
+				off();
+				clearInterval(timer);
+			};
 		},
 	};
 }

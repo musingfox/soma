@@ -1,10 +1,10 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
-import type { Conversation, Harness } from "@earendil-works/pi-durable";
+import type { Conversation, Harness, Tx } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { observeForeign } from "../src/core/domain/foreign.ts";
@@ -36,7 +36,7 @@ async function database() {
 }
 
 /** One core process over `db`, with a faux model whose request count is the model-call count. */
-async function core(db: string, agents: FakeAgentPort) {
+async function core(db: string, agents: FakeAgentPort, failing?: { next: () => boolean }) {
 	const faux = fauxProvider();
 	faux.setResponses(Array.from({ length: 20 }, () => fauxAssistantMessage("好。")));
 	const models = createModels();
@@ -47,12 +47,33 @@ async function core(db: string, agents: FakeAgentPort) {
 	open.push(harness);
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
-	const bridge = foreignBridge(root, agents, context);
+	// A commit that appended a notice may be made to fail, as a crash between the wake and the notice would: the
+	// callback ran, nothing of it is stored.
+	const flaky = new Proxy(root, {
+		get(target, key) {
+			const value = Reflect.get(target, key, target);
+			if (key !== "commit") return typeof value === "function" ? value.bind(target) : value;
+			return (change: (tx: Tx) => Promise<unknown>, ctx: Context) =>
+				root.commit(async (tx) => {
+					let appended = false;
+					const append = tx.appendEntry.bind(tx);
+					tx.appendEntry = ((...args: Parameters<Tx["appendEntry"]>) => {
+						appended = true;
+						return append(...args);
+					}) as Tx["appendEntry"];
+					const result = await change(tx);
+					if (appended && failing?.next()) throw new Error("the commit failed");
+					return result;
+				}, ctx);
+		},
+	});
+	const bridge = foreignBridge(flaky, agents, context);
 	const handled: Promise<void>[] = [];
-	const unlisten = agents.onForeignStatus((event) => handled.push(bridge.handle(event)));
+	const unlisten = agents.onForeignStatus((event) => handled.push(bridge.handle(event).catch(() => {})));
 	return {
 		harness,
 		root,
+		bridge,
 		calls: () => faux.state.callCount,
 		settle: async () => {
 			await Promise.all(handled);
@@ -313,4 +334,84 @@ describe("a foreign push that escalates", () => {
 		expect(questions()).toEqual([TERMINAL]);
 		await human.close();
 	});
+});
+
+test("a push whose commit failed leaves neither wake nor notice nor prompt told, so the model is never told of it", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await core(await database(), agents, { next: () => true });
+
+	agents.emitForeign(PANE, bash, 10);
+	await soma.settle();
+
+	expect(await entriesOf(soma.root, FOREIGN_BLOCKED)).toEqual([]);
+	expect(await entriesOf(soma.root, NOTICE)).toEqual([]);
+	expect(soma.calls()).toBe(0);
+	expect((await soma.told()) ?? {}).toEqual({});
+});
+
+test("a push that failed is retried, and then told once: one notice, one wake", async () => {
+	const agents = new FakeAgentPort();
+	let failures = 1;
+	const soma = await core(await database(), agents, { next: () => failures-- > 0 });
+
+	agents.emitForeign(PANE, bash, 10);
+	await soma.settle();
+	expect(await entriesOf(soma.root, NOTICE)).toEqual([]);
+
+	expect(await soma.bridge.retry()).toEqual([]);
+	await soma.settle();
+	expect(await entriesOf(soma.root, NOTICE)).toHaveLength(1);
+	expect(await entriesOf(soma.root, FOREIGN_BLOCKED)).toHaveLength(1);
+	expect(soma.calls()).toBe(1);
+
+	// Nothing is left to retry, and the dialog is not told again.
+	expect(await soma.bridge.retry()).toEqual([]);
+	await soma.settle();
+	expect(await entriesOf(soma.root, NOTICE)).toHaveLength(1);
+	expect(soma.calls()).toBe(1);
+});
+
+test("a failed push is dropped, not retried, once the agent reports again or is no longer listed", async () => {
+	const agents = new FakeAgentPort();
+	let failing = true;
+	const soma = await core(await database(), agents, { next: () => failing });
+
+	agents.emitForeign(PANE, bash, 10);
+	await soma.settle();
+	// It moved on, and the report of that replaced the failed one.
+	agents.emitForeign(PANE, { state: "working" }, 11);
+	await soma.settle();
+	failing = false;
+	expect(await soma.bridge.retry()).toEqual([]);
+	await soma.settle();
+	expect(await entriesOf(soma.root, NOTICE)).toEqual([]);
+
+	// Closed while blocked, before the retry.
+	failing = true;
+	agents.emitForeign(PANE, bash, 12);
+	await soma.settle();
+	agents.foreign.length = 0;
+	failing = false;
+	expect(await soma.bridge.retry()).toEqual([]);
+	await soma.settle();
+	expect(await entriesOf(soma.root, NOTICE)).toEqual([]);
+	expect(soma.calls()).toBe(0);
+});
+
+test("listen retries a failed push by itself on its interval", async () => {
+	const agents = new FakeAgentPort();
+	// core() listens too, so the one report is handled twice, and both fail.
+	let failures = 2;
+	const errors: unknown[] = [];
+	const soma = await core(await database(), agents, { next: () => failures-- > 0 });
+	const unlisten = soma.bridge.listen((error) => errors.push(error), 20);
+
+	agents.emitForeign(PANE, bash, 10);
+	await vi.waitFor(async () => expect(await entriesOf(soma.root, NOTICE)).toHaveLength(1));
+	unlisten();
+	await soma.settle();
+
+	expect(errors).toHaveLength(1);
+	expect(await entriesOf(soma.root, FOREIGN_BLOCKED)).toHaveLength(1);
+	expect(soma.calls()).toBe(1);
 });

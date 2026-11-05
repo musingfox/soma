@@ -93,9 +93,111 @@ body {
 }
 #bubble-text {
 	min-height: 0;
+	min-width: 0;
 	overflow-y: auto;
 	white-space: pre-wrap;
 	overflow-wrap: anywhere;
+}
+/* The reveal shows the words as typed; once done they are rendered markdown, which sets its own line breaks. */
+#bubble-text.md {
+	white-space: normal;
+	line-height: 1.45;
+}
+.md > :first-child {
+	margin-top: 0;
+}
+.md > :last-child {
+	margin-bottom: 0;
+}
+.md p,
+.md ul,
+.md ol,
+.md blockquote,
+.md pre,
+.md .table-wrap {
+	margin: 0.5em 0;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+	margin: 0.7em 0 0.3em;
+	line-height: 1.25;
+}
+.md h1 {
+	font-size: 1.25em;
+}
+.md h2 {
+	font-size: 1.15em;
+}
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+	font-size: 1.05em;
+}
+.md ul,
+.md ol {
+	padding-left: 1.4em;
+}
+.md li > p {
+	margin: 0.25em 0;
+}
+.md blockquote {
+	padding-left: 0.8em;
+	border-left: 3px solid rgba(42, 29, 22, 0.35);
+	opacity: 0.85;
+}
+.md hr {
+	border: 0;
+	border-top: 1px solid rgba(42, 29, 22, 0.3);
+	margin: 0.7em 0;
+}
+.md a {
+	color: #2a5fa8;
+	text-decoration: underline;
+}
+.md code {
+	padding: 0.05em 0.3em;
+	border-radius: 4px;
+	background: rgba(42, 29, 22, 0.1);
+	font-family: ui-monospace, "SF Mono", Menlo, monospace;
+	font-size: 0.88em;
+}
+/* A wide code block or table scrolls inside the bubble, never the page. */
+.md pre {
+	max-width: 100%;
+	overflow-x: auto;
+	padding: 8px 10px;
+	border-radius: 8px;
+	background: rgba(42, 29, 22, 0.1);
+	white-space: pre;
+	overflow-wrap: normal;
+}
+.md pre code {
+	padding: 0;
+	background: none;
+	font-size: 0.85em;
+}
+.md .table-wrap {
+	max-width: 100%;
+	overflow-x: auto;
+}
+.md table {
+	border-collapse: collapse;
+	font-size: 0.92em;
+}
+.md th,
+.md td {
+	padding: 4px 8px;
+	border: 1px solid rgba(42, 29, 22, 0.25);
+	text-align: left;
+	white-space: nowrap;
+}
+.md th {
+	background: rgba(42, 29, 22, 0.08);
 }
 
 .flying {

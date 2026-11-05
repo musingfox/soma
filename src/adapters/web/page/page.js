@@ -1,6 +1,7 @@
 // The page around the house: the socket to soma, the words typed to the fox, its speech bubbles, which state it is in,
 // and the debug panel.
 import { STATES } from "./fox.js";
+import { renderMarkdown } from "./markdown.js";
 import { createHouse } from "./scene.js";
 
 const $ = (id) => document.getElementById(id);
@@ -75,6 +76,7 @@ function showNext() {
 	}
 	bubble.hidden = false;
 	bubble.className = `bubble ${shown.kind}${shown.quiet ? " quiet" : ""}`;
+	bubbleText.className = "";
 	bubbleText.textContent = "";
 	settle();
 	placeBubble();
@@ -93,10 +95,22 @@ function showNext() {
 	}, 33);
 }
 
+/** The words as rendered markdown, built as DOM nodes; if that throws, the plain words stay. */
+function showRendered(words) {
+	try {
+		bubbleText.replaceChildren(renderMarkdown(words));
+		bubbleText.className = "md";
+	} catch (error) {
+		console.error("markdown", error);
+		bubbleText.className = "";
+		bubbleText.textContent = words;
+	}
+}
+
 function finishReveal() {
 	clearInterval(revealTimer);
 	revealTimer = 0;
-	bubbleText.textContent = shown.words;
+	showRendered(shown.words);
 	house.speak(false);
 	placeBubble();
 	startHold();

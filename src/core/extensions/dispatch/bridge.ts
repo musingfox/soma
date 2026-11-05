@@ -100,7 +100,11 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 				const msg = event.status.msg ? `\n${event.status.msg}` : "";
 				await tx.appendEntry(
 					conversation.id,
-					noticeEntry("question", `agent ${next.agent}（卡片 ${next.card}）在等登入或憑證，需要你處理。${msg}`),
+					noticeEntry(
+						"question",
+						"action",
+						`agent ${next.agent}（卡片 ${next.card}）在等登入或憑證，需要你處理。${msg}`,
+					),
 				);
 			}
 			// Signals commit with the seq, so a resent event records none twice.
@@ -115,7 +119,9 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 				if (notified) {
 					await tx.appendEntry(
 						conversation.id,
-						noticeEntry(outcome === "需要你" ? "question" : "report", resultNotice(next, reply)),
+						outcome === "需要你"
+							? noticeEntry("question", "action", resultNotice(next, reply))
+							: noticeEntry("report", "outcome", resultNotice(next, reply)),
 					);
 				}
 				const done = await tx.appendEntry(conversation.id, {
@@ -179,7 +185,7 @@ export async function reconcileDispatches(conversation: Conversation, agents: Ag
 			if (job.status.state !== "error" || before[index] === "error" || before[index] === "done") continue;
 			await tx.appendEntry(
 				conversation.id,
-				noticeEntry("report", `agent ${job.agent}（卡片 ${job.card}）不見了，這件工作沒有做完。`),
+				noticeEntry("report", "outcome", `agent ${job.agent}（卡片 ${job.card}）不見了，這件工作沒有做完。`),
 			);
 			await tx.appendEntry(conversation.id, {
 				kind: JOB_DONE,

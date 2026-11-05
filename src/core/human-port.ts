@@ -14,7 +14,16 @@ import {
 	type SubmissionRecord,
 } from "@earendil-works/pi-durable";
 import type { AgentPort, AgentState } from "../ports/agent.ts";
-import { type Choices, type HumanPort, type NoticeKind, PUSHED_FAILURES, type SomaEvent } from "../ports/human.ts";
+import {
+	type Choices,
+	type HumanPort,
+	MESSAGE_CLASSES,
+	type MessageClass,
+	type NoticeKind,
+	PUSHED_ANSWERS,
+	PUSHED_FAILURES,
+	type SomaEvent,
+} from "../ports/human.ts";
 import { HUMAN_CHOSEN } from "./domain/dispatch.ts";
 import type { Told } from "./domain/foreign.ts";
 import { escalation, type PendingPush, type Presence, pushTarget } from "./domain/push.ts";
@@ -37,6 +46,21 @@ const REASONS: Record<string, string> = {
 	aborted: "這一輪被中止",
 	faulted: "內部錯誤",
 };
+
+/**
+ * The class a notice entry names. One that names none is a fault in the code that wrote it: it is logged and pushed as
+ * an `action`, so the slip is heard rather than hidden.
+ */
+function classOf(data: { class?: unknown; content?: unknown }): MessageClass {
+	const found = MESSAGE_CLASSES.find((each) => each === data.class);
+	if (found !== undefined) return found;
+	console.error(`[soma] fault: a notice without a class, pushed as an action: ${JSON.stringify(data.content)}`);
+	return "action";
+}
+
+/** Escalations kept before pushes had classes: only questions and pushed failures were kept. */
+const pendingClass = (pending: PendingPush): MessageClass =>
+	pending.class ?? (pending.kind === "question" ? "action" : "outcome");
 
 const failureReason = (reason: string, detail: unknown) => {
 	const head = REASONS[reason] ?? reason;
@@ -166,6 +190,7 @@ export async function openHumanPort(
 				foreign?: PendingPush["foreign"];
 				target?: string;
 			};
+			const messageClass = classOf(entry.data as { class?: unknown });
 			// An escalation names its target; reports never escalate.
 			const pushed =
 				target !== undefined
@@ -173,10 +198,10 @@ export async function openHumanPort(
 					: await targetOf(
 							`notice:${entry.id}`,
 							kind === "question"
-								? { kind, content, ...(choices && { choices }), ...(foreign && { foreign }) }
+								? { kind, class: messageClass, content, ...(choices && { choices }), ...(foreign && { foreign }) }
 								: undefined,
 						);
-			emit({ type: "notice", kind, content, ...(choices && { choices }), ...pushed });
+			emit({ type: "notice", kind, class: messageClass, content, ...(choices && { choices }), ...pushed });
 		}
 		for (const record of submissions) {
 			if (record.type !== "input") continue;
@@ -191,7 +216,8 @@ export async function openHumanPort(
 						type: "failure",
 						requestId,
 						reason,
-						...(await targetOf(`failure:${record.id}`, { kind: "report", content })),
+						class: "outcome",
+						...(await targetOf(`failure:${record.id}`, { kind: "report", class: "outcome", content })),
 					});
 				} else if (requestId !== undefined) emit({ type: "failure", requestId, reason });
 				const round = { submission: record.id, requestId, entry: record.entry, reason };
@@ -199,7 +225,9 @@ export async function openHumanPort(
 					.commit((tx) => recordFact(tx, turnSignal(round, Date.now())), context)
 					.catch((error: unknown) => console.error("[soma] outcome signal:", error));
 			} else if (record.status === "done" && requestId !== undefined) {
-				emit({ type: "answer", requestId, content: answers.get(record.answer) ?? "" });
+				const content = answers.get(record.answer) ?? "";
+				const pushed = PUSHED_ANSWERS.some((source) => requestId.startsWith(source));
+				emit({ type: "answer", requestId, content, ...(pushed && { class: "outcome" as const }) });
 			}
 		}
 		if (began) emit({ type: "run", state: "working" });
@@ -253,7 +281,7 @@ export async function openHumanPort(
 					if (verdict === "wait") kept.push(pending);
 					if (verdict !== "due") continue;
 					const { kind, content, choices } = pending;
-					const { data } = noticeEntry(kind, content, choices);
+					const { data } = noticeEntry(kind, pendingClass(pending), content, choices);
 					await tx.appendEntry(root.id, { kind: NOTICE, data: { ...data, target: defaultTarget } });
 				}
 				if (kept.length !== stored.pending.length) doc.pending = kept;
@@ -292,8 +320,8 @@ export async function openHumanPort(
 			listeners.add(listener);
 			return () => listeners.delete(listener);
 		},
-		async notify(content, kind) {
-			await root.submit({ type: "write", entry: noticeEntry(kind, content) }, context);
+		async notify(content, kind, messageClass) {
+			await root.submit({ type: "write", entry: noticeEntry(kind, messageClass, content) }, context);
 		},
 		respond(card, answer) {
 			return answerJob(agents, (change) => root.commit(change, context), root.id, {

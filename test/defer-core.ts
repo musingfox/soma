@@ -109,6 +109,10 @@ export async function core(
 			(await root.entries({ order: "ascending" }, 1000, undefined, context)).items
 				.filter((entry) => entry.kind === NOTICE)
 				.map((entry) => (entry.data as { content: string }).content),
+		noticeClasses: async () =>
+			(await root.entries({ order: "ascending" }, 1000, undefined, context)).items
+				.filter((entry) => entry.kind === NOTICE)
+				.map((entry) => (entry.data as { class: string }).class),
 		outcome: async (id: string) => (await harness.waitForTask(Number(id) as TaskId, context)).state.outcome,
 	};
 }

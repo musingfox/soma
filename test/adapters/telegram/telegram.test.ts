@@ -222,8 +222,8 @@ test("only this client's answers, schedule rounds and notices reach the chat", a
 	human.emit({ type: "job", card: "a", agent: "a", status: { state: "done" } });
 	human.emit({ type: "answer", requestId: "telegram:9", content: "mine" });
 	human.emit({ type: "answer", requestId: "schedule:4", content: "提醒你：喝水" });
-	human.emit({ type: "notice", kind: "report", content: "報告：a 完成" });
-	human.emit({ type: "notice", kind: "question", content: "a 要密碼" });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "報告：a 完成" });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "a 要密碼" });
 
 	await vi.waitFor(() => expect(api.sent).toHaveLength(4));
 	await new Promise((resolve) => setTimeout(resolve, 100));
@@ -242,7 +242,7 @@ test("a long answer arrives as ordered parts within the limit", async () => {
 	start(human, apiBase);
 
 	human.emit({ type: "answer", requestId: "telegram:1", content: "x".repeat(5000) });
-	human.emit({ type: "notice", kind: "report", content: "after" });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "after" });
 
 	await vi.waitFor(() => expect(api.sent).toHaveLength(3));
 	expect(api.sent.map((message) => message.text.length)).toEqual([4096, 904, "[通知] after".length]);
@@ -282,7 +282,7 @@ test("a question with choices arrives with a button per option; a press answers 
 	const { api, apiBase } = await bot();
 	start(human, apiBase);
 
-	human.emit({ type: "notice", kind: "question", content: "要讓它執行嗎？", choices });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "要讓它執行嗎？", choices });
 	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
 	expect(api.sent[0]).toEqual({
 		chat_id: CHAT,
@@ -314,7 +314,7 @@ test("a press on a prompt that has since changed sends nothing and says so in th
 	const { api, apiBase } = await bot();
 	start(human, apiBase);
 
-	human.emit({ type: "notice", kind: "question", content: "要讓它執行嗎？", choices });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "要讓它執行嗎？", choices });
 	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
 	api.press("1:f00d:card-a", CHAT);
 
@@ -330,7 +330,7 @@ test("a press from another chat is ignored", async () => {
 	const { api, apiBase } = await bot();
 	start(human, apiBase);
 
-	human.emit({ type: "notice", kind: "question", content: "要讓它執行嗎？", choices });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "要讓它執行嗎？", choices });
 	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
 	api.press("1:f00d:card-a", 7);
 	api.deliver("after", CHAT);
@@ -345,7 +345,13 @@ test("choices whose button data would pass 64 bytes arrive as plain text", async
 	const { api, apiBase } = await bot();
 	start(human, apiBase);
 
-	human.emit({ type: "notice", kind: "question", content: "q", choices: { ...choices, card: "c".repeat(60) } });
+	human.emit({
+		type: "notice",
+		kind: "question",
+		class: "action",
+		content: "q",
+		choices: { ...choices, card: "c".repeat(60) },
+	});
 	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "[問題] q", parse_mode: "HTML" }]));
 });
 
@@ -354,7 +360,7 @@ test("a callback Telegram no longer accepts an answer for does not hold the poll
 	const { api, apiBase } = await bot();
 	const { onError } = start(human, apiBase);
 
-	human.emit({ type: "notice", kind: "question", content: "q", choices });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "q", choices });
 	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
 	api.failing.add("answerCallbackQuery");
 	api.press("1:f00d:card-a", CHAT);
@@ -370,7 +376,7 @@ test("a second tap on the same question answers nothing and leaves the first res
 	const { api, apiBase } = await bot();
 	start(human, apiBase);
 
-	human.emit({ type: "notice", kind: "question", content: "q", choices });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "q", choices });
 	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
 	api.press("2:f00d:card-a", CHAT);
 	const second = api.press("2:f00d:card-a", CHAT);
@@ -390,9 +396,9 @@ test("a push meant for another interface arrives silently; one for Telegram, or 
 	const { api, apiBase } = await bot();
 	start(human, apiBase);
 
-	human.emit({ type: "notice", kind: "report", content: "elsewhere", target: "chat.terminal" });
-	human.emit({ type: "notice", kind: "report", content: "here", target: "chat.telegram" });
-	human.emit({ type: "notice", kind: "report", content: "anywhere" });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "elsewhere", target: "chat.terminal" });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "here", target: "chat.telegram" });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "anywhere" });
 	human.emit({ type: "failure", requestId: "schedule:1", reason: "boom", target: "chat.terminal" });
 	await vi.waitFor(() => expect(api.sent).toHaveLength(4));
 	expect(api.sent.map((message) => message.disable_notification ?? false)).toEqual([true, false, false, true]);
@@ -406,8 +412,15 @@ test("a prompt's buttons go once its job leaves that prompt, unless a press here
 	start(human, apiBase);
 	const blocked = { state: "blocked", kind: "permission", fingerprint: "f00d" } as const;
 
-	human.emit({ type: "notice", kind: "question", content: "要讓它執行嗎？", choices });
-	human.emit({ type: "notice", kind: "question", content: "還是要嗎？", choices, target: "chat.telegram" });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "要讓它執行嗎？", choices });
+	human.emit({
+		type: "notice",
+		kind: "question",
+		class: "action",
+		content: "還是要嗎？",
+		choices,
+		target: "chat.telegram",
+	});
 	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
 	human.emit({ type: "job", card: "card-a", agent: "card-a", status: blocked });
 	human.emit({ type: "job", card: "card-b", agent: "card-b", status: { state: "working" } });
@@ -421,7 +434,13 @@ test("a prompt's buttons go once its job leaves that prompt, unless a press here
 		["editMessageReplyMarkup", elsewhere],
 	]);
 
-	human.emit({ type: "notice", kind: "question", content: "第三次", choices: { ...choices, fingerprint: "beef" } });
+	human.emit({
+		type: "notice",
+		kind: "question",
+		class: "action",
+		content: "第三次",
+		choices: { ...choices, fingerprint: "beef" },
+	});
 	await vi.waitFor(() => expect(api.sent).toHaveLength(3));
 	api.press("1:beef:card-a", CHAT);
 	await vi.waitFor(() => expect(api.calls).toHaveLength(4));
@@ -463,8 +482,8 @@ test("notices, prompts with buttons and pushed failures are converted too, and t
 	const { api, apiBase } = await bot();
 	start(human, apiBase);
 
-	human.emit({ type: "notice", kind: "report", content: "**done** <3" });
-	human.emit({ type: "notice", kind: "question", content: "run `rm x`?", choices });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "**done** <3" });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "run `rm x`?", choices });
 	human.emit({ type: "failure", requestId: "schedule:1", reason: "bad *thing* & <more>" });
 	await vi.waitFor(() => expect(api.sent).toHaveLength(3));
 	expect(api.sent.map((message) => [message.parse_mode, message.text])).toEqual([
@@ -487,7 +506,7 @@ test("a long markdown answer is split into parts that each parse, with the butto
 	const { onError } = start(human, apiBase);
 	const answer = `**${"bold words here ".repeat(600)}**\n\n\`\`\`py\n${"print('a < b')\n".repeat(300)}\`\`\``;
 
-	human.emit({ type: "notice", kind: "question", content: answer, choices });
+	human.emit({ type: "notice", kind: "question", class: "action", content: answer, choices });
 	await vi.waitFor(() => expect(api.sent.length).toBeGreaterThan(3));
 	expect(onError).not.toHaveBeenCalled();
 	for (const message of api.sent) {
@@ -505,7 +524,7 @@ test("a part Telegram refuses for its entities is resent as plain text, and noth
 	const { onError } = start(human, apiBase);
 	api.refuseEntities = true;
 
-	human.emit({ type: "notice", kind: "question", content: "**sure** about `a<b`?", choices });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "**sure** about `a<b`?", choices });
 	human.emit({ type: "answer", requestId: "telegram:1", content: "*next*" });
 	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
 	expect(api.sent[0]).toEqual({

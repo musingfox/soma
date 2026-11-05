@@ -266,7 +266,7 @@ test("an agent gone at a restart is told to the human once, however often soma r
 		await reconcileDispatches(soma.root, new FakeAgentPort(), context);
 		await soma.settle();
 		expect(await soma.job("card-a")).toMatchObject({ status: { state: "error", msg: "agent is gone" } });
-		expect(await entriesOf(soma.root, NOTICE)).toMatchObject([{ data: { kind: "report" } }]);
+		expect(await entriesOf(soma.root, NOTICE)).toMatchObject([{ data: { kind: "report", class: "outcome" } }]);
 		// notified, so the digest does not report it a second time.
 		expect(await entriesOf(soma.root, JOB_DONE)).toMatchObject([
 			{ data: { agent: "card-a", state: "error", outcome: "失敗", notified: true } },
@@ -338,7 +338,7 @@ test("an auth block first seen at a restart's reconcile is told to the human onc
 	await soma.settle();
 
 	expect(soma.calls()).toBe(0);
-	expect(await entriesOf(soma.root, NOTICE)).toMatchObject([{ data: { kind: "question" } }]);
+	expect(await entriesOf(soma.root, NOTICE)).toMatchObject([{ data: { kind: "question", class: "action" } }]);
 	expect((await soma.job("card-a"))?.decisions).toMatchObject([{ kind: "auth", action: "escalated" }]);
 });
 
@@ -409,7 +409,11 @@ test("需要你 is told to the human at once, without a model call, and once how
 	expect(soma.calls() - before).toBe(0);
 	expect(await entriesOf(soma.root, NOTICE)).toMatchObject([
 		{
-			data: { kind: "question", content: "agent card-a（卡片 card-a）這一輪結束了：\n結果：需要你\n要用哪個 server？" },
+			data: {
+				kind: "question",
+				class: "action",
+				content: "agent card-a（卡片 card-a）這一輪結束了：\n結果：需要你\n要用哪個 server？",
+			},
 		},
 	]);
 	expect(await entriesOf(soma.root, JOB_DONE)).toMatchObject([{ data: { outcome: "需要你", notified: true } }]);
@@ -436,7 +440,7 @@ test("完成 waits for the report, unless the human touched the job just before"
 	agents.finish("card-a", "結果：完成\n改好了。");
 	await soma.settle();
 
-	expect(await entriesOf(soma.root, NOTICE)).toMatchObject([{ data: { kind: "report" } }]);
+	expect(await entriesOf(soma.root, NOTICE)).toMatchObject([{ data: { kind: "report", class: "outcome" } }]);
 	const notified = (await entriesOf(soma.root, JOB_DONE)).map(
 		(entry) => (entry.data as { notified: boolean }).notified,
 	);

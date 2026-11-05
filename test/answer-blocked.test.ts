@@ -142,7 +142,12 @@ test("an auth block reaches the human as a notice without waking the model", asy
 	expect(await soma.wakes()).toEqual([]);
 	expect(agents.responses).toEqual([]);
 	expect(soma.notices).toEqual([
-		{ type: "notice", kind: "question", content: expect.stringContaining("Do you want to use this API key?") },
+		{
+			type: "notice",
+			kind: "question",
+			class: "action",
+			content: expect.stringContaining("Do you want to use this API key?"),
+		},
 	]);
 	expect((await soma.job())?.decisions).toMatchObject([{ kind: "auth", action: "escalated" }]);
 });
@@ -156,7 +161,7 @@ test("the model can hand a prompt to the human, with its reason recorded", async
 
 	expect(agents.responses).toEqual([]);
 	expect(soma.notices).toEqual([
-		{ type: "notice", kind: "question", content: "agent card-a（卡片 card-a）：要讓它執行嗎？" },
+		{ type: "notice", kind: "question", class: "action", content: "agent card-a（卡片 card-a）：要讓它執行嗎？" },
 	]);
 	expect((await soma.job())?.decisions).toMatchObject([
 		{ kind: "permission", action: "escalated", reason: "會動到正式資料" },
@@ -179,6 +184,7 @@ test("a prompt handed to the human carries its options and fingerprint, so a cli
 		{
 			type: "notice",
 			kind: "question",
+			class: "action",
 			content: "agent card-a（卡片 card-a）：要讓它執行嗎？",
 			choices: { card: "card-a", fingerprint: "f00d", options },
 		},

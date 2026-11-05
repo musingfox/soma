@@ -129,7 +129,7 @@ async function applyChange(
 	curated.lines = changed.lines;
 	curated.history.push(changed.revision);
 	const notice = renderRevision(changed.revision);
-	await tx.appendEntry(conversationId, noticeEntry("report", notice));
+	await tx.appendEntry(conversationId, noticeEntry("report", "ambient", notice));
 	return `${notice}已通知使用者。`;
 }
 

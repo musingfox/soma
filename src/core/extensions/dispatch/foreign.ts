@@ -94,7 +94,7 @@ export function foreignBridge(conversation: Conversation, agents: AgentPort, con
 			doc.told = { ...others, [agent.id]: prompt };
 			await tx.appendEntry(
 				conversation.id,
-				noticeEntry("question", noticeContent(agent, status), undefined, { id: agent.id, told: prompt }),
+				noticeEntry("question", "action", noticeContent(agent, status), undefined, { id: agent.id, told: prompt }),
 			);
 		}, context);
 	}

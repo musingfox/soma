@@ -9,6 +9,13 @@ export interface HumanInput {
 // ARCHITECTURE.md: the core notifies when it needs the human (a question) or has a report ready.
 export type NoticeKind = "question" | "report";
 
+/**
+ * What a push the core starts is about, which each interface's policy is set by (ARCHITECTURE.md "Whom to push to"):
+ * `action` waits on the human, `outcome` is how a piece of work ended, `ambient` is what soma did on its own.
+ */
+export const MESSAGE_CLASSES = ["action", "outcome", "ambient"] as const;
+export type MessageClass = (typeof MESSAGE_CLASSES)[number];
+
 /** A blocked prompt handed to the human with everything a client needs to offer its options. */
 export type Choices = { readonly card: string; readonly fingerprint: string; readonly options: Choice[] };
 
@@ -21,22 +28,26 @@ export type HumanAnswerOutcome = AnswerOutcome | { readonly sent: false; readonl
  */
 export const PUSHED_FAILURES = ["schedule:", "agent:", "foreign:"] as const;
 
+/** requestId prefixes of rounds the core starts itself whose answer no client asked for, so it is pushed. */
+export const PUSHED_ANSWERS = ["schedule:"] as const;
+
 /**
- * On a push the core starts itself, the entry kind of the one client that rings for it; every other client shows it
- * silently. Absent when the core was given no push target, and then every client rings.
+ * On a push the core starts itself: its class, and the entry kind of the one client that rings for it; every other
+ * client shows it silently. `target` is absent when the core was given no push target, and then every client rings.
  */
-type Target = { readonly target?: string };
+type Pushed = { readonly class: MessageClass; readonly target?: string };
 
 export type SomaEvent =
-	| { readonly type: "answer"; readonly requestId: string; readonly content: string }
-	// The round ended without an answer: a provider error, no model, an abort or a fault.
-	| ({ readonly type: "failure"; readonly requestId: string; readonly reason: string } & Target)
+	// Pushed when a round the core started answered (`PUSHED_ANSWERS`).
+	| ({ readonly type: "answer"; readonly requestId: string; readonly content: string } & Partial<Pushed>)
+	// The round ended without an answer: a provider error, no model, an abort or a fault. Pushed for `PUSHED_FAILURES`.
+	| ({ readonly type: "failure"; readonly requestId: string; readonly reason: string } & Partial<Pushed>)
 	| ({
 			readonly type: "notice";
 			readonly kind: NoticeKind;
 			readonly content: string;
 			readonly choices?: Choices;
-	  } & Target)
+	  } & Pushed)
 	// A round's words went on to a worker agent: progress on the input with this requestId, nothing to show as text.
 	| { readonly type: "notice"; readonly kind: "forwarded"; readonly requestId: string }
 	| { readonly type: "job"; readonly card: string; readonly agent: string; readonly status: AgentState }
@@ -46,7 +57,7 @@ export type SomaEvent =
 export interface HumanPort {
 	submit(input: HumanInput): Promise<void>;
 	subscribe(listener: (event: SomaEvent) => void): () => void;
-	notify(content: string, kind: NoticeKind): Promise<void>;
+	notify(content: string, kind: NoticeKind, messageClass: MessageClass): Promise<void>;
 	// The human's own choice on a blocked prompt: sent to the card's agent without a model round.
 	respond(card: string, answer: Answer): Promise<HumanAnswerOutcome>;
 }

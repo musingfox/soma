@@ -201,7 +201,12 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 						: undefined;
 				await tx.appendEntry(
 					api.conversationId,
-					noticeEntry("question", `agent ${current.agent}（卡片 ${current.card}）：${args.question}`, choices),
+					noticeEntry(
+						"question",
+						"action",
+						`agent ${current.agent}（卡片 ${current.card}）：${args.question}`,
+						choices,
+					),
 				);
 				return true;
 			}, context);

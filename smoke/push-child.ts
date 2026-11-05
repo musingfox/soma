@@ -93,7 +93,9 @@ emit({ event: "started" });
 for await (const line of createInterface({ input: process.stdin })) {
 	const [command, ...rest] = line.split(" ");
 	if (command === "!report" || command === "!question") {
-		await human.notify(rest.join(" "), command === "!report" ? "report" : "question");
+		await (command === "!report"
+			? human.notify(rest.join(" "), "report", "ambient")
+			: human.notify(rest.join(" "), "question", "action"));
 	} else if (command === "!block") block(...rest);
 	else typed.write(`${line}\n`);
 	emit({ event: "done", line });

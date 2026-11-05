@@ -156,7 +156,10 @@ export function reflection({ repo, createCard, readCard, agents }: ReflectionOpt
 						// A recurring problem goes to the human from the program, in the commit that moves past its signals.
 						const { alerted } = await tx.doc(Reflections, current.conversationId);
 						for (const recurrence of recurrences) {
-							await tx.appendEntry(current.conversationId, noticeEntry("report", renderRecurrence(recurrence)));
+							await tx.appendEntry(
+								current.conversationId,
+								noticeEntry("report", "ambient", renderRecurrence(recurrence)),
+							);
 							alerted.push(...recurrence.actions.map((action) => action.id));
 						}
 						if (signals.length === 0) return advance(end);
@@ -192,7 +195,7 @@ export function reflection({ repo, createCard, readCard, agents }: ReflectionOpt
 						? textOf(await runtime.entry(AssistantEntry, settled.answer, context))
 						: `模型沒有完成反省（${settled?.status === "unanswered" ? settled.reason : "no root conversation"}）。\n${content}`;
 				await runtime.commit(async (tx, current) => {
-					await tx.appendEntry(current.conversationId, noticeEntry("report", report));
+					await tx.appendEntry(current.conversationId, noticeEntry("report", "ambient", report));
 					return advance(pinnedUpto);
 				}, context);
 			},
@@ -258,7 +261,7 @@ export function reflection({ repo, createCard, readCard, agents }: ReflectionOpt
 				const { cards } = await tx.doc(Reflections, api.conversationId);
 				const index = cards.findIndex((card) => card.callId === api.callId);
 				cards[index] = done;
-				await tx.appendEntry(api.conversationId, noticeEntry("report", notice));
+				await tx.appendEntry(api.conversationId, noticeEntry("report", "ambient", notice));
 			}, context);
 			return answer(result);
 		},

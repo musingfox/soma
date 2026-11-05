@@ -296,9 +296,9 @@ test("the answer of a turn another interface started is not sent; a scheduled tu
 test("a push meant for another interface is shown without ringing", async () => {
 	const { human, server } = await serve();
 	const page = await open(server.port);
-	human.emit({ type: "notice", kind: "question", content: "q1", target: "chat.telegram" });
-	human.emit({ type: "notice", kind: "report", content: "r1", target: "chat.web" });
-	human.emit({ type: "notice", kind: "report", content: "r2" });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "q1", target: "chat.telegram" });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "r1", target: "chat.web" });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "r2" });
 	human.emit({ type: "failure", requestId: "agent:fix-bug:3", reason: "429", target: "chat.terminal" });
 	human.emit({ type: "run", state: "working" });
 	expect([await page.next(), await page.next(), await page.next(), await page.next(), await page.next()]).toEqual([

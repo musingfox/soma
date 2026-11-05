@@ -1,5 +1,5 @@
 import type { AgentState } from "../../ports/agent.ts";
-import type { Choices, NoticeKind } from "../../ports/human.ts";
+import type { Choices, MessageClass, NoticeKind } from "../../ports/human.ts";
 import { samePrompt, type Told } from "./foreign.ts";
 
 /** When the human last typed on each interface, in ms, by the entry kind the interface tags its inputs with. */
@@ -11,6 +11,8 @@ export type PendingPush = {
 	readonly key: string;
 	readonly at: number;
 	readonly kind: NoticeKind;
+	/** Absent only on one kept before pushes had classes. */
+	readonly class?: MessageClass;
 	readonly content: string;
 	readonly choices?: Choices;
 	/** The foreign agent and the prompt this question told the human of, as `ForeignPrompts` keeps it. */

@@ -120,6 +120,7 @@ test("a blocked foreign agent the human is away from is pushed once, with one wa
 	expect(notices.map((entry) => entry.data)).toEqual([
 		{
 			kind: "question",
+			class: "action",
 			content:
 				"外部 agent Window 1（session work）卡住了，kind=permission，你不在它的畫面前。\napprove Bash: touch probe.txt",
 			foreign: { id: "pane-1", told: { fingerprint: "f00d", msg: "approve Bash: touch probe.txt" } },
@@ -212,6 +213,7 @@ test("an auth prompt of a foreign agent is told to the human and never wakes the
 	expect((await entriesOf(soma.root, NOTICE)).map((entry) => entry.data)).toEqual([
 		{
 			kind: "question",
+			class: "action",
 			content: "外部 agent Window 1（session work）在等登入或憑證，需要你處理。\nlogin",
 			foreign: { id: "pane-1", told: { msg: "login" } },
 		},

@@ -165,6 +165,7 @@ test("an agent not listed at fire time that cannot be started again is not promp
 			NOTICE,
 			{
 				kind: "report",
+				class: "outcome",
 				content: expect.stringMatching(
 					new RegExp(
 						`^Deferred instruction ${reply.id} for agent card-a \\(card card-a\\) was not sent: .*run the tests$`,
@@ -244,7 +245,7 @@ test("a core stopped while the prompt was going out does not prompt again, and t
 	expect(prompts.length).toBe(1);
 	const notices = await entries(second.root);
 	expect(notices.map((entry) => entry.data)).toEqual([
-		{ kind: "report", content: expect.stringMatching(/may not have reached the agent/) },
+		{ kind: "report", class: "outcome", content: expect.stringMatching(/may not have reached the agent/) },
 	]);
 });
 
@@ -275,7 +276,11 @@ test("a prompt the agent side refuses, as for a busy agent, is tried again; one 
 	expect(await outcome(harness, never.id)).toEqual({ status: "completed", result: "failed" });
 	expect(prompts.length).toBe(1);
 	expect((await entries(root)).map((entry) => entry.data)).toEqual([
-		{ kind: "report", content: expect.stringMatching(/was not sent after 3 tries: rex agent card-a is working/) },
+		{
+			kind: "report",
+			class: "outcome",
+			content: expect.stringMatching(/was not sent after 3 tries: rex agent card-a is working/),
+		},
 	]);
 });
 
@@ -300,7 +305,11 @@ test("an adapter error that may come after typing is not tried again, and tells 
 	expect(await outcome(harness, reply.id)).toEqual({ status: "completed", result: "unsure" });
 	expect(prompts.length).toBe(1);
 	expect((await entries(root)).map((entry) => entry.data)).toEqual([
-		{ kind: "report", content: expect.stringMatching(/may not have reached the agent: .*rex connection lost/) },
+		{
+			kind: "report",
+			class: "outcome",
+			content: expect.stringMatching(/may not have reached the agent: .*rex connection lost/),
+		},
 	]);
 	expect(await pending(harness, root)).toEqual([]);
 });
@@ -336,7 +345,12 @@ test("a deferral that ends as soma starts reaches the human through the HumanPor
 		const notices = () => seen.filter((event) => event.type === "notice");
 		await vi.waitFor(() => expect(notices()).toHaveLength(1));
 		expect(notices()).toEqual([
-			{ type: "notice", kind: "report", content: expect.stringMatching(`^Deferred instruction ${reply.id} `) },
+			{
+				type: "notice",
+				kind: "report",
+				class: "outcome",
+				content: expect.stringMatching(`^Deferred instruction ${reply.id} `),
+			},
 		]);
 	} finally {
 		await human.close();

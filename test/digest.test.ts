@@ -46,8 +46,12 @@ test("two jobs finishing in one period make one report and one model call; a qui
 		eventBridge(root, agents, context).listen((error) => errors.push(error));
 		const human = await openHumanPort(harness, root, agents, context);
 		const notices: string[] = [];
+		const classes: string[] = [];
 		human.subscribe((event) => {
-			if (event.type === "notice" && event.kind === "report") notices.push(event.content);
+			if (event.type === "notice" && event.kind === "report") {
+				notices.push(event.content);
+				classes.push(event.class);
+			}
 		});
 		await startDigest(root, PERIOD, context);
 		await startDigest(root, PERIOD, context);
@@ -60,6 +64,7 @@ test("two jobs finishing in one period make one report and one model call; a qui
 		expect(errors).toEqual([]);
 		expect(calls()).toBe(1);
 		expect(notices).toEqual(["報告：a 完成；b 未知"]);
+		expect(classes).toEqual(["ambient"]);
 
 		const taskId = (await harness.snapshot(Digests, root.id, context))?.taskId as TaskId;
 		const nextTick = async () =>

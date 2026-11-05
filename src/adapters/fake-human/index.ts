@@ -1,5 +1,12 @@
 import type { Answer } from "../../ports/agent.ts";
-import type { HumanAnswerOutcome, HumanInput, HumanPort, NoticeKind, SomaEvent } from "../../ports/human.ts";
+import type {
+	HumanAnswerOutcome,
+	HumanInput,
+	HumanPort,
+	MessageClass,
+	NoticeKind,
+	SomaEvent,
+} from "../../ports/human.ts";
 
 export class FakeHumanPort implements HumanPort {
 	readonly inputs: HumanInput[] = [];
@@ -18,8 +25,8 @@ export class FakeHumanPort implements HumanPort {
 		return () => this.#listeners.delete(listener);
 	}
 
-	async notify(content: string, kind: NoticeKind): Promise<void> {
-		this.emit({ type: "notice", kind, content });
+	async notify(content: string, kind: NoticeKind, messageClass: MessageClass): Promise<void> {
+		this.emit({ type: "notice", kind, class: messageClass, content });
 	}
 
 	async respond(card: string, answer: Answer): Promise<HumanAnswerOutcome> {

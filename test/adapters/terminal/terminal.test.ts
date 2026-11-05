@@ -97,7 +97,7 @@ test("each line is an input with a fresh terminal requestId; only this client's 
 	human.emit({ type: "answer", requestId: "telegram:7", content: "telegram's answer" });
 	human.emit({ type: "answer", requestId: "schedule:3", content: "提醒：喝水" });
 	human.emit({ type: "answer", requestId: "digest:1", content: "報告的那一輪" });
-	human.emit({ type: "notice", kind: "report", content: "報告" });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "報告" });
 	human.emit({ type: "notice", kind: "forwarded", requestId: first });
 
 	expect(take()).toBe("已派工。\n[通知] 提醒：喝水\n[通知] 報告\n");
@@ -117,17 +117,17 @@ test("the root record follows runs, questions and reports; jobs get child record
 	expect(take()).toBe(
 		formatProgramStatus({ state: "blocked", id: "job/a", title: "a", kind: "permission", message: "rm -rf?" }),
 	);
-	human.emit({ type: "notice", kind: "question", content: "a 要權限，准嗎？\n細節" });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "a 要權限，准嗎？\n細節" });
 	expect(take()).toBe(
 		`[問題] a 要權限，准嗎？\n細節\n${root({ state: "blocked", kind: "question", message: "a 要權限，准嗎？" })}`,
 	);
 	human.emit({ type: "run", state: "idle" });
-	human.emit({ type: "notice", kind: "report", content: "十分鐘報告" });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "十分鐘報告" });
 	expect(take()).toBe("[通知] 十分鐘報告\n");
 
 	await type("准");
 	expect(take()).toBe(root({ state: "idle" }));
-	human.emit({ type: "notice", kind: "report", content: "下一份報告" });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "下一份報告" });
 	expect(take()).toBe(`[通知] 下一份報告\n${root({ state: "done", message: "下一份報告" })}`);
 	await end();
 });
@@ -160,7 +160,7 @@ test("an unsupported terminal gets no OSC 7501 bytes", async () => {
 	await type("派 a");
 	human.emit({ type: "run", state: "working" });
 	human.emit({ type: "job", card: "a", agent: "a", status: { state: "blocked", kind: "auth" } });
-	human.emit({ type: "notice", kind: "question", content: "?" });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "?" });
 	expect(take()).toBe("[問題] ?\n");
 	await end();
 });
@@ -170,10 +170,10 @@ test("a push meant for another interface is printed without raising the root rec
 	await type("派 a");
 	expect(take()).toBe(root({ state: "idle" }));
 
-	human.emit({ type: "notice", kind: "question", content: "問 telegram", target: "chat.telegram" });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "問 telegram", target: "chat.telegram" });
 	human.emit({ type: "failure", requestId: "schedule:1", reason: "boom", target: "chat.telegram" });
 	expect(take()).toBe("[問題] 問 telegram\n[失敗] schedule:1 那一輪：boom\n");
-	human.emit({ type: "notice", kind: "question", content: "問這裡", target: "chat.terminal" });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "問這裡", target: "chat.terminal" });
 	expect(take()).toBe(`[問題] 問這裡\n${root({ state: "blocked", kind: "question", message: "問這裡" })}`);
 	await end();
 });

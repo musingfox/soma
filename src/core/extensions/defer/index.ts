@@ -177,7 +177,7 @@ export function deferExtension(
 	function steps(id: string, item: Deferred, tried: number, runtime: Runtime, context: Context) {
 		const ending = async (tx: Tx, outcome: DeferOutcome, notice?: string, gone = false) => {
 			await settle(tx, runtime.conversationId, id, item.agent, gone);
-			if (notice !== undefined) await tx.appendEntry(runtime.conversationId, noticeEntry("report", notice));
+			if (notice !== undefined) await tx.appendEntry(runtime.conversationId, noticeEntry("report", "outcome", notice));
 			return { status: "terminal" as const, outcome: { status: "completed" as const, result: outcome } };
 		};
 		const end = (outcome: DeferOutcome, notice?: string, gone = false) =>
@@ -367,7 +367,10 @@ export function deferExtension(
 				let due = false;
 				await runtime.commit(async (tx) => {
 					due = await settle(tx, runtime.conversationId, id, task.input.agent);
-					await tx.appendEntry(runtime.conversationId, noticeEntry("report", deferNotice.unsure(id, task.input)));
+					await tx.appendEntry(
+						runtime.conversationId,
+						noticeEntry("report", "outcome", deferNotice.unsure(id, task.input)),
+					);
 					return { status: "terminal", outcome: { status: "completed", result: "unsure" } };
 				}, context);
 				// The process that typed the prompt, if it did, is dead: an agent the listing shows at rest now is not one

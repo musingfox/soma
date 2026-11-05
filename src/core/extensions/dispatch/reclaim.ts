@@ -30,7 +30,7 @@ export function reclaimer(conversation: Conversation, agents: Pick<AgentPort, "l
 			const current = doc.jobs[index];
 			if (current?.reclaim?.phase !== from) return false;
 			doc.jobs[index] = { ...current, reclaim: to };
-			if (notice !== undefined) await tx.appendEntry(conversation.id, noticeEntry("report", notice));
+			if (notice !== undefined) await tx.appendEntry(conversation.id, noticeEntry("report", "ambient", notice));
 			return true;
 		}, context);
 

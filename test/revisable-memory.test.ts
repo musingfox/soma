@@ -206,11 +206,13 @@ describe("revising the curated layer on the real harness", () => {
 			{
 				type: "notice",
 				kind: "report",
+				class: "ambient",
 				content: expect.stringMatching(/修改了長期記憶 #1：.*九點.*→.*十點.*submission:3/),
 			},
 			{
 				type: "notice",
 				kind: "report",
+				class: "ambient",
 				content: expect.stringMatching(/還原了長期記憶 #1：.*使用者說九點才對.*entry:12/),
 			},
 		]);

@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-durable";
 import type { AgentPort } from "../../../ports/agent.ts";
 import { digestPrompt, type JobReport, type Outcome } from "../../domain/report.ts";
+import { noticeEntry } from "../../notice.ts";
 import { JOB_DONE } from "../dispatch/bridge.ts";
 import { Dispatches } from "../dispatch/index.ts";
 
@@ -159,7 +160,7 @@ export function digest(agents: Pick<AgentPort, "readResult">) {
 						? textOf(await runtime.entry(AssistantEntry, settled.answer, context))
 						: `模型沒有寫出報告（${settled?.status === "unanswered" ? settled.reason : "no root conversation"}）。\n${content}`;
 				await runtime.commit(async (tx, current) => {
-					await tx.appendEntry(current.conversationId, { kind: NOTICE, data: { kind: "report", content: report } });
+					await tx.appendEntry(current.conversationId, noticeEntry("report", "ambient", report));
 					return advance(pinnedUpto);
 				}, context);
 			},

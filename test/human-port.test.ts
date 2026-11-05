@@ -12,7 +12,8 @@ import { runTerminal } from "../src/adapters/terminal/index.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { schedule } from "../src/core/extensions/schedule/index.ts";
 import { openHarness } from "../src/core/harness.ts";
-import { openHumanPort } from "../src/core/human-port.ts";
+import { openHumanPort, Pushes } from "../src/core/human-port.ts";
+import { NOTICE } from "../src/core/notice.ts";
 import type { SomaEvent } from "../src/ports/human.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -135,10 +136,15 @@ test("a reply to a card with no job forwards nothing", async () => {
 test("notify delivers a notice with its kind and starts no run", async () => {
 	const { human, seen } = await setup();
 
-	await human.notify("job a needs a password", "question");
+	await human.notify("job a needs a password", "question", "action");
 
 	await vi.waitFor(() =>
-		expect(seen).toContainEqual({ type: "notice", kind: "question", content: "job a needs a password" }),
+		expect(seen).toContainEqual({
+			type: "notice",
+			kind: "question",
+			class: "action",
+			content: "job a needs a password",
+		}),
 	);
 	expect(seen.filter((event) => event.type === "run")).toEqual([{ type: "run", state: "idle" }]);
 });
@@ -147,7 +153,7 @@ test("a notice appended before anyone subscribed reaches the first subscriber on
 	const { harness, root } = await setup();
 	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
 	cleanup.push(() => human.close());
-	await human.notify("agent a is gone", "report");
+	await human.notify("agent a is gone", "report", "outcome");
 	await root.commit(async (tx) => {
 		const status = { state: "idle" } as const;
 		(await tx.doc(Dispatches, root.id)).jobs = [{ card: "a", agent: "a", sessionId: "s", status, decisions: [] }];
@@ -160,7 +166,7 @@ test("a notice appended before anyone subscribed reaches the first subscriber on
 	const second: SomaEvent[] = [];
 	human.subscribe((event) => second.push(event));
 
-	const gone = { type: "notice", kind: "report", content: "agent a is gone" };
+	const gone = { type: "notice", kind: "report", class: "outcome", content: "agent a is gone" };
 	expect(first).toContainEqual(gone);
 	expect(second).not.toContainEqual(gone);
 	// After the held notice, so a client retires the buttons of a prompt the job has moved past.
@@ -190,9 +196,68 @@ test("a job state written to the dispatch list reaches subscribers once, and new
 	expect(late).toEqual([{ type: "run", state: "idle" }, blocked]);
 });
 
+test("a notice written without a class is a fault: it is logged and pushed as an action, never quietly", async () => {
+	const { root, seen } = await setup();
+	const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+	cleanup.push(async () => errors.mockRestore());
+
+	await root.submit(
+		{ type: "write", entry: { kind: NOTICE, data: { kind: "report", content: "who am I?" } } },
+		context,
+	);
+
+	await vi.waitFor(() =>
+		expect(seen).toContainEqual({ type: "notice", kind: "report", class: "action", content: "who am I?" }),
+	);
+	expect(errors).toHaveBeenCalledWith(expect.stringMatching(/^\[soma\] fault: a notice without a class/));
+});
+
 const boom = () => {
 	throw new Error("401 invalid x-api-key");
 };
+
+/** A HumanPort over a harness with the schedule tool, whose model answers with `responses`. */
+async function scheduling(...responses: Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0]) {
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	faux.setResponses([
+		fauxAssistantMessage([fauxToolCall("schedule", { at: "PT1S", instruction: "喝水" })], { stopReason: "toolUse" }),
+		fauxAssistantMessage("好。"),
+		...responses,
+	]);
+	const registry = createRegistry();
+	registry.install(schedule((id, c) => harness.abortTask(id, c)));
+	const harness: Harness = await Harness.open(new MemoryStorage(), { models, registry }, context);
+	cleanup.push(() => harness.close(context));
+	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+	harness.resume();
+	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
+	cleanup.push(() => human.close());
+	const seen: SomaEvent[] = [];
+	human.subscribe((event) => seen.push(event));
+	await human.submit({ content: "提醒我 喝水", entry: { kind: "chat.terminal" }, requestId: "terminal:1" });
+	return seen;
+}
+
+test("a scheduled round's answer is pushed as an outcome; the answer of a round the human started is not", async () => {
+	const seen = await scheduling(fauxAssistantMessage("該喝水了。"));
+
+	await vi.waitFor(() => expect(seen.filter((event) => event.type === "answer")).toHaveLength(2), { timeout: 10_000 });
+	expect(seen.filter((event) => event.type === "answer")).toEqual([
+		{ type: "answer", requestId: "terminal:1", content: "好。" },
+		{ type: "answer", requestId: expect.stringMatching(/^schedule:/), content: "該喝水了。", class: "outcome" },
+	]);
+});
+
+test("a pushed round's failure is an outcome; the failure of a round the human started is not pushed", async () => {
+	const seen = await scheduling(boom);
+
+	await vi.waitFor(() => expect(seen.some((event) => event.type === "failure")).toBe(true), { timeout: 10_000 });
+	expect(seen.filter((event) => event.type === "failure")).toEqual([
+		{ type: "failure", requestId: expect.stringMatching(/^schedule:/), reason: expect.any(String), class: "outcome" },
+	]);
+});
 
 test("a round whose model throws reaches subscribers as one failure with its requestId and the reason", async () => {
 	const { faux, root, human, seen } = await setup();
@@ -326,12 +391,12 @@ describe("push target and escalation", () => {
 	test("a notice goes to the interface typed on last within 15 minutes, else to the default", async () => {
 		const { root, open, notices, advance } = await pushing();
 		const { human, seen } = await open();
-		await human.notify("before any input", "report");
+		await human.notify("before any input", "report", "outcome");
 		await human.submit({ content: "嗨", entry: { kind: TERMINAL }, requestId: "terminal:1" });
 		await root.waitForIdle(context);
-		await human.notify("just after the terminal", "report");
+		await human.notify("just after the terminal", "report", "outcome");
 		advance(16 * MIN);
-		await human.notify("long after", "report");
+		await human.notify("long after", "report", "outcome");
 
 		await vi.waitFor(() => expect(notices(seen)).toHaveLength(3));
 		expect(notices(seen).map((notice) => [notice.content, notice.target])).toEqual([
@@ -346,8 +411,8 @@ describe("push target and escalation", () => {
 		const { human, seen } = await open();
 		await human.submit({ content: "嗨", entry: { kind: TERMINAL }, requestId: "terminal:1" });
 		await root.waitForIdle(context);
-		await human.notify("which one?", "question");
-		await human.notify("all done", "report");
+		await human.notify("which one?", "question", "action");
+		await human.notify("all done", "report", "outcome");
 		await vi.waitFor(() => expect(notices(seen)).toHaveLength(2));
 
 		advance(14 * MIN);
@@ -368,7 +433,7 @@ describe("push target and escalation", () => {
 		const { human, seen } = await open();
 		await human.submit({ content: "嗨", entry: { kind: TERMINAL }, requestId: "terminal:1" });
 		await root.waitForIdle(context);
-		await human.notify("which one?", "question");
+		await human.notify("which one?", "question", "action");
 		advance(MIN);
 		await human.submit({ content: "等等", entry: { kind: TELEGRAM }, requestId: "telegram:1" });
 		await root.waitForIdle(context);
@@ -382,7 +447,7 @@ describe("push target and escalation", () => {
 		const first = await open();
 		await first.human.submit({ content: "嗨", entry: { kind: TERMINAL }, requestId: "terminal:1" });
 		await root.waitForIdle(context);
-		await first.human.notify("which one?", "question");
+		await first.human.notify("which one?", "question", "action");
 		await vi.waitFor(() => expect(notices(first.seen)).toHaveLength(1));
 		await first.human.close();
 
@@ -393,8 +458,26 @@ describe("push target and escalation", () => {
 		const third = await open();
 		await settle();
 		expect(notices(second.seen)).toEqual([
-			{ type: "notice", kind: "question", content: "which one?", target: TELEGRAM },
+			{ type: "notice", kind: "question", class: "action", content: "which one?", target: TELEGRAM },
 		]);
 		expect(notices(third.seen)).toEqual([]);
+	});
+
+	test("an escalation kept before pushes had classes is pushed as an action if a question, else an outcome", async () => {
+		const { root, open, notices, advance } = await pushing();
+		await root.commit(async (tx) => {
+			(await tx.doc(Pushes, root.id)).pending = [
+				{ key: "notice:1", at: 100 * MIN, kind: "question", content: "old question" },
+				{ key: "failure:2", at: 100 * MIN, kind: "report", content: "schedule:1 那一輪失敗" },
+			];
+		}, context);
+		advance(16 * MIN);
+		const { seen } = await open();
+
+		await vi.waitFor(() => expect(notices(seen)).toHaveLength(2));
+		expect(notices(seen).map((notice) => [notice.content, notice.class])).toEqual([
+			["old question", "action"],
+			["schedule:1 那一輪失敗", "outcome"],
+		]);
 	});
 });

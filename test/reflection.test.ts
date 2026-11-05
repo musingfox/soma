@@ -103,8 +103,12 @@ async function core({ failStart = false } = {}) {
 	const human = await openHumanPort(harness, root, agents, context);
 	open.push(human);
 	const notices: string[] = [];
+	const classes: string[] = [];
 	human.subscribe((event) => {
-		if (event.type === "notice" && event.kind !== "forwarded") notices.push(event.content);
+		if (event.type === "notice" && event.kind !== "forwarded") {
+			notices.push(event.content);
+			classes.push(event.class);
+		}
 	});
 	const bridge = eventBridge(root, agents, context);
 	const handled: Promise<void>[] = [];
@@ -130,6 +134,7 @@ async function core({ failStart = false } = {}) {
 		root,
 		cards,
 		notices,
+		classes,
 		calls: () => faux.state.callCount,
 		start: () => reflections.startReflection(root, PERIOD, context),
 		checkpoint,
@@ -209,6 +214,7 @@ test("three answers of one kind and a block again lead to a memory revision citi
 		expect.stringMatching(/^soma 開了一張改程式碼的卡 fix-reblock：.*已派進 fleet（agent fix-reblock）/),
 		"觀察：…\n證據 id：…\n改動：…",
 	]);
+	expect(soma.classes).toEqual(["ambient", "ambient", "ambient"]);
 	expect(soma.agents.started).toEqual([expect.objectContaining({ name: "fix-reblock", cwd: "/soma" })]);
 	expect(soma.cards.get("fix-reblock")).toContain("decision:card-a#0、decision:card-a#1、decision:card-a#2");
 });
@@ -254,6 +260,7 @@ test("the same problem the next day wakes no model and tells the human once that
 			`先前的處理：長期記憶 #1 在 ${new Date((await soma.history())[0]?.at ?? 0).toISOString()} 的修改、卡片 fix-reblock。` +
 			"新訊號的證據：decision:card-a#3。soma 不會自動再修訂或開卡，請你看看。",
 	]);
+	expect(soma.classes.slice(handled)).toEqual(["ambient"]);
 	expect(await soma.reflections()).toHaveLength(1);
 	expect(await soma.history()).toHaveLength(1);
 	expect([...soma.cards.keys()]).toEqual(["fix-reblock"]);

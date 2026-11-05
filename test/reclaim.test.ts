@@ -306,6 +306,7 @@ test("a stop that fails tells the human once and is not tried again; a stop that
 		reclaim: { phase: "failed", error: expect.stringMatching(/no window/) },
 	});
 	expect(await soma.notices()).toEqual([expect.stringMatching(/^soma could not stop agent card-a \(card card-a\)/)]);
+	expect(await soma.noticeClasses()).toEqual(["ambient"]);
 	agents.emit("card-a", { state: "idle" });
 	await soma.settle();
 	await soma.close();

@@ -505,17 +505,40 @@ describe("push policies", () => {
 		);
 	});
 
+	test("summary holds every class, and a table may hold any class", () => {
+		const custom = { action: "ring", outcome: "hold", ambient: "hold" };
+		const path = write(JSON.stringify({ push: { telegram: "summary", web: custom } }));
+		expect(loadConfig(path, {}, HOME).push).toEqual({
+			telegram: { action: "hold", outcome: "hold", ambient: "hold" },
+			terminal: INSTANT,
+			web: custom,
+		});
+	});
+
+	test("the summary comes after 30 idle minutes unless push.summary.idleMinutes says otherwise", () => {
+		expect(resolveConfig(undefined, {}, HOME).summaryIdleMs).toBe(30 * 60_000);
+		expect(resolveConfig({ push: { summary: {} } }, {}, HOME).summaryIdleMs).toBe(30 * 60_000);
+		const path = write(JSON.stringify({ push: { telegram: "summary", summary: { idleMinutes: 45 } } }));
+		expect(loadConfig(path, {}, HOME).summaryIdleMs).toBe(45 * 60_000);
+		expect(resolveConfig({ push: { summary: { idleMinutes: 0.1 } } }, {}, HOME).summaryIdleMs).toBe(6_000);
+	});
+
 	test.each([
-		[{ telegram: "summary" }, 'push.telegram: "summary" needs hold, which is not built yet'],
-		[{ telegram: "quiet" }, 'push.telegram: Unknown preset "quiet"; expected a preset ("instant", "ask") or a table'],
+		[
+			{ telegram: "quiet" },
+			'push.telegram: Unknown preset "quiet"; expected a preset ("instant", "ask", "summary") or a table',
+		],
 		[{ web: 3 }, "push.web: Expected a preset"],
 		[{ web: ["ask"] }, "push.web: Expected a preset"],
 		[{ fax: "ask" }, "push.fax: Unrecognized key"],
 		[
-			{ terminal: { action: "ring", outcome: "hold", ambient: "log" } },
-			'push.terminal.outcome: "hold" is not built yet',
+			{ terminal: { action: "loud", outcome: "ring", ambient: "log" } },
+			'push.terminal.action: Unknown policy "loud"; expected "ring", "quiet", "hold", "log"',
 		],
-		[{ terminal: { action: "loud", outcome: "ring", ambient: "log" } }, 'push.terminal.action: Unknown policy "loud"'],
+		[{ summary: { idleMinutes: 0 } }, "push.summary.idleMinutes: Number must be greater than 0"],
+		[{ summary: { idleMinutes: "30" } }, "push.summary.idleMinutes: Expected number"],
+		[{ summary: { at: "08:00" } }, "push.summary.at: Unrecognized key"],
+		[{ summary: 30 }, "push.summary: Expected object"],
 		[{ terminal: { action: "ring", outcome: "ring" } }, "push.terminal.ambient: Required: a table sets"],
 		[{ terminal: { ...INSTANT, urgent: "ring" } }, "push.terminal.urgent: Unrecognized key"],
 		[{ terminal: { ...INSTANT, action: 1 } }, "push.terminal.action: Expected string"],

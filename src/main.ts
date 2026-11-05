@@ -145,6 +145,8 @@ const human = await startCore(
 		openHumanPort(harness, root, agents, context, {
 			policies,
 			...(config.telegram && { defaultTarget: TELEGRAM_KIND }),
+			summaryIdleMs: config.summaryIdleMs,
+			storage,
 		}),
 	[
 		() => digests.startDigest(root, DIGEST_PERIOD_MS, context),

@@ -27,28 +27,30 @@ export type AgentAdapter = (typeof AGENT_ADAPTERS)[number];
 export const INTERFACES = ["telegram", "terminal", "web"] as const;
 export type Interface = (typeof INTERFACES)[number];
 
-// `hold` and `summary` are refused until the core summarizes what is held.
-const BUILT_PRESETS = Object.keys(PRESETS).filter((name) => name !== "summary");
-const BUILT_POLICIES: readonly string[] = POLICIES.filter((policy) => policy !== "hold");
-const PUSH_VALUE = `a preset (${BUILT_PRESETS.map((name) => `"${name}"`).join(", ")}) or a table setting each of ${MESSAGE_CLASSES.join(", ")}`;
-const POLICY_VALUE = BUILT_POLICIES.map((policy) => `"${policy}"`).join(", ");
+const PUSH_VALUE = `a preset (${Object.keys(PRESETS)
+	.map((name) => `"${name}"`)
+	.join(", ")}) or a table setting each of ${MESSAGE_CLASSES.join(", ")}`;
+const POLICY_VALUE = POLICIES.map((policy) => `"${policy}"`).join(", ");
 
 const PolicyFile = z
 	.string({ required_error: `Required: a table sets ${MESSAGE_CLASSES.join(", ")}` })
 	.superRefine((value, ctx) => {
-		if (BUILT_POLICIES.includes(value)) return;
-		ctx.addIssue({
-			code: z.ZodIssueCode.custom,
-			message:
-				value === "hold"
-					? `"hold" is not built yet (push-levels milestone 2); expected ${POLICY_VALUE}`
-					: `Unknown policy "${value}"; expected ${POLICY_VALUE}`,
-		});
+		if ((POLICIES as readonly string[]).includes(value)) return;
+		ctx.addIssue({ code: z.ZodIssueCode.custom, message: `Unknown policy "${value}"; expected ${POLICY_VALUE}` });
 	});
 // A table sets every class: a class left out would need a default, and the config is where the human says it.
 const PolicyTableFile = z.object({ action: PolicyFile, outcome: PolicyFile, ambient: PolicyFile }).strict();
 
-const PushFileConfig = z.object({ telegram: z.unknown(), terminal: z.unknown(), web: z.unknown() }).partial().strict();
+const PushFileConfig = z
+	.object({ telegram: z.unknown(), terminal: z.unknown(), web: z.unknown(), summary: z.unknown() })
+	.partial()
+	.strict();
+
+// Minutes, not whole ones only, so a dev run can cut the wait short.
+const SummaryFileConfig = z.object({ idleMinutes: z.number().positive() }).partial().strict();
+
+/** How long the human types nowhere before what interfaces hold is summarized, unless the config says otherwise. */
+export const SUMMARY_IDLE_MINUTES = 30;
 
 /** The hangar is a rex session found by its id, never by its label, which rex does not keep unique. */
 export interface RexConfig {
@@ -136,6 +138,8 @@ export interface Config {
 	readonly vault?: VaultConfig;
 	/** Each interface's push policy; one the file leaves unset is `instant`, which is how soma pushed before. */
 	readonly push: Readonly<Record<Interface, PolicyTable>>;
+	/** `push.summary.idleMinutes` in ms: how long the human types nowhere before what is held is summarized. */
+	readonly summaryIdleMs: number;
 }
 
 export interface VaultConfig {
@@ -286,6 +290,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		...(web !== undefined && { web }),
 		...(file?.vault?.name !== undefined && { vault: { name: file.vault.name, deny: file.vault.deny ?? [] } }),
 		push: resolvePush(file?.push, path),
+		summaryIdleMs: resolveSummaryIdle(file?.push, path) * 60_000,
 	};
 }
 
@@ -296,12 +301,8 @@ function resolvePush(push: unknown, path: string): Record<Interface, PolicyTable
 		const value = set[name];
 		if (value === undefined) return PRESETS.instant;
 		if (typeof value === "string") {
-			if (BUILT_PRESETS.includes(value)) return PRESETS[value as keyof typeof PRESETS];
-			throw new ConfigError(
-				value === "summary"
-					? `${path}: push.${name}: "summary" needs hold, which is not built yet (push-levels milestone 2); expected ${PUSH_VALUE}`
-					: `${path}: push.${name}: Unknown preset "${value}"; expected ${PUSH_VALUE}`,
-			);
+			if (value in PRESETS) return PRESETS[value as keyof typeof PRESETS];
+			throw new ConfigError(`${path}: push.${name}: Unknown preset "${value}"; expected ${PUSH_VALUE}`);
 		}
 		if (typeof value !== "object" || value === null || Array.isArray(value)) {
 			throw new ConfigError(`${path}: push.${name}: Expected ${PUSH_VALUE}`);
@@ -309,6 +310,12 @@ function resolvePush(push: unknown, path: string): Record<Interface, PolicyTable
 		return parseOrThrow(PolicyTableFile, value, path, ["push", name]) as PolicyTable;
 	};
 	return { telegram: policyOf("telegram"), terminal: policyOf("terminal"), web: policyOf("web") };
+}
+
+function resolveSummaryIdle(push: unknown, path: string): number {
+	const { summary } = push === undefined ? {} : parseOrThrow(PushFileConfig, push, path, ["push"]);
+	if (summary === undefined) return SUMMARY_IDLE_MINUTES;
+	return parseOrThrow(SummaryFileConfig, summary, path, ["push", "summary"]).idleMinutes ?? SUMMARY_IDLE_MINUTES;
 }
 
 /**

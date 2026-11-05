@@ -3,10 +3,12 @@
 // `dispatch` on 「派 <card> <repo>」, hands every blocked agent to the human with `escalate`, and answers the last
 // prompt with option 1 when the human says 「選 1」.
 //   node smoke/push-child.ts <db>
-// A stdin line starting with "!" drives the core instead of the terminal: "!report <text>" and "!question <text>"
-// push a notice, "!block <card> <fingerprint> <seq>" blocks the card's agent on a two-option prompt. What the
-// terminal prints, OSC 7501 included, comes out as {event: "terminal"} lines. $SOMA_SMOKE_BLOCKED, the arguments of
-// one "!block", stands for an agent that outlived a killed core: it is blocked before the startup reconcile.
+// A stdin line starting with "!" drives the core instead of the terminal: "!report <text>" pushes an ambient report
+// and "!question <text>" an action, "!block <card> <fingerprint> <seq>" blocks the card's agent on a two-option
+// prompt, and "!finish <card> <reply>" ends its turn with that reply, "\n" for a line break. What the terminal prints,
+// OSC 7501 included, comes out as {event: "terminal"} lines. $SOMA_SMOKE_BLOCKED, the arguments of one "!block",
+// stands for an agent that outlived a killed core: it is blocked before the startup reconcile. $SOMA_SMOKE_PUSH is the
+// config file's `push` setting as JSON, read as main.ts reads it; unset, every interface is instant.
 import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
@@ -15,8 +17,9 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
-import { runTelegram } from "../src/adapters/telegram/index.ts";
-import { runTerminal } from "../src/adapters/terminal/index.ts";
+import { runTelegram, ENTRY_KIND as TELEGRAM_KIND } from "../src/adapters/telegram/index.ts";
+import { runTerminal, ENTRY_KIND as TERMINAL_KIND } from "../src/adapters/terminal/index.ts";
+import { ENTRY_KIND as WEB_KIND } from "../src/adapters/web/index.ts";
 import { resolveConfig } from "../src/config.ts";
 import { eventBridge, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
@@ -26,7 +29,8 @@ import { openHumanPort } from "../src/core/human-port.ts";
 const context = BACKGROUND_CONTEXT;
 const [db] = process.argv.slice(2);
 if (db === undefined) throw new Error("usage: push-child.ts <db>");
-const { telegram } = resolveConfig(undefined, process.env, homedir());
+const file = process.env.SOMA_SMOKE_PUSH ? { push: JSON.parse(process.env.SOMA_SMOKE_PUSH) as unknown } : undefined;
+const { telegram, push } = resolveConfig(file, process.env, homedir());
 if (telegram === undefined) throw new Error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set");
 const windowMs = Number(process.env.SOMA_SMOKE_WINDOW_MS ?? 4_000);
 const emit = (record: object) => console.log(JSON.stringify(record));
@@ -74,7 +78,8 @@ const harness = await openHarness(db, [dispatchExtension(agents, async (_repo, c
 const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 harness.resume();
 const human = await openHumanPort(harness, root, agents, context, {
-	defaultTarget: "chat.telegram",
+	defaultTarget: TELEGRAM_KIND,
+	policies: { [TELEGRAM_KIND]: push.telegram, [TERMINAL_KIND]: push.terminal, [WEB_KIND]: push.web },
 	presenceMs: windowMs,
 	escalateMs: windowMs,
 	checkMs: 200,
@@ -97,6 +102,10 @@ for await (const line of createInterface({ input: process.stdin })) {
 			? human.notify(rest.join(" "), "report", "ambient")
 			: human.notify(rest.join(" "), "question", "action"));
 	} else if (command === "!block") block(...rest);
-	else typed.write(`${line}\n`);
+	else if (command === "!finish") {
+		const [card = "", ...reply] = rest;
+		agents.emit(card, { state: "working" });
+		agents.finish(card, reply.join(" ").replaceAll("\\n", "\n"));
+	} else typed.write(`${line}\n`);
 	emit({ event: "done", line });
 }

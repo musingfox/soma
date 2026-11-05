@@ -5,9 +5,12 @@
 //   3. a blocked agent's question goes to the terminal and, unheeded, reaches Telegram once more with a sound;
 //      answered on the terminal, its buttons on Telegram give way to 「已在別處處理」;
 //   4. a question the human typed after, anywhere, is not pushed again;
-//   5. a core killed while a question waits is reopened twice, and the question reaches Telegram once.
-//   node smoke/push.ts
-import { mkdtemp, rm } from "node:fs/promises";
+//   5. a core killed while a question waits is reopened twice, and the question reaches Telegram once;
+//   6. on a fresh db with Telegram at ask and the terminal at instant, nobody typing for the window: a job's result and
+//      an ambient report show on the terminal without ringing and never reach Telegram, and a question rings there.
+// Steps 1 to 5 run with no push setting, so every interface is instant, as a config without one is.
+//   node smoke/push.ts [payloads.json]   (step 6's Bot API payloads and terminal lines are written there)
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,14 +45,15 @@ const sent = (match: string) => bot.sent.filter((message) => message.text.includ
 const loud = (messages: SentMessage[]) => messages.filter((message) => message.disable_notification === undefined);
 try {
 	const db = join(directory, "soma.sqlite");
-	const start = async (blocked?: string) => {
-		const child = run([db], CHILD, {
+	const start = async (blocked?: string, levels?: { db: string; push: object }) => {
+		const child = run([levels?.db ?? db], CHILD, {
 			...process.env,
 			TELEGRAM_BOT_TOKEN: TOKEN,
 			TELEGRAM_CHAT_ID: String(CHAT),
 			TELEGRAM_API_BASE: apiBase,
 			SOMA_SMOKE_WINDOW_MS: String(WINDOW_MS),
 			...(blocked && { SOMA_SMOKE_BLOCKED: blocked }),
+			...(levels && { SOMA_SMOKE_PUSH: JSON.stringify(levels.push) }),
 		});
 		children.push(child);
 		await child.next("started");
@@ -122,6 +126,51 @@ try {
 	}
 	check(loud(sent("卡片 c3")).length === 1, `c3 escalated ${loud(sent("卡片 c3")).length} times across restarts`);
 	log("5 restart", { c3: sent("卡片 c3").length });
+
+	const push = { telegram: "ask", terminal: "instant" };
+	const levels = await start(undefined, { db: join(directory, "levels.sqlite"), push });
+	send(levels, "派 c4 /repo");
+	await until(levels, "c4 dispatched", () =>
+		screen(levels).some((line) => String(line).includes("好。")) ? 1 : undefined,
+	);
+	// The human typed nowhere since this, so the push target is Telegram again.
+	await delay(WINDOW_MS + 500);
+	const callsBefore = bot.calls.length;
+	const sentBefore = bot.sent.length;
+	const screenBefore = screen(levels).length;
+	send(levels, "!finish c4 結果：失敗\\n測試沒過。");
+	await until(levels, "c4's result on the terminal", () =>
+		screen(levels).find((line) => String(line).includes("（卡片 c4）這一輪結束了")),
+	);
+	send(levels, "!report a4 記憶改了");
+	await until(levels, "the ambient report on the terminal", () =>
+		screen(levels).find((line) => String(line).includes("a4 記憶改了")),
+	);
+	send(levels, "!block c4 fp4 200");
+	const question = await until(levels, "c4's question on Telegram", () => sent("卡片 c4").at(0));
+	check(question.disable_notification === undefined, "c4's question did not ring on Telegram");
+	check(question.reply_markup !== undefined, "c4's question has no buttons on Telegram");
+	await delay(1_000);
+	const shown = bot.sent.slice(sentBefore);
+	check(shown.length === 1, `Telegram got ${shown.length} messages, not only the question: ${JSON.stringify(shown)}`);
+	check(sent("這一輪結束了").length === 0, "c4's result reached Telegram at ask");
+	check(sent("a4 記憶改了").length === 0, "the ambient report reached Telegram at ask");
+	const lines = screen(levels).slice(screenBefore).map(String);
+	const raised = ["\x1b]7501;state=done:app=soma", "\x1b]7501;state=blocked:app=soma"];
+	const rang = lines.filter((line) => raised.some((root) => line.includes(root)));
+	check(rang.length === 0, `the terminal rang for a push Telegram was the target of: ${JSON.stringify(rang)}`);
+	log("6 ask", { telegram: shown, terminal: lines.filter((line) => line.startsWith("[")) });
+	const saveTo = process.argv[2];
+	if (saveTo !== undefined) {
+		const payloads = {
+			push,
+			windowMs: WINDOW_MS,
+			sendMessage: shown,
+			otherBotApiCalls: bot.calls.slice(callsBefore),
+			terminal: lines,
+		};
+		await writeFile(saveTo, `${JSON.stringify(payloads, null, 2)}\n`);
+	}
 	console.log("PASS");
 } finally {
 	for (const child of children) child.process.kill("SIGKILL");

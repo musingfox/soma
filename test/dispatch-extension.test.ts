@@ -126,6 +126,29 @@ test("jobs lists the dispatched jobs", async () => {
 	expect(JSON.parse(JSON.parse(result).content[0].text)).toMatchObject([{ card: "card-a", agent: "card-a" }]);
 });
 
+test("foreign_agents lists what runs beside soma's jobs, and jobs does not", async () => {
+	const { agents, call, dispatch } = await setup();
+	await dispatch("card-a", "r1");
+	const agent = { id: "pane-1", session: "work", label: "Window 1", status: { state: "working" as const }, cwd: "/w" };
+	agents.foreign.push({ agent });
+
+	expect(await call("foreign_agents", {}, "r2")).toEqual([agent]);
+	expect(await call("jobs", {}, "r3")).toMatchObject([{ card: "card-a" }]);
+	expect(await call("jobs", {}, "r4")).toHaveLength(1);
+});
+
+test("foreign_result reads a foreign agent's last result, and says so when it cannot", async () => {
+	const { agents, call } = await setup();
+	const agent = { id: "pane-1", session: "work", label: "Window 1" };
+	agents.foreign.push({ agent, result: { id: "a-1", text: "結果：完成" } }, { agent: { ...agent, id: "pane-2" } });
+
+	expect(await call("foreign_result", { id: "pane-1" }, "r1")).toEqual({ id: "a-1", text: "結果：完成" });
+	expect(await call("foreign_result", { id: "pane-2" }, "r2")).toEqual({
+		error: "no transcript of foreign agent pane-2 can be read",
+	});
+	expect(await call("foreign_result", { id: "pane-9" }, "r3")).toEqual({ error: "no foreign agent pane-9" });
+});
+
 test("a card that cannot be read starts nothing", async () => {
 	const { agents, dispatch, jobs } = await setup();
 

@@ -119,7 +119,9 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 
 	const jobs = defineTool({
 		name: "jobs",
-		description: "List every dispatched job with its card, agent, session id and last known status.",
+		description:
+			"List every job soma dispatched, with its card, agent, session id and last known status. " +
+			"Only soma's own: every other agent running is listed by foreign_agents.",
 		parameters: obj({}),
 		replay: "safe",
 		execute: async (_args, api, context) =>
@@ -231,5 +233,40 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 		},
 	});
 
-	return defineExtension({ name: "soma.dispatch", tools: [dispatch, jobs, respond, escalate, reply] });
+	const foreignAgents = defineTool({
+		name: "foreign_agents",
+		description:
+			"List every claude agent running now that soma did not dispatch: each terminal pane, in any session, " +
+			"with claude in the foreground and no job of soma's in it, the human's own sessions included. " +
+			"Each has an id, its session's label, the pane's label, its state (idle, working, blocked, done or error; " +
+			"absent when it cannot be told) and its cwd. Read only: soma cannot answer, prompt or stop these. " +
+			"The jobs soma dispatched are listed by jobs, not here.",
+		parameters: obj({}),
+		replay: "safe",
+		execute: async () => text(await agents.listForeign()),
+	});
+
+	const foreignResult = defineTool({
+		name: "foreign_result",
+		description:
+			"Read what a foreign agent's claude transcript ends on: id names its last record, and text is its last reply, " +
+			"absent while the transcript ends awaiting one. An error when the id names no foreign agent now, or none of " +
+			"its transcript can be read.",
+		parameters: obj({ id: str({ description: "The agent's id as foreign_agents listed it" }) }),
+		replay: "safe",
+		execute: async ({ id }) => {
+			try {
+				return text(
+					(await agents.readForeignResult(id)) ?? { error: `no transcript of foreign agent ${id} can be read` },
+				);
+			} catch (error) {
+				return text({ error: (error as Error).message });
+			}
+		},
+	});
+
+	return defineExtension({
+		name: "soma.dispatch",
+		tools: [dispatch, jobs, respond, escalate, reply, foreignAgents, foreignResult],
+	});
 }

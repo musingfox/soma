@@ -3,10 +3,11 @@ import { z } from "zod";
 import type { Answer } from "../../ports/agent.ts";
 import {
 	type Choices,
+	type Delivery,
+	deliveryTo,
 	type HumanAnswerOutcome,
 	type HumanPort,
 	type NoticeKind,
-	PUSHED_FAILURES,
 } from "../../ports/human.ts";
 import { escapeHtml, htmlToPlain, markdownToHtml, splitHtml } from "./html.ts";
 
@@ -26,11 +27,8 @@ export interface TelegramOptions extends TelegramConfig {
 }
 
 const REQUEST_PREFIX = "telegram:";
-/** The entry kind of this client's inputs, which the core names as a push's target when it means this chat. */
-const ENTRY_KIND = "chat.telegram";
-// Rounds started by these sources produce something the human did not ask for here: push them as notices.
-// A digest round is not among them: its report arrives as a notice entry of its own.
-const PUSHED_SOURCES = ["schedule:"];
+/** The entry kind of this client's inputs, by which the core says what this chat does with each push. */
+export const ENTRY_KIND = "chat.telegram";
 // sendMessage takes 1-4096 characters; JavaScript string length counts the same UTF-16 units.
 export const MESSAGE_LIMIT = 4096;
 const EMPTY_ANSWER = "（這一輪沒有文字回答）";
@@ -222,19 +220,21 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		reacting = reacting.then(() => quietly("setMessageReaction", body).then(() => {}));
 	};
 
+	// A push the core starts: it says whether this chat rings, shows it without a sound, or leaves it to the history.
+	const push = (text: string, delivery: Delivery, choices?: Choices) => {
+		if (delivery === "log") return;
+		const markup = choices && keyboard(choices);
+		send(text, markup, { silent: delivery === "quiet", ...(markup && { prompt: choices }) });
+	};
+
 	// The prefix, not a set of ids sent from here, marks this client's rounds: a round the core finishes after a
 	// restart still reaches the chat that started it.
 	const unsubscribe = human.subscribe((event) => {
 		const mine = "requestId" in event && event.requestId.startsWith(REQUEST_PREFIX);
-		// A push meant for another interface still arrives here, without a sound.
-		const silent = "target" in event && event.target !== undefined && event.target !== ENTRY_KIND;
 		if (event.type === "notice") {
 			if (event.kind === "forwarded") {
 				if (mine) react(event.requestId, "forwarded");
-			} else {
-				const markup = event.choices && keyboard(event.choices);
-				send(label(event.kind, event.content), markup, { silent, ...(markup && { prompt: event.choices }) });
-			}
+			} else push(label(event.kind, event.content), deliveryTo(event, ENTRY_KIND), event.choices);
 		} else if (event.type === "job") {
 			// Answered elsewhere: the prompt is no longer on the job's screen. Queued behind the sends, so it sees them.
 			const { card, status } = event;
@@ -257,14 +257,13 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			if (mine) {
 				react(event.requestId, "answered");
 				send(event.content);
-			} else if (PUSHED_SOURCES.some((source) => event.requestId.startsWith(source)))
-				send(label("report", event.content));
+			} else if (event.class !== undefined) push(label("report", event.content), deliveryTo(event, ENTRY_KIND));
 		} else if (event.type === "failure") {
 			if (mine) {
 				react(event.requestId, "failed");
 				send(`[失敗] ${event.reason}`);
-			} else if (PUSHED_FAILURES.some((source) => event.requestId.startsWith(source)))
-				send(`[失敗] ${event.requestId} 那一輪：${event.reason}`, undefined, { silent });
+			} else if (event.class !== undefined)
+				push(`[失敗] ${event.requestId} 那一輪：${event.reason}`, deliveryTo(event, ENTRY_KIND));
 		}
 	});
 	type CallbackQuery = NonNullable<z.infer<typeof UpdateSchema>["callback_query"]>;

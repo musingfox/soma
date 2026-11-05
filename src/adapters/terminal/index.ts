@@ -1,6 +1,6 @@
 import { createInterface } from "node:readline";
 import type { AgentState } from "../../ports/agent.ts";
-import { type HumanPort, PUSHED_FAILURES, type SomaEvent } from "../../ports/human.ts";
+import { type Delivery, deliveryTo, type HumanPort, type SomaEvent } from "../../ports/human.ts";
 import {
 	formatProgramStatus,
 	isProgramStatusReply,
@@ -29,11 +29,8 @@ export interface TerminalOptions {
 const DEVICE_ATTRIBUTES_QUERY = "\x1b[c";
 const DEVICE_ATTRIBUTES_REPLY = "\x1b[?";
 const PROGRAM_STATUS_REPLY = "\x1b]7501;?";
-// Rounds started by these sources produce something the human did not ask for here: show them as notices.
-// A digest round is not among them: its report arrives as a notice entry of its own.
-const PUSHED_SOURCES = ["schedule:"];
-/** The entry kind of this client's inputs, which the core names as a push's target when it means this terminal. */
-const ENTRY_KIND = "chat.terminal";
+/** The entry kind of this client's inputs, by which the core says what this terminal does with each push. */
+export const ENTRY_KIND = "chat.terminal";
 
 /**
  * Ask whether the terminal supports OSC 7501. Every terminal answers the device attributes query that follows it,
@@ -114,10 +111,11 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 		lastRoot = sequence;
 		report({ ...status, app: "soma" });
 	};
-	// A push meant for another interface is printed only: the root record is how this client rings.
-	const notice = (kind: "question" | "report", content: string, loud = true) => {
+	// A push this terminal shows quietly is printed only: the root record is how this client rings.
+	const notice = (kind: "question" | "report", content: string, delivery: Delivery) => {
+		if (delivery === "log") return;
 		print(`[${kind === "question" ? "問題" : "通知"}] ${content}`);
-		if (!loud) return;
+		if (delivery === "quiet") return;
 		if (attention?.state !== "blocked" || kind === "question") {
 			attention =
 				kind === "question"
@@ -126,24 +124,25 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 		}
 	};
 
-	const fail = (content: string, loud = true) => {
+	const fail = (content: string, delivery: Delivery = "ring") => {
+		if (delivery === "log") return;
 		print(`[失敗] ${content}`);
-		if (!loud) return;
+		if (delivery === "quiet") return;
 		if (attention?.state !== "blocked") attention = { state: "error", message: firstLine(content) };
 	};
 
-	const loud = ({ target }: { target?: string }) => target === undefined || target === ENTRY_KIND;
 	const mine = new Set<string>();
 	const onEvent = (event: SomaEvent) => {
 		if (event.type === "run") running = event.state === "working";
-		else if (event.type === "notice" && event.kind !== "forwarded") notice(event.kind, event.content, loud(event));
+		else if (event.type === "notice" && event.kind !== "forwarded")
+			notice(event.kind, event.content, deliveryTo(event, ENTRY_KIND));
 		else if (event.type === "answer") {
 			if (mine.delete(event.requestId)) print(event.content);
-			else if (PUSHED_SOURCES.some((source) => event.requestId.startsWith(source))) notice("report", event.content);
+			else if (event.class !== undefined) notice("report", event.content, deliveryTo(event, ENTRY_KIND));
 		} else if (event.type === "failure") {
 			if (mine.delete(event.requestId)) fail(event.reason);
-			else if (PUSHED_FAILURES.some((source) => event.requestId.startsWith(source)))
-				fail(`${event.requestId} 那一輪：${event.reason}`, loud(event));
+			else if (event.class !== undefined)
+				fail(`${event.requestId} 那一輪：${event.reason}`, deliveryTo(event, ENTRY_KIND));
 		} else if (event.type === "job") report(jobStatus(event.card, event.status));
 		reportRoot();
 	};

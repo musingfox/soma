@@ -1,6 +1,50 @@
 import type { AgentState } from "../../ports/agent.ts";
-import type { Choices, MessageClass, NoticeKind } from "../../ports/human.ts";
+import type { Choices, Delivery, MessageClass, NoticeKind } from "../../ports/human.ts";
 import { samePrompt, type Told } from "./foreign.ts";
+
+/**
+ * What an interface does with one class of push: `ring` sends it now with a sound, `quiet` sends it now without one,
+ * `log` keeps it in the history only. `hold` comes with the `summary` preset, in milestone 2 of push-levels.
+ */
+export const POLICIES = ["ring", "quiet", "log"] as const;
+export type Policy = (typeof POLICIES)[number];
+export type PolicyTable = Readonly<Record<MessageClass, Policy>>;
+
+/** ARCHITECTURE.md "Whom to push to": `instant` is how every interface pushed before classes existed. */
+export const PRESETS = {
+	instant: { action: "ring", outcome: "ring", ambient: "ring" },
+	ask: { action: "ring", outcome: "log", ambient: "log" },
+} as const satisfies Record<string, PolicyTable>;
+export type Preset = keyof typeof PRESETS;
+
+/** Each interface's policy table, by the entry kind it tags its inputs with; one not named is `instant`. */
+export type Policies = Readonly<Record<string, PolicyTable>>;
+
+export const policyOf = (policies: Policies, entryKind: string): PolicyTable => policies[entryKind] ?? PRESETS.instant;
+
+/**
+ * What each interface does with a push of `messageClass`, by entry kind (ARCHITECTURE.md "Whom to push to"). Each
+ * interface's policy is a ceiling: at `log` it does not show the push. Only `target` rings, and only when its own
+ * policy is `ring`; every other interface shows it quietly. When the target may not ring, nobody does: the ring never
+ * falls to another interface. Without a target, as when there is no default interface, each one follows its policy.
+ */
+export function deliveries(
+	policies: Policies,
+	messageClass: MessageClass,
+	target: string | undefined,
+): Record<string, Delivery> {
+	const kinds = new Set([...Object.keys(policies), ...(target === undefined ? [] : [target])]);
+	const delivery: Record<string, Delivery> = {};
+	for (const kind of kinds) {
+		const policy = policyOf(policies, kind)[messageClass];
+		delivery[kind] = policy === "log" || target === undefined || kind === target ? policy : "quiet";
+	}
+	return delivery;
+}
+
+/** An unheeded push is pushed again to the default interface only when its policy shows that class at all. */
+export const escalates = (policies: Policies, defaultTarget: string, messageClass: MessageClass): boolean =>
+	policyOf(policies, defaultTarget)[messageClass] !== "log";
 
 /** When the human last typed on each interface, in ms, by the entry kind the interface tags its inputs with. */
 export type Presence = Record<string, number>;

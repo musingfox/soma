@@ -16,6 +16,7 @@ import {
 import type { AgentPort, AgentState } from "../ports/agent.ts";
 import {
 	type Choices,
+	type Delivery,
 	type HumanPort,
 	MESSAGE_CLASSES,
 	type MessageClass,
@@ -26,7 +27,15 @@ import {
 } from "../ports/human.ts";
 import { HUMAN_CHOSEN } from "./domain/dispatch.ts";
 import type { Told } from "./domain/foreign.ts";
-import { escalation, type PendingPush, type Presence, pushTarget } from "./domain/push.ts";
+import {
+	deliveries,
+	escalates,
+	escalation,
+	type PendingPush,
+	type Policies,
+	type Presence,
+	pushTarget,
+} from "./domain/push.ts";
 import { turnSignal } from "./domain/signal.ts";
 import { ForeignPrompts } from "./extensions/dispatch/foreign.ts";
 import { answerJob, Dispatches } from "./extensions/dispatch/index.ts";
@@ -81,8 +90,13 @@ export const Pushes = defineDoc<{ presence: Presence; pending: PendingPush[] }>(
 
 /** ARCHITECTURE.md "Whom to push to when there are several interfaces"; the windows are its 15 minutes by default. */
 export interface PushOptions {
-	/** The entry kind of the interface pushed to when the human typed nowhere lately, and of every escalation. */
-	readonly defaultTarget: string;
+	/**
+	 * The entry kind of the interface pushed to when the human typed nowhere lately, and of every escalation. Without
+	 * one there is no push target and no escalation: each interface follows its own policy.
+	 */
+	readonly defaultTarget?: string;
+	/** Each interface's policy by entry kind; one not named is `instant`. */
+	readonly policies?: Policies;
 	readonly presenceMs?: number;
 	readonly escalateMs?: number;
 	/** How often pending pushes are checked for escalation. */
@@ -92,7 +106,7 @@ export interface PushOptions {
 
 const FIFTEEN_MINUTES = 15 * 60_000;
 
-type Target = { target?: string };
+type Delivered = { delivery?: Record<string, Delivery> };
 
 /**
  * The in-process HumanPort over the root conversation. A new subscriber first gets the current run state and every
@@ -109,30 +123,40 @@ export async function openHumanPort(
 	const now = push?.now ?? Date.now;
 	const presenceMs = push?.presenceMs ?? FIFTEEN_MINUTES;
 	const escalateMs = push?.escalateMs ?? FIFTEEN_MINUTES;
-	const presence: Presence = push
-		? await root.commit(
-				async (tx) => JSON.parse(JSON.stringify((await tx.doc(Pushes, root.id)).presence)) as Presence,
-				context,
-			)
-		: {};
+	const policies = push?.policies ?? {};
+	const defaultTarget = push?.defaultTarget;
+	const presence: Presence =
+		defaultTarget !== undefined
+			? await root.commit(
+					async (tx) => JSON.parse(JSON.stringify((await tx.doc(Pushes, root.id)).presence)) as Presence,
+					context,
+				)
+			: {};
 	/**
-	 * The target of a push the core starts. One that may escalate is kept as pending first, under the key of what it
-	 * came from, so a crash before it reaches anyone leaves it pending rather than lost.
+	 * What each interface does with a push the core starts. One that may escalate is kept as pending first, under the
+	 * key of what it came from, so a crash before it reaches anyone leaves it pending rather than lost; it may only when
+	 * the default interface's policy shows its class.
 	 */
-	async function targetOf(key: string, pending?: Omit<PendingPush, "key" | "at">): Promise<Target> {
+	async function deliveryOf(
+		key: string,
+		messageClass: MessageClass,
+		pending?: Omit<PendingPush, "key" | "at" | "class">,
+	): Promise<Delivered> {
 		if (push === undefined) return {};
+		if (defaultTarget === undefined) return { delivery: deliveries(policies, messageClass, undefined) };
 		const at = now();
-		const target = pushTarget(presence, at, presenceMs, push.defaultTarget);
-		if (pending !== undefined && target !== push.defaultTarget) {
+		const target = pushTarget(presence, at, presenceMs, defaultTarget);
+		if (pending !== undefined && target !== defaultTarget && escalates(policies, defaultTarget, messageClass)) {
 			await root
 				.commit(async (tx) => {
 					const doc = await tx.doc(Pushes, root.id);
-					if (!doc.pending.some((each) => each.key === key)) doc.pending.push({ key, at, ...pending });
+					if (!doc.pending.some((each) => each.key === key))
+						doc.pending.push({ key, at, class: messageClass, ...pending });
 				}, context)
 				// A throw would drop the rest of the commit's events: the push still goes out, only its escalation is lost.
 				.catch((error: unknown) => console.error("[soma] pending push:", error));
 		}
-		return { target };
+		return { delivery: deliveries(policies, messageClass, target) };
 	}
 
 	const listeners = new Set<(event: SomaEvent) => void>();
@@ -194,11 +218,12 @@ export async function openHumanPort(
 			// An escalation names its target; reports never escalate.
 			const pushed =
 				target !== undefined
-					? { target }
-					: await targetOf(
+					? { delivery: deliveries(policies, messageClass, target) }
+					: await deliveryOf(
 							`notice:${entry.id}`,
+							messageClass,
 							kind === "question"
-								? { kind, class: messageClass, content, ...(choices && { choices }), ...(foreign && { foreign }) }
+								? { kind, content, ...(choices && { choices }), ...(foreign && { foreign }) }
 								: undefined,
 						);
 			emit({ type: "notice", kind, class: messageClass, content, ...(choices && { choices }), ...pushed });
@@ -217,7 +242,7 @@ export async function openHumanPort(
 						requestId,
 						reason,
 						class: "outcome",
-						...(await targetOf(`failure:${record.id}`, { kind: "report", class: "outcome", content })),
+						...(await deliveryOf(`failure:${record.id}`, "outcome", { kind: "report", content })),
 					});
 				} else if (requestId !== undefined) emit({ type: "failure", requestId, reason });
 				const round = { submission: record.id, requestId, entry: record.entry, reason };
@@ -226,8 +251,10 @@ export async function openHumanPort(
 					.catch((error: unknown) => console.error("[soma] outcome signal:", error));
 			} else if (record.status === "done" && requestId !== undefined) {
 				const content = answers.get(record.answer) ?? "";
-				const pushed = PUSHED_ANSWERS.some((source) => requestId.startsWith(source));
-				emit({ type: "answer", requestId, content, ...(pushed && { class: "outcome" as const }) });
+				const pushed = PUSHED_ANSWERS.some((source) => requestId.startsWith(source))
+					? { class: "outcome" as const, ...(await deliveryOf(`answer:${record.id}`, "outcome")) }
+					: {};
+				emit({ type: "answer", requestId, content, ...pushed });
 			}
 		}
 		if (began) emit({ type: "run", state: "working" });
@@ -265,6 +292,7 @@ export async function openHumanPort(
 	});
 
 	// Each due push becomes a notice to the default interface in the commit that drops it, so a restart repeats none.
+	// One kept under a policy the config has since set to `log` is dropped.
 	let checking = false;
 	const check = async (defaultTarget: string) => {
 		if (checking) return;
@@ -277,11 +305,13 @@ export async function openHumanPort(
 				const stored = JSON.parse(JSON.stringify(doc)) as { presence: Presence; pending: PendingPush[] };
 				const kept: PendingPush[] = [];
 				for (const pending of stored.pending) {
+					const messageClass = pendingClass(pending);
+					if (!escalates(policies, defaultTarget, messageClass)) continue;
 					const verdict = escalation(pending, stored.presence, jobsNow, told, now(), escalateMs);
 					if (verdict === "wait") kept.push(pending);
 					if (verdict !== "due") continue;
 					const { kind, content, choices } = pending;
-					const { data } = noticeEntry(kind, pendingClass(pending), content, choices);
+					const { data } = noticeEntry(kind, messageClass, content, choices);
 					await tx.appendEntry(root.id, { kind: NOTICE, data: { ...data, target: defaultTarget } });
 				}
 				if (kept.length !== stored.pending.length) doc.pending = kept;
@@ -292,14 +322,15 @@ export async function openHumanPort(
 			checking = false;
 		}
 	};
-	const checker = push && setInterval(() => void check(push.defaultTarget), push.checkMs ?? 30_000);
+	const checker =
+		defaultTarget === undefined ? undefined : setInterval(() => void check(defaultTarget), push?.checkMs ?? 30_000);
 	checker?.unref();
 
 	return {
 		async submit(input) {
 			const { kind, data } = input.entry;
 			const entry = data === undefined ? { kind } : { kind, data: data as JsonValue };
-			if (push !== undefined) {
+			if (defaultTarget !== undefined) {
 				const at = now();
 				presence[kind] = at;
 				await root.commit(async (tx) => {

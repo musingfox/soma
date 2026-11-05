@@ -150,7 +150,7 @@ test("only this client's inputs get reactions", async () => {
 	start(human, apiBase);
 
 	human.emit({ type: "notice", kind: "forwarded", requestId: "terminal:1" });
-	human.emit({ type: "answer", requestId: "schedule:4", content: "提醒你：喝水" });
+	human.emit({ type: "answer", requestId: "schedule:4", content: "提醒你：喝水", class: "outcome" });
 	human.emit({ type: "notice", kind: "forwarded", requestId: "telegram:5" });
 
 	await vi.waitFor(() => expect(api.reactions).toHaveLength(1));
@@ -182,10 +182,10 @@ test("failures of schedule and event-bridge rounds are pushed; digest and other 
 	start(human, apiBase);
 
 	human.emit({ type: "failure", requestId: "terminal:1", reason: "x" });
-	human.emit({ type: "failure", requestId: "schedule:4", reason: "模型出錯：y" });
+	human.emit({ type: "failure", requestId: "schedule:4", reason: "模型出錯：y", class: "outcome" });
 	human.emit({ type: "failure", requestId: "digest:1", reason: "找不到模型" });
 
-	human.emit({ type: "failure", requestId: "agent:a:3", reason: "內部錯誤：z" });
+	human.emit({ type: "failure", requestId: "agent:a:3", reason: "內部錯誤：z", class: "outcome" });
 
 	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
 	await new Promise((resolve) => setTimeout(resolve, 100));
@@ -221,7 +221,7 @@ test("only this client's answers, schedule rounds and notices reach the chat", a
 	human.emit({ type: "run", state: "working" });
 	human.emit({ type: "job", card: "a", agent: "a", status: { state: "done" } });
 	human.emit({ type: "answer", requestId: "telegram:9", content: "mine" });
-	human.emit({ type: "answer", requestId: "schedule:4", content: "提醒你：喝水" });
+	human.emit({ type: "answer", requestId: "schedule:4", content: "提醒你：喝水", class: "outcome" });
 	human.emit({ type: "notice", kind: "report", class: "outcome", content: "報告：a 完成" });
 	human.emit({ type: "notice", kind: "question", class: "action", content: "a 要密碼" });
 
@@ -391,17 +391,38 @@ test("a second tap on the same question answers nothing and leaves the first res
 	});
 });
 
-test("a push meant for another interface arrives silently; one for Telegram, or with no target, rings", async () => {
+test("a push arrives as the core delivers it here: ringing, silently, or not at all when logged", async () => {
 	const human = new FakeHumanPort();
 	const { api, apiBase } = await bot();
 	start(human, apiBase);
+	const report = { type: "notice", kind: "report", class: "outcome" } as const;
 
-	human.emit({ type: "notice", kind: "report", class: "outcome", content: "elsewhere", target: "chat.terminal" });
-	human.emit({ type: "notice", kind: "report", class: "outcome", content: "here", target: "chat.telegram" });
-	human.emit({ type: "notice", kind: "report", class: "outcome", content: "anywhere" });
-	human.emit({ type: "failure", requestId: "schedule:1", reason: "boom", target: "chat.terminal" });
-	await vi.waitFor(() => expect(api.sent).toHaveLength(4));
-	expect(api.sent.map((message) => message.disable_notification ?? false)).toEqual([true, false, false, true]);
+	human.emit({ ...report, content: "elsewhere", delivery: { "chat.terminal": "ring", "chat.telegram": "quiet" } });
+	human.emit({ ...report, content: "here", delivery: { "chat.telegram": "ring" } });
+	human.emit({ ...report, content: "anywhere" });
+	human.emit({ ...report, content: "unnamed", delivery: { "chat.terminal": "ring" } });
+	human.emit({ ...report, content: "logged", delivery: { "chat.telegram": "log", "chat.terminal": "ring" } });
+	human.emit({ type: "failure", requestId: "schedule:1", reason: "boom", class: "outcome", delivery: {} });
+	const logged = { "chat.telegram": "log" } as const;
+	human.emit({ type: "failure", requestId: "schedule:2", reason: "logged", class: "outcome", delivery: logged });
+	human.emit({ type: "answer", requestId: "schedule:3", content: "logged", class: "outcome", delivery: logged });
+	human.emit({
+		type: "answer",
+		requestId: "schedule:4",
+		content: "rung",
+		class: "outcome",
+		delivery: { "chat.telegram": "ring" },
+	});
+	await vi.waitFor(() => expect(api.sent).toHaveLength(6));
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	expect(api.sent.map((message) => [message.text, message.disable_notification ?? false])).toEqual([
+		["[通知] elsewhere", true],
+		["[通知] here", false],
+		["[通知] anywhere", false],
+		["[通知] unnamed", true],
+		["[失敗] schedule:1 那一輪：boom", true],
+		["[通知] rung", false],
+	]);
 });
 
 const elsewhere = chosen("已在別處處理");
@@ -419,7 +440,7 @@ test("a prompt's buttons go once its job leaves that prompt, unless a press here
 		class: "action",
 		content: "還是要嗎？",
 		choices,
-		target: "chat.telegram",
+		delivery: { "chat.telegram": "ring" },
 	});
 	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
 	human.emit({ type: "job", card: "card-a", agent: "card-a", status: blocked });
@@ -484,7 +505,7 @@ test("notices, prompts with buttons and pushed failures are converted too, and t
 
 	human.emit({ type: "notice", kind: "report", class: "outcome", content: "**done** <3" });
 	human.emit({ type: "notice", kind: "question", class: "action", content: "run `rm x`?", choices });
-	human.emit({ type: "failure", requestId: "schedule:1", reason: "bad *thing* & <more>" });
+	human.emit({ type: "failure", requestId: "schedule:1", reason: "bad *thing* & <more>", class: "outcome" });
 	await vi.waitFor(() => expect(api.sent).toHaveLength(3));
 	expect(api.sent.map((message) => [message.parse_mode, message.text])).toEqual([
 		["HTML", "[通知] <b>done</b> &lt;3"],

@@ -16,6 +16,9 @@ export type NoticeKind = "question" | "report";
 export const MESSAGE_CLASSES = ["action", "outcome", "ambient"] as const;
 export type MessageClass = (typeof MESSAGE_CLASSES)[number];
 
+/** What one client does with a push: ring, show it without a sound, or not show it (it stays in the history). */
+export type Delivery = "ring" | "quiet" | "log";
+
 /** A blocked prompt handed to the human with everything a client needs to offer its options. */
 export type Choices = { readonly card: string; readonly fingerprint: string; readonly options: Choice[] };
 
@@ -32,10 +35,15 @@ export const PUSHED_FAILURES = ["schedule:", "agent:", "foreign:"] as const;
 export const PUSHED_ANSWERS = ["schedule:"] as const;
 
 /**
- * On a push the core starts itself: its class, and the entry kind of the one client that rings for it; every other
- * client shows it silently. `target` is absent when the core was given no push target, and then every client rings.
+ * On a push the core starts itself: its class, and by entry kind what each client does with it, which the core decides
+ * from the interfaces' policies and the push target; a client it does not name shows it without a sound. `delivery` is
+ * absent when the core was given no push options, and then every client rings.
  */
-type Pushed = { readonly class: MessageClass; readonly target?: string };
+type Pushed = { readonly class: MessageClass; readonly delivery?: Readonly<Record<string, Delivery>> };
+
+/** What the client tagging its inputs `entryKind` does with a push. */
+export const deliveryTo = (event: { readonly delivery?: Pushed["delivery"] }, entryKind: string): Delivery =>
+	event.delivery === undefined ? "ring" : (event.delivery[entryKind] ?? "quiet");
 
 export type SomaEvent =
 	// Pushed when a round the core started answered (`PUSHED_ANSWERS`).

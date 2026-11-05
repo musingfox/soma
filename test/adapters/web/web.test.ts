@@ -288,18 +288,24 @@ test("the answer of a turn another interface started is not sent; a scheduled tu
 	human.emit({ type: "failure", requestId: "telegram:43", reason: "theirs" });
 	human.emit({ type: "answer", requestId: "digest:2026-10-27T10:00:00Z", content: "a digest, noticed apart" });
 	human.emit({ type: "notice", kind: "forwarded", requestId: `web:${ID}` });
-	human.emit({ type: "answer", requestId: "schedule:7", content: "記得喝水" });
+	human.emit({ type: "answer", requestId: "schedule:7", content: "記得喝水", class: "outcome" });
 	expect(await page.next()).toEqual({ type: "notice", kind: "report", text: "記得喝水", loud: true });
 	expect(page.received).toHaveLength(1);
 });
 
-test("a push meant for another interface is shown without ringing", async () => {
+test("a push shown quietly here is shown without ringing, and a logged one is not sent", async () => {
 	const { human, server } = await serve();
 	const page = await open(server.port);
-	human.emit({ type: "notice", kind: "question", class: "action", content: "q1", target: "chat.telegram" });
-	human.emit({ type: "notice", kind: "report", class: "outcome", content: "r1", target: "chat.web" });
+	const quiet = { "chat.telegram": "ring", "chat.web": "quiet" } as const;
+	const logged = { "chat.web": "log" } as const;
+	human.emit({ type: "notice", kind: "question", class: "action", content: "q1", delivery: quiet });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "logged", delivery: logged });
+	human.emit({ type: "answer", requestId: "schedule:1", content: "logged", class: "outcome", delivery: logged });
+	human.emit({ type: "failure", requestId: "schedule:2", reason: "logged", class: "outcome", delivery: logged });
+	human.emit({ type: "notice", kind: "report", class: "outcome", content: "r1", delivery: { "chat.web": "ring" } });
 	human.emit({ type: "notice", kind: "report", class: "outcome", content: "r2" });
-	human.emit({ type: "failure", requestId: "agent:fix-bug:3", reason: "429", target: "chat.terminal" });
+	const failure = { type: "failure", requestId: "agent:fix-bug:3", reason: "429", class: "outcome" } as const;
+	human.emit({ ...failure, delivery: { "chat.terminal": "ring" } });
 	human.emit({ type: "run", state: "working" });
 	expect([await page.next(), await page.next(), await page.next(), await page.next(), await page.next()]).toEqual([
 		{ type: "notice", kind: "question", text: "q1", loud: false },

@@ -8,7 +8,7 @@ import type { Duplex } from "node:stream";
 import { gzipSync } from "node:zlib";
 import { type RawData, WebSocket, WebSocketServer } from "ws";
 import { z } from "zod";
-import { type HumanPort, PUSHED_FAILURES, type SomaEvent } from "../../ports/human.ts";
+import { deliveryTo, type HumanPort, type SomaEvent } from "../../ports/human.ts";
 
 /** Serve mode: soma is behind `tailscale serve`, which terminates HTTPS and says who the caller is. */
 export interface ServeConfig {
@@ -40,11 +40,8 @@ export interface WebServer {
 }
 
 const REQUEST_PREFIX = "web:";
-/** The entry kind of this client's inputs, which the core names as a push's target when it means the page. */
-const ENTRY_KIND = "chat.web";
-// Rounds started by these sources produce something the human did not ask for here: show them as notices.
-// A digest round is not among them: its report arrives as a notice entry of its own.
-const PUSHED_SOURCES = ["schedule:"];
+/** The entry kind of this client's inputs, by which the core says what the page does with each push. */
+export const ENTRY_KIND = "chat.web";
 export const SOCKET_PATH = "/socket";
 /** A larger message closes the connection: typed text is far smaller, and nothing else is buffered without bound. */
 export const MAX_MESSAGE_BYTES = 1 << 20;
@@ -148,25 +145,28 @@ export async function startWeb(options: WebOptions): Promise<WebServer> {
 		if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
 	};
 
-	const loud = ({ target }: { target?: string }) => target === undefined || target === ENTRY_KIND;
-	/** What one page is sent of an event, if anything. */
+	/** What one page is sent of an event, if anything. A push the core leaves to the history here is not sent. */
 	const toMessage = (event: SomaEvent): WebMessage | undefined => {
 		const mine = "requestId" in event && event.requestId.startsWith(REQUEST_PREFIX);
 		const id = mine ? event.requestId.slice(REQUEST_PREFIX.length) : "";
 		if (event.type === "run") return { type: "run", state: event.state };
 		if (event.type === "notice") {
-			return event.kind === "forwarded"
+			if (event.kind === "forwarded") return undefined;
+			const delivery = deliveryTo(event, ENTRY_KIND);
+			return delivery === "log"
 				? undefined
-				: { type: "notice", kind: event.kind, text: event.content, loud: loud(event) };
+				: { type: "notice", kind: event.kind, text: event.content, loud: delivery === "ring" };
 		}
 		if (event.type === "answer") {
 			if (mine) return { type: "answer", id, text: event.content };
-			if (PUSHED_SOURCES.some((source) => event.requestId.startsWith(source)))
-				return { type: "notice", kind: "report", text: event.content, loud: true };
+			const delivery = deliveryTo(event, ENTRY_KIND);
+			if (event.class !== undefined && delivery !== "log")
+				return { type: "notice", kind: "report", text: event.content, loud: delivery === "ring" };
 		} else if (event.type === "failure") {
 			if (mine) return { type: "failure", id, text: event.reason, loud: true };
-			if (PUSHED_FAILURES.some((source) => event.requestId.startsWith(source)))
-				return { type: "failure", text: `${event.requestId} 那一輪：${event.reason}`, loud: loud(event) };
+			const delivery = deliveryTo(event, ENTRY_KIND);
+			if (event.class !== undefined && delivery !== "log")
+				return { type: "failure", text: `${event.requestId} 那一輪：${event.reason}`, loud: delivery === "ring" };
 		}
 		return undefined;
 	};

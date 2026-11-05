@@ -95,7 +95,7 @@ test("each line is an input with a fresh terminal requestId; only this client's 
 	human.emit({ type: "answer", requestId: first, content: "已派工。" });
 	human.emit({ type: "answer", requestId: "terminal:1", content: "another terminal's answer" });
 	human.emit({ type: "answer", requestId: "telegram:7", content: "telegram's answer" });
-	human.emit({ type: "answer", requestId: "schedule:3", content: "提醒：喝水" });
+	human.emit({ type: "answer", requestId: "schedule:3", content: "提醒：喝水", class: "outcome" });
 	human.emit({ type: "answer", requestId: "digest:1", content: "報告的那一輪" });
 	human.emit({ type: "notice", kind: "report", class: "outcome", content: "報告" });
 	human.emit({ type: "notice", kind: "forwarded", requestId: first });
@@ -145,7 +145,7 @@ test("a failed round of this client or of the core is printed and turns the root
 	expect(take()).toBe(
 		`[失敗] 模型出錯：Provider is not configured: anthropic\n${root({ state: "error", message: "模型出錯：Provider is not configured: anthropic" })}`,
 	);
-	human.emit({ type: "failure", requestId: "agent:a:3", reason: "內部錯誤：boom" });
+	human.emit({ type: "failure", requestId: "agent:a:3", reason: "內部錯誤：boom", class: "outcome" });
 	expect(take()).toBe(
 		`[失敗] agent:a:3 那一輪：內部錯誤：boom\n${root({ state: "error", message: "agent:a:3 那一輪：內部錯誤：boom" })}`,
 	);
@@ -165,15 +165,22 @@ test("an unsupported terminal gets no OSC 7501 bytes", async () => {
 	await end();
 });
 
-test("a push meant for another interface is printed without raising the root record", async () => {
+test("a push shown quietly here is printed without raising the root record, and a logged one is not printed", async () => {
 	const { human, type, take, end } = await session(true);
 	await type("派 a");
 	expect(take()).toBe(root({ state: "idle" }));
 
-	human.emit({ type: "notice", kind: "question", class: "action", content: "問 telegram", target: "chat.telegram" });
-	human.emit({ type: "failure", requestId: "schedule:1", reason: "boom", target: "chat.telegram" });
+	const quiet = { "chat.telegram": "ring", "chat.terminal": "quiet" } as const;
+	const logged = { "chat.telegram": "ring", "chat.terminal": "log" } as const;
+	human.emit({ type: "notice", kind: "question", class: "action", content: "問 telegram", delivery: quiet });
+	human.emit({ type: "failure", requestId: "schedule:1", reason: "boom", class: "outcome", delivery: quiet });
 	expect(take()).toBe("[問題] 問 telegram\n[失敗] schedule:1 那一輪：boom\n");
-	human.emit({ type: "notice", kind: "question", class: "action", content: "問這裡", target: "chat.terminal" });
+	human.emit({ type: "notice", kind: "report", class: "ambient", content: "記下了", delivery: logged });
+	human.emit({ type: "failure", requestId: "schedule:2", reason: "boom", class: "outcome", delivery: logged });
+	human.emit({ type: "answer", requestId: "schedule:3", content: "喝水", class: "outcome", delivery: logged });
+	expect(take()).toBe("");
+	const here = { "chat.terminal": "ring" } as const;
+	human.emit({ type: "notice", kind: "question", class: "action", content: "問這裡", delivery: here });
 	expect(take()).toBe(`[問題] 問這裡\n${root({ state: "blocked", kind: "question", message: "問這裡" })}`);
 	await end();
 });

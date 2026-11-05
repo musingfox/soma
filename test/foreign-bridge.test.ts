@@ -20,6 +20,7 @@ import { openHumanPort } from "../src/core/human-port.ts";
 import { NOTICE } from "../src/core/notice.ts";
 import type { AgentState } from "../src/ports/agent.ts";
 import type { SomaEvent } from "../src/ports/human.ts";
+import { ringing } from "./ringing.ts";
 
 const context = BACKGROUND_CONTEXT;
 const open: Harness[] = [];
@@ -245,7 +246,7 @@ test("a foreign push reaches the human side through the push rule, which picks t
 
 	await vi.waitFor(() =>
 		expect(seen.filter((event) => event.type === "notice")).toEqual([
-			expect.objectContaining({ kind: "question", target: "chat.telegram" }),
+			expect.objectContaining({ kind: "question", class: "action", delivery: { "chat.telegram": "ring" } }),
 		]),
 	);
 	await human.close();
@@ -285,7 +286,7 @@ describe("a foreign push that escalates", () => {
 		await soma.root.waitForIdle(context);
 		clock += MIN;
 		const questions = () =>
-			seen.flatMap((event) => (event.type === "notice" && event.kind === "question" ? [event.target] : []));
+			seen.flatMap((event) => (event.type === "notice" && event.kind === "question" ? [ringing(event)] : []));
 		return {
 			agents,
 			soma,

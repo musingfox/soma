@@ -9,12 +9,14 @@ import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durab
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { runTerminal } from "../src/adapters/terminal/index.ts";
+import { type Policies, PRESETS } from "../src/core/domain/push.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { schedule } from "../src/core/extensions/schedule/index.ts";
 import { openHarness } from "../src/core/harness.ts";
-import { openHumanPort, Pushes } from "../src/core/human-port.ts";
+import { openHumanPort, Pushes, type PushOptions } from "../src/core/human-port.ts";
 import { NOTICE } from "../src/core/notice.ts";
 import type { SomaEvent } from "../src/ports/human.ts";
+import { ringing } from "./ringing.ts";
 
 const context = BACKGROUND_CONTEXT;
 const cleanup: (() => Promise<unknown>)[] = [];
@@ -217,7 +219,10 @@ const boom = () => {
 };
 
 /** A HumanPort over a harness with the schedule tool, whose model answers with `responses`. */
-async function scheduling(...responses: Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0]) {
+async function scheduling(
+	responses: Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0],
+	push?: PushOptions,
+) {
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
@@ -232,7 +237,7 @@ async function scheduling(...responses: Parameters<ReturnType<typeof fauxProvide
 	cleanup.push(() => harness.close(context));
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
-	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
+	const human = await openHumanPort(harness, root, new FakeAgentPort(), context, push);
 	cleanup.push(() => human.close());
 	const seen: SomaEvent[] = [];
 	human.subscribe((event) => seen.push(event));
@@ -241,7 +246,7 @@ async function scheduling(...responses: Parameters<ReturnType<typeof fauxProvide
 }
 
 test("a scheduled round's answer is pushed as an outcome; the answer of a round the human started is not", async () => {
-	const seen = await scheduling(fauxAssistantMessage("該喝水了。"));
+	const seen = await scheduling([fauxAssistantMessage("該喝水了。")]);
 
 	await vi.waitFor(() => expect(seen.filter((event) => event.type === "answer")).toHaveLength(2), { timeout: 10_000 });
 	expect(seen.filter((event) => event.type === "answer")).toEqual([
@@ -250,8 +255,19 @@ test("a scheduled round's answer is pushed as an outcome; the answer of a round 
 	]);
 });
 
+test("a scheduled round's answer follows the outcome policies: logged on Telegram at ask", async () => {
+	const policies = { "chat.telegram": PRESETS.ask, "chat.terminal": PRESETS.instant };
+	const seen = await scheduling([fauxAssistantMessage("該喝水了。")], { policies });
+
+	await vi.waitFor(() => expect(seen.filter((event) => event.type === "answer")).toHaveLength(2), { timeout: 10_000 });
+	expect(seen.filter((event) => event.type === "answer").at(-1)).toMatchObject({
+		class: "outcome",
+		delivery: { "chat.telegram": "log", "chat.terminal": "ring" },
+	});
+});
+
 test("a pushed round's failure is an outcome; the failure of a round the human started is not pushed", async () => {
-	const seen = await scheduling(boom);
+	const seen = await scheduling([boom]);
 
 	await vi.waitFor(() => expect(seen.some((event) => event.type === "failure")).toBe(true), { timeout: 10_000 });
 	expect(seen.filter((event) => event.type === "failure")).toEqual([
@@ -363,9 +379,10 @@ describe("push target and escalation", () => {
 		const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 		harness.resume();
 		let clock = 100 * MIN;
-		const open = async () => {
+		const open = async (policies?: Policies) => {
 			const human = await openHumanPort(harness, root, new FakeAgentPort(), context, {
 				defaultTarget: TELEGRAM,
+				...(policies && { policies }),
 				now: () => clock,
 				checkMs: 10,
 			});
@@ -399,7 +416,7 @@ describe("push target and escalation", () => {
 		await human.notify("long after", "report", "outcome");
 
 		await vi.waitFor(() => expect(notices(seen)).toHaveLength(3));
-		expect(notices(seen).map((notice) => [notice.content, notice.target])).toEqual([
+		expect(notices(seen).map((notice) => [notice.content, ringing(notice)])).toEqual([
 			["before any input", TELEGRAM],
 			["just after the terminal", TERMINAL],
 			["long after", TELEGRAM],
@@ -421,7 +438,7 @@ describe("push target and escalation", () => {
 		advance(2 * MIN);
 		await vi.waitFor(() => expect(notices(seen)).toHaveLength(3));
 		await settle();
-		expect(notices(seen).map((notice) => [notice.content, notice.target])).toEqual([
+		expect(notices(seen).map((notice) => [notice.content, ringing(notice)])).toEqual([
 			["which one?", TERMINAL],
 			["all done", TERMINAL],
 			["which one?", TELEGRAM],
@@ -458,9 +475,75 @@ describe("push target and escalation", () => {
 		const third = await open();
 		await settle();
 		expect(notices(second.seen)).toEqual([
-			{ type: "notice", kind: "question", class: "action", content: "which one?", target: TELEGRAM },
+			{
+				type: "notice",
+				kind: "question",
+				class: "action",
+				content: "which one?",
+				delivery: { [TELEGRAM]: "ring" },
+			},
 		]);
 		expect(notices(third.seen)).toEqual([]);
+	});
+
+	const ASK = { [TELEGRAM]: PRESETS.ask, [TERMINAL]: PRESETS.instant };
+
+	test("with Telegram at ask and nobody typing, a question rings there and nothing else reaches it", async () => {
+		const { open, notices } = await pushing();
+		const { human, seen } = await open(ASK);
+		await human.notify("which one?", "question", "action");
+		await human.notify("card a 完成", "report", "outcome");
+		await human.notify("記下了", "report", "ambient");
+
+		await vi.waitFor(() => expect(notices(seen)).toHaveLength(3));
+		expect(notices(seen).map((notice) => [notice.content, notice.delivery])).toEqual([
+			["which one?", { [TELEGRAM]: "ring", [TERMINAL]: "quiet" }],
+			["card a 完成", { [TELEGRAM]: "log", [TERMINAL]: "quiet" }],
+			["記下了", { [TELEGRAM]: "log", [TERMINAL]: "quiet" }],
+		]);
+	});
+
+	test("under ask, an unheeded question still escalates to Telegram and rings there", async () => {
+		const { root, open, notices, advance } = await pushing();
+		const { human, seen } = await open(ASK);
+		await human.submit({ content: "嗨", entry: { kind: TERMINAL }, requestId: "terminal:1" });
+		await root.waitForIdle(context);
+		await human.notify("which one?", "question", "action");
+		advance(16 * MIN);
+
+		await vi.waitFor(() => expect(notices(seen)).toHaveLength(2));
+		expect(notices(seen).map((notice) => notice.delivery)).toEqual([
+			{ [TELEGRAM]: "quiet", [TERMINAL]: "ring" },
+			{ [TELEGRAM]: "ring", [TERMINAL]: "quiet" },
+		]);
+	});
+
+	test("an escalation is kept only while Telegram's policy shows its class", async () => {
+		const { root, open, notices, settle, advance } = await pushing();
+		const muted = { action: "log", outcome: "log", ambient: "log" } as const;
+		const { human, seen } = await open({ [TELEGRAM]: muted });
+		await human.submit({ content: "嗨", entry: { kind: TERMINAL }, requestId: "terminal:1" });
+		await root.waitForIdle(context);
+		await human.notify("which one?", "question", "action");
+		await vi.waitFor(() => expect(notices(seen)).toHaveLength(1));
+		expect(await root.commit(async (tx) => (await tx.doc(Pushes, root.id)).pending.length, context)).toBe(0);
+		advance(16 * MIN);
+		await settle();
+		expect(notices(seen)).toHaveLength(1);
+		await human.close();
+
+		// A failure kept while Telegram was instant, then the config set it to ask: it is dropped, not pushed.
+		await root.commit(async (tx) => {
+			(await tx.doc(Pushes, root.id)).pending = [
+				{ key: "failure:9", at: 100 * MIN, kind: "report", class: "outcome", content: "schedule:1 那一輪失敗" },
+			];
+		}, context);
+		const again = await open(ASK);
+		await vi.waitFor(async () =>
+			expect(await root.commit(async (tx) => (await tx.doc(Pushes, root.id)).pending.length, context)).toBe(0),
+		);
+		await settle();
+		expect(notices(again.seen)).toEqual([]);
 	});
 
 	test("an escalation kept before pushes had classes is pushed as an action if a question, else an outcome", async () => {

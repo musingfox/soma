@@ -483,3 +483,50 @@ describe("configPath", () => {
 		expect(configPath({ SOMA_CONFIG: "  " }, "/home/me")).toBe("/home/me/.config/soma/config.json");
 	});
 });
+
+describe("push policies", () => {
+	const INSTANT = { action: "ring", outcome: "ring", ambient: "ring" };
+	const ASK = { action: "ring", outcome: "log", ambient: "log" };
+
+	test("unset, every interface is instant, which is how soma pushed before", () => {
+		expect(resolveConfig(undefined, {}, HOME).push).toEqual({ telegram: INSTANT, terminal: INSTANT, web: INSTANT });
+		expect(resolveConfig({ push: {} }, {}, HOME).push).toEqual({ telegram: INSTANT, terminal: INSTANT, web: INSTANT });
+	});
+
+	test("a preset name or a table of all three classes, per interface", () => {
+		const custom = { action: "quiet", outcome: "ring", ambient: "log" };
+		const path = write(JSON.stringify({ push: { telegram: "ask", web: custom, terminal: "instant" } }));
+		expect(loadConfig(path, {}, HOME).push).toEqual({ telegram: ASK, terminal: INSTANT, web: custom });
+	});
+
+	test("no environment variable sets it", () => {
+		expect(resolveConfig(undefined, { SOMA_PUSH: "ask", SOMA_PUSH_TELEGRAM: "ask" }, HOME).push.telegram).toEqual(
+			INSTANT,
+		);
+	});
+
+	test.each([
+		[{ telegram: "summary" }, 'push.telegram: "summary" needs hold, which is not built yet'],
+		[{ telegram: "quiet" }, 'push.telegram: Unknown preset "quiet"; expected a preset ("instant", "ask") or a table'],
+		[{ web: 3 }, "push.web: Expected a preset"],
+		[{ web: ["ask"] }, "push.web: Expected a preset"],
+		[{ fax: "ask" }, "push.fax: Unrecognized key"],
+		[
+			{ terminal: { action: "ring", outcome: "hold", ambient: "log" } },
+			'push.terminal.outcome: "hold" is not built yet',
+		],
+		[{ terminal: { action: "loud", outcome: "ring", ambient: "log" } }, 'push.terminal.action: Unknown policy "loud"'],
+		[{ terminal: { action: "ring", outcome: "ring" } }, "push.terminal.ambient: Required: a table sets"],
+		[{ terminal: { ...INSTANT, urgent: "ring" } }, "push.terminal.urgent: Unrecognized key"],
+		[{ terminal: { ...INSTANT, action: 1 } }, "push.terminal.action: Expected string"],
+	])("%j is a config error naming its path", (push, message) => {
+		const path = write(JSON.stringify({ push }));
+		expect(() => loadConfig(path, {}, HOME)).toThrow(ConfigError);
+		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: ${message}`);
+	});
+
+	test("a push that is not an object is a config error", () => {
+		const path = write(JSON.stringify({ push: "ask" }));
+		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: push: Expected object`);
+	});
+});

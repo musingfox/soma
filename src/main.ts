@@ -11,11 +11,11 @@ import { createHerdrClient } from "./adapters/herdr/client.ts";
 import { createCard, readCard } from "./adapters/obsidian/card.ts";
 import { createRexAgentPort } from "./adapters/rex/agent-port.ts";
 import { createRexClient } from "./adapters/rex/client.ts";
-import { runTelegram } from "./adapters/telegram/index.ts";
-import { runTerminal } from "./adapters/terminal/index.ts";
+import { runTelegram, ENTRY_KIND as TELEGRAM_KIND } from "./adapters/telegram/index.ts";
+import { runTerminal, ENTRY_KIND as TERMINAL_KIND } from "./adapters/terminal/index.ts";
 import { createTtyAgentPort } from "./adapters/tty/agent-port.ts";
 import { spawnPty } from "./adapters/tty/pty.ts";
-import { SERVE_HOST, startWeb } from "./adapters/web/index.ts";
+import { SERVE_HOST, startWeb, ENTRY_KIND as WEB_KIND } from "./adapters/web/index.ts";
 import { anthropicAuthContext, type Config, ConfigError, configPath, loadConfig } from "./config.ts";
 import { clock } from "./core/extensions/clock/index.ts";
 import { deferExtension } from "./core/extensions/defer/index.ts";
@@ -132,10 +132,20 @@ const root = await harness.root(context, {
 // Opened before the tasks resume and before the reconcile, either of which may tell the human of an agent gone while
 // soma was down: the HumanPort passes on only the notices appended after it began to watch. Telegram polls after the
 // reconcile, so no message queued while soma was down dispatches a job the reconcile's listing has not seen.
-// Telegram is the default channel a push goes to when the human typed nowhere lately; without it, every client rings.
+// Telegram is the default channel a push goes to when the human typed nowhere lately; without it, there is no push
+// target and each client follows its own policy. The policies are by the entry kind each client tags its inputs with.
+const policies = {
+	[TELEGRAM_KIND]: config.push.telegram,
+	[TERMINAL_KIND]: config.push.terminal,
+	[WEB_KIND]: config.push.web,
+};
 const human = await startCore(
 	harness,
-	() => openHumanPort(harness, root, agents, context, config.telegram && { defaultTarget: "chat.telegram" }),
+	() =>
+		openHumanPort(harness, root, agents, context, {
+			policies,
+			...(config.telegram && { defaultTarget: TELEGRAM_KIND }),
+		}),
 	[
 		() => digests.startDigest(root, DIGEST_PERIOD_MS, context),
 		...(config.reflection ? [() => reflections.startReflection(root, REFLECTION_PERIOD_MS, context)] : []),

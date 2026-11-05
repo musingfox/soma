@@ -7,6 +7,8 @@ import { z } from "zod";
 import { defaultRexSocket } from "./adapters/rex/client.ts";
 import type { TelegramConfig } from "./adapters/telegram/index.ts";
 import { SERVE_HOST, type WebConfig } from "./adapters/web/index.ts";
+import { POLICIES, type PolicyTable, PRESETS } from "./core/domain/push.ts";
+import { MESSAGE_CLASSES } from "./ports/human.ts";
 
 /** The canonical form of a BCP 47 language tag, or undefined when it is not one. */
 function canonicalLanguage(tag: string): string | undefined {
@@ -20,6 +22,32 @@ function canonicalLanguage(tag: string): string | undefined {
 /** The agent-side adapters soma can dispatch through; the config picks one. */
 export const AGENT_ADAPTERS = ["herdr", "rex", "tty"] as const;
 export type AgentAdapter = (typeof AGENT_ADAPTERS)[number];
+
+/** The interfaces whose push policy the config sets. */
+export const INTERFACES = ["telegram", "terminal", "web"] as const;
+export type Interface = (typeof INTERFACES)[number];
+
+const PUSH_VALUE = `a preset (${Object.keys(PRESETS)
+	.map((name) => `"${name}"`)
+	.join(", ")}) or a table setting each of ${MESSAGE_CLASSES.join(", ")}`;
+const POLICY_VALUE = POLICIES.map((policy) => `"${policy}"`).join(", ");
+
+const PolicyFile = z
+	.string({ required_error: `Required: a table sets ${MESSAGE_CLASSES.join(", ")}` })
+	.superRefine((value, ctx) => {
+		if ((POLICIES as readonly string[]).includes(value)) return;
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			message:
+				value === "hold"
+					? `"hold" is not built yet (push-levels milestone 2); expected ${POLICY_VALUE}`
+					: `Unknown policy "${value}"; expected ${POLICY_VALUE}`,
+		});
+	});
+// A table sets every class: a class left out would need a default, and the config is where the human says it.
+const PolicyTableFile = z.object({ action: PolicyFile, outcome: PolicyFile, ambient: PolicyFile }).strict();
+
+const PushFileConfig = z.object({ telegram: z.unknown(), terminal: z.unknown(), web: z.unknown() }).partial().strict();
 
 /** The hangar is a rex session found by its id, never by its label, which rex does not keep unique. */
 export interface RexConfig {
@@ -47,6 +75,7 @@ const FileConfig = z
 		reflection: z.boolean(),
 		agentAdapter: z.enum(AGENT_ADAPTERS),
 		rex: z.unknown(),
+		push: z.unknown(),
 		anthropic: z
 			.object({ apiKey: z.string().min(1) })
 			.partial()
@@ -104,6 +133,8 @@ export interface Config {
 	readonly web?: WebConfig;
 	/** The Obsidian vault soma may read, by the name the obsidian CLI knows; set only when a name is. */
 	readonly vault?: VaultConfig;
+	/** Each interface's push policy; one the file leaves unset is `instant`, which is how soma pushed before. */
+	readonly push: Readonly<Record<Interface, PolicyTable>>;
 }
 
 export interface VaultConfig {
@@ -253,7 +284,30 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		...(token !== undefined && chatId !== undefined && { telegram: { token, chatId, apiBase } }),
 		...(web !== undefined && { web }),
 		...(file?.vault?.name !== undefined && { vault: { name: file.vault.name, deny: file.vault.deny ?? [] } }),
+		push: resolvePush(file?.push, path),
 	};
+}
+
+/** The file only: a policy is set once per interface, with no environment variable and no switching by time. */
+function resolvePush(push: unknown, path: string): Record<Interface, PolicyTable> {
+	const set = push === undefined ? {} : parseOrThrow(PushFileConfig, push, path, ["push"]);
+	const policyOf = (name: Interface): PolicyTable => {
+		const value = set[name];
+		if (value === undefined) return PRESETS.instant;
+		if (typeof value === "string") {
+			if (value in PRESETS) return PRESETS[value as keyof typeof PRESETS];
+			throw new ConfigError(
+				value === "summary"
+					? `${path}: push.${name}: "summary" needs hold, which is not built yet (push-levels milestone 2); expected ${PUSH_VALUE}`
+					: `${path}: push.${name}: Unknown preset "${value}"; expected ${PUSH_VALUE}`,
+			);
+		}
+		if (typeof value !== "object" || value === null || Array.isArray(value)) {
+			throw new ConfigError(`${path}: push.${name}: Expected ${PUSH_VALUE}`);
+		}
+		return parseOrThrow(PolicyTableFile, value, path, ["push", name]) as PolicyTable;
+	};
+	return { telegram: policyOf("telegram"), terminal: policyOf("terminal"), web: policyOf("web") };
 }
 
 /**

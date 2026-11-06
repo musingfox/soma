@@ -99,6 +99,6 @@ export function summaryPrompt(held: readonly { kind: NoticeKind; class: MessageC
 		"[summary] 人沒有在看的這段時間，先收著沒送出的訊息：\n" +
 		(questions.length > 0 ? `等人回答的問題：\n${list(questions)}\n` : "") +
 		(rest.length > 0 ? `其他：\n${list(rest)}\n` : "") +
-		"\n寫一份給人看的摘要：先寫等人回答的問題，再寫其他的事，每件一行。每個問題在摘要之後會帶著它的按鈕再送一次。"
+		"\n寫一份給人看的摘要：先寫等人回答的問題，再寫其他的事，每件一行。只寫上面列出的訊息，不要加入對話歷史裡的其他事。每個問題在摘要之後會帶著它的按鈕再送一次。"
 	);
 }

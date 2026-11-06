@@ -211,4 +211,5 @@ test("the summary's input lists the questions first, each push with its class", 
 	expect(prompt).toContain("（soma 自己做的事）記憶改了");
 	expect(prompt).toMatch(/^\[summary\]/);
 	expect(summaryPrompt([{ kind: "report", class: "outcome", content: "x" }])).not.toContain("等人回答的問題：");
+	expect(prompt).toContain("只寫上面列出的訊息");
 });

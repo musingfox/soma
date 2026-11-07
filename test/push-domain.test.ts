@@ -213,3 +213,11 @@ test("the summary's input lists the questions first, each push with its class", 
 	expect(summaryPrompt([{ kind: "report", class: "outcome", content: "x" }])).not.toContain("等人回答的問題：");
 	expect(prompt).toContain("只寫上面列出的訊息");
 });
+
+test("the summary keeps what waits on the human apart from what is only told, and leaves a question's options to the message that follows", () => {
+	const prompt = summaryPrompt([{ kind: "question", class: "action", content: "要讓 b 執行嗎？\n1. 是\n2. 否" }]);
+	const instruction = prompt.slice(prompt.lastIndexOf("寫一份給人看的摘要"));
+	expect(instruction.indexOf("要你決定：")).toBeLessThan(instruction.indexOf("僅供參考："));
+	expect(instruction).toContain("不要寫選項、編號或畫面內容");
+	expect(instruction).toContain("不要貼表格");
+});

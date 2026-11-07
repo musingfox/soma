@@ -1,10 +1,11 @@
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import type { Harness } from "@earendil-works/pi-durable";
+import { createAcpAgentPort } from "./adapters/acp/agent-port.ts";
 import { serveDefer } from "./adapters/defer-socket/index.ts";
 import { createHerdrAgentPort } from "./adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "./adapters/herdr/client.ts";
@@ -59,18 +60,24 @@ const context = BACKGROUND_CONTEXT;
 const models = createModels({ authContext: anthropicAuthContext(config.anthropicApiKey) });
 models.setProvider(anthropicProvider());
 /** The one place the agent-side adapter is chosen, by the config's `agentAdapter`. */
-function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, deferSocket }: Config): AgentPort {
+function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, deferSocket, db }: Config): AgentPort {
 	const cap = hangarCap === undefined ? {} : { cap: hangarCap };
+	// What `soma defer` needs in an agent's shell: this release's bin/soma on PATH, the socket, and the node soma runs
+	// on, since the agent's own may be one its project pins.
+	const env = { SOMA_SOCKET: deferSocket, SOMA_NODE: process.execPath };
+	const path = join(dirname(dirname(fileURLToPath(import.meta.url))), "bin");
 	if (agentAdapter === "rex") {
 		// resolveConfig sets rex exactly when it is selected.
 		if (rex === undefined) throw new Error("agentAdapter is rex but the config holds no rex settings");
 		const onError = (error: Error) => console.error("[soma] rex:", error.message);
 		const client = createRexClient({ socketPath: rex.socket, onError });
-		// What `soma defer` needs in an agent's shell: this release's bin/soma on PATH, the socket, and the node soma
-		// runs on, since the agent's own may be one its project pins.
-		const env = { SOMA_SOCKET: deferSocket, SOMA_NODE: process.execPath };
-		const path = join(dirname(dirname(fileURLToPath(import.meta.url))), "bin");
 		return createRexAgentPort({ client, sessionId: rex.sessionId, onError, env, path, ...cap });
+	}
+	if (agentAdapter === "acp") {
+		const onError = (error: Error) => console.error("[soma] acp:", error.message);
+		// Next to the db, as the defer socket is: one soma per db, so prod and a dev instance keep their own.
+		const sessionsFile = resolve(`${db}.acp-sessions.json`);
+		return createAcpAgentPort({ env: process.env, vars: env, path, sessionsFile, onError, ...cap });
 	}
 	if (agentAdapter === "tty") {
 		const onError = (error: Error) => console.error("[soma] tty:", error.message);

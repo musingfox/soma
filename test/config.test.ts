@@ -413,6 +413,12 @@ describe("the agent-side adapter", () => {
 		expect(config.agentAdapter).toBe("tty");
 		expect(config.rex).toBeUndefined();
 	});
+	test("acp needs no settings of its own, from the file or the environment", () => {
+		expect(resolveConfig({ agentAdapter: "acp" }, {}, HOME)).toMatchObject({ agentAdapter: "acp" });
+		const config = resolveConfig(undefined, { SOMA_AGENT_ADAPTER: "acp" }, HOME);
+		expect(config.agentAdapter).toBe("acp");
+		expect(config.rex).toBeUndefined();
+	});
 	test("an unknown one in the file throws with the path and the field", () => {
 		const path = write(JSON.stringify({ agentAdapter: "tmux" }));
 		expect(() => loadConfig(path, {}, HOME)).toThrow(ConfigError);

@@ -20,7 +20,7 @@ function canonicalLanguage(tag: string): string | undefined {
 }
 
 /** The agent-side adapters soma can dispatch through; the config picks one. */
-export const AGENT_ADAPTERS = ["herdr", "rex", "tty"] as const;
+export const AGENT_ADAPTERS = ["herdr", "rex", "tty", "acp"] as const;
 export type AgentAdapter = (typeof AGENT_ADAPTERS)[number];
 
 /** The interfaces whose push policy the config sets. */

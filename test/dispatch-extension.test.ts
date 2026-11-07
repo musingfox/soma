@@ -41,7 +41,7 @@ async function setup() {
 		expect((await submission.wait(context)).status).toBe("done");
 	}
 	const jobs = async () => (await harness.snapshot(Dispatches, root.id, context))?.jobs ?? [];
-	async function call(tool: string, args: Record<string, string>, requestId: string) {
+	async function call(tool: string, args: Record<string, string | number>, requestId: string) {
 		let result: unknown;
 		faux.setResponses([
 			fauxAssistantMessage([fauxToolCall(tool, args)], { stopReason: "toolUse" }),
@@ -147,6 +147,60 @@ test("foreign_result reads a foreign agent's last result, and says so when it ca
 		error: "no transcript of foreign agent pane-2 can be read",
 	});
 	expect(await call("foreign_result", { id: "pane-9" }, "r3")).toEqual({ error: "no foreign agent pane-9" });
+});
+
+test("screen reads a job's pane by its card and a foreign agent's by its id, off the pane at every call", async () => {
+	const { agents, call, dispatch, jobs } = await setup();
+	await dispatch("card-a", "r1");
+	agents.screens.set("card-a", "● Done.");
+	const foreign = { agent: { id: "pane-1", session: "work", label: "Window 1" }, screen: "✻ Working…" };
+	agents.foreign.push(foreign);
+
+	expect(await call("screen", { card: "card-a" }, "r2")).toEqual({ text: "● Done." });
+	expect(await call("screen", { foreign: "pane-1" }, "r3")).toEqual({ text: "✻ Working…" });
+
+	// The human answered at the panes since: each read shows that, not what was read or recorded before.
+	agents.screens.set("card-a", "● Done.\n> also open the PR\n✻ Working…");
+	foreign.screen = "Open the PR?\n❯ 1. Yes";
+	expect(await call("screen", { card: "card-a" }, "r4")).toEqual({ text: "● Done.\n> also open the PR\n✻ Working…" });
+	expect(await call("screen", { foreign: "pane-1" }, "r5")).toEqual({ text: "Open the PR?\n❯ 1. Yes" });
+	expect(await jobs()).toMatchObject([{ card: "card-a", status: { state: "idle" } }]);
+});
+
+test("screen returns the pane's last lines, past the blank ones below, and says when earlier ones were left out", async () => {
+	const { agents, call, dispatch } = await setup();
+	await dispatch("card-a", "r1");
+	const lines = Array.from({ length: 100 }, (_, index) => `line ${index + 1}`);
+	agents.screens.set("card-a", `${lines.join("\n")}\n\n   \n`);
+
+	expect(await call("screen", { card: "card-a", lines: 3 }, "r2")).toEqual({
+		text: "line 98\nline 99\nline 100",
+		more: true,
+	});
+	expect(await call("screen", { card: "card-a" }, "r3")).toEqual({ text: lines.slice(-60).join("\n"), more: true });
+	expect(await call("screen", { card: "card-a", lines: 400 }, "r4")).toEqual({ text: lines.join("\n") });
+});
+
+test("screen names a job or a foreign agent, not both and not neither, and says why it cannot read one", async () => {
+	const { call, dispatch } = await setup();
+	await dispatch("card-a", "r1");
+	const error = { error: "name either card, for a job, or foreign, for a foreign agent" };
+
+	expect(await call("screen", {}, "r2")).toEqual(error);
+	expect(await call("screen", { card: "card-a", foreign: "pane-1" }, "r3")).toEqual(error);
+	expect(await call("screen", { card: "card-z" }, "r4")).toEqual({ error: "no job for card card-z" });
+	expect(await call("screen", { card: "card-a" }, "r5")).toEqual({ error: "no pane of agent card-a" });
+	expect(await call("screen", { foreign: "pane-9" }, "r6")).toEqual({ error: "no foreign agent pane-9" });
+});
+
+test("screen is read only, and the foreign tools point to it", () => {
+	const tools = dispatchExtension(new FakeAgentPort(), async () => "").tools ?? [];
+	const byName = new Map(tools.map((tool) => [tool.name, tool]));
+
+	expect(byName.get("screen")?.replay).toBe("safe");
+	for (const name of ["foreign_agents", "foreign_result", "foreign_prompt"]) {
+		expect(byName.get(name)?.description).toContain("screen");
+	}
 });
 
 test("respond answers a foreign agent's prompt by its id, checking the fingerprint, and never an auth one", async () => {

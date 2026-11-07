@@ -8,7 +8,7 @@ import {
 	type ToolExecutionApi,
 	type Tx,
 } from "@earendil-works/pi-durable";
-import { obj, opt, str } from "@earendil-works/pi-schema";
+import { int, obj, opt, str } from "@earendil-works/pi-schema";
 import { type AgentPort, type Answer, PromptRefused } from "../../../ports/agent.ts";
 import type { Choices, HumanAnswerOutcome } from "../../../ports/human.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
@@ -27,6 +27,18 @@ export const Dispatches = defineDoc<{ jobs: Job[] }>({
 });
 
 const text = (value: unknown) => ({ output: [{ type: "text" as const, text: JSON.stringify(value) }] });
+
+// How many of a pane's last lines the screen tool returns when not told, and at most.
+export const SCREEN_LINES = 60;
+export const SCREEN_LINES_MAX = 400;
+
+/** The last `lines` lines of a pane's text, past the blank ones below what it shows; `more` when some were left out. */
+export function tailOf(screen: string, lines: number): { text: string; more?: true } {
+	const all = screen.split("\n");
+	while (all.length > 0 && all.at(-1)?.trim() === "") all.pop();
+	const tail = all.slice(-lines);
+	return { text: tail.join("\n"), ...(all.length > tail.length ? { more: true as const } : {}) };
+}
 
 /**
  * A job of the name exists for another request, or for a card where this asks for a ticket, or the other way round. A
@@ -308,8 +320,9 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 			"Each has an id, its session's label, the pane's label, its state (idle, working, blocked, done or error; " +
 			"absent when it cannot be told; a blocked one with its prompt's options and fingerprint when its screen could be " +
 			"read) and its cwd. A blocked one's prompt can be answered with respond, by its id as foreign, never for " +
-			"kind=auth; an idle or done one can be sent a new prompt with foreign_prompt. soma never stops or resumes " +
-			"these. The jobs soma dispatched are listed by jobs, not here.",
+			"kind=auth; an idle or done one can be sent a new prompt with foreign_prompt; what any one's pane shows now is " +
+			"read with screen, by its id as foreign. soma never stops or resumes these. The jobs soma dispatched are listed " +
+			"by jobs, not here.",
 		parameters: obj({}),
 		replay: "safe",
 		execute: async () => text(await agents.listForeign()),
@@ -320,7 +333,7 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 		description:
 			"Read what a foreign agent's claude transcript ends on: id names its last record, and text is its last reply, " +
 			"absent while the transcript ends awaiting one. An error when the id names no foreign agent now, or none of " +
-			"its transcript can be read.",
+			"its transcript can be read. What its pane shows now, as while it works, is read with screen.",
 		parameters: obj({ id: str({ description: "The agent's id as foreign_agents listed it" }) }),
 		replay: "safe",
 		execute: async ({ id }) => {
@@ -334,14 +347,52 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 		},
 	});
 
+	const screen = defineTool({
+		name: "screen",
+		description:
+			"Read what an agent's terminal pane shows now: the last lines of its screen and the output above it, as plain " +
+			"text, read off the pane at this call, never from a status or result read before. Name a job by its card, as " +
+			"jobs lists it, or a foreign agent by its id, as foreign_agents lists it; exactly one. Use it to see what an " +
+			"agent is doing, asking or has printed, whatever jobs, foreign_agents or foreign_result last said of it. " +
+			"more: true means earlier lines were left out; ask for more lines to see them. Read only: nothing is typed.",
+		parameters: obj({
+			card: opt(str({ description: "The job's card, as jobs listed it" })),
+			foreign: opt(str({ description: "The foreign agent's id, as foreign_agents listed it, instead of card" })),
+			lines: opt(
+				int({
+					minimum: 1,
+					maximum: SCREEN_LINES_MAX,
+					description: `How many of the pane's last lines to read; ${SCREEN_LINES} when left out`,
+				}),
+			),
+		}),
+		replay: "safe",
+		execute: async ({ card, foreign, lines = SCREEN_LINES }, api, context) => {
+			if ((card === undefined) === (foreign === undefined)) {
+				return text({ error: "name either card, for a job, or foreign, for a foreign agent" });
+			}
+			try {
+				if (foreign !== undefined) return text(tailOf(await agents.readForeignScreen(foreign), lines));
+				const agent = await api.commit(
+					async (tx) => (await tx.doc(Dispatches, api.conversationId)).jobs.find((each) => each.card === card)?.agent,
+					context,
+				);
+				if (agent === undefined) return text({ error: `no job for card ${card}` });
+				return text(tailOf(await agents.readScreen(agent), lines));
+			} catch (error) {
+				return text({ error: (error as Error).message });
+			}
+		},
+	});
+
 	const foreignPrompt = defineTool({
 		name: "foreign_prompt",
 		description:
 			"Send a foreign agent a new prompt, as if typed at its pane: only one that is idle or done. Its state is read " +
 			"again just before sending, and one that is working or blocked is refused with the reason, so the text never " +
 			"lands in the middle of a turn or answers a dialog. No notice comes when its turn ends: read its reply with " +
-			'foreign_result. sent: "unknown" means sending failed after some of the text may have reached the agent; ' +
-			"look with foreign_agents and foreign_result before sending again.",
+			'foreign_result, or its pane with screen. sent: "unknown" means sending failed after some of the text may have ' +
+			"reached the agent; look with foreign_agents and screen before sending again.",
 		parameters: obj({
 			id: str({ description: "The agent's id as foreign_agents listed it" }),
 			text: str({ description: "The prompt to send" }),
@@ -363,6 +414,6 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 
 	return defineExtension({
 		name: "soma.dispatch",
-		tools: [dispatch, jobs, respond, escalate, reply, foreignAgents, foreignResult, foreignPrompt],
+		tools: [dispatch, jobs, respond, escalate, reply, foreignAgents, foreignResult, screen, foreignPrompt],
 	});
 }

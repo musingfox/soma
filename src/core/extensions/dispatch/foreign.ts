@@ -2,6 +2,7 @@ import type { Context } from "@earendil-works/chord/context";
 import { type Conversation, defineDoc } from "@earendil-works/pi-durable";
 import type { AgentPort, AgentState, ForeignAgent, ForeignStatusEvent } from "../../../ports/agent.ts";
 import { type ForeignAction, observeForeign, type Told, toldOf } from "../../domain/foreign.ts";
+import { clip } from "../../domain/report.ts";
 import { noticeEntry } from "../../notice.ts";
 
 /** By foreign agent id, the prompt last told to the human; see `observeForeign`. */
@@ -25,10 +26,10 @@ type Blocked = Extract<AgentState, { state: "blocked" }>;
 const where = (agent: ForeignAgent) => `外部 agent ${agent.label}（session ${agent.session}）`;
 
 function noticeContent(agent: ForeignAgent, { kind, msg }: Blocked): string {
-	const screen = msg ? `\n${msg}` : "";
+	const screen = msg ? `\n畫面：\n${clip(msg)}` : "";
 	return kind === "auth"
-		? `${where(agent)}在等登入或憑證，需要你處理。${screen}`
-		: `${where(agent)}卡住了，kind=${kind}，你不在它的畫面前。${screen}`;
+		? `要你處理：${where(agent)}在等登入或憑證。${screen}`
+		: `要你決定：${where(agent)}卡住了，kind=${kind}，你不在它的畫面前。${screen}`;
 }
 
 function wakeContent(agent: ForeignAgent, { kind, msg, fingerprint }: Blocked): string {

@@ -48,7 +48,7 @@ export interface Report {
 // Long enough for a result line and a few sentences of a worker's reply; the model writes a short report anyway.
 const RESULT_LIMIT = 600;
 
-const clip = (result: string) => (result.length > RESULT_LIMIT ? `${result.slice(0, RESULT_LIMIT)}…` : result);
+export const clip = (result: string) => (result.length > RESULT_LIMIT ? `${result.slice(0, RESULT_LIMIT)}…` : result);
 
 /**
  * The notice of a turn told to the human at once. It carries the worker's own reply, result line first, so they can

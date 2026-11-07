@@ -123,7 +123,7 @@ test("a blocked foreign agent the human is away from is pushed once, with one wa
 			kind: "question",
 			class: "action",
 			content:
-				"外部 agent Window 1（session work）卡住了，kind=permission，你不在它的畫面前。\napprove Bash: touch probe.txt",
+				"要你決定：外部 agent Window 1（session work）卡住了，kind=permission，你不在它的畫面前。\n畫面：\napprove Bash: touch probe.txt",
 			foreign: { id: "pane-1", told: { fingerprint: "f00d", msg: "approve Bash: touch probe.txt" } },
 		},
 	]);
@@ -215,7 +215,7 @@ test("an auth prompt of a foreign agent is told to the human and never wakes the
 		{
 			kind: "question",
 			class: "action",
-			content: "外部 agent Window 1（session work）在等登入或憑證，需要你處理。\nlogin",
+			content: "要你處理：外部 agent Window 1（session work）在等登入或憑證。\n畫面：\nlogin",
 			foreign: { id: "pane-1", told: { msg: "login" } },
 		},
 	]);
@@ -417,4 +417,19 @@ test("listen retries a failed push by itself on its interval", async () => {
 	expect(errors).toHaveLength(1);
 	expect(await entriesOf(soma.root, FOREIGN_BLOCKED)).toHaveLength(1);
 	expect(soma.calls()).toBe(1);
+});
+
+test("a long screen is clipped in the notice and kept whole in what was told", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await core(await database(), agents);
+	const screen = "x".repeat(700);
+
+	agents.emitForeign(PANE, { state: "blocked", kind: "auth", msg: screen }, 10);
+	await soma.settle();
+
+	const [notice] = (await entriesOf(soma.root, NOTICE)).map((entry) => entry.data as { content: string });
+	expect(notice?.content).toBe(
+		`要你處理：外部 agent Window 1（session work）在等登入或憑證。\n畫面：\n${"x".repeat(600)}…`,
+	);
+	expect(await soma.told()).toEqual({ "pane-1": { msg: screen } });
 });

@@ -323,7 +323,7 @@ The adapters on both sides are optional. Users pick them in the configuration to
 | Reading what a pane shows now (`screen`) | The same `format`, for jobs and foreign agents | `pane.read source: visible`, for jobs only | The emulator's screen and scrollback | `screen` returns the adapter's error |
 | Creating worktrees | The adapter runs git itself | herdr's `worktree.create` | The adapter runs git itself | Not applicable; all three have it |
 | Refusing a duplicate name | No; relies on list-before-start | Yes | soma's own pty table, which blocks it within one process | Relies only on list-before-start |
-| Foreign agents, and whether the human looks at one | Every claude pane outside soma's agents; looked at while a connected rex app shows its window | No | No | None is listed, pushed, answered or prompted |
+| Foreign agents, and whether the human looks at one | Every claude pane outside soma's agents; looked at while a connected rex app shows its window | No | No | None is listed, pushed, answered, prompted or read |
 
 The human side is the same: Telegram can push and answer prompts with buttons, the terminal is seen only while it is in the foreground, and shikigami comes later.
 

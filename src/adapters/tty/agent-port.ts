@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { copyFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import xterm from "@xterm/headless";
+import { agentEnv } from "../../agent-cli/env.ts";
 import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "../../agent-cli/hangar-cap.ts";
 import {
 	answerKeys,
@@ -73,9 +74,6 @@ const ROWS = 40;
 const BLOCKED_KINDS: readonly string[] = ["permission", "question", "auth"] satisfies BlockedKind[];
 // Reads of a blocked record's screen, redrawMs apart, before it is taken not to parse.
 const BLOCKED_READS = 3;
-// What a running claude hands its children to mark them as its own session. Inherited from a soma started inside
-// claude, CLAUDE_CODE_CHILD_SESSION turns off the agent's transcript, which readResult reads.
-const PARENT_SESSION_ENV = /^(CLAUDECODE|CLAUDE_PID|CLAUDE_CODE_(CHILD_SESSION|SESSION_\w+|MESSAGING_\w+|ENTRYPOINT))$/;
 // The OSC 7501 feature-detection reply: claude reports its status only to a terminal that answers the probe.
 const PROBE_REPLY = "\x1b]7501;?\x1b\\";
 
@@ -228,16 +226,12 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 	trustCheck.unref();
 
 	function launch(request: StartRequest, cwd: string): Agent {
-		const env: Record<string, string> = {};
-		for (const [key, value] of Object.entries(options.env)) {
-			if (value !== undefined && !PARENT_SESSION_ENV.test(key)) env[key] = value;
-		}
 		const pty = spawn(command, ["--session-id", request.sessionId], {
 			name: "xterm-256color",
 			cols: COLS,
 			rows: ROWS,
 			cwd,
-			env,
+			env: agentEnv(options.env),
 		});
 		const term = new xterm.Terminal({ cols: COLS, rows: ROWS, allowProposedApi: true });
 		const agent: Agent = {

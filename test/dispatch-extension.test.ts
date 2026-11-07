@@ -126,6 +126,34 @@ test("jobs lists the dispatched jobs", async () => {
 	expect(JSON.parse(JSON.parse(result).content[0].text)).toMatchObject([{ card: "card-a", agent: "card-a" }]);
 });
 
+test("jobs says outcome is the last finished turn's result and status.state the current state", () => {
+	const tools = dispatchExtension(new FakeAgentPort(), async () => "").tools ?? [];
+	const description = tools.find((tool) => tool.name === "jobs")?.description ?? "";
+
+	expect(description).toMatch(/status\.state is the agent's current state/);
+	expect(description).toMatch(/outcome is the result of its last finished turn only/);
+	expect(description).toMatch(/judge where an agent is now by status\.state, never by outcome/);
+	expect(description).toContain("screen");
+});
+
+test("a job's outcome stays its last finished turn's while status.state says it works on the next", async () => {
+	const { agents, call, dispatch, root } = await setup();
+	await dispatch("card-a", "r1");
+	const bridge = eventBridge(root, agents, context);
+	const handled: Promise<void>[] = [];
+	const off = agents.onStatus((event) => handled.push(bridge.handle(event)));
+	agents.finish("card-a", "結果：需要你\n要開 PR 嗎？");
+	await Promise.all(handled);
+	// The human answered the agent at its pane, and it went to work on the answer.
+	agents.emit("card-a", { state: "working" });
+	await Promise.all(handled);
+	off();
+
+	expect(await call("jobs", {}, "r2")).toMatchObject([
+		{ card: "card-a", status: { state: "working" }, outcome: "需要你" },
+	]);
+});
+
 test("foreign_agents lists what runs beside soma's jobs, and jobs does not", async () => {
 	const { agents, call, dispatch } = await setup();
 	await dispatch("card-a", "r1");

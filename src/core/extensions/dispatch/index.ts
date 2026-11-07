@@ -181,7 +181,11 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 	const jobs = defineTool({
 		name: "jobs",
 		description:
-			"List every job soma dispatched, with its card, agent, session id and last known status. " +
+			"List every job soma dispatched, with its card, agent, session id, status and outcome. status.state is the " +
+			"agent's current state, as the agent side last reported it: working while it runs a turn, blocked on a prompt, " +
+			"idle or done between turns. outcome is the result of its last finished turn only, and stays as it was while a " +
+			"later turn runs, so an outcome that needs the human may already be answered: judge where an agent is now by " +
+			"status.state, never by outcome, and read what its pane shows now with screen. " +
 			"Only soma's own: every other agent running is listed by foreign_agents.",
 		parameters: obj({}),
 		replay: "safe",

@@ -21,7 +21,7 @@ import {
 	summaryDue,
 	summaryRings,
 } from "./domain/push.ts";
-import { summaryPrompt } from "./domain/report.ts";
+import { summaryPrompt, withCardLines } from "./domain/report.ts";
 import { ForeignPrompts } from "./extensions/dispatch/foreign.ts";
 import { Dispatches } from "./extensions/dispatch/index.ts";
 import { noticeEntry } from "./notice.ts";
@@ -226,7 +226,8 @@ const delivered = (entry: ReturnType<typeof noticeEntry>, delivery: Record<strin
 /**
  * The summary of what interfaces hold (ARCHITECTURE.md "Whom to push to"). Once one is due, one commit drops the held
  * questions whose prompt is gone, pins the rest and admits the input that asks the model for the summary, so a restart
- * waits on the same round. When the round answers, one commit writes the summary, ringing on the interfaces holding
+ * waits on the same round. When the round answers, one commit writes the summary, with each `卡片：` line of what it
+ * covers that the model left out (`withCardLines`), ringing on the interfaces holding
  * what it covers unless one rang since the human last typed, sends each question still waiting there again with its
  * buttons and no sound, and stops holding what it covered. A round that fails keeps everything held. Either way the
  * end of the attempt is kept, and the next summary waits the idle time from it.
@@ -273,9 +274,14 @@ export function summaries({ harness, root, context, policies, now, presence, idl
 				Object.fromEntries(kinds.map((kind) => [kind, shown.includes(kind) ? how : "log"]));
 			const rings = summaryRings(presence(), doc.rang);
 			const messageClass = MESSAGE_CLASSES.find((each) => covered.some((push) => push.class === each)) ?? "ambient";
+			// A ticket's card name reaches the human by code, not by the model copying it.
+			const content = withCardLines(
+				summary,
+				covered.map((push) => push.content),
+			);
 			await tx.appendEntry(
 				root.id,
-				delivered(noticeEntry("report", messageClass, summary), only(to, rings ? "ring" : "quiet")),
+				delivered(noticeEntry("report", messageClass, content), only(to, rings ? "ring" : "quiet")),
 			);
 			const { jobs, told } = await prompts(tx);
 			for (const push of covered) {

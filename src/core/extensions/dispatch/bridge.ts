@@ -21,13 +21,23 @@ export const blockedRequestId = (agent: string, seq: number) => `agent:${agent}:
 function wakeContent(job: Job, status: Extract<AgentState, { state: "blocked" }>): string {
 	const { kind, msg, fingerprint } = status;
 	const head = `[bridge] agent ${job.agent}（卡片 ${job.card}）卡住了，kind=${kind}。`;
+	// A ticket job's brief forbids code changes in prose only; the permission prompt is where soma can hold it to that.
+	// claude takes a "no" as the user interrupting: its turn ends with no reply and it waits, so the refusal needs a reply.
+	const ticket =
+		job.ticket === undefined
+			? ""
+			: "\nThis is a ticket job: its agent must only write one task card in the vault, and change no code. Refuse " +
+				"an Edit or Write of any file outside the vault, and any command that changes code, commits or dispatches: " +
+				"answer with the option that says no. A refused agent stops and waits, so right after refusing, use the " +
+				`reply tool (card=${job.card}) to tell it to write only the card in the vault and to finish with its ` +
+				"result line.";
 	const screen = msg ? `\n畫面：\n${msg}\n` : "\n";
 	const how =
 		fingerprint === undefined
 			? "畫面讀不出選項，無法代答：用 escalate 工具轉給人並寫下理由。"
 			: `用 respond 工具代答（card=${job.card}、fingerprint=${fingerprint}、option 填選項編號、寫下理由），` +
 				"或用 escalate 工具轉給人並寫下理由。";
-	return head + screen + how;
+	return head + ticket + screen + how;
 }
 
 /**
@@ -115,7 +125,7 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			if (action === "complete") {
 				const outcome = next.outcome ?? "未知";
 				// Told now, in the commit of its seq, so a resent event or a restart tells it once; the report skips it.
-				const notified = reply !== undefined && urgent(outcome, current.decisions, Date.now());
+				const notified = reply !== undefined && urgent(outcome, current, Date.now());
 				if (notified) {
 					await tx.appendEntry(
 						conversation.id,

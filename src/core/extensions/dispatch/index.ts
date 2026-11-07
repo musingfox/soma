@@ -12,7 +12,7 @@ import { obj, opt, str } from "@earendil-works/pi-schema";
 import { type AgentPort, type Answer, PromptRefused } from "../../../ports/agent.ts";
 import type { Choices, HumanAnswerOutcome } from "../../../ports/human.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
-import { composeLaunchPrompt } from "../../domain/launch-prompt.ts";
+import { composeLaunchPrompt, composeTicketPrompt } from "../../domain/launch-prompt.ts";
 import { FORWARDED, noticeEntry } from "../../notice.ts";
 
 /** Every job dispatched from this conversation; one per card. */
@@ -29,14 +29,34 @@ export const Dispatches = defineDoc<{ jobs: Job[] }>({
 const text = (value: unknown) => ({ output: [{ type: "text" as const, text: JSON.stringify(value) }] });
 
 /**
+ * A job of the name exists for another request, or for a card where this asks for a ticket, or the other way round. A
+ * ticket can take another job name; a card cannot, its job being named after its file.
+ */
+export class JobNameTaken extends Error {
+	constructor(card: string, { taken, asked }: { taken: "card" | "ticket"; asked: "card" | "ticket" }) {
+		const head = `Not dispatched: the job name ${card} is taken by `;
+		super(
+			asked === "card"
+				? `${head}a ticket job, so the card was not started. Dispatch a card only under its own file name; if the ` +
+						"card has the ticket job's name, tell the human."
+				: `${head}${taken === "ticket" ? "another ticket" : "a card's job"}, so this ticket was not started. ` +
+						"Call dispatch again with the same ticket and a new job name, such as ticket-<topic>.",
+		);
+	}
+}
+
+/**
  * Starts the card's agent unless the dispatch list or the agents listed already have it. Shared by every tool that
  * dispatches: a rerun after a crash checks both before it starts anything, and memoizes the session id under the call.
+ * With a `ticket`, the agent's brief is the human's request for a card it is to write, and no card is read. A recorded
+ * job of the name with another request throws `JobNameTaken`: the same call rerun has the same request, so it still
+ * gets its own job back.
  */
 export async function startJob(
 	agents: AgentPort,
 	readCard: (repo: string, card: string) => Promise<string>,
 	api: ToolExecutionApi,
-	{ card, repo }: { card: string; repo: string },
+	{ card, repo, ticket }: { card: string; repo: string; ticket?: string },
 	context: Context,
 ): Promise<Job> {
 	const sessionId = await api.memo("sessionId", randomUUID(), context);
@@ -45,10 +65,16 @@ export async function startJob(
 		// Copied out as JSON: a doc is a live proxy only valid inside its commit.
 		return found && (JSON.parse(JSON.stringify(found)) as Job);
 	}, context);
-	if (recorded) return recorded;
+	if (recorded) {
+		if (recorded.ticket !== ticket) {
+			const kind = (each?: string) => (each === undefined ? "card" : "ticket");
+			throw new JobNameTaken(card, { taken: kind(recorded.ticket), asked: kind(ticket) });
+		}
+		return recorded;
+	}
 
 	// Read before anything starts, so a card that does not exist starts nothing.
-	const launch = composeLaunchPrompt(await readCard(repo, card));
+	const launch = ticket === undefined ? composeLaunchPrompt(await readCard(repo, card)) : composeTicketPrompt(ticket);
 	const listed = (await agents.list()).find((agent) => agent.name === card);
 	if (listed === undefined) await agents.start({ name: card, card, cwd: repo, sessionId });
 	const job: Job = {
@@ -57,6 +83,7 @@ export async function startJob(
 		sessionId: listed?.sessionId ?? sessionId,
 		status: listed?.status ?? { state: "idle" },
 		launch,
+		...(ticket === undefined ? {} : { ticket }),
 		decisions: [],
 	};
 	await api.commit(async (tx) => {
@@ -106,15 +133,37 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 		name: "dispatch",
 		description:
 			"Start a coding agent on an obw task card, in a fleet/<card> worktree of the repo. " +
-			"A card that already has a job, or a running agent named after it, is not started again.",
+			"A card that already has a job, or a running agent named after it, is not started again. " +
+			"When the human asks for a ticket, card or task to be opened or written, call this with ticket set to their " +
+			"request: the agent writes the card, and its name comes to the human once it is written. Never write that " +
+			"card yourself, and never ask the human for evidence ids or a format; ask only which repo, when no repo " +
+			"you know fits.",
 		parameters: obj({
-			card: str({ pattern: "^[a-z0-9][a-z0-9-]*$", description: "The card's file name, without .md" }),
+			card: str({
+				pattern: "^[a-z0-9][a-z0-9-]*$",
+				description: "The card's file name, without .md; with ticket, a new name for the job, such as ticket-<topic>",
+			}),
 			repo: str({ description: "Absolute path of the git repository the card belongs to" }),
+			ticket: opt(
+				str({
+					pattern: "\\S",
+					description:
+						"The human's request for a new ticket, word for word, as the agent's brief instead of an existing card",
+				}),
+			),
 		}),
 		// A rerun after a crash checks the dispatch list, then the agents listed, before it starts anything.
 		replay: "safe",
-		execute: async ({ card, repo }, api, context) =>
-			text(await startJob(agents, readCard, api, { card, repo }, context)),
+		execute: async ({ card, repo, ticket }, api, context) => {
+			try {
+				return text(
+					await startJob(agents, readCard, api, { card, repo, ...(ticket === undefined ? {} : { ticket }) }, context),
+				);
+			} catch (error) {
+				if (error instanceof JobNameTaken) return text({ dispatched: false, reason: error.message });
+				throw error;
+			}
+		},
 	});
 
 	const jobs = defineTool({

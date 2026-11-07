@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 import { HUMAN_CHOSEN } from "../src/core/domain/dispatch.ts";
-import { digestPrompt, outcomeOf, resultNotice, TOUCHED_MS, urgent } from "../src/core/domain/report.ts";
+import { digestPrompt, outcomeOf, resultNotice, TOUCHED_MS, urgent, withCardLines } from "../src/core/domain/report.ts";
 
 test.each([
 	["結果：完成\n\n三個驗收項目都通過。", "完成"],
@@ -56,12 +56,12 @@ const NOW = Date.parse("2026-10-23T01:00:00.000Z");
 const ago = (ms: number) => new Date(NOW - ms).toISOString();
 
 test.each(["需要你", "失敗"] as const)("%s is told at once, touched or not", (outcome) => {
-	expect(urgent(outcome, [], NOW)).toBe(true);
+	expect(urgent(outcome, { decisions: [] }, NOW)).toBe(true);
 });
 
 test("完成 and 未知 wait for the report when nobody touched the job", () => {
-	expect(urgent("完成", [], NOW)).toBe(false);
-	expect(urgent("未知", [], NOW)).toBe(false);
+	expect(urgent("完成", { decisions: [] }, NOW)).toBe(false);
+	expect(urgent("未知", { decisions: [] }, NOW)).toBe(false);
 });
 
 test.each([
@@ -69,17 +69,39 @@ test.each([
 	["a reply the human sent", { action: "replied", reason: "人回答了" }],
 ] as const)("完成 is told at once after %s within the window", (_label, decision) => {
 	const touched = { kind: "question", ...decision } as const;
-	expect(urgent("完成", [{ ...touched, at: ago(TOUCHED_MS) }], NOW)).toBe(true);
-	expect(urgent("完成", [{ ...touched, at: ago(TOUCHED_MS + 1) }], NOW)).toBe(false);
+	expect(urgent("完成", { decisions: [{ ...touched, at: ago(TOUCHED_MS) }] }, NOW)).toBe(true);
+	expect(urgent("完成", { decisions: [{ ...touched, at: ago(TOUCHED_MS + 1) }] }, NOW)).toBe(false);
 });
 
 test("an option the model chose does not count as the human touching the job", () => {
 	const decision = { at: ago(1_000), kind: "permission", action: "answered", reason: "只讀" } as const;
-	expect(urgent("完成", [decision], NOW)).toBe(false);
+	expect(urgent("完成", { decisions: [decision] }, NOW)).toBe(false);
+});
+
+test("a ticket's 完成 is told at once, however long ago the human asked: its reply names the card", () => {
+	const ticket = { decisions: [], ticket: "幫 soma 開一張卡：digest 太長" };
+	expect(urgent("完成", ticket, NOW)).toBe(true);
+	expect(urgent("未知", ticket, NOW)).toBe(false);
 });
 
 test("the notice carries the worker's reply, clipped like the report's", () => {
 	const notice = resultNotice({ card: "c", agent: "c" }, `結果：需要你\n${"x".repeat(700)}`);
 	expect(notice).toMatch(/^agent c（卡片 c）這一輪結束了：\n結果：需要你\nx+…$/);
 	expect(notice.length).toBeLessThan(700);
+});
+
+test("a summary gets each 卡片： line of what it covers that it lacks, once, and none it carries", () => {
+	const covered = [
+		"agent a（卡片 ticket-a）這一輪結束了：\n結果：完成\n卡片：soma-a\n寫好了。",
+		"agent b（卡片 ticket-b）這一輪結束了：\n結果：完成\n卡片：soma-b",
+		"agent c（卡片 card-c）這一輪結束了：\n結果：完成\n卡片：soma-a",
+		"agent d（卡片 card-d）這一輪結束了：\n結果：失敗",
+	];
+	expect(withCardLines("摘要：\n- 寫好了 卡片：soma-b。\n", covered)).toBe(
+		"摘要：\n- 寫好了 卡片：soma-b。\n卡片：soma-a",
+	);
+	// A longer name is not the card's: 卡片：soma-a-2 does not carry 卡片：soma-a.
+	expect(withCardLines("卡片：soma-a-2", covered.slice(0, 1))).toBe("卡片：soma-a-2\n卡片：soma-a");
+	expect(withCardLines("", covered.slice(0, 2))).toBe("卡片：soma-a\n卡片：soma-b");
+	expect(withCardLines("摘要", covered.slice(3))).toBe("摘要");
 });

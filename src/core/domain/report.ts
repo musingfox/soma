@@ -1,5 +1,6 @@
 import type { MessageClass, NoticeKind } from "../../ports/human.ts";
 import { type Decision, HUMAN_CHOSEN } from "./dispatch.ts";
+import { TICKET_CARD_LINE } from "./launch-prompt.ts";
 
 // The first line of a worker's final reply: 結果：完成／需要你／失敗.
 export type Outcome = "完成" | "需要你" | "失敗";
@@ -17,17 +18,23 @@ export const TOUCHED_MS = 10 * 60_000;
 
 /**
  * Whether a finished turn goes to the human at once instead of waiting for the next report: someone has to act on
- * 需要你 and 失敗, and a 完成 is awaited by a human who touched the job within TOUCHED_MS.
+ * 需要你 and 失敗, and a 完成 is awaited by a human who touched the job within TOUCHED_MS, or who asked for the ticket
+ * the job writes: its reply names the card.
  */
-export function urgent(outcome: Outcome | "未知", decisions: readonly Decision[], now: number): boolean {
+export function urgent(
+	outcome: Outcome | "未知",
+	{ decisions, ticket }: { readonly decisions: readonly Decision[]; readonly ticket?: string },
+	now: number,
+): boolean {
 	if (outcome === "需要你" || outcome === "失敗") return true;
 	return (
 		outcome === "完成" &&
-		decisions.some(
-			(decision) =>
-				(decision.action === "replied" || (decision.action === "answered" && decision.reason === HUMAN_CHOSEN)) &&
-				now - Date.parse(decision.at) <= TOUCHED_MS,
-		)
+		(ticket !== undefined ||
+			decisions.some(
+				(decision) =>
+					(decision.action === "replied" || (decision.action === "answered" && decision.reason === HUMAN_CHOSEN)) &&
+					now - Date.parse(decision.at) <= TOUCHED_MS,
+			))
 	);
 }
 
@@ -83,6 +90,29 @@ export function digestPrompt(report: Report): string {
 		"- 其他工作每件寫一行，寫出卡片和結果。\n" +
 		"結果是「未知」的也要列出。每句只講一件事，句子要短。不要貼表格、整段文件或其他長篇內容。"
 	);
+}
+
+// A character that would go on naming a card, so a line the summary holds only as the start of a longer name is missing.
+const NAMING = /[\p{L}\p{N}_.-]/u;
+
+/**
+ * The summary with every `卡片：` line of the pushes it covers that it does not carry, appended word for word: such a line
+ * names the card a ticket job's agent wrote, so the human gets the name whatever the summary's model kept.
+ */
+export function withCardLines(summary: string, contents: readonly string[]): string {
+	const carried = (line: string) => {
+		for (let at = summary.indexOf(line); at !== -1; at = summary.indexOf(line, at + 1)) {
+			if (!NAMING.test(summary.charAt(at + line.length))) return true;
+		}
+		return false;
+	};
+	const lines = contents
+		.flatMap((content) => content.split("\n"))
+		.map((line) => line.trim())
+		.filter((line) => line.startsWith(TICKET_CARD_LINE) && line.length > TICKET_CARD_LINE.length);
+	const missing = [...new Set(lines)].filter((line) => !carried(line));
+	if (missing.length === 0) return summary;
+	return summary.trim() === "" ? missing.join("\n") : `${summary.trimEnd()}\n${missing.join("\n")}`;
 }
 
 const CLASS_LABELS: Record<MessageClass, string> = {

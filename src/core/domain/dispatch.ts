@@ -42,6 +42,8 @@ export type Job = {
 	readonly seq?: number;
 	// The first prompt, held until the agent can take it: claude refuses prompts until its trust dialog is answered.
 	readonly launch?: string;
+	// The human's request, for a job whose agent writes it as a card; `card` then names the job, not a card.
+	readonly ticket?: string;
 	// Read off the result line of the agent's last finished turn.
 	readonly outcome?: Outcome | "未知";
 	// The id of the transcript's last record when a finished turn was last recorded; the same record observed again is

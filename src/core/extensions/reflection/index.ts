@@ -208,8 +208,10 @@ export function reflection({ repo, createCard, readCard, agents }: ReflectionOpt
 	const openCard = defineTool({
 		name: "open_card",
 		description:
-			"要改 soma 的程式碼時，在 soma 的 obw 專案開一張任務卡（status todo），接著把它派進 fleet，並通知使用者。" +
-			"正文要寫明問題和證據。同名的卡已存在就不會再開。soma 不能合併任何東西。",
+			"Reflection's tool only: when a reflection finds that soma's own code must change, open a todo task card in " +
+			"soma's obw project, dispatch it into fleet and tell the human. The body states the problem and its evidence. " +
+			"A card of the same name is not opened again. soma merges nothing. Never for a ticket the human asks for: " +
+			"that goes to dispatch with ticket set to their request, and the human is never asked for evidence ids.",
 		parameters: obj({
 			card: str({ pattern: "^[a-z0-9][a-z0-9-]*$", description: "卡片檔名，kebab-case，不含 .md" }),
 			title: str({ description: "卡片標題" }),

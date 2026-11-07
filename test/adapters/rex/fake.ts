@@ -42,14 +42,14 @@ export const fixture = (name: string) =>
 
 /**
  * An in-memory rex: the hangar's windows, each with one block, any other sessions, the clients connected, and every
- * call made on it. Each reply reads the arrays and blocks as they are then, so a test may change them between calls.
+ * call made on it. `hangar` is the hangar's label. Each reply reads the arrays and blocks as they are then, so a test may change them between calls.
  */
-export function rex(blocks: Block[], others: Session[] = [], clients: Client[] = []) {
+export function rex(blocks: Block[], others: Session[] = [], clients: Client[] = [], hangar = "hangar") {
 	const calls: { method: string; payload: Record<string, unknown> }[] = [];
 	const events = new Set<(event: SessionEvent) => void>();
 	const connected = new Set<() => void>();
 	const attached: string[] = [];
-	const sessions = () => [{ id: HANGAR, label: "hangar", blocks }, ...others];
+	const sessions = () => [{ id: HANGAR, label: hangar, blocks }, ...others];
 	const of = (payload: Record<string, unknown>) =>
 		sessions().find((session) => session.id === payload.session_id)?.blocks ?? [];
 	const byId = (payload: Record<string, unknown>) => of(payload).find((each) => each.block === payload.block_id);

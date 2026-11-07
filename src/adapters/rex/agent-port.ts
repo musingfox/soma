@@ -101,9 +101,9 @@ type Foreign = {
 };
 
 /**
- * The label prefix of the sessions soma makes: prod's `soma-hangar` and every `soma-smoke-*`. Their panes are never
- * foreign (ARCHITECTURE.md "Foreign agents"), so a dev instance, prod and the rex smokes do not take each other's for
- * the human's.
+ * The label prefix of the sessions soma makes: prod's `soma-hangar` and every `soma-smoke-*`. The panes of such a
+ * session are never foreign (ARCHITECTURE.md "Foreign agents"), so a dev instance, prod and the rex smokes do not take
+ * each other's for the human's; the exception is the port's own hangar, whose panes that are not soma's jobs are.
  */
 const SOMA_SESSION_PREFIX = "soma-";
 
@@ -293,19 +293,21 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	}
 
 	/**
-	 * Every terminal block of every session whose foreground is claude, but for the agents' blocks `list` names: the
-	 * hangar's other blocks, as one a human split off, are foreign too. attach_all lets the connection call any session's
-	 * methods without joining it, so no session lists soma among its clients, and with its `session` scope no block
-	 * events of other sessions arrive; it is asked again on every read, since a reconnect drops it. A session or block
-	 * that went away while it was read is left out. A blocked one's status is read off its screen, as `statusOf` reads
-	 * an agent's, so it carries the prompt's fingerprint and options.
+	 * Every terminal block of every session whose foreground is claude, but for soma's jobs: the hangar's blocks whose
+	 * label is a session id, which `openWindow` gives a block in `start` and `resume`, detached or not and wherever it
+	 * sits in its window. Any other block of the hangar, one a human opened in a window of its own or split off, is
+	 * foreign too. A session whose label starts with `soma-` is skipped unless it is this port's own hangar. attach_all
+	 * lets the connection call any session's methods without joining it, so no session lists soma among its clients, and
+	 * with its `session` scope no block events of other sessions arrive; it is asked again on every read, since a
+	 * reconnect drops it. A session or block that went away while it was read is left out. A blocked one's status is
+	 * read off its screen, as `statusOf` reads an agent's, so it carries the prompt's fingerprint and options.
 	 */
 	async function foreign(): Promise<Foreign[]> {
-		const own = new Set([...(await panes()).values()].flat().map((pane) => pane.blockId));
+		await client.attach(sessionId);
 		const { sessions } = await client.call("session.attach_all", { event_scope: "session" }, AttachAllResultSchema);
 		const found = await Promise.all(
 			(sessions ?? []).map(async (session): Promise<Foreign[]> => {
-				if (session.label.startsWith(SOMA_SESSION_PREFIX)) return [];
+				if (session.session_id !== sessionId && session.label.startsWith(SOMA_SESSION_PREFIX)) return [];
 				const where = { session_id: session.session_id };
 				let blocks: z.infer<typeof BlockListSchema>["blocks"];
 				let view: z.infer<typeof ViewSchema>;
@@ -326,7 +328,9 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 				const each = await Promise.all(
 					(blocks ?? []).map(async (block): Promise<Foreign[]> => {
 						const blockId = block.block_id;
-						if (blockId === null || own.has(blockId)) return [];
+						if (blockId === null) return [];
+						if (session.session_id === sessionId && block.label !== undefined && SESSION_ID.test(block.label))
+							return [];
 						if (block.creator_name !== undefined && block.creator_name !== TERMINAL) return [];
 						const call = <T>(method: string, schema: ZodType<T>) =>
 							client.call(`${TERMINAL}.${method}`, { ...where, block_id: blockId, args: {} }, schema);
@@ -1070,8 +1074,9 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 
 		/**
 		 * As prompt, on the foreign agent's block in its own session. Its state is read again after the listing found it,
-		 * just before the paste, so a claude that began a turn or a dialog since is refused. Its \r is confirmed only by the
-		 * state read once confirmMs passed (`turnsWorking`), so the prompt always takes that long.
+		 * just before the paste, so a claude that began a turn or a dialog since is refused. Its \r is confirmed by its
+		 * working event (`turnsWorking`) when it is in the hangar, whose block events reach the connection; in any other
+		 * session no event arrives, so the prompt waits out confirmMs for the state read then.
 		 */
 		async promptForeign(id: string, text: string): Promise<void> {
 			return promptOn(`rex foreign agent ${id}`, text, async () => {

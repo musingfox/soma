@@ -492,6 +492,126 @@ test("a session whose label starts with soma- never holds a foreign agent, any o
 	]);
 });
 
+test("a claude pane a human opens in soma's own hangar is foreign, though the hangar's label starts with soma-", async () => {
+	const fake = rex(
+		[
+			{
+				name: "card-a",
+				block: "block:a",
+				label: SESSION,
+				argv0: "claude",
+				records: [{ state: "idle", updated_at: AT }],
+			},
+			{ name: "card-a", block: "block:split", label: "mine", window: "window:block:a", argv0: "claude", pid: 7 },
+			{ name: "scratch", block: "block:scratch", argv0: "claude", pid: 8, cwd: "/repo/scratch" },
+			{ name: "shell", block: "block:shell", argv0: "-fish" },
+		],
+		[],
+		[],
+		"soma-hangar",
+	);
+
+	const listed = await port(fake).listForeign();
+
+	expect(listed).toEqual([
+		{ id: "block:split", session: "soma-hangar", label: "card-a / mine" },
+		{ id: "block:scratch", session: "soma-hangar", label: "scratch", cwd: "/repo/scratch" },
+	]);
+});
+
+test("a pane running a soma job in the hangar is not foreign, whether the hangar is labelled soma- or not", async () => {
+	for (const label of ["soma-hangar", "hangar"]) {
+		const fake = rex(
+			[
+				{
+					name: "card-a",
+					block: "block:a",
+					label: SESSION,
+					argv0: "claude",
+					records: [{ state: "working", updated_at: AT }],
+				},
+				{
+					name: "card-b",
+					block: "block:b",
+					label: SESSION,
+					argv0: "claude",
+					records: [{ state: "idle", updated_at: AT }],
+				},
+			],
+			[],
+			[],
+			label,
+		);
+
+		expect(await port(fake).listForeign()).toEqual([]);
+	}
+});
+
+test("a soma job is never foreign, however its block sits in the hangar", async () => {
+	const fake = rex(
+		[
+			// Detached, in no window.
+			{ name: "", block: "block:detached", label: SESSION, detached: true, argv0: "claude" },
+			// Behind a block a human split off, so the window's first block is not the job's.
+			{ name: "card-b", block: "block:human", label: "mine", window: "window:b", argv0: "claude" },
+			{ name: "card-b", block: "block:job", label: OTHER, window: "window:b", argv0: "claude" },
+		],
+		[],
+		[],
+		"soma-hangar",
+	);
+
+	const listed = await port(fake).listForeign();
+
+	expect(listed.map(({ id }) => id)).toEqual(["block:human"]);
+});
+
+test("a hangar window whose block carries a label that is no session id is foreign", async () => {
+	const fake = rex(
+		[
+			{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude" },
+			{ name: "tab", block: "block:tab", label: "shell", argv0: "claude" },
+			{ name: "almost", block: "block:almost", label: SESSION.slice(1), argv0: "claude" },
+		],
+		[],
+		[],
+		"soma-hangar",
+	);
+
+	const listed = await port(fake).listForeign();
+
+	expect(listed.map(({ id }) => id)).toEqual(["block:tab", "block:almost"]);
+});
+
+test("another soma- session stays unlisted while soma's own hangar is listed", async () => {
+	const claude = (block: string): Block => ({ name: "w", block, argv0: "claude" });
+	const fake = rex(
+		[
+			{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude" },
+			{ name: "scratch", block: "block:scratch", argv0: "claude" },
+		],
+		[
+			{ id: "session:prod", label: "soma-hangar", blocks: [claude("block:prod")] },
+			{ id: "session:dev-hangar", label: "soma-dev-1234", blocks: [claude("block:dev")] },
+			{ id: "session:smoke", label: "soma-smoke-edde1b", blocks: [claude("block:smoke")] },
+			{ id: "session:work", label: "work", blocks: [claude("block:work")] },
+		],
+		[],
+		"soma-hangar-mine",
+	);
+
+	const listed = await port(fake).listForeign();
+
+	expect(listed.map(({ id, session }) => [id, session])).toEqual([
+		["block:scratch", "soma-hangar-mine"],
+		["block:work", "work"],
+	]);
+	expect(fake.calls.filter((call) => call.method.endsWith(".process")).map((call) => call.payload.block_id)).toEqual([
+		"block:scratch",
+		"block:work",
+	]);
+});
+
 /** A foreign agent blocked at the Bash prompt in a window of its own, and the app that showed another window last. */
 function looked(shows: "claude" | "other") {
 	const { session, claude, other } = blockedWork();

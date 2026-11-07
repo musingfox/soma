@@ -43,7 +43,7 @@ export interface AgentListing {
 
 /**
  * An agent soma did not dispatch: a pane, in any session of the agent side, whose foreground is claude and which is
- * none of the agents `list` names. soma may read it, answer its prompts and send an idle or done one a prompt, but
+ * none of the agents soma dispatched, so a claude a human opened in the hangar counts. soma may read it, answer its prompts and send an idle or done one a prompt, but
  * never starts, stops or resumes one (ARCHITECTURE.md "Foreign agents").
  */
 export interface ForeignAgent {

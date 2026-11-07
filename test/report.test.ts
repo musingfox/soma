@@ -47,6 +47,9 @@ test("the digest prompt names its source and lists every job, unknown outcomes a
 	expect(prompt).toContain(
 		`- 卡片 b（agent b）結果：未知\n  回覆：${"x".repeat(600)}…\n  判斷（permission，answered）：只讀`,
 	);
+	const instruction = prompt.slice(prompt.lastIndexOf("寫一份給人看的短報告"));
+	expect(instruction.indexOf("要你注意：")).toBeLessThan(instruction.indexOf("僅供參考："));
+	expect(instruction).toContain("不要貼表格");
 });
 
 const NOW = Date.parse("2026-10-23T01:00:00.000Z");

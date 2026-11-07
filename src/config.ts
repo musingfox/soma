@@ -104,6 +104,7 @@ const FileConfig = z
 			.object({ name: z.string().min(1), deny: z.array(z.string().min(1)) })
 			.partial()
 			.strict(),
+		skillsDir: z.string().min(1),
 	})
 	.partial()
 	.strict();
@@ -136,6 +137,8 @@ export interface Config {
 	readonly web?: WebConfig;
 	/** The Obsidian vault soma may read, by the name the obsidian CLI knows; set only when a name is. */
 	readonly vault?: VaultConfig;
+	/** Where soma's skills are, one directory with a SKILL.md each (card soma-skills). */
+	readonly skillsDir: string;
 	/** Each interface's push policy; one the file leaves unset is `instant`, which is how soma pushed before. */
 	readonly push: Readonly<Record<Interface, PolicyTable>>;
 	/** `push.summary.idleMinutes` in ms: how long the human types nowhere before what is held is summarized. */
@@ -289,6 +292,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		...(token !== undefined && chatId !== undefined && { telegram: { token, chatId, apiBase } }),
 		...(web !== undefined && { web }),
 		...(file?.vault?.name !== undefined && { vault: { name: file.vault.name, deny: file.vault.deny ?? [] } }),
+		skillsDir: resolve(fromEnv("SOMA_SKILLS_DIR") ?? file?.skillsDir ?? join(home, ".config/soma/skills")),
 		push: resolvePush(file?.push, path),
 		summaryIdleMs: resolveSummaryIdle(file?.push, path) * 60_000,
 	};

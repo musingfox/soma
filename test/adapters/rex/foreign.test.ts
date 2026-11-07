@@ -172,6 +172,58 @@ test("readForeignResult refuses a block that is no foreign agent: soma's own, on
 	await expect(reader.readForeignResult("block:gone")).rejects.toThrow("no foreign agent block:gone");
 });
 
+test("readForeignScreen reads the foreign agent's block in its own session at every call, read only", async () => {
+	const claude: Block = {
+		name: "Window 1",
+		block: "block:w1",
+		argv0: "claude",
+		records: [{ state: "working", updated_at: AT }],
+		screen: "✻ Building improve-report-readability…",
+	};
+	const fake = rex([], [{ id: "session:work", label: "work", blocks: [claude] }]);
+	const reader = port(fake);
+
+	expect(await reader.readForeignScreen("block:w1")).toBe("✻ Building improve-report-readability…");
+	claude.screen = "Do you want to open the PR?\n❯ 1. Yes\n  2. No";
+	expect(await reader.readForeignScreen("block:w1")).toBe("Do you want to open the PR?\n❯ 1. Yes\n  2. No");
+
+	expect(fake.calls.filter((call) => call.method.endsWith(".format")).map((call) => call.payload)).toEqual(
+		Array(2).fill({
+			session_id: "session:work",
+			block_id: "block:w1",
+			args: { format: "text", trim: true, max_bytes: 65_536 },
+		}),
+	);
+	expect(fake.methods().filter((method) => method.endsWith(".write") || method === "block.event")).toEqual([]);
+	expect(fake.attached).toEqual([HANGAR, HANGAR]);
+});
+
+test("readForeignScreen reads a pane the human opened in soma's own hangar", async () => {
+	const fake = rex([
+		{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude", screen: "a job" },
+		{ name: "mine", block: "block:m", argv0: "claude", screen: "the human's claude" },
+	]);
+
+	expect(await port(fake).readForeignScreen("block:m")).toBe("the human's claude");
+	expect(fake.calls.find((call) => call.method.endsWith(".format"))?.payload).toMatchObject({
+		session_id: HANGAR,
+		block_id: "block:m",
+	});
+});
+
+test("readForeignScreen refuses a block that is no foreign agent: soma's own, one without claude, or none", async () => {
+	const fake = rex([{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude" }], [work]);
+	const reader = port(fake);
+
+	await expect(reader.readForeignScreen("block:a")).rejects.toThrow("no foreign agent block:a");
+	await expect(reader.readForeignScreen("block:w2")).rejects.toThrow("no foreign agent block:w2");
+	await expect(reader.readForeignScreen("block:gone")).rejects.toThrow("no foreign agent block:gone");
+	// Only the listing's reads of the blocked one's prompt; no screen of a block refused.
+	expect(
+		new Set(fake.calls.filter((call) => call.method.endsWith(".format")).map((call) => call.payload.block_id)),
+	).toEqual(new Set(["block:w3b"]));
+});
+
 const BASH = fixture("claude-bash-prompt-2.1.302.txt");
 const prompt = readBlockedScreen(BASH).prompt;
 

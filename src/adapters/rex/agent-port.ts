@@ -579,20 +579,33 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	const write = (blockId: string, data: string, session = sessionId) =>
 		blockCall("write", blockId, WriteResultSchema, { data }, session);
 
-	/** The block's screen as plain text, cut to its last SCREEN_BYTES: the whole scrollback can outgrow one reply. */
-	async function readScreen(blockId: string, session = sessionId): Promise<BlockedScreen> {
+	/**
+	 * The block's screen and scrollback as plain text, read off the block now and cut to its last SCREEN_BYTES: the
+	 * whole scrollback can outgrow one reply.
+	 */
+	async function screenText(blockId: string, session = sessionId): Promise<string> {
 		const args = { format: "text", trim: true, max_bytes: SCREEN_BYTES };
 		const first = await blockCall("format", blockId, FormatResultSchema, args, session);
-		if (first.id === undefined || first.total === undefined || first.eof === true) {
-			return readBlockedScreen(first.content);
-		}
+		if (first.id === undefined || first.total === undefined || first.eof === true) return first.content;
 		let text = "";
 		for (let offset = Math.max(0, first.total - SCREEN_BYTES); ; ) {
 			const part = await blockCall("blob_read", blockId, BlobReadResultSchema, { id: first.id, offset }, session);
 			text += part.data;
 			offset += Buffer.byteLength(part.data);
-			if (part.eof || part.data === "") return readBlockedScreen(text);
+			if (part.eof || part.data === "") return text;
 		}
+	}
+
+	/** The prompt on the block's screen, as `readBlockedScreen` reads it. */
+	async function readScreen(blockId: string, session = sessionId): Promise<BlockedScreen> {
+		return readBlockedScreen(await screenText(blockId, session));
+	}
+
+	/** A foreign agent as `foreign` finds it now; throws for an id that names none. */
+	async function foreignOf(id: string): Promise<Foreign> {
+		const found = (await foreign()).find((each) => each.agent.id === id);
+		if (found === undefined) throw new Error(`no foreign agent ${id}: no block of that id runs claude outside soma`);
+		return found;
 	}
 
 	/** A press and a release, as `rex send-key` sends them, straight to the block so no key binding takes it. */
@@ -1047,6 +1060,11 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			}
 		},
 
+		/** The screen of the agent's block in the hangar, read now, whatever runs in it, even after claude exited. */
+		async readScreen(agent: string): Promise<string> {
+			return screenText(only(await panes(), agent).blockId);
+		},
+
 		async respond(agent: string, answer: Answer): Promise<AnswerOutcome> {
 			const { blockId } = only(await panes(), agent);
 			return answerOn(sessionId, blockId, answer, true);
@@ -1067,9 +1085,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		 * trust dialog only of a claude it started.
 		 */
 		async respondForeign(id: string, answer: Answer): Promise<AnswerOutcome> {
-			const found = (await foreign()).find((each) => each.agent.id === id);
-			if (found === undefined) throw new Error(`no foreign agent ${id}: no block of that id runs claude outside soma`);
-			return answerOn(found.sessionId, id, answer, false);
+			return answerOn((await foreignOf(id)).sessionId, id, answer, false);
 		},
 
 		/**
@@ -1079,13 +1095,10 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		 * session no event arrives, so the prompt waits out confirmMs for the state read then.
 		 */
 		async promptForeign(id: string, text: string): Promise<void> {
-			return promptOn(`rex foreign agent ${id}`, text, async () => {
-				const found = (await foreign()).find((each) => each.agent.id === id);
-				if (found === undefined) {
-					throw new Error(`no foreign agent ${id}: no block of that id runs claude outside soma`);
-				}
-				return { session: found.sessionId, blockId: id };
-			});
+			return promptOn(`rex foreign agent ${id}`, text, async () => ({
+				session: (await foreignOf(id)).sessionId,
+				blockId: id,
+			}));
 		},
 
 		onForeignStatus(listener: (event: ForeignStatusEvent) => void): () => void {
@@ -1104,12 +1117,16 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 		 * and moves on `/clear`, read as it is: no turn end is known for a block the watch does not follow.
 		 */
 		async readForeignResult(id: string): Promise<AgentResult | undefined> {
-			const found = (await foreign()).find((each) => each.agent.id === id);
-			if (found === undefined) throw new Error(`no foreign agent ${id}: no block of that id runs claude outside soma`);
+			const found = await foreignOf(id);
 			const session = await readProcessSession(found.pid, options.sessionsDir);
 			if (session === undefined) return undefined;
 			const path = await resolveTranscriptPath(session.sessionId, session.cwd ?? found.agent.cwd, options.projectsDir);
 			return path === undefined ? undefined : readLastRecord(path);
+		},
+
+		/** As readScreen, on the foreign agent's block in its own session, once the listing found it running claude. */
+		async readForeignScreen(id: string): Promise<string> {
+			return screenText(id, (await foreignOf(id)).sessionId);
 		},
 	};
 }

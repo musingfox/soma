@@ -186,8 +186,9 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 	}
 
 	/** The emulator's screen once every byte the pty sent so far is parsed. */
-	const readScreen = (agent: Agent) =>
-		new Promise<BlockedScreen>((resolve) => agent.term.write("", () => resolve(readBlockedScreen(screenText(agent)))));
+	const parsedText = (agent: Agent) =>
+		new Promise<string>((resolve) => agent.term.write("", () => resolve(screenText(agent))));
+	const readScreen = async (agent: Agent): Promise<BlockedScreen> => readBlockedScreen(await parsedText(agent));
 
 	/** A blocked record's status with the prompt read off the screen, read again while it does not parse yet. */
 	async function statusOf(agent: Agent, record: AgentState): Promise<AgentState> {
@@ -399,6 +400,11 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 			}
 		},
 
+		/** The emulator's screen and scrollback, with every byte the pty sent so far parsed; an exited one's too. */
+		async readScreen(agent: string): Promise<string> {
+			return parsedText(only(agent));
+		},
+
 		async respond(agent: string, answer: Answer): Promise<AnswerOutcome> {
 			const target = agents.get(agent);
 			const record = target?.record;
@@ -435,6 +441,7 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 		// Every pty soma holds is one of its own agents.
 		listForeign: async () => [],
 		readForeignResult: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: tty runs none`)),
+		readForeignScreen: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: tty runs none`)),
 		onForeignStatus: () => () => {},
 		respondForeign: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: tty runs none`)),
 		promptForeign: (id: string) => Promise.reject(new PromptRefused(`no foreign agent ${id}: tty runs none`)),

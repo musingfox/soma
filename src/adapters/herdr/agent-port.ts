@@ -172,6 +172,12 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 			return path === undefined ? undefined : readLastRecord(path);
 		},
 
+		/** What the agent's pane shows now; `visible`, since herdr's `recent` is empty on a fresh pane. */
+		async readScreen(agent: string): Promise<string> {
+			const info = await client.agentGet(agent);
+			return (await client.paneRead({ pane_id: info.pane_id, source: "visible" })).text;
+		},
+
 		// cc-mobile native-permission.ts:334-440: fresh status, fresh screen, then the keys read off that screen.
 		async respond(agent: string, answer: Answer): Promise<AnswerOutcome> {
 			const info = await client.agentGet(agent);
@@ -193,6 +199,7 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 		// soma's herdr adapter looks only at the hangar's agents.
 		listForeign: async () => [],
 		readForeignResult: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: herdr lists none`)),
+		readForeignScreen: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: herdr lists none`)),
 		onForeignStatus: () => () => {},
 		respondForeign: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: herdr lists none`)),
 		promptForeign: (id: string) => Promise.reject(new PromptRefused(`no foreign agent ${id}: herdr lists none`)),

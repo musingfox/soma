@@ -96,6 +96,7 @@ test("herdr lists no foreign agents, and reads and prompts none, having called h
 	const port = createHerdrAgentPort({ client, cap: 1 });
 	expect(await port.listForeign()).toEqual([]);
 	await expect(port.readForeignResult("w1:p1")).rejects.toThrow("no foreign agent w1:p1");
+	await expect(port.readForeignScreen("w1:p1")).rejects.toThrow("no foreign agent w1:p1");
 	await expect(port.promptForeign("w1:p1", "go")).rejects.toThrow("no foreign agent w1:p1");
 	await expect(port.promptForeign("w1:p1", "go")).rejects.toBeInstanceOf(PromptRefused);
 	expect(calls).toEqual([]);
@@ -162,6 +163,21 @@ test("a blocked status carries the prompt's options as the parser read them", as
 	const parsed = readBlockedScreen(BASH).prompt?.options.map(({ id, label }) => ({ id, label }));
 	expect(parsed?.length).toBeGreaterThan(0);
 	expect(listed?.status).toMatchObject({ state: "blocked", fingerprint: fingerprintOf(BASH), options: parsed });
+});
+
+test("readScreen reads what the agent's pane shows at every call, whatever its status", async () => {
+	const { port, calls, state } = pane("done", "● Done.");
+
+	expect(await port.readScreen("card-a")).toBe("● Done.");
+	state.text = "● Done.\n> go on\n✻ Working…";
+	expect(await port.readScreen("card-a")).toBe("● Done.\n> go on\n✻ Working…");
+
+	expect(calls).toEqual([
+		{ method: "agent.get", params: { target: "card-a" } },
+		{ method: "pane.read", params: { pane_id: "w1:p1", source: "visible" } },
+		{ method: "agent.get", params: { target: "card-a" } },
+		{ method: "pane.read", params: { pane_id: "w1:p1", source: "visible" } },
+	]);
 });
 
 test("respond presses the chosen option's key after a fresh status and screen read", async () => {

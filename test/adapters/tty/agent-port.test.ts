@@ -116,6 +116,7 @@ test("tty lists no foreign agents, and reads and prompts none, every pty being o
 	await port.start(request);
 	expect(await port.listForeign()).toEqual([]);
 	await expect(port.readForeignResult("card-a")).rejects.toThrow("no foreign agent card-a");
+	await expect(port.readForeignScreen("card-a")).rejects.toThrow("no foreign agent card-a");
 	await expect(port.promptForeign("card-a", "go")).rejects.toThrow("no foreign agent card-a");
 	await expect(port.promptForeign("card-a", "go")).rejects.toBeInstanceOf(PromptRefused);
 	expect(spawns).toHaveLength(1);
@@ -241,6 +242,22 @@ test("claude exiting is an error, listed until the name is started again or stop
 	await port.stop("card-a");
 	expect(again.killed).toBe(true);
 	expect(await port.list()).toEqual([]);
+});
+
+test("readScreen reads the emulator's screen as the pty drew it up to the call, an exited one's too", async () => {
+	const { port, ptys } = harness();
+	const pty = await started(port, ptys);
+	pty.out("● Done.\n");
+	expect(await port.readScreen("card-a")).toBe("● Done.");
+
+	// Written just before the read, with nothing waited for: the read still sees it.
+	pty.out("> go on\n✻ Working…");
+	expect(await port.readScreen("card-a")).toBe("● Done.\n> go on\n✻ Working…");
+
+	pty.exit(1);
+	await settle();
+	expect(await port.readScreen("card-a")).toBe("● Done.\n> go on\n✻ Working…");
+	await expect(port.readScreen("card-z")).rejects.toThrow("tty has no agent named card-z");
 });
 
 test("an agent a restart lost has no result and waits on nothing", async () => {

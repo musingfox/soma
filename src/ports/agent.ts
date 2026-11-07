@@ -43,7 +43,7 @@ export interface AgentListing {
 
 /**
  * An agent soma did not dispatch: a pane, in any session of the agent side, whose foreground is claude and which is
- * none of the agents soma dispatched, so a claude a human opened in the hangar counts. soma may read it, answer its prompts and send an idle or done one a prompt, but
+ * none of the agents soma dispatched, so a claude a human opened in the hangar counts. soma may read it and its screen, answer its prompts and send an idle or done one a prompt, but
  * never starts, stops or resumes one (ARCHITECTURE.md "Foreign agents").
  */
 export interface ForeignAgent {
@@ -120,6 +120,10 @@ export interface AgentPort {
 	onStatus(listener: (event: AgentStatusEvent) => void): () => void;
 	// Undefined only when no transcript, or no record in it with an id, can be read.
 	readResult(agent: string): Promise<AgentResult | undefined>;
+	// The text the agent's pane shows now: its screen, with the scrollback above it where the agent side keeps one, as
+	// plain text. Read off the pane at every call, never from a status or result read before. Throws when the agent has
+	// no pane to read.
+	readScreen(agent: string): Promise<string>;
 	// Re-reads the screen before sending: a stored status is never trusted to still be on it.
 	respond(agent: string, answer: Answer): Promise<AnswerOutcome>;
 	stop(agent: string): Promise<void>;
@@ -132,6 +136,8 @@ export interface AgentPort {
 	// written. Undefined when no transcript, or no record in it with an id, can be read; throws for an id that names no
 	// foreign agent now.
 	readForeignResult(id: string): Promise<AgentResult | undefined>;
+	// As readScreen, for a foreign agent by its id; throws for an id that names no foreign agent now.
+	readForeignScreen(id: string): Promise<string>;
 	// As respond, for a foreign agent by its id, and never for kind=auth; throws for an id that names no foreign agent now.
 	respondForeign(id: string, answer: Answer): Promise<AnswerOutcome>;
 	// As prompt, for a foreign agent by its id: only an idle or done one, its state read again just before the text is

@@ -28,8 +28,10 @@ export class FakeAgentPort implements AgentPort {
 	readonly #foreignListeners = new Set<(event: ForeignStatusEvent) => void>();
 	readonly #results = new Map<string, AgentResult>();
 	readonly #states = new Map<string, { status: AgentState; seq: number }>();
-	/** Agents running beside the dispatched ones, with what each one's transcript ends on. */
-	readonly foreign: { agent: ForeignAgent; result?: AgentResult }[] = [];
+	/** What each agent's pane shows, by name, as a test sets it; read at each call, as a pane is. */
+	readonly screens = new Map<string, string>();
+	/** Agents running beside the dispatched ones, with what each one's transcript ends on and its pane shows. */
+	readonly foreign: { agent: ForeignAgent; result?: AgentResult; screen?: string }[] = [];
 	#seq = 0;
 	#turn = 0;
 
@@ -62,6 +64,12 @@ export class FakeAgentPort implements AgentPort {
 		return this.#results.get(agent);
 	}
 
+	async readScreen(agent: string): Promise<string> {
+		const screen = this.screens.get(agent);
+		if (screen === undefined) throw new Error(`no pane of agent ${agent}`);
+		return screen;
+	}
+
 	/** Sends only to the blocked status last emitted, matched by fingerprint, as the herdr adapter does. */
 	async respond(agent: string, answer: Answer): Promise<AnswerOutcome> {
 		const status = this.#states.get(agent)?.status;
@@ -86,6 +94,12 @@ export class FakeAgentPort implements AgentPort {
 		const found = this.foreign.find(({ agent }) => agent.id === id);
 		if (found === undefined) throw new Error(`no foreign agent ${id}`);
 		return found.result;
+	}
+
+	async readForeignScreen(id: string): Promise<string> {
+		const found = this.foreign.find(({ agent }) => agent.id === id);
+		if (found === undefined) throw new Error(`no foreign agent ${id}`);
+		return found.screen ?? "";
 	}
 
 	/** As respond, against the foreign agent's listed status; it turns working once answered. */

@@ -802,6 +802,63 @@ test("stop closes the agent's block", async () => {
 	expect(fake.calls.at(-1)).toEqual({ method: "block.close", payload: { session_id: HANGAR, block_id: "block:a" } });
 });
 
+test("readScreen reads the agent's block in the hangar at every call, whatever its status says", async () => {
+	const block: Block = {
+		name: "card-a",
+		block: "block:a",
+		label: SESSION,
+		argv0: "claude",
+		records: [{ state: "done", updated_at: AT }],
+		screen: "● Done: the tests pass.",
+	};
+	const fake = rex([{ name: "card-b", block: "block:b", label: SESSION, argv0: "claude", screen: "other" }, block]);
+	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
+
+	expect(await port.readScreen("card-a")).toBe("● Done: the tests pass.");
+	// The human answered the agent at its pane since: the next read shows the new turn, not the done one.
+	block.screen = "● Done: the tests pass.\n> also open the PR\n✻ Working…";
+	expect(await port.readScreen("card-a")).toBe("● Done: the tests pass.\n> also open the PR\n✻ Working…");
+
+	const reads = fake.calls.filter((call) => call.method === "com.superlogical.terminal.format");
+	expect(reads.map((call) => call.payload)).toEqual(
+		Array(2).fill({ session_id: HANGAR, block_id: "block:a", args: { format: "text", trim: true, max_bytes: 65_536 } }),
+	);
+	// Read only: nothing typed or pressed.
+	expect(fake.methods().filter((method) => method.endsWith(".write") || method === "block.event")).toEqual([]);
+});
+
+test("readScreen reads the shell left in the block once claude exited, and refuses a name with no window", async () => {
+	const fake = rex([{ name: "card-a", block: "block:a", label: SESSION, argv0: "-fish", screen: "$ " }]);
+	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
+
+	expect(await port.readScreen("card-a")).toBe("$ ");
+	await expect(port.readScreen("card-z")).rejects.toThrow(`rex hangar ${HANGAR} has no window named card-z`);
+});
+
+test("readScreen reads only the tail of a scrollback too long for one reply", async () => {
+	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude" }]);
+	const original = fake.client.call.bind(fake.client);
+	fake.client.call = async (method, payload, schema) => {
+		if (method.endsWith(".format")) return schema.parse({ content: "old output", id: 7, total: 200_000, eof: false });
+		if (method.endsWith(".blob_read")) {
+			const offset = (payload as { args: { offset: number } }).args.offset;
+			return schema.parse(
+				offset < 200_000 - 1_000
+					? { id: 7, data: "x".repeat(65_536 - 1_000), total: 200_000, eof: false }
+					: { id: 7, data: "\nthe last line", total: 200_000, eof: true },
+			);
+		}
+		return original(method, payload, schema);
+	};
+
+	const text = await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR }).readScreen(
+		"card-a",
+	);
+
+	expect(text).not.toContain("old output");
+	expect(text.endsWith("\nthe last line")).toBe(true);
+});
+
 /** A session of its own that claude ran in `cwd`, with the projects directory holding only its transcript. */
 function resumable(cwd: string) {
 	const session = "5b1c0d2e-3f40-4a51-8b62-7c83d94e0a15";

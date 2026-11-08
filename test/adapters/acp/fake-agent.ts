@@ -21,6 +21,7 @@
 // $FAKE_ACP_NEW_MS delays session/new, as claude's CLI start does; $FAKE_ACP_NEW_AUTH refuses it with -32000.
 // $FAKE_ACP_LOAD_AUTH and $FAKE_ACP_LOAD_EXIT, comma-separated agent names, have the agent whose SOMA_AGENT is named
 // refuse session/load with -32000 or exit with code 4 during it. Each agent appends "<SOMA_AGENT> <pid>" to $FAKE_ACP_PIDS.
+// $FAKE_ACP_LOAD_MS delays session/load. $FAKE_ACP_IGNORE_TERM has the agent live through SIGTERM.
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -40,6 +41,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const named = (variable: string | undefined) => (variable ?? "").split(",").includes(process.env.SOMA_AGENT ?? "");
 const transcriptOf = (sessionId: string, cwd: string) =>
 	join(projects, cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${sessionId}.jsonl`);
+if (process.env.FAKE_ACP_IGNORE_TERM) process.on("SIGTERM", () => {});
 if (process.env.FAKE_ACP_PIDS) appendFileSync(process.env.FAKE_ACP_PIDS, `${process.env.SOMA_AGENT} ${process.pid}\n`);
 
 /** Appends one record to the session's transcript, chained to the one before, as claude writes them. */
@@ -49,7 +51,10 @@ function write(sessionId: string, type: "user" | "assistant", content: unknown):
 	const path = transcriptOf(sessionId, session.cwd);
 	mkdirSync(join(path, ".."), { recursive: true });
 	const uuid = randomUUID();
-	const message = type === "user" ? { role: "user", content } : { id: `msg-${uuid}`, role: "assistant", content };
+	const message =
+		type === "user"
+			? { role: "user", content }
+			: { id: `msg-${uuid}`, role: "assistant", model: "claude-fake-1", content };
 	const record = { type, uuid, parentUuid: session.last ?? null, sessionId, cwd: session.cwd, message };
 	appendFileSync(path, `${JSON.stringify(record)}\n`);
 	session.last = uuid;
@@ -71,6 +76,7 @@ const app = agent({ name: "fake-acp" })
 		return { sessionId };
 	})
 	.onRequest(methods.agent.session.load, async ({ params, client }) => {
+		await sleep(Number(process.env.FAKE_ACP_LOAD_MS ?? 0));
 		if (named(process.env.FAKE_ACP_LOAD_EXIT)) process.exit(4);
 		if (named(process.env.FAKE_ACP_LOAD_AUTH)) throw RequestError.authRequired();
 		const { sessionId, cwd } = params;

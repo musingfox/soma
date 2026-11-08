@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { readFile, realpath, rm } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
 import { type AgentStatusEvent, NotImplemented, PromptRefused } from "../../../src/ports/agent.ts";
@@ -821,4 +821,266 @@ test("resume of an agent whose worktree is gone throws that, with no process sta
 	expect((failure as Error).message).toBe(`the worktree ${cwd} of agent card-a is gone`);
 	expect(await spawned(acp)).toHaveLength(1);
 	expect((await recorded(acp))["card-a"]?.stopped).toBe(true);
+});
+
+test("release closes the session, returns once the process is gone, and marks the entry, keeping what the other side needs", async () => {
+	const acp = await harness();
+	await acp.start();
+	const from = acp.events.length;
+	await acp.until("idle");
+	await acp.port.prompt("card-a", "hello");
+	await acp.until("done", from);
+	const { [acp.instance]: _none, ...sessions } = JSON.parse(await readFile(acp.sessionsFile, "utf8"));
+	const { acpSessionId, cwd } = sessions["card-a"];
+	const [pid] = (await readFile(join(acp.cwd, "..", `pids-${acp.instance}`), "utf8")).trim().split("\n");
+
+	const held = { name: "card-a", card: "card-a", sessionId: SESSION, claudeSession: acpSessionId, cwd };
+	expect(await acp.port.releasable("card-a")).toEqual(held);
+	expect(await acp.port.release("card-a")).toEqual(held);
+
+	expect(() => process.kill(Number(pid?.split(" ")[1]), 0)).toThrow();
+	expect(await readFile(join(acp.cwd, "..", "projects", "closed"), "utf8")).toBe(`${acpSessionId}\n`);
+	expect(JSON.parse(await readFile(acp.sessionsFile, "utf8"))["card-a"]).toEqual({
+		card: "card-a",
+		sessionId: SESSION,
+		acpSessionId,
+		cwd,
+		handedOver: true,
+	});
+	expect(await acp.port.released()).toEqual([held]);
+	// Its exit is no failure anyone is told of.
+	await sleep(50);
+	expect(acp.events.filter((event) => event.status.state === "error")).toEqual([]);
+});
+
+test("the ACP side never lists, wakes, resumes or starts again an agent it released, this soma or the next", async () => {
+	const acp = await harness();
+	await acp.start();
+	await acp.until("idle");
+	const from = acp.events.length;
+	await acp.port.prompt("card-a", "hello");
+	await acp.until("done", from);
+	const held = await acp.port.release("card-a");
+
+	const after = await harness({ cwd: acp.cwd });
+	for (const port of [acp.port, after.port]) {
+		expect(await port.list()).toEqual([]);
+		await expect(port.prompt("card-a", "RECALL")).rejects.toThrow(PromptRefused);
+		await expect(port.resume({ name: "card-a", card: "card-a", sessionId: SESSION })).rejects.toThrow(NotImplemented);
+		await expect(port.start({ name: "card-a", card: "card-a", cwd: acp.cwd, sessionId: SESSION })).rejects.toThrow(
+			"handed over",
+		);
+		expect(await port.releasable("card-a")).toMatchObject({ refusal: "not_acp" });
+	}
+	expect(await after.port.dormant()).toEqual([]);
+	expect(await after.port.released()).toEqual([held]);
+	expect(after.errors).toEqual([]);
+	expect(await readFile(join(acp.cwd, "..", `pids-${after.instance}`), "utf8").catch(() => "")).toBe("");
+});
+
+test("release gives up a dormant agent with no process, and refuses, with nothing done, what is not at rest or not its own", async () => {
+	const first = await harness();
+	await first.start();
+	await first.until("idle");
+	let from = first.events.length;
+	await first.port.prompt("card-a", "hello");
+	await first.until("done", from);
+	await first.end();
+
+	const acp = await harness({ cwd: first.cwd });
+	expect(await acp.port.dormant()).toEqual(["card-a"]);
+	expect(await acp.port.release("card-a")).toMatchObject({ name: "card-a" });
+	expect(await acp.port.list()).toEqual([]);
+	expect(await readFile(join(acp.cwd, "..", `pids-${acp.instance}`), "utf8").catch(() => "")).toBe("");
+
+	expect(await acp.port.release("nobody")).toMatchObject({ refusal: "not_acp" });
+
+	await acp.start("card-b");
+	await acp.until("idle", 0, "card-b");
+	from = acp.events.length;
+	await acp.port.prompt("card-b", "ASK");
+	await acp.until("blocked", from, "card-b");
+	expect(await acp.port.releasable("card-b")).toMatchObject({ refusal: "not_at_rest", reason: /is blocked/ });
+	expect(await acp.port.release("card-b")).toMatchObject({ refusal: "not_at_rest" });
+	expect((await acp.port.list()).map(({ name }) => name)).toEqual(["card-b"]);
+
+	await acp.start("card-c");
+	await acp.until("idle", 0, "card-c");
+	from = acp.events.length;
+	await acp.port.prompt("card-c", "HANG");
+	await acp.until("working", from, "card-c");
+	expect(await acp.port.release("card-c")).toMatchObject({ refusal: "not_at_rest", reason: /is working/ });
+
+	await acp.start("card-d");
+	await acp.until("idle", 0, "card-d");
+	await acp.port.stop("card-d");
+	expect(await acp.port.releasable("card-d")).toMatchObject({ refusal: "not_at_rest", reason: /is not running/ });
+
+	expect(JSON.parse(await readFile(acp.sessionsFile, "utf8"))["card-b"].handedOver).toBeUndefined();
+});
+
+test("an agent whose session is not open yet is not released, though a start before it left an entry", async () => {
+	const acp = await harness({ fake: { FAKE_ACP_NEW_MS: "200" } });
+	await acp.start();
+	expect(await acp.port.releasable("card-a")).toMatchObject({ refusal: "not_at_rest", reason: /no session yet/ });
+	await acp.until("idle");
+	await acp.port.stop("card-a");
+
+	const from = acp.events.length;
+	await acp.start();
+	expect(await acp.port.releasable("card-a")).toMatchObject({ refusal: "not_at_rest", reason: /no session yet/ });
+	await acp.until("idle", from);
+});
+
+test("a prompt under way as the agent is released opens no turn on the session being closed", async () => {
+	const acp = await harness();
+	await acp.start();
+	await acp.until("idle");
+	const from = acp.events.length;
+	await acp.port.prompt("card-a", "first");
+	await acp.until("done", from);
+
+	const prompted = acp.port.prompt("card-a", "second");
+	const released = acp.port.release("card-a");
+
+	await expect(prompted).rejects.toThrow(PromptRefused);
+	await released;
+	expect(await acp.port.readResult("card-a")).toMatchObject({ text: "echo: first" });
+});
+
+test("a mark that does not reach the file refuses the release: the agent stays, its process running, and its entry unmarked", async () => {
+	const acp = await harness();
+	await acp.start();
+	await acp.until("idle");
+	let from = acp.events.length;
+	await acp.port.prompt("card-a", "the word is KIWI");
+	await acp.until("done", from);
+	const [pid] = (await readFile(join(acp.cwd, "..", `pids-${acp.instance}`), "utf8")).trim().split("\n");
+	// A directory where the write puts its temp file, which fails whoever the tests run as.
+	await mkdir(`${acp.sessionsFile}.tmp`);
+
+	expect(await acp.port.release("card-a")).toEqual({
+		refusal: "cannot_resume",
+		reason: expect.stringMatching(/^card-a stays on ACP: .*could not be recorded in .*acp-sessions\.json: /),
+	});
+
+	expect(() => process.kill(Number(pid?.split(" ")[1]), 0)).not.toThrow();
+	expect(await readFile(join(acp.cwd, "..", "projects", "closed"), "utf8").catch(() => "")).toBe("");
+	expect(JSON.parse(await readFile(acp.sessionsFile, "utf8"))["card-a"].handedOver).toBeUndefined();
+	expect(await acp.port.released()).toEqual([]);
+	expect((await acp.port.list()).map(({ name }) => name)).toEqual(["card-a"]);
+	from = acp.events.length;
+	await acp.port.prompt("card-a", "RECALL");
+	await acp.until("done", from);
+	expect((await acp.port.readResult("card-a"))?.text).toBe("recall: the word is KIWI");
+
+	// Once the file takes writes again, the same agent goes.
+	await rmdir(`${acp.sessionsFile}.tmp`);
+	expect(await acp.port.release("card-a")).toMatchObject({ name: "card-a" });
+	expect(JSON.parse(await readFile(acp.sessionsFile, "utf8"))["card-a"].handedOver).toBe(true);
+});
+
+test("a mark that does not reach the file leaves a dormant agent dormant, and its next prompt wakes it", async () => {
+	const first = await harness();
+	await first.start();
+	await first.until("idle");
+	await first.port.prompt("card-a", "the word is KIWI");
+	await first.until("done");
+	await first.end();
+	const acp = await harness({ cwd: first.cwd });
+	expect(await acp.port.dormant()).toEqual(["card-a"]);
+	await mkdir(`${acp.sessionsFile}.tmp`);
+
+	expect(await acp.port.release("card-a")).toMatchObject({ refusal: "cannot_resume" });
+
+	expect(await acp.port.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	expect(await acp.port.released()).toEqual([]);
+	const from = acp.events.length;
+	await acp.port.prompt("card-a", "RECALL");
+	await acp.until("done", from);
+	expect((await acp.port.readResult("card-a"))?.text).toBe("recall: the word is KIWI");
+	await rmdir(`${acp.sessionsFile}.tmp`);
+});
+
+test("any other write of the sessions file that fails is logged, and the agent goes on", async () => {
+	const acp = await harness();
+	await mkdir(`${acp.sessionsFile}.tmp`);
+	await acp.start();
+	await acp.until("idle");
+
+	expect(acp.errors.map((error) => error.message)).toEqual([expect.stringContaining("acp sessions file")]);
+	const from = acp.events.length;
+	await acp.port.prompt("card-a", "hello");
+	await acp.until("done", from);
+	await rmdir(`${acp.sessionsFile}.tmp`);
+});
+
+test("a process that lives through the end of its session and SIGTERM is killed before release returns", async () => {
+	const acp = await harness({ fake: { FAKE_ACP_IGNORE_TERM: "1" }, closeMs: 100 });
+	await acp.start();
+	await acp.until("idle");
+	const from = acp.events.length;
+	await acp.port.prompt("card-a", "hello");
+	await acp.until("done", from);
+	const line = (await readFile(join(acp.cwd, "..", `pids-${acp.instance}`), "utf8")).trim();
+	const pid = Number(line.split(" ")[1]);
+	const living = () => {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+
+	try {
+		expect(await acp.port.release("card-a")).toMatchObject({ name: "card-a" });
+		expect(living()).toBe(false);
+	} finally {
+		if (living()) process.kill(pid, "SIGKILL");
+	}
+});
+
+test("a dormant agent waking for a prompt is not released, and the prompt goes on over ACP", async () => {
+	const first = await harness();
+	await first.start();
+	await first.until("idle");
+	await first.port.prompt("card-a", "the word is KIWI");
+	await first.until("done");
+	await first.end();
+	const acp = await harness({ cwd: first.cwd, fake: { FAKE_ACP_LOAD_MS: "300" } });
+	await acp.port.dormant();
+
+	const prompting = acp.port.prompt("card-a", "RECALL");
+	await sleep(50);
+
+	const refusal = { refusal: "not_at_rest", reason: "card-a is waking for a prompt" };
+	expect(await acp.port.releasable("card-a")).toEqual(refusal);
+	expect(await acp.port.release("card-a")).toEqual(refusal);
+	expect(await acp.port.released()).toEqual([]);
+
+	await prompting;
+	await acp.until("done");
+	expect((await acp.port.readResult("card-a"))?.text).toBe("recall: the word is KIWI");
+	expect(JSON.parse(await readFile(acp.sessionsFile, "utf8"))["card-a"].handedOver).toBeUndefined();
+});
+
+test("reinstate takes a released agent back: dormant, its mark off, and the next prompt goes on in its session", async () => {
+	const acp = await harness();
+	await acp.start();
+	await acp.until("idle");
+	let from = acp.events.length;
+	await acp.port.prompt("card-a", "the word is KIWI");
+	await acp.until("done", from);
+	await acp.port.release("card-a");
+
+	await acp.port.reinstate("card-a");
+
+	expect(await acp.port.released()).toEqual([]);
+	expect(JSON.parse(await readFile(acp.sessionsFile, "utf8"))["card-a"].handedOver).toBeUndefined();
+	expect(await acp.port.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	from = acp.events.length;
+	await acp.port.prompt("card-a", "RECALL");
+	await acp.until("done", from);
+	expect((await acp.port.readResult("card-a"))?.text).toBe("recall: the word is KIWI");
 });

@@ -39,6 +39,7 @@ import {
 	type ResumeRequest,
 	type StartRequest,
 } from "../../ports/agent.ts";
+import type { HeldSession, Refused, SessionGiver } from "../../ports/handover.ts";
 import { drawTranscript } from "./screen.ts";
 
 export interface AcpAgentPortOptions {
@@ -125,6 +126,8 @@ type Session = {
 	readonly cwd: string;
 	/** soma stopped the agent, so a restart lists it no more; a resume starts it again and takes this off. */
 	readonly stopped?: true;
+	/** The session went on another agent side: nothing here lists, wakes, resumes or starts this name again. */
+	readonly handedOver?: true;
 };
 
 /**
@@ -141,10 +144,11 @@ type Dormant = {
 };
 
 /** The ACP AgentPort, and the agents it found dormant as it was made. */
-export type AcpAgentPort = AgentPort & {
-	/** The names of the agents the port listed dormant as it was made, from the soma before it; empty when none. */
-	dormant(): Promise<readonly string[]>;
-};
+export type AcpAgentPort = AgentPort &
+	SessionGiver & {
+		/** The names of the agents the port listed dormant as it was made, from the soma before it; empty when none. */
+		dormant(): Promise<readonly string[]>;
+	};
 
 const AUTH_REQUIRED = RequestError.authRequired().code;
 const STDERR_BYTES = 4096;
@@ -267,19 +271,25 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 
 	// Each write reads the file anew, one at a time, so two sessions opening at once both land.
 	let recording = Promise.resolve();
+	function write(file: string, name: string, session: Session): Promise<void> {
+		const written = recording.then(async () => {
+			const kept = await readSessions(file);
+			await writeFile(`${file}.tmp`, `${JSON.stringify({ ...kept, [name]: session }, null, "\t")}\n`, {
+				mode: 0o600,
+			});
+			await rename(`${file}.tmp`, file);
+		});
+		recording = written.catch(() => {});
+		return written;
+	}
+
+	/** As `write`, and a write that fails is logged: the agent goes on, and only a restart would miss the entry. */
 	function record(name: string, session: Session): Promise<void> {
 		const file = options.sessionsFile;
 		if (file === undefined) return Promise.resolve();
-		recording = recording
-			.then(async () => {
-				const kept = await readSessions(file);
-				await writeFile(`${file}.tmp`, `${JSON.stringify({ ...kept, [name]: session }, null, "\t")}\n`, {
-					mode: 0o600,
-				});
-				await rename(`${file}.tmp`, file);
-			})
-			.catch((error: Error) => onError(new Error(`acp sessions file ${file}: ${error.message}`)));
-		return recording;
+		return write(file, name, session).catch((error: Error) =>
+			onError(new Error(`acp sessions file ${file}: ${error.message}`)),
+		);
 	}
 
 	function launch(request: StartRequest, cwd: string): Agent {
@@ -412,6 +422,8 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 	/** Why the agent cannot take a prompt now; undefined when it can. */
 	function busy(agent: Agent): string | undefined {
 		if (agent.exited) return "has exited: a prompt would go nowhere";
+		// A prompt that was reading the transcript as the stop came would open a turn on a session being closed.
+		if (agent.stopped) return "was stopped: a prompt would go nowhere";
 		if (agent.session === undefined) return "has no session yet: a prompt goes once it reports idle";
 		if (agent.turning) return `is ${agent.seen?.status.state ?? "working"}: a prompt goes only between turns`;
 		return undefined;
@@ -455,6 +467,56 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		const last = agent.stderr.trimEnd().split("\n").at(-1);
 		return last ? `: ${last}` : "";
 	};
+
+	/** Sends session/close, waiting closeMs at most, and ends the process. */
+	async function close(agent: Agent): Promise<void> {
+		if (agent.exited) return;
+		if (agent.session !== undefined) {
+			await agent.connection.agent
+				.request(
+					methods.agent.session.close,
+					{ sessionId: agent.session },
+					{ cancellationSignal: AbortSignal.timeout(closeMs), stopWaitingOnCancel: true },
+				)
+				.catch((error: Error) => onError(new Error(`acp agent ${agent.name}: session/close: ${error.message}`)));
+		}
+		agent.child.kill();
+	}
+
+	const heldOf = (name: string, session: Session): HeldSession => ({
+		name,
+		card: session.card,
+		sessionId: session.sessionId,
+		claudeSession: session.acpSessionId,
+		cwd: session.cwd,
+	});
+
+	/** What a release of the agent would give up now; a refusal, with why, unless it is at rest with a session open. */
+	function holdOf(name: string): HeldSession | Refused {
+		const session = sessions.get(name);
+		const refused = (refusal: Refused["refusal"], reason: string) => ({ refusal, reason: `${name} ${reason}` });
+		if (session?.handedOver) return refused("not_acp", "was handed over: it no longer runs over ACP");
+		if (resuming.has(name)) return refused("not_at_rest", "is being started again for a deferred instruction");
+		const asleep = dormant.get(name);
+		if (asleep?.waking !== undefined) return refused("not_at_rest", "is waking for a prompt");
+		const agent = agents.get(name);
+		if (asleep === undefined && agent === undefined) {
+			return session === undefined
+				? refused("not_acp", "is no agent acp holds")
+				: refused("not_at_rest", "is not running: a job soma stopped starts again with its deferred instruction");
+		}
+		if (agent !== undefined) {
+			const state = agent.seen?.status.state;
+			if (agent.turning || state === "working" || state === "blocked") {
+				return refused("not_at_rest", `is ${state ?? "working"}: only a job at rest is handed over`);
+			}
+		}
+		// A session/new still under way has recorded nothing yet, or only the session of a start before this one.
+		if (session === undefined || (agent !== undefined && agent.session === undefined)) {
+			return refused("not_at_rest", "has no session yet");
+		}
+		return heldOf(name, session);
+	}
 
 	/** The agents that hold a process, or are getting one: what the hangar cap counts. */
 	const running = () =>
@@ -571,7 +633,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		try {
 			const all = Object.entries(await readSessions(file));
 			for (const [name, session] of all) sessions.set(name, session);
-			const kept = all.filter(([, s]) => s.stopped !== true);
+			const kept = all.filter(([, s]) => s.stopped !== true && s.handedOver !== true);
 			const ran = await Promise.all(kept.map(async ([, session]) => (await transcriptOf(session)) !== undefined));
 			const found: string[] = [];
 			for (const [index, [name, session]] of kept.entries()) {
@@ -608,6 +670,8 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			// Its session goes on with a reply; a new one would take its place in the sessions file.
 			if (dormant.has(request.name)) throw new Error(`acp holds a dormant agent named ${request.name}`);
 			if (resuming.has(request.name)) throw new Error(`acp is starting an agent named ${request.name} again`);
+			// A new session would take its entry's place, and the other side's window would still run the old one.
+			if (sessions.get(request.name)?.handedOver) throw new Error(`acp handed over the agent named ${request.name}`);
 			const count = running();
 			if (count >= cap) throw new Error(`hangar is full: ${count} of ${cap} agents running`);
 			const path = await openWorktree(git, request.cwd, request.card);
@@ -659,7 +723,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 				throw new Error(`acp already lists an agent named ${name}`);
 			}
 			const found = sessions.get(name);
-			if (found === undefined || found.sessionId !== sessionId) {
+			if (found === undefined || found.sessionId !== sessionId || found.handedOver) {
 				throw new NotImplemented(`acp holds no session ${sessionId} of agent ${name} to start again`);
 			}
 			const { stopped: _resumed, ...session } = found;
@@ -822,17 +886,74 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			clearTimeout(target.recheck);
 			const session = sessions.get(agent);
 			if (session !== undefined) await record(agent, { ...session, stopped: true });
-			if (target.exited) return;
-			if (target.session !== undefined) {
-				await target.connection.agent
-					.request(
-						methods.agent.session.close,
-						{ sessionId: target.session },
-						{ cancellationSignal: AbortSignal.timeout(closeMs), stopWaitingOnCancel: true },
-					)
-					.catch((error: Error) => onError(new Error(`acp agent ${agent}: session/close: ${error.message}`)));
+			await close(target);
+		},
+
+		async releasable(agent: string): Promise<HeldSession | Refused> {
+			await loading;
+			return holdOf(agent);
+		},
+
+		/**
+		 * Records the agent handed over, so no restart lists it again, then closes the session and ends the process, and
+		 * returns only once the process is gone: the side that takes the session must not write its transcript beside it.
+		 * A dormant agent has none to end. Refuses, with nothing done, what `releasable` would refuse now: the check and
+		 * the taking of the agent off this side are one synchronous step, so no turn can begin between them. A mark that
+		 * does not reach the file puts the agent back and refuses too, since after a restart a prompt would wake it here
+		 * beside the other side's claude, two writers on one transcript.
+		 */
+		async release(agent: string): Promise<HeldSession | Refused> {
+			await loading;
+			const held = holdOf(agent);
+			if ("refusal" in held) return held;
+			const before = sessions.get(agent) as Session;
+			const session = { ...before, handedOver: true as const };
+			const asleep = dormant.get(agent);
+			const target = agents.get(agent);
+			sessions.set(agent, session);
+			dormant.delete(agent);
+			agents.delete(agent);
+			if (target !== undefined) target.stopped = true;
+			const file = options.sessionsFile;
+			try {
+				if (file !== undefined) await write(file, agent, session);
+			} catch (error) {
+				sessions.set(agent, before);
+				if (target !== undefined && !target.exited) {
+					target.stopped = false;
+					agents.set(agent, target);
+				} else dormant.set(agent, asleep ?? { name: agent, session: before });
+				return {
+					refusal: "cannot_resume",
+					reason: `${agent} stays on ACP: its handover could not be recorded in ${file}: ${(error as Error).message}`,
+				};
 			}
-			target.child.kill();
+			if (target === undefined) return held;
+			clearTimeout(target.recheck);
+			await close(target);
+			const exit = () => Promise.race([once(target.child, "exit"), sleep(closeMs)]);
+			if (!target.exited) await exit();
+			if (!target.exited) {
+				target.child.kill("SIGKILL");
+				await exit();
+			}
+			return held;
+		},
+
+		/** The agent is listed dormant again, and goes on with its session at its next prompt, as after a restart. */
+		async reinstate(agent: string): Promise<void> {
+			await loading;
+			const found = sessions.get(agent);
+			if (!found?.handedOver) return;
+			const { handedOver: _reinstated, ...session } = found;
+			sessions.set(agent, session);
+			dormant.set(agent, { name: agent, session });
+			await record(agent, session);
+		},
+
+		async released(): Promise<readonly HeldSession[]> {
+			await loading;
+			return [...sessions].flatMap(([name, session]) => (session.handedOver ? [heldOf(name, session)] : []));
 		},
 
 		// Every agent is a process soma holds; there is no pane of anyone else's.

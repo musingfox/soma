@@ -137,6 +137,8 @@ type Session = {
 	readonly hangar?: string;
 	/** When the mark was written or the take failed, in milliseconds since the epoch. */
 	readonly handingOverAt?: number;
+	/** The time of the mark `reinstate` took off, written with its removal: what the human is owed a notice of, durably. */
+	readonly givenBack?: number;
 };
 
 const givenUp = (session?: Session) => session?.handedOver === true || session?.handingOver === true;
@@ -914,7 +916,8 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			const held = holdOf(agent);
 			if ("refusal" in held) return held;
 			const before = sessions.get(agent) as Session;
-			const session = { ...before, handingOver: true as const, hangar, handingOverAt: at };
+			const { givenBack: _told, ...unmarked } = before;
+			const session = { ...unmarked, handingOver: true as const, hangar, handingOverAt: at };
 			const asleep = dormant.get(agent);
 			const target = agents.get(agent);
 			sessions.set(agent, session);
@@ -972,7 +975,8 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			await loading;
 			const found = sessions.get(agent);
 			if (!found?.handingOver) return;
-			const { handingOver: _reinstated, hangar: _hangar, handingOverAt: _at, ...session } = found;
+			const { handingOver: _reinstated, hangar: _hangar, handingOverAt: at, ...rest } = found;
+			const session = { ...rest, givenBack: at ?? 0 };
 			sessions.set(agent, session);
 			dormant.set(agent, { name: agent, session });
 			await record(agent, session);
@@ -981,6 +985,11 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		async released(): Promise<readonly HeldSession[]> {
 			await loading;
 			return [...sessions].flatMap(([name, session]) => (session.handedOver ? [heldOf(name, session)] : []));
+		},
+
+		async givenBack() {
+			await loading;
+			return [...sessions].flatMap(([name, { givenBack: at }]) => (at === undefined ? [] : [{ name, at }]));
 		},
 
 		async handingOver(): Promise<readonly HandingOver[]> {

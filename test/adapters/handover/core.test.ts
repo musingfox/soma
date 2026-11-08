@@ -100,13 +100,14 @@ async function core(
 	open.push(harness);
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
-	await reconcileDispatches(root, both.agents, context, await both.agents.dormant());
-	reconciled();
 	const quietOnceClosed = (error: unknown) => {
 		if (open.includes(harness)) throw error;
 	};
-	const offEvents = eventBridge(root, both.agents, context).listen(quietOnceClosed);
 	const offSettled = handoverBridge(root, both.agents, context).listen(quietOnceClosed);
+	await both.agents.heard();
+	await reconcileDispatches(root, both.agents, context, await both.agents.dormant());
+	reconciled();
+	const offEvents = eventBridge(root, both.agents, context).listen(quietOnceClosed);
 	const off = () => {
 		offEvents();
 		offSettled();
@@ -324,10 +325,14 @@ test("a job that is working when the human asks is refused, with no notice, and 
  * A soma that went down with the job's handover in progress: the entry marked and the ACP process gone. `window`: its
  * window opened first.
  */
-async function leftMidHandover(window: boolean, mark: Record<string, unknown> = { handingOver: true }) {
+async function leftMidHandover(
+	window: boolean,
+	mark: Record<string, unknown> = { handingOver: true },
+	{ rested = true }: { rested?: boolean } = {},
+) {
 	const soma = await core();
 	await dispatched(soma);
-	await soma.rest();
+	if (rested) await soma.rest();
 	const entry = await soma.entry();
 	await writeFile(soma.acp.sessionsFile, `${JSON.stringify({ "card-a": { ...entry, ...mark } })}\n`);
 	await soma.end();
@@ -676,6 +681,112 @@ test("a startup look that gives the job back tells once, by the reconcile, and n
 	const notices = await soma.notices();
 	expect(notices).toEqual([expect.stringContaining("agent card-a（卡片 card-a）")]);
 	expect(counted(notices, backOnAcp)).toBe(0);
+	soma.off();
+});
+
+const gone = "不見了";
+const noWindow = "no window of it is open now";
+
+test("a crash between the final mark and the commit, the window closed since: the job is gone, with no claim of a window", async () => {
+	const { cwd, blocks, entry } = await leftMidHandover(false, { handedOver: true });
+
+	const soma = await core({ restartOf: cwd, blocks });
+
+	expect(await soma.notices()).toEqual([expect.stringContaining(gone)]);
+	expect(await soma.agents.list()).toEqual([]);
+	expect((await soma.job())?.sessionId).toBe(entry.acpSessionId);
+	expect((await soma.job())?.status.state).toBe("error");
+
+	const next = await again(soma);
+	await sleep(50);
+	expect(await next.notices()).toEqual([expect.stringContaining(gone)]);
+	next.off();
+});
+
+test("the same for a job done by a real turn, which the reconcile leaves alone: told once, with no claim of a window", async () => {
+	const { cwd, blocks } = await leftMidHandover(false, { handedOver: true }, { rested: false });
+
+	const soma = await core({ restartOf: cwd, blocks });
+
+	expect(await soma.notices()).toEqual([expect.stringContaining(noWindow)]);
+	expect(counted(await soma.notices(), onRex)).toBe(0);
+	expect((await soma.job())?.status.state).toBe("done");
+
+	const next = await again(soma);
+	await sleep(50);
+	expect(await next.notices()).toEqual([expect.stringContaining(noWindow)]);
+	next.off();
+});
+
+test("a later look gives a done job back and soma dies before the commit: the next one tells it, once, across restarts", async () => {
+	const clock = fakeClock();
+	const { soma } = await showGaveUp({ clock });
+	expect((await soma.job())?.status.state).toBe("done");
+	soma.off();
+	clock.advance(60_000);
+	await soma.agents.list();
+	expect((await soma.entry()).handingOver).toBeUndefined();
+	expect(counted(await soma.notices(), backOnAcp)).toBe(0);
+
+	const next = await again(soma, { clock });
+
+	expect(counted(await next.notices(), backOnAcp)).toBe(1);
+	const last = await again(next, { clock });
+	await sleep(50);
+	expect(counted(await last.notices(), backOnAcp)).toBe(1);
+	expect(await last.notices()).toHaveLength(1);
+	last.off();
+});
+
+test("a startup past the grace period gives a done job back: told once, across restarts, and not named as a restart's", async () => {
+	const { cwd, blocks } = await leftMidHandover(false, { handingOver: true }, { rested: false });
+
+	const soma = await core({ restartOf: cwd, blocks });
+
+	expect(await soma.job()).toMatchObject({ status: { state: "done" } });
+	expect(await soma.notices()).toEqual([expect.stringContaining(backOnAcp)]);
+	const next = await again(soma);
+	await sleep(50);
+	expect(await next.notices()).toEqual([expect.stringContaining(backOnAcp)]);
+	next.off();
+});
+
+test("a startup that gives a done job back and dies before anything is committed: the next one tells it, once", async () => {
+	const { cwd, blocks } = await leftMidHandover(false, { handingOver: true }, { rested: false });
+	const between = await sides({ restartOf: cwd, blocks });
+	expect(await between.agents.dormant()).toEqual(["card-a"]);
+	await between.acp.end();
+
+	const soma = await core({ restartOf: cwd, blocks });
+
+	expect(await soma.notices()).toEqual([expect.stringContaining(backOnAcp)]);
+	soma.off();
+});
+
+test("a job told by the restart's notice is not told again as a return, by this restart or the next", async () => {
+	const { cwd, blocks } = await leftMidHandover(false);
+
+	const soma = await core({ restartOf: cwd, blocks });
+
+	expect(counted(await soma.notices(), backOnAcp)).toBe(0);
+	await sleep(50);
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), backOnAcp)).toBe(0);
+	next.off();
+});
+
+test("a job never handed over gets nothing new at a restart, done by a real turn or not", async () => {
+	const first = await core();
+	await dispatched(first);
+	expect((await first.job())?.status.state).toBe("done");
+
+	const soma = await again(first);
+
+	await sleep(50);
+	expect(await soma.notices()).toEqual([]);
+	expect((await soma.job())?.toldBack).toBeUndefined();
+	expect((await soma.entry()).givenBack).toBeUndefined();
 	soma.off();
 });
 

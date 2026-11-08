@@ -119,9 +119,10 @@ const harness = await openHarness(
 );
 const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 harness.resume();
+const offSettled = handoverBridge(root, agents, context).listen((error) => console.error("[soma] handover:", error));
+await agents.heard();
 await reconcileDispatches(root, agents, context, await agents.dormant());
 const offEvents = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
-const offSettled = handoverBridge(root, agents, context).listen((error) => console.error("[soma] handover:", error));
 
 const job = async () => (await harness.snapshot(Dispatches, root.id, context))?.jobs.find((each) => each.card === card);
 const entries = async (kind: string) =>
@@ -155,10 +156,8 @@ if (mode === "first") {
 	throw new Error(`show_job returned, so this soma did not die: ${JSON.stringify(results.at(-1))}`);
 }
 
-// The handover bridge told of the window the startup's look found as it came up, a moment after the reconcile.
-if (scenario === "after") {
-	await until("the notice of the move", 30_000, async () => ((await notices()).length > 0 ? true : undefined));
-}
+// The handover bridge told of the window the startup's look found before the reconcile.
+if (scenario === "after" && (await notices()).length === 0) throw new Error("no notice of the move at startup");
 emit("reconciled", {
 	dormant: await agents.dormant(),
 	listed: await agents.list(),

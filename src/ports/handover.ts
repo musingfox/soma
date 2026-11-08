@@ -34,7 +34,9 @@ export interface AgentHandover {
 
 /**
  * A job on a side no `handOver` answered for. rex: its window is `window` in the session labelled `session`, and it runs
- * the claude session `sessionId`. acp: a look gave it back, and its next prompt goes on in its session.
+ * the claude session `sessionId`. acp: a look gave it back, and its next prompt goes on in its session; `at` names this
+ * return, and `startup` says it was found as this soma started, when the restart's notice names an unfinished job. gone:
+ * it went to rex for good, and no window of it is there now.
  */
 export type Settled =
 	| {
@@ -44,14 +46,17 @@ export type Settled =
 			readonly session: string;
 			readonly sessionId: string;
 	  }
-	| { readonly agent: string; readonly onto: "acp" };
+	| { readonly agent: string; readonly onto: "acp"; readonly at: number; readonly startup: boolean }
+	| { readonly agent: string; readonly onto: "gone"; readonly sessionId: string };
 
 /** Beside AgentHandover: tells whoever keeps the jobs what no `handOver` answered. */
 export interface HandoverSettling {
-	// Each job as a look settles it, and what settled before the listener came, the startup's look included but for a job
-	// `dormant()` names. Every job on rex at startup is said again, since a soma can die between its final mark and the
-	// listener's commit: the listener tells a job from one it has told by the session the job holds.
-	onSettled(listener: (settled: Settled) => void): () => void;
+	// Each job as a look settles it, and what settled before the listener came. Every job on rex at startup and every job
+	// given back and not handed over since is said again, since a soma can die before the listener's commit: the listener
+	// tells a job on rex it has told by the session the job holds, and a return it has told by its `at`.
+	onSettled(listener: (settled: Settled) => void | Promise<void>): () => void;
+	// Once what settled before the listener came has been said and the listener has answered.
+	heard(): Promise<void>;
 }
 
 /** The claude session an agent runs, as the side that holds it recorded it. */
@@ -92,6 +97,9 @@ export interface SessionGiver {
 	reinstate(agent: string): Promise<void>;
 	// Every session this side gave up for good, a soma before this one's too.
 	released(): Promise<readonly HeldSession[]>;
+	// Every session `reinstate` gave back and no handover took since, a soma before this one's too, with the time of the
+	// mark it came off: what the human may still be owed a notice of.
+	givenBack(): Promise<readonly { readonly name: string; readonly at: number }[]>;
 	// Every session whose handover neither `confirm` nor `reinstate` ended, a soma before this one's too.
 	handingOver(): Promise<readonly HandingOver[]>;
 	// The names of the agents this side listed with no process as it was made, from the soma before it.

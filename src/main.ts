@@ -127,12 +127,14 @@ const human = await startCore(
 		...(config.reflection ? [() => reflections.startReflection(root, REFLECTION_PERIOD_MS, context)] : []),
 	],
 );
-await reconcileDispatches(root, agents, context, await dormant());
-reconciled();
-const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
+// Before the reconcile, so that it finds a move a crash left unrecorded recorded, and tells what it tells of the rest.
 const unlistenSettled =
 	side.settling &&
 	handoverBridge(root, side.settling, context).listen((error) => console.error("[soma] handover bridge:", error));
+await side.settling?.heard();
+await reconcileDispatches(root, agents, context, await dormant());
+reconciled();
+const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 // Its first look at the foreign agents is at once, so a prompt that appeared while soma was down is pushed now.
 const unlistenForeign = foreignBridge(root, agents, context).listen((error) =>
 	console.error("[soma] foreign bridge:", error),

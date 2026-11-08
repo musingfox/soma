@@ -170,30 +170,43 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 
 /**
  * What the agent side settled with no `show_job` to record it: a handover cut short, or one whose soma died before its
- * commit. A job on rex takes the session its window runs and the human is told, in one commit, so a job that already
- * holds that session has been told, by `show_job` or by this, in this soma or one before. A job given back to ACP by a
- * later look is told once as it happens; one the startup's look gave back is told by the reconcile.
+ * commit. Listening before the reconcile, as main.ts does, the reconcile finds each move recorded. A job on rex takes the
+ * session its window runs and the human is told, in one commit, so a job that already holds that session has been told,
+ * by `show_job` or by this, in this soma or one before. A job given back is told once, by its return's time, kept with
+ * the job in the commit of the notice: unfinished at a startup, by the restart's notice, which never names a done one. A
+ * job whose window closed before its move was recorded takes the session too, with no claim of a window: one the
+ * reconcile will report gone is told by that, and a done one, which it leaves alone, is told here.
  */
 export function handoverBridge(conversation: Conversation, settling: HandoverSettling, context: Context) {
 	async function apply(settled: Settled): Promise<void> {
 		await conversation.commit(async (tx) => {
 			const doc = await tx.doc(Dispatches, conversation.id);
-			const job = doc.jobs.find((each) => each.agent === settled.agent);
+			const index = doc.jobs.findIndex((each) => each.agent === settled.agent);
+			const job = doc.jobs[index];
 			if (job === undefined) return;
 			const { agent, card } = job;
+			const report = (content: string) => tx.appendEntry(conversation.id, noticeEntry("report", "outcome", content));
 			if (settled.onto === "acp") {
-				await tx.appendEntry(
-					conversation.id,
-					noticeEntry(
-						"report",
-						"outcome",
-						`agent ${agent} (card ${card}) is back on ACP: its handover was cut short and no window of it opened. ` +
-							"A reply goes on in the same session.",
-					),
+				if (job.toldBack === settled.at) return;
+				doc.jobs[index] = { ...job, toldBack: settled.at };
+				if (settled.startup && unfinished(job.status)) return;
+				await report(
+					`agent ${agent} (card ${card}) is back on ACP: its handover was cut short and no window of it opened. ` +
+						"A reply goes on in the same session.",
 				);
 				return;
 			}
 			if (job.sessionId === settled.sessionId) return;
+			if (settled.onto === "gone") {
+				const { launch: _sent, ...rest } = job;
+				doc.jobs[index] = { ...rest, sessionId: settled.sessionId };
+				if (!unfinished(job.status)) {
+					await report(
+						`agent ${agent} (card ${card}) was handed over to rex, and no window of it is open now: it is gone.`,
+					);
+				}
+				return;
+			}
 			await commitMove(tx, conversation.id, { agent, card }, settled, " Its handover was cut short and ended there.");
 		}, context);
 	}
@@ -203,6 +216,7 @@ export function handoverBridge(conversation: Conversation, settling: HandoverSet
 		listen(onError: (error: unknown) => void): () => void {
 			return settling.onSettled((settled) => {
 				queue = queue.then(() => apply(settled)).catch(onError);
+				return queue;
 			});
 		},
 	};

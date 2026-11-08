@@ -78,6 +78,8 @@ test("main.ts builds its dispatch extension from the whole side it opened, as th
 	expect(main).toContain("dispatchOver(side, readCard),");
 	expect(main).not.toContain("dispatchExtension");
 	expect(main).toContain("handoverBridge(root, side.settling, context)");
+	expect(main.indexOf("await side.settling?.heard();")).toBeGreaterThan(main.indexOf("handoverBridge("));
+	expect(main.indexOf("reconcileDispatches(")).toBeGreaterThan(main.indexOf("await side.settling?.heard();"));
 });
 
 test("acp with a hangar named runs its jobs on two sides, and with none handed over asks rex nothing", async () => {

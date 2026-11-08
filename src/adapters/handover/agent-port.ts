@@ -111,29 +111,39 @@ export function createHandoverAgentPort({
 		await from.reinstate(name);
 		undecided.delete(name);
 		onError(new Error(`${name} was left mid-handover and no window of it is open: it is dormant on ACP`));
-		if (started) tell({ agent: name, onto: "acp" });
+		if (started) tell({ agent: name, onto: "acp", at: session.at ?? 0, startup: false });
 		else back.push(name);
 	}
 
-	/** A settled job, its window's place still to be read off rex, which only one on rex needs and only once it is told. */
+	/**
+	 * A settled job, its window's place still to be read off rex, which only one on rex needs and only once it is told.
+	 * `released`: only a final mark says it is there, which holds nothing of a window that closed since.
+	 */
 	type Telling =
-		| { readonly agent: string; readonly onto: "acp" }
-		| Omit<Extract<Settled, { onto: "rex" }>, "window" | "session">;
-	const listeners = new Set<(settled: Settled) => void>();
+		| Extract<Settled, { onto: "acp" }>
+		| {
+				readonly agent: string;
+				readonly onto: "rex";
+				readonly sessionId: string;
+				readonly released?: HeldSession;
+		  };
+	const listeners = new Set<(settled: Settled) => void | Promise<void>>();
 	const unheard: Telling[] = [];
+	/** Throws when rex cannot say whether a released job's window is there: the job is then told by the next soma. */
+	async function settledOf(telling: Telling): Promise<Settled> {
+		if (telling.onto === "acp") return telling;
+		const { agent, sessionId, released } = telling;
+		if (released !== undefined && (await to.holds(released, to.hangar)) !== "window") {
+			return { agent, onto: "gone", sessionId };
+		}
+		return { agent, onto: "rex", sessionId, window: agent, session: await to.label().catch(() => to.hangar) };
+	}
 	async function deliver(telling: Telling): Promise<void> {
-		const settled: Settled =
-			telling.onto === "acp"
-				? telling
-				: {
-						...telling,
-						window: telling.agent,
-						session: await to.label().catch(() => to.hangar),
-					};
-		for (const listener of listeners) listener(settled);
+		const settled = await settledOf(telling);
+		await Promise.all([...listeners].map((listener) => listener(settled)));
 	}
 	function tell(telling: Telling): void {
-		if (listeners.size === 0) unheard.push(telling);
+		if (listeners.size === 0 || !started) unheard.push(telling);
 		else void deliver(telling).catch(onError);
 	}
 
@@ -164,7 +174,7 @@ export function createHandoverAgentPort({
 	const loading = (async () => {
 		for (const session of await from.released()) {
 			moved.set(session.name, session);
-			tell({ agent: session.name, onto: "rex", sessionId: session.claudeSession });
+			tell({ agent: session.name, onto: "rex", sessionId: session.claudeSession, released: session });
 		}
 		for (const session of await from.handingOver()) {
 			// A time ahead of this clock, one set back since it was written, would hold the job for as long, or overflow a timer.
@@ -172,6 +182,7 @@ export function createHandoverAgentPort({
 			undecided.set(session.name, { ...session, ...at, why: "rex" });
 		}
 		await look();
+		for (const { name, at } of await from.givenBack()) tell({ agent: name, onto: "acp", at, startup: true });
 		started = true;
 	})();
 	const side = async (agent: string) => {
@@ -266,6 +277,7 @@ export function createHandoverAgentPort({
 	}
 
 	let queue: Promise<unknown> = Promise.resolve();
+	let flushed: Promise<unknown> = Promise.resolve();
 
 	return {
 		dormant: async () => {
@@ -275,8 +287,12 @@ export function createHandoverAgentPort({
 
 		onSettled(listener) {
 			listeners.add(listener);
-			void loading.then(() => Promise.all(unheard.splice(0).map(deliver))).catch(onError);
+			flushed = loading.then(() => Promise.all(unheard.splice(0).map((telling) => deliver(telling).catch(onError))));
 			return () => listeners.delete(listener);
+		},
+
+		heard: async () => {
+			await flushed;
 		},
 
 		handOver(agent: string): Promise<HandoverOutcome> {

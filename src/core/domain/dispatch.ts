@@ -54,6 +54,8 @@ export type Job = {
 	readonly handedOver?: HandedOver;
 	// Absent for a job with no deferral pending that soma has not stopped.
 	readonly reclaim?: Reclaim;
+	// The time of the handover mark whose return to ACP the human was last told of; a return of that time is not told again.
+	readonly toldBack?: number;
 	readonly decisions: Decision[];
 };
 

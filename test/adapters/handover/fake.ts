@@ -121,6 +121,7 @@ export async function sides(
 				handingOver?: true;
 				hangar?: string;
 				handingOverAt?: number;
+				givenBack?: number;
 			},
 		closed: () => readFile(join(projects, "closed"), "utf8").catch(() => ""),
 		pids: async () =>

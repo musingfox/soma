@@ -105,7 +105,10 @@ export type AgentResult = { readonly id: string; readonly text?: string };
  */
 export class PromptRefused extends Error {}
 
-/** What an adapter throws, having done nothing, for a call it does not implement. */
+/**
+ * What an adapter throws, having done nothing, for a call it does not implement, or for a resume of an agent it can
+ * never start again (no recorded session, nothing to load). The core ends such a deferral gone.
+ */
 export class NotImplemented extends Error {}
 
 export interface AgentPort {

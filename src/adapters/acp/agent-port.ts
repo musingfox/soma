@@ -36,6 +36,7 @@ import {
 	type AnswerOutcome,
 	NotImplemented,
 	PromptRefused,
+	type ResumeRequest,
 	type StartRequest,
 } from "../../ports/agent.ts";
 import { drawTranscript } from "./screen.ts";
@@ -57,7 +58,8 @@ export interface AcpAgentPortOptions {
 	/**
 	 * Where each agent's ACP session id and cwd are kept, and whether soma stopped it. As it is made, the port lists each
 	 * agent it holds that soma did not stop and that ran a prompt as dormant, with no process; the first prompt to one
-	 * starts it in the session it ran, with session/load. Kept nowhere when unset.
+	 * starts it in the session it ran, with session/load, and so does a resume of one soma stopped. Kept nowhere when
+	 * unset, so a resume finds only the agents this port ran.
 	 */
 	readonly sessionsFile?: string;
 	/** How long the agent may take to answer initialize, and a restarted one session/load, before it is given up. */
@@ -121,7 +123,7 @@ type Session = {
 	readonly sessionId: string;
 	readonly acpSessionId: string;
 	readonly cwd: string;
-	/** soma stopped the agent, so a restart does not start it again. */
+	/** soma stopped the agent, so a restart lists it no more; a resume starts it again and takes this off. */
 	readonly stopped?: true;
 };
 
@@ -211,8 +213,8 @@ async function drawTail(path: string): Promise<string> {
  * Runs each card's agent over the Agent Client Protocol: one claude-agent-acp process per job, a child of soma, with
  * one session in the card's `fleet/<card>` worktree. Its permission requests are structured, so `respond` reads no
  * screen; it has no pane, so `readScreen` draws its claude transcript. The agents end with soma; the next soma's port
- * lists each one soma did not stop as dormant, and its first prompt starts it again with session/load (ARCHITECTURE.md
- * "The ACP implementation").
+ * lists each one soma did not stop as dormant, and its first prompt starts it again with session/load; one soma stopped
+ * is started again the same way by `resume` (ARCHITECTURE.md "The ACP implementation").
  */
 export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 	const { command, args } =
@@ -228,8 +230,10 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 
 	const agents = new Map<string, Agent>();
 	const dormant = new Map<string, Dormant>();
-	// The session each agent ran, kept past its stop, so its transcript is still read.
+	// The session each agent ran, kept past its stop, so its transcript is still read and a resume finds it.
 	const sessions = new Map<string, Session>();
+	// The names a resume is starting: not listed until the session is loaded, so a load that fails leaves none.
+	const resuming = new Set<string>();
 	const listeners = new Set<(event: AgentStatusEvent) => void>();
 	let lastSeq = 0;
 	// Microseconds of the adapter's clock, never repeated: the agents live no longer than this process does.
@@ -253,6 +257,14 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		emit(agent, status);
 	}
 
+	const readSessions = async (file: string) =>
+		JSON.parse(
+			await readFile(file, "utf8").catch((error: NodeJS.ErrnoException) => {
+				if (error.code === "ENOENT") return "{}";
+				throw error;
+			}),
+		) as Record<string, Session>;
+
 	// Each write reads the file anew, one at a time, so two sessions opening at once both land.
 	let recording = Promise.resolve();
 	function record(name: string, session: Session): Promise<void> {
@@ -260,11 +272,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		if (file === undefined) return Promise.resolve();
 		recording = recording
 			.then(async () => {
-				const text = await readFile(file, "utf8").catch((error: NodeJS.ErrnoException) => {
-					if (error.code === "ENOENT") return "{}";
-					throw error;
-				});
-				const kept = JSON.parse(text) as Record<string, Session>;
+				const kept = await readSessions(file);
 				await writeFile(`${file}.tmp`, `${JSON.stringify({ ...kept, [name]: session }, null, "\t")}\n`, {
 					mode: 0o600,
 				});
@@ -451,35 +459,21 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 	/** The agents that hold a process, or are getting one: what the hangar cap counts. */
 	const running = () =>
 		[...agents.values()].filter((agent) => !agent.exited).length +
-		[...dormant.values()].filter((asleep) => asleep.waking !== undefined).length;
+		[...dormant.values()].filter((asleep) => asleep.waking !== undefined).length +
+		resuming.size;
 
-	/**
-	 * Gives a dormant agent its process: a new claude-agent-acp, with session/load of its ACP session in its cwd, which
-	 * claude answers from the session's transcript. Held to the hangar cap, as start is. A wake that fails ends the job
-	 * error with the reason and leaves the agent dormant, so a later prompt tries again. A stop that came while no wake
-	 * was under way to wait for took the agent off the dormant ones: the wake then refuses the prompt, and its process,
-	 * if it has one yet, ends.
-	 */
-	async function wake(name: string, asleep: Dormant): Promise<Agent> {
-		const count = running();
-		if (count >= cap)
-			throw new PromptRefused(`acp agent ${name} is dormant: hangar is full: ${count} of ${cap} agents running`);
-		const { session } = asleep;
-		const stopped = () => dormant.get(name) !== asleep;
-		const refusal = () => new PromptRefused(`acp agent ${name} was stopped as it woke`);
-		const failed = (why: string): never => {
-			onError(new Error(`agent ${name} is not woken: ${why}`));
-			emit(asleep, { state: "error", msg: why });
-			throw new PromptRefused(`acp agent ${name} is not woken: ${why}`);
-		};
-		// Spawned in a cwd that is gone, the process fails with an ENOENT that names node, not the cwd.
-		const gone = await access(session.cwd).then(
+	/** Spawned in a cwd that is gone, the process fails with an ENOENT that names node, not the cwd. */
+	const worktreeGone = (session: Session) =>
+		access(session.cwd).then(
 			() => false,
 			() => true,
 		);
-		// A stop that looked before this wake began has taken the agent off the dormant ones by now, so none is spawned.
-		if (stopped()) throw refusal();
-		if (gone) return failed(`its worktree ${session.cwd} is gone`);
+
+	/**
+	 * A new claude-agent-acp in the agent's session: session/load of its ACP session in its cwd, which claude answers from
+	 * the session's transcript. Throws naming why, its process ended, when the session does not load.
+	 */
+	async function load(name: string, session: Session): Promise<Agent> {
 		const agent = launch({ name, card: session.card, cwd: session.cwd, sessionId: session.sessionId }, session.cwd);
 		// Each request has startMs of its own.
 		const cancel = () => ({ cancellationSignal: AbortSignal.timeout(startMs), stopWaitingOnCancel: true });
@@ -505,10 +499,42 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			const exit = agent.exited
 				? `; the process exited with ${agent.child.signalCode ?? `code ${agent.child.exitCode}`}`
 				: "";
-			return failed(
+			throw new Error(
 				`session/load of ACP session ${session.acpSessionId} in ${session.cwd} failed: ` +
 					`${code}${(error as Error).message}${exit}${lastStderr(agent)}`,
 			);
+		}
+		agent.session = session.acpSessionId;
+		return agent;
+	}
+
+	/**
+	 * Gives a dormant agent its process, with session/load. Held to the hangar cap, as start is. A wake that fails ends the
+	 * job error with the reason and leaves the agent dormant, so a later prompt tries again. A stop that came while no
+	 * wake was under way to wait for took the agent off the dormant ones: the wake then refuses the prompt, and its
+	 * process, if it has one yet, ends.
+	 */
+	async function wake(name: string, asleep: Dormant): Promise<Agent> {
+		const count = running();
+		if (count >= cap)
+			throw new PromptRefused(`acp agent ${name} is dormant: hangar is full: ${count} of ${cap} agents running`);
+		const { session } = asleep;
+		const stopped = () => dormant.get(name) !== asleep;
+		const refusal = () => new PromptRefused(`acp agent ${name} was stopped as it woke`);
+		const failed = (why: string): never => {
+			onError(new Error(`agent ${name} is not woken: ${why}`));
+			emit(asleep, { state: "error", msg: why });
+			throw new PromptRefused(`acp agent ${name} is not woken: ${why}`);
+		};
+		const gone = await worktreeGone(session);
+		// A stop that looked before this wake began has taken the agent off the dormant ones by now, so none is spawned.
+		if (stopped()) throw refusal();
+		if (gone) return failed(`its worktree ${session.cwd} is gone`);
+		let agent: Agent;
+		try {
+			agent = await load(name, session);
+		} catch (error) {
+			return failed((error as Error).message);
 		}
 		// A stop that saw the wake waits for it, so this holds unless that changes: only the dormant agent goes live.
 		if (stopped()) {
@@ -518,7 +544,6 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		}
 		// Between the load's answer and here, an exit would have reported to no one.
 		if (agent.exited) return failed(`it exited once its session was loaded${lastStderr(agent)}`);
-		agent.session = session.acpSessionId;
 		dormant.delete(name);
 		agents.set(name, agent);
 		return agent;
@@ -540,15 +565,13 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 	/**
 	 * Every session the file holds that soma did not stop and that ran a prompt, made dormant: listed, with no process.
 	 * One with no transcript never ran its brief, and claude refuses to load it, so it is left out and the
-	 * reconciliation takes its job for gone.
+	 * reconciliation takes its job for gone. One soma stopped is not listed: only a resume starts it again.
 	 */
 	async function findDormant(file: string): Promise<readonly string[]> {
 		try {
-			const text = await readFile(file, "utf8").catch((error: NodeJS.ErrnoException) => {
-				if (error.code === "ENOENT") return "{}";
-				throw error;
-			});
-			const kept = Object.entries(JSON.parse(text) as Record<string, Session>).filter(([, s]) => s.stopped !== true);
+			const all = Object.entries(await readSessions(file));
+			for (const [name, session] of all) sessions.set(name, session);
+			const kept = all.filter(([, s]) => s.stopped !== true);
 			const ran = await Promise.all(kept.map(async ([, session]) => (await transcriptOf(session)) !== undefined));
 			const found: string[] = [];
 			for (const [index, [name, session]] of kept.entries()) {
@@ -561,7 +584,6 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 					);
 					continue;
 				}
-				sessions.set(name, session);
 				dormant.set(name, { name, session });
 				found.push(name);
 			}
@@ -585,6 +607,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			}
 			// Its session goes on with a reply; a new one would take its place in the sessions file.
 			if (dormant.has(request.name)) throw new Error(`acp holds a dormant agent named ${request.name}`);
+			if (resuming.has(request.name)) throw new Error(`acp is starting an agent named ${request.name} again`);
 			const count = running();
 			if (count >= cap) throw new Error(`hangar is full: ${count} of ${cap} agents running`);
 			const path = await openWorktree(git, request.cwd, request.card);
@@ -597,7 +620,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			// claude names the transcript's directory after the cwd's realpath, which a later session/load must match.
 			const cwd = await realpath(path);
 			// Checked again: another start of the same name may have got here while git ran.
-			if (agents.get(request.name)?.exited === false || dormant.has(request.name)) {
+			if (agents.get(request.name)?.exited === false || dormant.has(request.name) || resuming.has(request.name)) {
 				throw new Error(`acp already runs an agent named ${request.name}`);
 			}
 			const agent = launch(request, cwd);
@@ -620,8 +643,45 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			void open(agent);
 		},
 
-		// Resuming a stopped agent over session/load is a later milestone (card acp-agent-adapter).
-		resume: () => Promise.reject(new NotImplemented("acp AgentPort: resume is not implemented")),
+		/**
+		 * Starts an agent soma stopped again in its recorded session, with session/load, and takes the stopped mark off.
+		 * Not held to the cap: a due deferred instruction outranks it (ARCHITECTURE.md "Agent-deferred instructions"). It
+		 * is listed idle, with no status reported: the deferral's listing is what looks, and an idle reported to the core
+		 * could send a brief it still holds or record a turn. Refuses a name already listed, or a resume already under way.
+		 * An agent with no session of this id recorded, or no transcript of it, cannot be resumed: claude refuses to load
+		 * such a session, so NotImplemented ends the deferral `gone`. One whose worktree is gone or whose session does not
+		 * load throws what happened, and stays stopped.
+		 */
+		async resume(request: ResumeRequest): Promise<void> {
+			await loading;
+			const { name, sessionId } = request;
+			if (agents.has(name) || dormant.has(name) || resuming.has(name)) {
+				throw new Error(`acp already lists an agent named ${name}`);
+			}
+			const found = sessions.get(name);
+			if (found === undefined || found.sessionId !== sessionId) {
+				throw new NotImplemented(`acp holds no session ${sessionId} of agent ${name} to start again`);
+			}
+			const { stopped: _resumed, ...session } = found;
+			resuming.add(name);
+			try {
+				if ((await transcriptOf(session)) === undefined) {
+					throw new NotImplemented(
+						`ACP session ${session.acpSessionId} of agent ${name} has no transcript, so it never ran a prompt`,
+					);
+				}
+				if (await worktreeGone(session)) throw new Error(`the worktree ${session.cwd} of agent ${name} is gone`);
+				const agent = await load(name, session);
+				// Between the load's answer and here, an exit would have reported to no one.
+				if (agent.exited) throw new Error(`agent ${name} exited once its session was loaded${lastStderr(agent)}`);
+				agent.seen = { status: { state: "idle" }, seq: nextSeq() };
+				sessions.set(name, session);
+				agents.set(name, agent);
+				await record(name, session);
+			} finally {
+				resuming.delete(name);
+			}
+		},
 
 		/** Every agent, a dormant one with no status: no turn of its runs, and what ran last is the core's to know. */
 		async list(): Promise<readonly AgentListing[]> {
@@ -744,7 +804,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 
 		/**
 		 * Records that soma stopped the agent, so no restart lists it again, then closes the session and ends the process,
-		 * which a dormant agent has none of; what session/load needs stays recorded.
+		 * which a dormant agent has none of; what session/load needs stays recorded, for a resume.
 		 */
 		async stop(agent: string): Promise<void> {
 			await loading;

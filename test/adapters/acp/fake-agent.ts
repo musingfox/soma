@@ -13,6 +13,7 @@
 //   BULKY  writes a 600 KiB record that is no part of the conversation, as claude's API request records are
 //   RECALL replies with every earlier prompt of the session, the ones session/load read back included
 //   HANG   never ends the turn
+//   SLOW   echoes 500 ms later, a turn long enough for a test to act while it runs
 //   anything else is echoed.
 // session/close appends the session's id to $FAKE_ACP_PROJECTS/closed. session/load reads the session's transcript
 // back, as claude-agent-acp does, replaying its prompts, and appends "<session id> <cwd>" to $FAKE_ACP_PROJECTS/loaded;
@@ -106,6 +107,7 @@ const app = agent({ name: "fake-acp" })
 		sessions.get(sessionId)?.prompts.push(text);
 		write(sessionId, "user", text);
 		if (text.includes("HANG")) await new Promise(() => {});
+		if (text.includes("SLOW")) await sleep(500);
 		if (text.includes("RECALL")) {
 			reply(sessionId, `recall: ${earlier.join(" | ")}`);
 			return { stopReason: "end_turn" };

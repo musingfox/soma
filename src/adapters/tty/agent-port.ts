@@ -336,7 +336,7 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 			agents.set(request.name, launch(request, path));
 		},
 
-		// Only rex resumes an agent for now (ARCHITECTURE.md "Agent-deferred instructions").
+		// Only rex and ACP resume an agent for now (ARCHITECTURE.md "Agent-deferred instructions").
 		resume: () => Promise.reject(new NotImplemented("tty AgentPort: resume is not implemented")),
 
 		async list(): Promise<readonly AgentListing[]> {

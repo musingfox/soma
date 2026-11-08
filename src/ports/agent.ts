@@ -85,7 +85,8 @@ export interface Answer {
 /**
  * not_blocked: the agent no longer waits on anything. stale: the prompt on screen is not the one answered.
  * unknown_option: the prompt offers no such option. auth: credentials are the human's to give.
- * unreadable: nothing on screen could be parsed into options.
+ * unreadable: nothing on screen could be parsed into options, or the cursor would not hold on the one chosen. No choice
+ * was made, though an arrow may have been pressed; the same answer may be tried again from a fresh read.
  */
 export type AnswerRefusal = "not_blocked" | "stale" | "unknown_option" | "auth" | "unreadable";
 

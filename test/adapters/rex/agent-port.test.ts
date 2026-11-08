@@ -1027,6 +1027,89 @@ test("respond answers the trust dialog that has no record, travelling from the c
 	]);
 });
 
+describe("an answer that needs an arrow", () => {
+	const pressedOf = (fake: ReturnType<typeof rex>) =>
+		keys(fake).flatMap(({ key, action }) => (action === "press" ? [key] : []));
+	const answerYes = { option: "2", fingerprint: fingerprintOf(TRUST) };
+	const dialog = (): Block => ({ name: "card-a", block: "block:a", argv0: "claude", records: [], screen: TRUST });
+	const answering = (fake: ReturnType<typeof rex>) =>
+		createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, keyGapMs: 0 });
+	const onYes = (block: Block) => /❯ Yes, I trust this folder/.test(block.screen ?? "");
+
+	test("the arrow the pane drops gets no Enter, and the next answer travels from a fresh read", async () => {
+		const block = dialog();
+		const fake = rex([block]);
+		let dropped = false;
+		let enteredOn: boolean | undefined;
+		fake.replace("block.event", (payload) => {
+			const { key, action } = (payload.event as { payload: { key: string; action: string } }).payload;
+			if (key === "arrow_down" && !dropped) {
+				if (action === "release") dropped = true;
+				return {};
+			}
+			if (key === "enter" && action === "press") enteredOn = onYes(block);
+			return fake.original("block.event")(payload);
+		});
+		const port = answering(fake);
+
+		expect(await port.respond("card-a", answerYes)).toEqual({ sent: false, refusal: "unreadable" });
+		expect(pressedOf(fake)).toEqual(["arrow_down"]);
+
+		expect(await port.respond("card-a", answerYes)).toEqual({ sent: true });
+		expect(pressedOf(fake)).toEqual(["arrow_down", "arrow_down", "enter"]);
+		expect(enteredOn).toBe(true);
+	});
+
+	test("a screen that never shows the cursor on the option gets no Enter, after a bounded number of reads", async () => {
+		const fake = rex([dialog()]);
+		fake.replace("block.event", () => ({}));
+
+		expect(await answering(fake).respond("card-a", answerYes)).toEqual({ sent: false, refusal: "unreadable" });
+
+		expect(pressedOf(fake)).toEqual(["arrow_down"]);
+		expect(fake.methods().filter((method) => method.endsWith(".format")).length).toBeLessThanOrEqual(11);
+	});
+
+	test("a cursor seen on the option and then put back gets no Enter", async () => {
+		const block = dialog();
+		const fake = rex([block]);
+		const format = "com.superlogical.terminal.format";
+		fake.replace(format, (payload) => {
+			const read = fake.original(format)(payload);
+			// Claude Code puts the cursor back as it redraws a dialog it has just drawn.
+			block.screen = TRUST;
+			return read;
+		});
+
+		expect(await answering(fake).respond("card-a", answerYes)).toEqual({ sent: false, refusal: "unreadable" });
+
+		expect(pressedOf(fake)).toEqual(["arrow_down"]);
+	});
+
+	test("another prompt drawn while the cursor is awaited is stale, and gets no Enter", async () => {
+		const block = dialog();
+		const fake = rex([block]);
+		fake.replace("block.event", () => {
+			block.screen = BASH;
+			return {};
+		});
+
+		expect(await answering(fake).respond("card-a", answerYes)).toEqual({ sent: false, refusal: "stale" });
+
+		expect(pressedOf(fake)).toEqual(["arrow_down"]);
+	});
+
+	test("an arrow travelling up gets its Enter once the cursor is on the option", async () => {
+		const block = { ...dialog(), screen: TRUST.replace("❯ No, exit", "  No, exit").replace("  Yes, I", "❯ Yes, I") };
+		const fake = rex([block]);
+
+		expect(await answering(fake).respond("card-a", { ...answerYes, option: "1" })).toEqual({ sent: true });
+
+		expect(pressedOf(fake)).toEqual(["arrow_up", "enter"]);
+		expect(block.screen).toMatch(/❯ No, exit/);
+	});
+});
+
 test("respond reads only the tail of a scrollback too long for one reply", async () => {
 	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude", records: blocked }]);
 	const original = fake.client.call.bind(fake.client);
@@ -1576,17 +1659,71 @@ describe("taking over a session another side ran", () => {
 		const { projectsDir, session } = held();
 		const { fake, blocks, created } = port(projectsDir, { records: [], screen: TRUST_SCREEN });
 		const pressed: string[] = [];
-		fake.replace("block.event", ({ event }) => {
-			const { key, action } = (event as { payload: { key: string; action: string } }).payload;
+		fake.replace("block.event", (payload) => {
+			const { key, action } = (payload.event as { payload: { key: string; action: string } }).payload;
 			if (action === "press") pressed.push(key);
 			// The dialog stays drawn a while after the Enter that answered it, and then claude reports.
 			if (action === "press" && key === "enter") setTimeout(() => (blocks[0] as Block).records?.push(idle), 40);
-			return {};
+			return fake.original("block.event")(payload);
 		});
 
 		expect(await created.take(session)).toMatchObject({ ready: true });
 
 		expect(pressed).toEqual(["arrow_down", "enter"]);
+		rmSync(projectsDir, { recursive: true, force: true });
+	});
+
+	/** A window on the dialog, where Enter takes the option under the cursor as claude does: a yes reports, a no exits. */
+	function onDialog(projectsDir: string, oddly: (key: string, action: string, block: Block) => boolean) {
+		const opening = port(projectsDir, { records: [], screen: TRUST_SCREEN });
+		const pressed: string[] = [];
+		opening.fake.replace("block.event", (payload) => {
+			const { key, action } = (payload.event as { payload: { key: string; action: string } }).payload;
+			const block = opening.blocks[0] as Block;
+			if (action === "press") pressed.push(key);
+			if (oddly(key, action, block)) return {};
+			if (action === "press" && key === "enter") {
+				if (/❯ Yes/.test(block.screen ?? "")) setTimeout(() => block.records?.push(idle), 5);
+				else block.argv0 = "-fish";
+			}
+			return opening.fake.original("block.event")(payload);
+		});
+		return { ...opening, pressed };
+	}
+
+	test("take answers again when the dialog dropped its first arrow, and says yes", async () => {
+		const { projectsDir, session } = held();
+		let dropped = false;
+		const { created, pressed } = onDialog(projectsDir, (key, action) => {
+			if (key !== "arrow_down" || dropped) return false;
+			dropped = action === "release";
+			return true;
+		});
+
+		expect(await created.take(session)).toMatchObject({ ready: true });
+
+		expect(pressed).toEqual(["arrow_down", "arrow_down", "enter"]);
+		rmSync(projectsDir, { recursive: true, force: true });
+	});
+
+	test("take answers again when the dialog redrew and put the cursor back, and says yes", async () => {
+		const { projectsDir, session } = held();
+		const { fake, blocks, created, pressed } = onDialog(projectsDir, () => false);
+		const format = "com.superlogical.terminal.format";
+		let undone = false;
+		fake.replace(format, (payload) => {
+			const read = fake.original(format)(payload);
+			const block = blocks[0] as Block;
+			if (!undone && /❯ Yes/.test(block.screen ?? "")) {
+				undone = true;
+				block.screen = TRUST_SCREEN;
+			}
+			return read;
+		});
+
+		expect(await created.take(session)).toMatchObject({ ready: true });
+
+		expect(pressed).toEqual(["arrow_down", "arrow_down", "enter"]);
 		rmSync(projectsDir, { recursive: true, force: true });
 	});
 

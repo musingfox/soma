@@ -26,6 +26,7 @@ import {
 	type AgentStatusEvent,
 	type Answer,
 	type AnswerOutcome,
+	type AnswerRefusal,
 	type BlockedKind,
 	type ForeignAgent,
 	type ForeignStatusEvent,
@@ -70,7 +71,7 @@ export interface RexAgentPortOptions {
 	readonly git?: Git;
 	/** How long a sent prompt may take to turn the agent working before `\r` is sent once more. */
 	readonly confirmMs?: number;
-	/** Pause between the keys of one answer, so claude reads an arrow and the Enter after it as two keys. */
+	/** Pause between the keys of one answer, and between the reads that look for the cursor its arrows moved. */
 	readonly keyGapMs?: number;
 	/** How long claude may be in the foreground without a record before its screen is read for the trust dialog. */
 	readonly trustMs?: number;
@@ -155,6 +156,8 @@ const isRoot = (record: StatusRecord) => record.id === undefined || record.id ==
 const SCREEN_BYTES = 65_536;
 // Reads of a blocked record's screen, redrawMs apart, before it is taken not to parse.
 const BLOCKED_READS = 3;
+// Reads of a screen, keyGapMs apart, for the cursor an answer's arrows moved, before the answer is given up.
+const CURSOR_READS = 10;
 
 // rex's key event is client.key's `key` object, as a keyboard reports it; block.event takes it under type `key`.
 const NAMED_KEYS: Record<string, { key: string; text: string }> = {
@@ -637,9 +640,35 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	}
 
 	/**
+	 * Whether the prompt `fingerprint` names shows its cursor on option `index`, on two reads running: undefined when it
+	 * does, else the refusal. An arrow on screen is no promise. Claude Code 2.1.319 draws its trust dialog, then about
+	 * 140 ms later puts the cursor back on the first option, so one read could see an arrow that is about to be undone.
+	 */
+	async function cursorHolds(
+		session: string,
+		blockId: string,
+		fingerprint: string,
+		index: number,
+	): Promise<AnswerRefusal | undefined> {
+		let held = false;
+		for (let read = 0; read < CURSOR_READS; read++) {
+			await new Promise((resolve) => setTimeout(resolve, keyGapMs));
+			const { prompt } = await readScreen(blockId, session);
+			if (prompt !== undefined && prompt.fingerprint !== fingerprint) return "stale";
+			const on = prompt?.selectedIndex === index;
+			if (on && held) return undefined;
+			held = on;
+		}
+		return "unreadable";
+	}
+
+	/**
 	 * Answers the prompt on a block of `session`, as herdr's adapter does: fresh status, fresh screen, then the keys read
 	 * off that screen. An auth prompt is refused whether the record or the screen names it. With `trust`, a block with
 	 * no record is answered when its screen shows claude's trust dialog, the one block claude reports nothing for.
+	 * Enter after arrows goes only once `cursorHolds` says the cursor reached the option; a refusal then leaves the prompt
+	 * unanswered and the cursor wherever it is. Arrows are not pressed again here: claude's list wraps, so one more could
+	 * carry a slow first arrow past the option, and the next answer travels from a fresh read anyway.
 	 */
 	async function answerOn(session: string, blockId: string, answer: Answer, trust: boolean): Promise<AnswerOutcome> {
 		const [{ records }, { foreground }] = await Promise.all([
@@ -661,10 +690,18 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		}
 		const keys = answerKeys(prompt, answer.option)?.map(keyOf);
 		if (keys === undefined || keys.some((key) => key === undefined)) return { sent: false, refusal: "unreadable" };
-		for (const [index, key] of keys.entries()) {
+		const pressKey = (key: (typeof keys)[number]) => press(session, blockId, key as NonNullable<typeof key>);
+		const arrows = keys.slice(0, -1);
+		for (const [index, key] of arrows.entries()) {
 			if (index > 0) await new Promise((resolve) => setTimeout(resolve, keyGapMs));
-			await press(session, blockId, key as NonNullable<typeof key>);
+			await pressKey(key);
 		}
+		if (arrows.length > 0) {
+			const chosen = prompt.options.findIndex((option) => option.id === answer.option);
+			const refusal = await cursorHolds(session, blockId, prompt.fingerprint, chosen);
+			if (refusal !== undefined) return { sent: false, refusal };
+		}
+		await pressKey(keys.at(-1));
 		return { sent: true };
 	}
 
@@ -809,8 +846,9 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	/**
 	 * Waits for claude to report itself up in a window `take` opened: true once the block has a root record, which it
 	 * reports with no dialog in its way, false when takeMs passes first. The CLI asks for workspace trust where ACP never
-	 * does, and has reported nothing while it asks, so a dialog on screen is answered yes, once, with the checks `respond`
-	 * makes: the job has run in this worktree all along, and only the human's asking brought it here.
+	 * does, and has reported nothing while it asks, so a dialog on screen is answered yes, with the checks `respond`
+	 * makes, until an answer is sent: the job has run in this worktree all along, and only the human's asking brought it
+	 * here.
 	 */
 	async function comeUp(blockId: string): Promise<boolean> {
 		let answered = false;

@@ -40,6 +40,22 @@ export type Session = { id: string; label: string; blocks: Block[] };
 export const fixture = (name: string) =>
 	readFileSync(join(import.meta.dirname, "../../agent-cli/permission/fixtures", name), "utf8");
 
+/** `screen` with the cursor of its dialog one option on or back, wrapping as claude's does; as it was if none is drawn. */
+function movedCursor(screen: string, by: 1 | -1): string {
+	const lines = screen.split("\n");
+	const from = lines.findLastIndex((line) => /^\s*❯ /.test(line));
+	if (from === -1) return screen;
+	let first = from;
+	while (lines[first - 1]?.trim()) first -= 1;
+	let last = from;
+	while (lines[last + 1]?.trim()) last += 1;
+	const count = last - first + 1;
+	const to = first + ((from - first + by + count) % count);
+	lines[from] = (lines[from] as string).replace("❯", " ");
+	lines[to] = (lines[to] as string).replace(/^( *) {2}(?=\S)/, "$1❯ ");
+	return lines.join("\n");
+}
+
 /**
  * An in-memory rex: the hangar's windows, each with one block, any other sessions, the clients connected, and every
  * call made on it. `hangar` is the hangar's label. Each reply reads the arrays and blocks as they are then, so a test may change them between calls.
@@ -105,7 +121,16 @@ export function rex(blocks: Block[], others: Session[] = [], clients: Client[] =
 		}),
 		"session.new_window": () => ({ window_id: "window:new", block_ids: ["block:new"], revision: 2 }),
 		"block.close": (payload) => ({ block_id: payload.block_id, revision: 3 }),
-		"block.event": () => ({}),
+		// An arrow moves the cursor drawn on the block's screen, as claude redraws it.
+		"block.event": (payload) => {
+			const found = byId(payload);
+			const { type, payload: key } = payload.event as { type: string; payload: { key?: string; action?: string } };
+			const by = { arrow_down: 1, arrow_up: -1 }[key.key ?? ""] as 1 | -1 | undefined;
+			if (found?.screen !== undefined && type === "key" && key.action === "press" && by !== undefined) {
+				found.screen = movedCursor(found.screen, by);
+			}
+			return {};
+		},
 		"com.superlogical.terminal.write": (payload) => ({
 			bytes_written: String((payload.args as { data: string }).data).length,
 		}),

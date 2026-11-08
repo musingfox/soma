@@ -396,6 +396,24 @@ test("respondForeign presses the option's key on the foreign agent's own block, 
 	expect(pressed(fake)).toEqual(["session:work block:w1 digit_1:press", "session:work block:w1 digit_1:release"]);
 });
 
+test("respondForeign presses no Enter while the foreign agent's screen does not show the cursor on the option", async () => {
+	const screen = fixture("claude-trust-dialog-2.1.302.txt");
+	const records = [{ state: "blocked", kind: "permission", updated_at: AT }];
+	const human = { name: "shell", block: "block:w1", argv0: "claude", records, screen };
+	const fake = rex([], [{ id: "session:work", label: "work", blocks: [human] }]);
+	fake.replace("block.event", () => ({}));
+	const fingerprint = readBlockedScreen(screen).prompt?.fingerprint ?? "";
+
+	const outcome = await port(fake).respondForeign("block:w1", { option: "2", fingerprint });
+
+	expect(outcome).toEqual({ sent: false, refusal: "unreadable" });
+	const pressed = fake.calls
+		.filter((call) => call.method === "block.event")
+		.map((call) => (call.payload.event as { payload: { key: string; action: string } }).payload)
+		.filter(({ action }) => action === "press");
+	expect(pressed.map(({ key }) => key)).toEqual(["arrow_down"]);
+});
+
 test("respondForeign refuses auth whether the record or the screen names it, and any other refusal, pressing nothing", async () => {
 	const cases: [Partial<Block>, string | undefined, string][] = [
 		[{ records: [{ state: "blocked", kind: "auth", updated_at: AT }] }, prompt?.fingerprint, "auth"],

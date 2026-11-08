@@ -115,7 +115,7 @@ const REFUSALS: Record<Extract<HumanAnswerOutcome, { sent: false }>["refusal"], 
 	stale: "提示已經變了",
 	unknown_option: "沒有這個選項",
 	auth: "憑證要你親自處理",
-	unreadable: "畫面讀不出選項",
+	unreadable: "畫面讀不出選項，或游標停不到選項上，可以再按一次",
 	no_job: "派工清單裡沒有這張卡片",
 };
 

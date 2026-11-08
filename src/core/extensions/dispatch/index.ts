@@ -222,7 +222,8 @@ export function dispatchExtension(
 		description:
 			"Answer a blocked agent's prompt by choosing one of its options: a job's, named by its card, or a foreign " +
 			"agent's, named by its id. The agent's screen is read again first: if it no longer shows the prompt the " +
-			"fingerprint names, nothing is sent and the refusal is returned. Never for kind=auth.",
+			"fingerprint names, nothing is chosen and the refusal is returned. On unreadable the prompt may still wait: read " +
+			"the screen and try again. Never for kind=auth.",
 		parameters: obj({
 			card: opt(card),
 			foreign: opt(

@@ -322,11 +322,11 @@ test("the trust dialog a handover answers never reaches the core, and what the w
 	const off = both.agents.onStatus((event) => heard.push(event));
 	await both.ran();
 	const pressed: string[] = [];
-	both.hangar.replace("block.event", ({ event }) => {
-		const { key, action } = (event as { payload: { key: string; action: string } }).payload;
+	both.hangar.replace("block.event", (payload) => {
+		const { key, action } = (payload.event as { payload: { key: string; action: string } }).payload;
 		if (action === "press") pressed.push(key);
 		if (action === "press" && key === "enter") setTimeout(() => (both.blocks[0] as Block).records?.push(AT_IDLE), 30);
-		return {};
+		return both.hangar.original("block.event")(payload);
 	});
 
 	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: true, ready: true });

@@ -461,3 +461,67 @@ test("a job that is no longer due when the agent is found gone is left to whatev
 		reclaim: { phase: "failed", error: "rex call block.close failed" },
 	});
 });
+
+/** What a move does to a deferral armed as its job moved: off the pending ones, and off the job. */
+const takenOff = (root: Conversation, reclaim?: "stopping") =>
+	root.commit(async (tx) => {
+		const { items } = await tx.doc(Deferrals, root.id);
+		for (const id of Object.keys(items)) delete items[id];
+		const doc = await tx.doc(Dispatches, root.id);
+		doc.jobs = doc.jobs.map(({ reclaim: _armed, ...each }) =>
+			reclaim ? { ...each, reclaim: { phase: reclaim } } : each,
+		);
+	}, context);
+
+test.each([
+	["listed, about to be prompted", [{ name: "card-a", status: { state: "working" as const } }]],
+	["not listed, about to be started again", []],
+])(
+	"a deferral its job's move takes off as it wakes, %s, ends cancelled, and sends, starts and tells nothing",
+	async (_name, listed) => {
+		const prompted: string[] = [];
+		const resumed: ResumeRequest[] = [];
+		let listings = 0;
+		const opened = await core(await database(), {
+			// The defer itself lists twice; the next listing is the wake's, which the move's commit gets ahead of.
+			list: async () => {
+				if (++listings === 3) await takenOff(opened.root);
+				return listed;
+			},
+			prompt: async (_agent, text) => void prompted.push(text),
+			resume: async (request) => void resumed.push(request),
+			stop: async () => {},
+		});
+		const { harness, root, defer } = opened;
+		const reply = await defer("PT1S");
+		if (!reply.accepted) throw new Error(reply.reason);
+
+		expect(await outcome(harness, reply.id)).toEqual({ status: "completed", result: "cancelled" });
+
+		expect(listings).toBe(3);
+		expect(prompted).toEqual([]);
+		expect(resumed).toEqual([]);
+		expect((await entries(root)).filter((entry) => entry.kind === NOTICE)).toEqual([]);
+	},
+);
+
+test("a deferral its job's move took off wakes to say nothing, whatever holds the job by then", async () => {
+	let listings = 0;
+	const opened = await core(await database(), {
+		// Within the defer, so whatever the machine's load this is done before the deferral can wake.
+		list: async () => {
+			if (++listings === 2) await takenOff(opened.root, "stopping");
+			return [{ name: "card-a", status: { state: "working" } }];
+		},
+		prompt: async () => {},
+		resume: async () => {},
+		stop: async () => {},
+	});
+	const { harness, root, defer } = opened;
+	const reply = await defer("PT1S");
+	if (!reply.accepted) throw new Error(reply.reason);
+
+	expect(await outcome(harness, reply.id)).toEqual({ status: "completed", result: "cancelled" });
+
+	expect((await entries(root)).filter((entry) => entry.kind === NOTICE)).toEqual([]);
+});

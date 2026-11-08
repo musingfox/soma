@@ -34,6 +34,10 @@ export function deferredPrompt(id: string, { instruction, setAt }: Deferred): st
 
 const named = (id: string, { agent, card }: Deferred) => `Deferred instruction ${id} for agent ${agent} (card ${card})`;
 
+/** What the notice of a move says of a deferral its job armed as it moved: only the human can still send it. */
+export const deferCancelled = ({ at, instruction }: Deferred) =>
+	` A deferred instruction it set as it moved was cancelled, since the stop it arms would have closed this window: it was due at ${iso(at)}: ${instruction}. Send it in the window yourself if it still matters.`;
+
 /** The one notice for an agent soma could not stop once it deferred: it stays open, and its deferrals still go to it. */
 export const reclaimFailedNotice = (agent: string, card: string, error: string) =>
 	`soma could not stop agent ${agent} (card ${card}) after it deferred an instruction: ${error}. It may still hold its hangar slot; soma tries again only if the agent defers again, and its pending deferred instructions still go to it if it is there when they fall due.`;

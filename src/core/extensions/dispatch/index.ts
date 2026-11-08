@@ -12,10 +12,12 @@ import { int, obj, opt, str } from "@earendil-works/pi-schema";
 import { type AgentPort, type Answer, PromptRefused } from "../../../ports/agent.ts";
 import type { AgentHandover, HandoverOutcome, HandoverRefusal } from "../../../ports/handover.ts";
 import type { Choices, HumanAnswerOutcome } from "../../../ports/human.ts";
+import { deferCancelled } from "../../domain/defer.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
 import { composeLaunchPrompt, composeTicketPrompt } from "../../domain/launch-prompt.ts";
 import { cutInWindow, cutSentence, HANDOVER_CUT, turning } from "../../domain/reconcile.ts";
 import { FORWARDED, noticeEntry } from "../../notice.ts";
+import { Deferrals } from "../defer/deferrals.ts";
 
 /** Entry kind of a turn the bridge recorded as finished; it carries no model message. */
 export const JOB_DONE = "soma.dispatch.done";
@@ -150,7 +152,9 @@ export async function answerJob(
  * is what that transcript ends on, whatever a cut turn left there, so the window's first idle records no turn, and with
  * none read that idle takes what it reads as the same (`resultUnread`); a block handed over before the move is forgotten,
  * so the same prompt in the window is handed over; and a status from before is no longer true of a job that was in a
- * turn: the window's own reaches the bridge once this is committed.
+ * turn: the window's own reaches the bridge once this is committed. `show_job` refuses a job a deferral holds, so a deferral
+ * due now was armed as the job moved, by the turn being cut: its reclaim would close the window the human is being told
+ * to watch, so it is cancelled here, its task ending when it next wakes, and the notice says what it was.
  */
 export async function commitMove(
 	tx: Tx,
@@ -167,10 +171,21 @@ export async function commitMove(
 	const doc = await tx.doc(Dispatches, conversationId);
 	const index = doc.jobs.findIndex((each) => each.agent === agent);
 	const current = doc.jobs[index];
+	let cancelled = "";
 	if (current !== undefined) {
-		const { launch: _sent, handedOver: _forgotten, ...rest } = current;
+		const { launch: _sent, handedOver: _forgotten, reclaim, ...rest } = current;
+		const armed = reclaim?.phase === "due" || reclaim?.phase === "sending";
+		if (armed) {
+			const { items } = await tx.doc(Deferrals, conversationId);
+			for (const [id, item] of Object.entries(items)) {
+				if (item.agent !== agent) continue;
+				cancelled += deferCancelled(item);
+				delete items[id];
+			}
+		}
 		doc.jobs[index] = {
 			...rest,
+			...(armed || reclaim === undefined ? {} : { reclaim }),
 			sessionId,
 			...(turning(current.status) ? { status: { state: "idle" as const } } : {}),
 			...(lastRecord === undefined ? { resultUnread: true as const } : { resultId: lastRecord }),
@@ -182,7 +197,7 @@ export async function commitMove(
 			"report",
 			"outcome",
 			`agent ${agent} (card ${card}) moved to rex: its window is ${window} in session ${session}, ` +
-				`where you can watch it and type into it. It goes on in the same conversation.${after}`,
+				`where you can watch it and type into it. It goes on in the same conversation.${after}${cancelled}`,
 		),
 	);
 }
@@ -509,7 +524,8 @@ export function dispatchExtension(
 			"window, for good: it cannot be handed back. Afterwards jobs, screen, reply and respond work on it under the same " +
 			"card, and what runs in it may have more tools than it had. Refused, with nothing done and the reason: an unknown " +
 			"card, a job not on ACP (one already handed over or on another agent side), one blocked on a login, waking, with " +
-			"no session open yet or waiting on a deferred instruction, and any job when no rex hangar is configured. Refused " +
+			"no session open yet or waiting on a deferred instruction, and any job when no rex hangar is configured. A " +
+			"deferred instruction the job sets as it moves is cancelled, and the human told. Refused " +
 			"with its turn cancelled: a turn that does not stop in time, which leaves the job on ACP with nothing closed. On " +
 			"success the human has been told in a notice naming the window and what was cut, and on a refusal that cut a " +
 			"turn or says the job stays on ACP with its process ended, in a notice quoting the reason: do not repeat either.",

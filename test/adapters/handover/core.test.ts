@@ -10,7 +10,7 @@ import type { AcpAgentPort } from "../../../src/adapters/acp/agent-port.ts";
 import { HANDOVER_GRACE_MS } from "../../../src/adapters/handover/agent-port.ts";
 import { type createRexAgentPort, seqOf } from "../../../src/adapters/rex/agent-port.ts";
 import { RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
-import { deferExtension } from "../../../src/core/extensions/defer/index.ts";
+import { Deferrals, deferExtension } from "../../../src/core/extensions/defer/index.ts";
 import {
 	AGENT_BLOCKED,
 	eventBridge,
@@ -82,6 +82,7 @@ async function core(
 	const defers = deferExtension(both.agents, {
 		pollMs: 20,
 		readyMs: 5_000,
+		retryMs: 50,
 		reclaim: (agent) => ready.then(() => reclaimer(root, both.agents, context)(agent)),
 	});
 	const harness = await openHarness(
@@ -138,12 +139,19 @@ async function core(
 				if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
 			}
 		},
-		defer: async (at: string, instruction: string) => {
-			const reply = await defers.defer(root, { agent: "card-a", at, instruction }, context);
+		defer: async (at: string, instruction: string, agent = "card-a") => {
+			const reply = await defers.defer(root, { agent, at, instruction }, context);
 			if (!reply.accepted) throw new Error(reply.reason);
 			return reply.id;
 		},
 		outcome: async (id: string) => (await harness.waitForTask(Number(id) as TaskId, context)).state.outcome,
+		deferrals: async () => (await harness.snapshot(Deferrals, root.id, context))?.items ?? {},
+		/** The job's reclaim is in this phase, as a deferral's task or a failed stop would have left it. */
+		reclaims: (phase: "failed" | "sending") =>
+			root.commit(async (tx) => {
+				const doc = await tx.doc(Dispatches, root.id);
+				doc.jobs = doc.jobs.map((each) => ({ ...each, reclaim: { phase } }));
+			}, context),
 		/** The job's last finished turn stated this. */
 		stated: (outcome: "完成") =>
 			root.commit(async (tx) => {
@@ -1014,6 +1022,156 @@ function failsWindow(soma: Soma, failure: Error) {
 		return original(method, payload, schema);
 	};
 }
+
+/** A cut that answers only once `arm` is called: what happens as a turn is cut, whatever the machine's load. */
+function heldCut() {
+	let arm = () => {};
+	const armed = new Promise<void>((resolve) => {
+		arm = resolve;
+	});
+	const from = (port: AcpAgentPort): AcpAgentPort => ({
+		...port,
+		cut: async (agent) => {
+			const cut = await port.cut(agent);
+			await armed;
+			return cut;
+		},
+	});
+	return { from, arm };
+}
+
+/** A deferral the turn arms as `show_job` is cutting it. `moves` lets the move go on, and waits for `show_job`'s end. */
+async function armedInTheCut(soma: Soma, arm: () => void, at: string, instruction: string) {
+	await busy(soma, "SPIN");
+	const showing = soma.say("看 card-a");
+	await soma.until(async () => (await soma.cancelled()) !== "", "the cancel");
+	const id = await soma.defer(at, instruction);
+	const due = (await soma.deferrals())[id]?.at as number;
+	return {
+		id,
+		due,
+		moves: () => {
+			arm();
+			return showing;
+		},
+	};
+}
+
+const cancelledDeferral = "A deferred instruction it set as it moved was cancelled";
+
+test("a deferral armed during the cut is cancelled in the commit of the move, told with its time and instruction, and closes nothing", async () => {
+	const { from, arm } = heldCut();
+	const soma = await core({ from });
+	const { due, moves } = await armedInTheCut(soma, arm, "PT1H", "write the report");
+	expect((await soma.job())?.reclaim).toEqual({ phase: "due" });
+
+	await moves();
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true, cut: {} });
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining(onRex)]);
+	expect(notices[0]).toContain(cutTurn);
+	expect(notices[0]).toContain(cancelledDeferral);
+	expect(notices[0]).toContain(new Date(due).toISOString());
+	expect(notices[0]).toContain("write the report");
+	expect((await soma.job())?.reclaim).toBeUndefined();
+	expect(await soma.deferrals()).toEqual({});
+	await sleep(100);
+	expect(soma.blocks).toHaveLength(1);
+	expect(soma.hangar.methods()).not.toContain("block.close");
+	expect(await soma.notices()).toEqual(notices);
+	soma.off();
+});
+
+test("a deferral cancelled by the move sends nothing when it falls due, restarts nothing and tells nothing more", async () => {
+	const { from, arm } = heldCut();
+	const soma = await core({ from });
+	const { id, moves } = await armedInTheCut(soma, arm, "PT1S", "write the report");
+	await moves();
+	const notices = await soma.notices();
+	const pids = await soma.pids();
+
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "cancelled" });
+
+	expect(soma.typed()).toEqual([]);
+	expect(soma.windowsOpened()).toHaveLength(1);
+	expect(soma.hangar.methods()).not.toContain("block.close");
+	expect(await soma.notices()).toEqual(notices);
+	expect(await soma.pids()).toEqual(pids);
+	expect((await soma.job())?.reclaim).toBeUndefined();
+	soma.off();
+});
+
+test("a deferral whose prompt is going out as the move commits is cancelled too", async () => {
+	const { from, arm } = heldCut();
+	const soma = await core({ from });
+	const { moves } = await armedInTheCut(soma, arm, "PT1H", "write the report");
+	await soma.reclaims("sending");
+
+	await moves();
+
+	expect((await soma.notices())[0]).toContain(cancelledDeferral);
+	expect((await soma.job())?.reclaim).toBeUndefined();
+	expect(await soma.deferrals()).toEqual({});
+	soma.off();
+});
+
+test("a deferral left from a stop that failed is left alone by the move", async () => {
+	const soma = await core();
+	await busy(soma, "SPIN");
+	const id = await soma.defer("PT1H", "write the report");
+	await soma.reclaims("failed");
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true });
+	expect((await soma.notices())[0]).not.toContain(cancelledDeferral);
+	expect((await soma.job())?.reclaim).toEqual({ phase: "failed" });
+	expect(Object.keys(await soma.deferrals())).toEqual([id]);
+	soma.off();
+});
+
+test("a deferral of another job is left alone by the move of this one", async () => {
+	const { from, arm } = heldCut();
+	const soma = await core({ from });
+	await soma.say("派 card-b");
+	await soma.until(async () => (await soma.job("card-b"))?.outcome !== undefined, "card-b's brief");
+	const other = await soma.defer("PT1H", "card-b's own", "card-b");
+	const { moves } = await armedInTheCut(soma, arm, "PT1H", "write the report");
+
+	await moves();
+
+	const [notice] = await soma.notices();
+	expect(notice).toContain("write the report");
+	expect(notice).not.toContain("card-b's own");
+	expect(Object.keys(await soma.deferrals())).toEqual([other]);
+	soma.off();
+});
+
+test("a deferral armed during the cut of a job killed with its window open: the next soma cancels it, tells it, and stops nothing", async () => {
+	const first = await core();
+	await busy(first, "SPIN");
+	hangsAfterWindow(first);
+	const moving = first.agents.handOver("card-a");
+	await first.until(() => first.blocks.length === 1, "the window");
+	await Promise.race([moving, sleep(50)]);
+	await first.defer("PT1H", "write the report");
+	expect((await first.job())?.reclaim).toEqual({ phase: "due" });
+
+	const soma = await again(first);
+
+	await soma.until(async () => (await soma.notices()).length === 1, "the notice of the move");
+	const [notice] = await soma.notices();
+	expect(notice).toContain(onRex);
+	expect(notice).toContain(cancelledDeferral);
+	expect(notice).toContain("write the report");
+	await sleep(100);
+	expect((await soma.job())?.reclaim).toBeUndefined();
+	expect(await soma.deferrals()).toEqual({});
+	expect(soma.blocks).toHaveLength(1);
+	expect(soma.hangar.methods()).not.toContain("block.close");
+	soma.off();
+});
 
 test("a turn cut and a window rex refuses: the turn is over, told once with why, and the job goes on on ACP", async () => {
 	const soma = await core();

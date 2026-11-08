@@ -18,8 +18,8 @@ import { Deferrals } from "./deferrals.ts";
 
 export { Deferrals };
 
-/** How a deferral ended: sent, or why it was not, each but `sent` told to the human in one notice. */
-export type DeferOutcome = "sent" | "gone" | "unresumed" | "unsure" | "failed";
+/** How a deferral ended: sent, or why it was not, each but `sent` told to the human in one notice: `cancelled`, the move's. */
+export type DeferOutcome = "sent" | "gone" | "unresumed" | "unsure" | "failed" | "cancelled";
 
 type Checkpoint =
 	| { phase: "wait"; at: number; tries: number; error?: string }
@@ -173,6 +173,12 @@ export function deferExtension(
 
 	const listing = async (agent: string) => (await agents.list()).find((each) => each.name === agent);
 
+	/** A deferral whose job's move took it off the pending ones ends so when it wakes, doing nothing and telling nothing. */
+	const cancelled = {
+		status: "terminal" as const,
+		outcome: { status: "completed" as const, result: "cancelled" as const },
+	};
+
 	/** What every phase of deferral `id` does to end, to try again later, and to send its prompt, `tried` times tried. */
 	function steps(id: string, item: Deferred, tried: number, runtime: Runtime, context: Context) {
 		const ending = async (tx: Tx, outcome: DeferOutcome, notice?: string, gone = false) => {
@@ -201,15 +207,16 @@ export function deferExtension(
 			let sending = false;
 			let held = false;
 			await runtime.commit(async (tx) => {
+				const { items } = await tx.doc(Deferrals, runtime.conversationId);
+				const own = items[id];
+				if (own === undefined) return cancelled;
 				const doc = await tx.doc(Dispatches, runtime.conversationId);
 				const index = doc.jobs.findIndex((each) => each.agent === item.agent);
 				const current = doc.jobs[index];
 				const phase = current?.reclaim?.phase;
 				// A reclaim that committed `stopping` since the listing wins, and nothing is sent.
 				if (phase === "stopping") return ending(tx, "gone", deferNotice.stopping(id, item));
-				const { items } = await tx.doc(Deferrals, runtime.conversationId);
-				const own = items[id];
-				if (phase === "resuming" && !own?.resuming) {
+				if (phase === "resuming" && !own.resuming) {
 					held = true;
 					return undefined;
 				}
@@ -217,10 +224,8 @@ export function deferExtension(
 				if (current !== undefined && (phase === "due" || phase === "stopped" || phase === "resuming")) {
 					doc.jobs[index] = { ...current, reclaim: { phase: "sending" } };
 				}
-				if (own !== undefined) {
-					const { resuming: _started, before: _held, ...rest } = own;
-					items[id] = { ...rest, sending: true };
-				}
+				const { resuming: _started, before: _held, ...rest } = own;
+				items[id] = { ...rest, sending: true };
 				sending = true;
 				return { status: "running", checkpoint: { phase: "sending", tries: tried } };
 			}, context);
@@ -241,6 +246,9 @@ export function deferExtension(
 		async function resume(): Promise<void> {
 			let held = false;
 			await runtime.commit(async (tx) => {
+				const { items } = await tx.doc(Deferrals, runtime.conversationId);
+				const own = items[id];
+				if (own === undefined) return cancelled;
 				const doc = await tx.doc(Dispatches, runtime.conversationId);
 				const index = doc.jobs.findIndex((each) => each.agent === item.agent);
 				const current = doc.jobs[index];
@@ -252,12 +260,8 @@ export function deferExtension(
 					return undefined;
 				}
 				doc.jobs[index] = { ...current, reclaim: { phase: "resuming" } };
-				const { items } = await tx.doc(Deferrals, runtime.conversationId);
-				const own = items[id];
-				if (own !== undefined) {
-					const before = current.reclaim && { ...current.reclaim };
-					items[id] = { ...own, resuming: true, ...(before && { before }) };
-				}
+				const before = current.reclaim && { ...current.reclaim };
+				items[id] = { ...own, resuming: true, ...(before && { before }) };
 				const until = runtime.now() + readyMs;
 				return {
 					status: "running",
@@ -280,6 +284,8 @@ export function deferExtension(
 				if (runtime.now() < checkpoint.at) return runtime.sleepUntil(checkpoint.at, checkpoint, context);
 				const id = String(task.id);
 				const { end, retry, send, resume } = steps(id, task.input, checkpoint.tries, runtime, context);
+				const pending = await runtime.snapshot(Deferrals, runtime.conversationId, context);
+				if (pending?.items[id] === undefined) return runtime.commit(() => cancelled, context);
 				const job = (await runtime.snapshot(Dispatches, runtime.conversationId, context))?.jobs.find(
 					(each) => each.agent === task.input.agent,
 				);

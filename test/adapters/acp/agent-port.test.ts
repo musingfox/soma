@@ -7,7 +7,7 @@ import { cleanUp, git, harness, SESSION, sleep } from "./fake.ts";
 
 afterEach(cleanUp);
 
-const MARK = { hangar: "session:hangar" };
+const MARK = { hangar: "session:hangar", at: 1_000 };
 
 const states = (events: AgentStatusEvent[], from = 0) => events.slice(from).map((event) => event.status.state);
 
@@ -848,7 +848,8 @@ test("release closes the session, returns once the process is gone, and marks th
 		acpSessionId,
 		cwd,
 		handingOver: true,
-		...MARK,
+		hangar: MARK.hangar,
+		handingOverAt: MARK.at,
 	});
 	expect(await acp.port.handingOver()).toEqual([{ ...held, ...MARK }]);
 	expect(await acp.port.released()).toEqual([]);
@@ -1119,7 +1120,7 @@ test("confirm makes a handover in progress final, here and for the next soma, an
 	expect(await after.port.dormant()).toEqual([]);
 });
 
-test("the mark's hangar comes off with the mark, whichever way it ends, and a mark from before it records none", async () => {
+test("the mark's hangar and time come off with the mark, whichever way it ends, and a mark from before them records neither", async () => {
 	const acp = await harness();
 	await acp.start();
 	const from = acp.events.length;
@@ -1129,15 +1130,24 @@ test("the mark's hangar comes off with the mark, whichever way it ends, and a ma
 	const entry = async () => JSON.parse(await readFile(acp.sessionsFile, "utf8"))["card-a"];
 	await acp.port.release("card-a", MARK);
 	const marked = await entry();
-	expect(marked.hangar).toBe(MARK.hangar);
+	expect(marked).toMatchObject({ hangar: MARK.hangar, handingOverAt: MARK.at });
+
+	await acp.port.markedAt("card-a", 2_000);
+	expect((await entry()).handingOverAt).toBe(2_000);
+	expect(await acp.port.handingOver()).toMatchObject([{ at: 2_000 }]);
 
 	await acp.port.reinstate("card-a");
 	expect((await entry()).hangar).toBeUndefined();
+	expect((await entry()).handingOverAt).toBeUndefined();
+	await acp.port.markedAt("card-a", 3_000);
+	expect((await entry()).handingOverAt).toBeUndefined();
 
-	const { hangar: _hangar, ...old } = marked;
+	const { hangar: _hangar, handingOverAt: _at, ...old } = marked;
 	await writeFile(acp.sessionsFile, `${JSON.stringify({ "card-a": old })}\n`);
 	const after = await harness({ cwd: acp.cwd });
-	expect((await after.port.handingOver())[0]).not.toHaveProperty("hangar");
+	const [left] = await after.port.handingOver();
+	expect(left).not.toHaveProperty("hangar");
+	expect(left).not.toHaveProperty("at");
 });
 
 test("confirm of an agent with no handover in progress does nothing", async () => {

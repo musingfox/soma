@@ -34,7 +34,7 @@ import {
 	type ResumeRequest,
 	type StartRequest,
 } from "../../ports/agent.ts";
-import type { HeldSession, Holding, SessionTaker, Taken } from "../../ports/handover.ts";
+import { type HeldSession, type Holding, type SessionTaker, type Taken, TakeRefused } from "../../ports/handover.ts";
 import { type RexClient, RexRpcError } from "./client.ts";
 import { type ProcessStart, readProcessStart } from "./process-start.ts";
 import {
@@ -1131,13 +1131,18 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		 * A window of the hangar running `claude --resume` on the session, with the dispatch's environment and the model it
 		 * last ran on, labelled as `start` and `resume` label theirs, so from here on it is a job of this hangar. Not held
 		 * to the cap: the human asked for this one. Throws what `takeable` would have said; past the window's opening,
-		 * nothing throws, so a claude slow to come up or a read that fails leaves the window and says `ready: false`.
+		 * nothing throws, so a claude slow to come up or a read that fails leaves the window and says `ready: false`. All
+		 * that is TakeRefused but a `session.new_window` rex did not answer with an error, which may be running still.
 		 */
 		async take(session: HeldSession) {
-			const line = await takeLine(session);
-			if ("refused" in line) throw new Error(line.refused);
+			const line = await takeLine(session).catch((error: Error) => {
+				throw new TakeRefused(error.message, { cause: error });
+			});
+			if ("refused" in line) throw new TakeRefused(line.refused);
 			const { name, claudeSession, cwd } = session;
-			const opened = await openWindow(name, claudeSession, cwd, line.launch);
+			const opened = await openWindow(name, claudeSession, cwd, line.launch).catch((error: Error) => {
+				throw error instanceof RexRpcError ? new TakeRefused(error.message, { cause: error }) : error;
+			});
 			return brought(name, async () => opened ?? only(await panes(), name).blockId);
 		},
 

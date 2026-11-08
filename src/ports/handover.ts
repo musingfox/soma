@@ -44,10 +44,13 @@ export interface HeldSession {
 	readonly cwd: string;
 }
 
-/** What the mark of a handover in progress records: the rex session id of the hangar its window goes to. */
-export type HandoverMark = { readonly hangar: string };
+/**
+ * What the mark of a handover in progress records: the rex session id of the hangar its window goes to, and when, in
+ * milliseconds since the epoch, the mark was written or the take failed: when a window may last have been asked for.
+ */
+export type HandoverMark = { readonly hangar: string; readonly at: number };
 
-/** A session whose handover is in progress. No hangar on a mark from before marks recorded it. */
+/** A session whose handover is in progress. Neither on a mark from before marks recorded them. */
 export type HandingOver = HeldSession & Partial<HandoverMark>;
 
 /** The side a session moves away from. */
@@ -57,6 +60,8 @@ export interface SessionGiver {
 	// Records that a handover of the agent is in progress, then ends its process: from then on this side, and the next
 	// soma's, takes the agent up only when `reinstate` says so.
 	release(agent: string, mark: HandoverMark): Promise<HeldSession | Refused>;
+	// The mark now counts from `at`. A write that fails is logged, and leaves the time it had for the next soma.
+	markedAt(agent: string, at: number): Promise<void>;
 	// The other side holds the session: the handover is over, for good. A write that fails is logged, and leaves it in
 	// progress for the next soma to look at.
 	confirm(agent: string): Promise<void>;
@@ -78,13 +83,17 @@ export interface SessionGiver {
  */
 export type Holding = "window" | "loose" | "none";
 
+/** What `take` throws when nothing was asked for, or the side plainly refused it: no window can still come of it. */
+export class TakeRefused extends Error {}
+
 /** The side a session moves to. */
 export interface SessionTaker {
 	// The id of the session `take` opens windows in and `list` reads them from.
 	readonly hangar: string;
 	// Why `take` would refuse now, with nothing done; undefined when it would not.
 	takeable(session: HeldSession): Promise<string | undefined>;
-	// Opens the session where the human can see it, and waits a bounded time for its claude to come up.
+	// Opens the session where the human can see it, and waits a bounded time for its claude to come up. Throws TakeRefused
+	// when no window of this take can still open; any other error says nothing either way, as a reply that was lost.
 	take(session: HeldSession): Promise<Taken>;
 	// Where `hangar`, which need not be this side's own, holds the session, whether or not its claude still runs. A hangar
 	// that does not exist holds nothing. Reads only; throws when this side cannot answer, which says nothing either way.

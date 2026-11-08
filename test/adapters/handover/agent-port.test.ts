@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
 import { createHandoverAgentPort, noHandover } from "../../../src/adapters/handover/agent-port.ts";
 import { seqOf } from "../../../src/adapters/rex/agent-port.ts";
+import { RexRpcError } from "../../../src/adapters/rex/client.ts";
 import { type AgentStatusEvent, PromptRefused } from "../../../src/ports/agent.ts";
 import { cleanUp, SESSION } from "../acp/fake.ts";
 import { AT, type Block, fixture, HANGAR } from "../rex/fake.ts";
@@ -182,7 +183,7 @@ test("a window that will not open leaves the job on ACP, dormant, and its next p
 	await both.ran();
 	const original = both.hangar.client.call.bind(both.hangar.client);
 	both.hangar.client.call = async (method, payload, schema) => {
-		if (method === "session.new_window") throw new Error("rex refused the window");
+		if (method === "session.new_window") throw new RexRpcError(method, "refused", "rex refused the window", 400);
 		return original(method, payload, schema);
 	};
 

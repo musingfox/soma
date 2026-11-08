@@ -1,12 +1,23 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createHandoverAgentPort } from "../../../src/adapters/handover/agent-port.ts";
+import { createHandoverAgentPort, HANDOVER_GRACE_MS } from "../../../src/adapters/handover/agent-port.ts";
 import { createRexAgentPort } from "../../../src/adapters/rex/agent-port.ts";
 import { harness as acpHarness, sleep } from "../acp/fake.ts";
 import { AT, type Block, HANGAR, rex, type Session } from "../rex/fake.ts";
 
 export const AT_IDLE = { state: "idle", updated_at: AT };
+
+/** A clock only a test moves. */
+export function fakeClock(start = 1_700_000_000_000) {
+	let at = start;
+	return {
+		now: () => at,
+		advance: (ms: number) => {
+			at += ms;
+		},
+	};
+}
 
 /**
  * Jobs on two sides, as main.ts wires them: the real ACP adapter running the fake agent, and the real rex adapter on the
@@ -23,6 +34,10 @@ export async function sides(
 		takeMs?: number;
 		/** Rex answers nothing from the start, until the `rexUp` of the result. */
 		rexDown?: boolean;
+		/** The clock of the handover, whose grace period is then the real one unless `graceMs` names another. */
+		clock?: ReturnType<typeof fakeClock>;
+		/** None by default, so a job with no window goes back to ACP at the first look. */
+		graceMs?: number;
 	} = {},
 ) {
 	const acp = await acpHarness({ cwd: options.restartOf, ...(options.fake ? { fake: options.fake } : {}) });
@@ -72,7 +87,14 @@ export async function sides(
 	});
 	const said: string[] = [];
 	const onError = (error: Error) => said.push(error.message);
-	const agents = createHandoverAgentPort({ from: acp.port, to: onRex, onError });
+	const { clock, graceMs = clock === undefined ? 0 : HANDOVER_GRACE_MS } = options;
+	const agents = createHandoverAgentPort({
+		from: acp.port,
+		to: onRex,
+		onError,
+		graceMs,
+		...(clock === undefined ? {} : { now: clock.now }),
+	});
 	return {
 		acp,
 		agents,
@@ -98,6 +120,7 @@ export async function sides(
 				handedOver?: true;
 				handingOver?: true;
 				hangar?: string;
+				handingOverAt?: number;
 			},
 		closed: () => readFile(join(projects, "closed"), "utf8").catch(() => ""),
 		pids: async () =>

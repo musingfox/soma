@@ -1,12 +1,12 @@
 import { mkdir, readFile, rmdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
-import { createHandoverAgentPort } from "../../../src/adapters/handover/agent-port.ts";
+import { createHandoverAgentPort, HANDOVER_GRACE_MS } from "../../../src/adapters/handover/agent-port.ts";
 import { RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
 import { PromptRefused } from "../../../src/ports/agent.ts";
 import { cleanUp, SESSION } from "../acp/fake.ts";
-import { type Block, fixture, HANGAR, type Session } from "../rex/fake.ts";
-import { alive, sides, sleep } from "./fake.ts";
+import { type Block, fixture, HANGAR } from "../rex/fake.ts";
+import { AT_IDLE, alive, fakeClock, sides, sleep } from "./fake.ts";
 
 afterEach(cleanUp);
 
@@ -34,7 +34,10 @@ function aroundWindow(both: Sides, around: (open: () => Promise<unknown>) => Pro
  * opens, or `after`, before the final mark. Nothing of it runs on: its take hangs where the kill would have fallen, and
  * what the next soma finds is the sessions file, the transcripts and the hangar.
  */
-async function died(when: "before" | "after", alongside?: string) {
+async function died(
+	when: "before" | "after",
+	{ alongside, clock }: { alongside?: string; clock?: ReturnType<typeof fakeClock> } = {},
+) {
 	const first = await sides();
 	await first.ran();
 	if (alongside !== undefined) await first.ran(alongside);
@@ -49,6 +52,7 @@ async function died(when: "before" | "after", alongside?: string) {
 		from: first.acp.port,
 		to: when === "before" ? { ...first.onRex, take: never } : first.onRex,
 		onError: () => {},
+		...(clock === undefined ? {} : { now: clock.now }),
 	});
 	void dying.handOver("card-a");
 	await until(() => !alive(pid as number), "the ACP process to end");
@@ -58,7 +62,7 @@ async function died(when: "before" | "after", alongside?: string) {
 }
 
 /** The soma after `first`, once its startup has looked at whatever was left in progress. */
-async function restarted(first: Sides, more: { rexDown?: boolean; others?: Session[] } = {}) {
+async function restarted(first: Sides, more: Omit<Parameters<typeof sides>[0] & {}, "restartOf" | "blocks"> = {}) {
 	const both = await sides({ restartOf: first.acp.cwd, blocks: first.blocks, ...more });
 	await both.agents.dormant();
 	return both;
@@ -320,35 +324,276 @@ test("a new_window whose reply was lost, in a window whose claude has exited: th
 	expect(both.typed()).toEqual([]);
 });
 
-test.each([
-	["throws", new Error("rex refused the window")],
-	["has its reply lost", new RexTransportError("rex refused the window")],
-])(
-	"a new_window that %s with no window open: back on ACP, with today's refusal, and it goes on in its session",
-	async (_name, failure) => {
-		const both = await sides();
-		await both.ran();
-		aroundWindow(both, () => Promise.reject(failure));
+test("a new_window rex plainly refuses, with no window open: back on ACP at once, with today's refusal, and it goes on in its session", async () => {
+	const clock = fakeClock();
+	const both = await sides({ clock });
+	await both.ran();
+	aroundWindow(both, () => Promise.reject(new RexRpcError("session.new_window", "refused", "no window for you", 400)));
 
-		expect(await both.agents.handOver("card-a")).toEqual({
-			handedOver: false,
-			refusal: "cannot_resume",
-			reason:
-				"rex refused the window. Its ACP process has ended and the job stays on ACP: its next prompt starts it again in " +
-				"its session",
-		});
+	expect(await both.agents.handOver("card-a")).toEqual({
+		handedOver: false,
+		refusal: "cannot_resume",
+		reason:
+			"session.new_window: refused: no window for you. Its ACP process has ended and the job stays on ACP: its next " +
+			"prompt starts it again in its session",
+	});
+
+	const entry = await both.entry();
+	expect(entry.handingOver).toBeUndefined();
+	expect(entry.handedOver).toBeUndefined();
+	expect(await both.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	const from = both.acp.events.length;
+	await both.agents.prompt("card-a", "RECALL");
+	await both.acp.until("done", from);
+	expect((await both.agents.readResult("card-a"))?.text).toBe("recall: the word is KIWI");
+	expect(both.typed()).toEqual([]);
+});
+
+test.each([
+	[
+		"a window of its name opened since",
+		(both: Sides) => {
+			both.blocks.push({ name: "card-a", block: "block:namesake", label: "another" });
+		},
+	],
+	[
+		"a read that failed before any window was asked for",
+		(both: Sides) => {
+			const original = both.hangar.client.call.bind(both.hangar.client);
+			let failed = false;
+			both.hangar.client.call = (async (method: string, payload: unknown, schema: never) => {
+				if (method === "session.view" && !failed) {
+					failed = true;
+					throw new RexTransportError("session.view: no response within 10000 ms");
+				}
+				return original(method, payload, schema);
+			}) as typeof both.hangar.client.call;
+		},
+	],
+])("a take that never asked for a window, for %s, gives the job back at once", async (_name, arrange) => {
+	const clock = fakeClock();
+	const both = await sides({ clock });
+	await both.ran();
+	arrange(both);
+	const agents = createHandoverAgentPort({
+		from: both.acp.port,
+		to: { ...both.onRex, takeable: async () => undefined },
+		onError: both.onError,
+		now: clock.now,
+	});
+
+	expect(await agents.handOver("card-a")).toMatchObject({ reason: expect.stringContaining("stays on ACP") });
+
+	expect((await both.entry()).handingOver).toBeUndefined();
+	expect(both.windowsOpened()).toEqual([]);
+});
+
+/** A soma whose card-a take gave up on `session.new_window`, 10 s in, on `clock`, with rex maybe still at it. */
+async function gaveUp(
+	clock: ReturnType<typeof fakeClock>,
+	failure = new RexTransportError("no response within 10000 ms"),
+) {
+	const both = await sides({ clock });
+	await both.ran();
+	aroundWindow(both, async () => {
+		clock.advance(10_000);
+		throw failure;
+	});
+	return { both, outcome: await both.agents.handOver("card-a") };
+}
+
+/** The window rex opens for card-a after all, late, as session.new_window would make it. */
+const opensLate = async (both: Sides) => {
+	const { acpSessionId, cwd } = await both.entry();
+	both.blocks.push({
+		name: "card-a",
+		block: "block:late",
+		label: acpSessionId,
+		argv0: "claude",
+		cwd,
+		records: [AT_IDLE],
+	});
+};
+
+test.each([
+	["its reply was lost", new RexTransportError("rex connection closed")],
+	["it timed out", new RexTransportError("session.new_window: no response within 10000 ms")],
+	["its reply was off the schema", new Error("Invalid input")],
+])(
+	"a take that failed because %s stays undecided, saying so and why, and not that it stays on ACP",
+	async (_name, failure) => {
+		const clock = fakeClock();
+		const before = clock.now();
+
+		const { both, outcome } = await gaveUp(clock, failure);
+
+		expect(outcome).toMatchObject({ handedOver: false, refusal: "cannot_resume" });
+		const { reason } = outcome as { reason: string };
+		expect(reason).toContain(failure.message);
+		expect(reason).toContain("the job is undecided");
+		expect(reason).toContain("grace period, 60 s from now");
+		expect(reason).not.toContain("stays on ACP");
+		const entry = await both.entry();
+		expect(entry.handingOver).toBe(true);
+		// When the take failed, not when the mark was written.
+		expect(entry.handingOverAt).toBe(before + 10_000);
+		await heldOff(both, await both.pids());
+		expect(both.said).toEqual([expect.stringContaining("card-a is undecided: its window may still open")]);
+	},
+);
+
+test("the grace period is 60 s", () => {
+	expect(HANDOVER_GRACE_MS).toBe(60_000);
+});
+
+test("a window that opens at 59 s puts the job on rex, at the next look, with no ACP process", async () => {
+	const clock = fakeClock();
+	const { both } = await gaveUp(clock);
+	const pids = await both.pids();
+
+	clock.advance(30_000);
+	await expect(both.agents.prompt("card-a", "at 30 s")).rejects.toThrow("grace period, 30 s from now");
+	expect(await both.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	clock.advance(29_000);
+	await opensLate(both);
+
+	await both.agents.prompt("card-a", "at 59 s");
+
+	expect(both.typed()).toEqual(["at 59 s"]);
+	expect((await both.entry()).handedOver).toBe(true);
+	expect((await both.entry()).handingOver).toBeUndefined();
+	expect(await both.pids()).toEqual(pids);
+	expect(await readFile(join(both.acp.cwd, "..", "projects", "loaded"), "utf8").catch(() => "")).toBe("");
+});
+
+test.each([
+	["a listing", (both: Sides) => both.agents.list()],
+	["a prompt", (both: Sides) => both.agents.prompt("card-a", "RECALL")],
+])(
+	"a window that never opens: the job goes back to ACP only at a look at or after the end, here %s",
+	async (_name, looks) => {
+		const clock = fakeClock();
+		const { both } = await gaveUp(clock);
+
+		clock.advance(59_999);
+		await expect(both.agents.prompt("card-a", "too soon")).rejects.toThrow("grace period, 1 s from now");
+		expect(await both.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+		expect((await both.entry()).handingOver).toBe(true);
+		clock.advance(1);
+
+		await looks(both);
 
 		const entry = await both.entry();
 		expect(entry.handingOver).toBeUndefined();
 		expect(entry.handedOver).toBeUndefined();
-		expect(await both.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
-		const from = both.acp.events.length;
-		await both.agents.prompt("card-a", "RECALL");
-		await both.acp.until("done", from);
-		expect((await both.agents.readResult("card-a"))?.text).toBe("recall: the word is KIWI");
-		expect(both.typed()).toEqual([]);
+		expect(await both.agents.list()).toMatchObject([{ name: "card-a", sessionId: SESSION }]);
+		expect(both.said).toContain("card-a was left mid-handover and no window of it is open: it is dormant on ACP");
 	},
 );
+
+test("at the end of the grace period a look is made with no caller: no window, back on ACP", async () => {
+	const both = await sides({ graceMs: 40 });
+	await both.ran();
+	aroundWindow(both, () => Promise.reject(new RexTransportError("no response within 10000 ms")));
+
+	await both.agents.handOver("card-a");
+	expect((await both.entry()).handingOver).toBe(true);
+
+	await until(async () => (await both.entry()).handingOver === undefined, "the look at the end of the grace period");
+	expect((await both.entry()).handedOver).toBeUndefined();
+});
+
+test("at the end of the grace period a look is made with no caller: a window opened within it, on rex", async () => {
+	const both = await sides({ graceMs: 40 });
+	await both.ran();
+	aroundWindow(both, () => Promise.reject(new RexTransportError("no response within 10000 ms")));
+
+	await both.agents.handOver("card-a");
+	await opensLate(both);
+
+	await until(async () => (await both.entry()).handedOver === true, "the look at the end of the grace period");
+	expect(await both.agents.list()).toMatchObject([{ name: "card-a", status: { state: "idle" } }]);
+});
+
+test("a look that fails at the end of the grace period gives nothing back, and the next one after rex answers does", async () => {
+	const clock = fakeClock();
+	const { both } = await gaveUp(clock);
+	clock.advance(60_000);
+	both.rexDown();
+
+	await expect(both.agents.prompt("card-a", "now")).rejects.toThrow("rex does not answer");
+
+	expect((await both.entry()).handingOver).toBe(true);
+	both.rexUp();
+	await both.agents.list();
+	expect((await both.entry()).handingOver).toBeUndefined();
+});
+
+test("a restart inside the grace period waits out the rest, and one past it is resolved at once", async () => {
+	const clock = fakeClock();
+	const first = await died("before", { clock });
+	clock.advance(59_999);
+
+	const within = await restarted(first, { clock });
+
+	expect(await within.agents.dormant()).toEqual([]);
+	expect((await within.entry()).handingOver).toBe(true);
+	await heldOff(within, []);
+	await expect(within.agents.prompt("card-a", "now")).rejects.toThrow("grace period, 1 s from now");
+	await within.acp.end();
+	clock.advance(1);
+
+	const past = await restarted(first, { clock });
+
+	expect(await past.agents.dormant()).toEqual(["card-a"]);
+	expect((await past.entry()).handingOver).toBeUndefined();
+	await goesOnOverAcp(past, first);
+});
+
+test("a restart inside the grace period looks at the end of it, with no caller", async () => {
+	const first = await died("before");
+
+	const both = await restarted(first, { graceMs: 1_500 });
+
+	expect(await both.agents.dormant()).toEqual([]);
+	expect((await both.entry()).handingOver).toBe(true);
+	await until(async () => (await both.entry()).handingOver === undefined, "the look at the end of the grace period");
+	expect(await both.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+});
+
+test("the grace period of a restart counts from when the take failed, not from when the mark was written", async () => {
+	const clock = fakeClock();
+	const { both: first } = await gaveUp(clock);
+	await first.acp.end();
+	clock.advance(55_000);
+
+	const within = await restarted(first, { clock });
+
+	expect((await within.entry()).handingOver).toBe(true);
+	await expect(within.agents.prompt("card-a", "now")).rejects.toThrow("grace period, 5 s from now");
+});
+
+test("a window found at a restart inside the grace period puts the job on rex at once", async () => {
+	const clock = fakeClock();
+	const first = await died("after", { clock });
+
+	const both = await restarted(first, { clock });
+
+	expect((await both.entry()).handedOver).toBe(true);
+	await goesOnInWindow(both);
+});
+
+test("a mark from before marks had a time is older than the grace period: resolved at once", async () => {
+	const clock = fakeClock();
+	const first = await died("before", { clock });
+	const { handingOverAt: _written, ...entry } = await first.entry();
+	await writeFile(first.acp.sessionsFile, `${JSON.stringify({ "card-a": entry })}\n`);
+
+	const both = await restarted(first, { clock });
+
+	expect(await both.agents.dormant()).toEqual(["card-a"]);
+	expect((await both.entry()).handingOver).toBeUndefined();
+});
 
 /** Everything the core could ask of an undecided card-a is held off, and nothing starts for it over ACP. */
 async function heldOff(both: Sides, pids: readonly number[]) {
@@ -544,7 +789,7 @@ test("two prompts at once look once, and neither looks again for the other", asy
 });
 
 test("a prompt to another job looks at nothing, and goes on though rex is away", async () => {
-	const first = await died("before", "card-b");
+	const first = await died("before", { alongside: "card-b" });
 	const both = await restarted(first, { rexDown: true });
 	let asked = 0;
 	both.hangar.client.attach = () => {
@@ -712,7 +957,7 @@ test("a removal of the mark that does not reach the file: back on ACP, the mark 
 	await both.ran();
 	aroundWindow(both, async () => {
 		await mkdir(`${both.acp.sessionsFile}.tmp`);
-		throw new Error("rex refused the window");
+		throw new RexRpcError("session.new_window", "refused", "rex refused the window", 400);
 	});
 
 	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: false, refusal: "cannot_resume" });

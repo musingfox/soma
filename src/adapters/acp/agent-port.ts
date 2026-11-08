@@ -135,6 +135,8 @@ type Session = {
 	readonly handingOver?: true;
 	/** The hangar a handover in progress went to, the one place its window can be, whatever the config says later. */
 	readonly hangar?: string;
+	/** When the mark was written or the take failed, in milliseconds since the epoch. */
+	readonly handingOverAt?: number;
 };
 
 const givenUp = (session?: Session) => session?.handedOver === true || session?.handingOver === true;
@@ -907,12 +909,12 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		 * so no turn can begin between them. A mark that does not reach the file puts the agent back and refuses too, since
 		 * after a restart a prompt would wake it here beside the other side's claude, two writers on one transcript.
 		 */
-		async release(agent: string, { hangar }: HandoverMark): Promise<HeldSession | Refused> {
+		async release(agent: string, { hangar, at }: HandoverMark): Promise<HeldSession | Refused> {
 			await loading;
 			const held = holdOf(agent);
 			if ("refusal" in held) return held;
 			const before = sessions.get(agent) as Session;
-			const session = { ...before, handingOver: true as const, hangar };
+			const session = { ...before, handingOver: true as const, hangar, handingOverAt: at };
 			const asleep = dormant.get(agent);
 			const target = agents.get(agent);
 			sessions.set(agent, session);
@@ -945,12 +947,21 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			return held;
 		},
 
+		async markedAt(agent: string, at: number): Promise<void> {
+			await loading;
+			const found = sessions.get(agent);
+			if (!found?.handingOver) return;
+			const session = { ...found, handingOverAt: at };
+			sessions.set(agent, session);
+			await record(agent, session);
+		},
+
 		/** The window exists, so the session is the other side's for good. */
 		async confirm(agent: string): Promise<void> {
 			await loading;
 			const found = sessions.get(agent);
 			if (!found?.handingOver) return;
-			const { handingOver: _over, hangar: _hangar, ...rest } = found;
+			const { handingOver: _over, hangar: _hangar, handingOverAt: _at, ...rest } = found;
 			const session = { ...rest, handedOver: true as const };
 			sessions.set(agent, session);
 			await record(agent, session);
@@ -961,7 +972,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			await loading;
 			const found = sessions.get(agent);
 			if (!found?.handingOver) return;
-			const { handingOver: _reinstated, hangar: _hangar, ...session } = found;
+			const { handingOver: _reinstated, hangar: _hangar, handingOverAt: _at, ...session } = found;
 			sessions.set(agent, session);
 			dormant.set(agent, { name: agent, session });
 			await record(agent, session);
@@ -976,8 +987,14 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			await loading;
 			return [...sessions].flatMap(([name, session]) => {
 				if (!session.handingOver) return [];
-				const { hangar } = session;
-				return [{ ...heldOf(name, session), ...(hangar === undefined ? {} : { hangar }) }];
+				const { hangar, handingOverAt: at } = session;
+				return [
+					{
+						...heldOf(name, session),
+						...(hangar === undefined ? {} : { hangar }),
+						...(at === undefined ? {} : { at }),
+					},
+				];
 			});
 		},
 

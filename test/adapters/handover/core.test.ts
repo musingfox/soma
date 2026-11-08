@@ -5,6 +5,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { Harness, TaskId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
+import { RexTransportError } from "../../../src/adapters/rex/client.ts";
 import { deferExtension } from "../../../src/core/extensions/defer/index.ts";
 import { eventBridge, JOB_DONE, reconcileDispatches } from "../../../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../../../src/core/extensions/dispatch/index.ts";
@@ -13,7 +14,7 @@ import { openHarness } from "../../../src/core/harness.ts";
 import { NOTICE } from "../../../src/core/notice.ts";
 import { cleanUp } from "../acp/fake.ts";
 import type { Block, Session } from "../rex/fake.ts";
-import { AT_IDLE, sides, sleep } from "./fake.ts";
+import { AT_IDLE, fakeClock, sides, sleep } from "./fake.ts";
 
 const context = BACKGROUND_CONTEXT;
 // A request id goes with the db: the soma after this one must not get its words back as already said.
@@ -37,6 +38,8 @@ async function core(
 		blocks?: Block[];
 		restartOf?: string;
 		rexDown?: boolean;
+		clock?: ReturnType<typeof fakeClock>;
+		graceMs?: number;
 	} = {},
 ) {
 	const both = await sides(options);
@@ -362,6 +365,29 @@ test("a restart that finds a handover cut short with its window open has the job
 	expect(soma.results.at(-1)).toEqual({ sent: true });
 	expect(soma.typed()).toEqual(["the word again"]);
 	expect(await soma.pids()).toEqual([]);
+	soma.off();
+});
+
+test("show_job on a take that gave up tells the model the job is undecided and why, not that it stays on ACP", async () => {
+	const soma = await core({ clock: fakeClock() });
+	await dispatched(soma);
+	const original = soma.hangar.client.call.bind(soma.hangar.client);
+	soma.hangar.client.call = async (method, payload, schema) => {
+		if (method === "session.new_window") throw new RexTransportError("session.new_window: no response within 10000 ms");
+		return original(method, payload, schema);
+	};
+
+	await soma.say("看 card-a");
+
+	const told = soma.results.at(-1) as { handedOver: boolean; refusal: string; reason: string };
+	expect(told).toMatchObject({ handedOver: false, refusal: "cannot_resume" });
+	expect(told.reason).toContain("no response within 10000 ms");
+	expect(told.reason).toContain("the job is undecided");
+	expect(told.reason).toContain("its window may still open");
+	expect(told.reason).toContain("grace period");
+	expect(told.reason).not.toContain("stays on ACP");
+	expect(await soma.notices()).toEqual([]);
+	expect(await soma.job()).toMatchObject({ status: { state: "done" } });
 	soma.off();
 });
 

@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { int, obj, opt, str } from "@earendil-works/pi-schema";
 import { type AgentPort, type Answer, PromptRefused } from "../../../ports/agent.ts";
+import type { AgentHandover, HandoverOutcome, HandoverRefusal } from "../../../ports/handover.ts";
 import type { Choices, HumanAnswerOutcome } from "../../../ports/human.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
 import { composeLaunchPrompt, composeTicketPrompt } from "../../domain/launch-prompt.ts";
@@ -139,8 +140,24 @@ export async function answerJob(
 	return outcome;
 }
 
-/** `readCard` returns the card's markdown, read from wherever the repo's cards live. */
-export function dispatchExtension(agents: AgentPort, readCard: (repo: string, card: string) => Promise<string>) {
+/** A soma given no handover has no rex hangar to hand over to. */
+const NO_HANGAR: AgentHandover = {
+	handOver: async () => ({
+		handedOver: false,
+		refusal: "no_hangar",
+		reason: "no rex hangar is configured: rex.sessionId names one",
+	}),
+};
+
+/**
+ * `readCard` returns the card's markdown, read from wherever the repo's cards live. `handover` moves a job to where the
+ * human can see it, which the agent side alone knows how to do.
+ */
+export function dispatchExtension(
+	agents: AgentPort,
+	readCard: (repo: string, card: string) => Promise<string>,
+	handover: AgentHandover = NO_HANGAR,
+) {
 	const dispatch = defineTool({
 		name: "dispatch",
 		description:
@@ -416,8 +433,68 @@ export function dispatchExtension(agents: AgentPort, readCard: (repo: string, ca
 		},
 	});
 
+	const showJob = defineTool({
+		name: "show_job",
+		description:
+			"Hand a job soma runs over ACP over to a window of soma's rex hangar, where the human can watch it and type " +
+			"into it. Use it when the human asks to see, show or take over a job. A job over ACP has no terminal pane until " +
+			"this is called. Its ACP session is closed and the same conversation goes on in the window, for good: it cannot " +
+			"be handed back. Afterwards jobs, screen, reply and respond work on it under the same card, and what runs in it " +
+			"may have more tools than it had. Refused, with nothing done and the reason: an unknown card, a job not on ACP " +
+			"(one already handed over or on another agent side), one working, blocked or waiting on a deferred instruction, " +
+			"and any job when no rex hangar is configured. On success the human has been told in a notice naming the window, " +
+			"so do not repeat it.",
+		parameters: obj({ card: str({ description: "The job's card, as jobs lists it" }) }),
+		// Not replayed: a crash mid-call reports it interrupted rather than moving the job a second time.
+		replay: "unsafe",
+		execute: async ({ card: name }, api, context) => {
+			const refuse = (refusal: HandoverRefusal, reason: string) => text({ handedOver: false, refusal, reason });
+			// Copied out as JSON: a doc is a live proxy only valid inside its commit.
+			const job = await api.commit(async (tx) => {
+				const found = (await tx.doc(Dispatches, api.conversationId)).jobs.find((each) => each.card === name);
+				return found && (JSON.parse(JSON.stringify(found)) as Job);
+			}, context);
+			if (job === undefined) return refuse("unknown", `no job for card ${name}`);
+			// A deferral has this job's stop or restart in hand. A stop that failed is over: the agent stays as it was.
+			const phase = job.reclaim?.phase;
+			if (phase !== undefined && phase !== "failed") {
+				return refuse("not_at_rest", `a deferred instruction holds ${name} (${phase}): ask again once it has gone out`);
+			}
+			let moved: HandoverOutcome;
+			try {
+				moved = await handover.handOver(job.agent);
+			} catch (error) {
+				return refuse("cannot_resume", (error as Error).message);
+			}
+			if (!moved.handedOver) return text(moved);
+			const { window, session, sessionId, ready } = moved;
+			// In the commit of the move, so the human is told once. The session id is what the window runs and a later resume
+			// names; the brief, had it not gone, would be sent again at the window's first idle, and its transcript says it did.
+			await api.commit(async (tx) => {
+				const doc = await tx.doc(Dispatches, api.conversationId);
+				const index = doc.jobs.findIndex((each) => each.card === name);
+				const current = doc.jobs[index];
+				if (current !== undefined) {
+					const { launch: _sent, ...rest } = current;
+					doc.jobs[index] = { ...rest, sessionId };
+				}
+				await tx.appendEntry(
+					api.conversationId,
+					noticeEntry(
+						"report",
+						"outcome",
+						`agent ${job.agent} (card ${name}) moved to rex: its window is ${window} in session ${session}, ` +
+							"where you can watch it and type into it. It goes on in the same conversation." +
+							(ready ? "" : " claude has not reported itself up in the window yet, so look at the window."),
+					),
+				);
+			}, context);
+			return text(moved);
+		},
+	});
+
 	return defineExtension({
 		name: "soma.dispatch",
-		tools: [dispatch, jobs, respond, escalate, reply, foreignAgents, foreignResult, screen, foreignPrompt],
+		tools: [dispatch, jobs, respond, escalate, reply, foreignAgents, foreignResult, screen, foreignPrompt, showJob],
 	});
 }

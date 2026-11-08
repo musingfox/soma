@@ -7,6 +7,7 @@ import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import type { Harness } from "@earendil-works/pi-durable";
 import { createAcpAgentPort } from "./adapters/acp/agent-port.ts";
 import { serveDefer } from "./adapters/defer-socket/index.ts";
+import { createHandoverAgentPort, noHandover } from "./adapters/handover/agent-port.ts";
 import { createHerdrAgentPort } from "./adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "./adapters/herdr/client.ts";
 import { createCard, readCard } from "./adapters/obsidian/card.ts";
@@ -37,6 +38,7 @@ import { acquireDbLock, DbLockedError, openHarness, openStorage } from "./core/h
 import { openHumanPort } from "./core/human-port.ts";
 import { startCore } from "./core/startup.ts";
 import type { AgentPort } from "./ports/agent.ts";
+import type { AgentHandover } from "./ports/handover.ts";
 import { skillsExtensions } from "./skills.ts";
 import { vaultExtensions } from "./vault.ts";
 
@@ -61,11 +63,14 @@ const models = createModels({ authContext: anthropicAuthContext(config.anthropic
 models.setProvider(anthropicProvider());
 /**
  * The one place the agent-side adapter is chosen, by the config's `agentAdapter`, with the agents it found dormant as it
- * was made, which only ACP has: rex and herdr host theirs past soma, and tty's end with it.
+ * was made, which only ACP has: rex and herdr host theirs past soma, and tty's end with it. ACP with a hangar named runs
+ * its jobs on two sides, and is the one that can hand a job over; ACP without one hands over to nothing, which the
+ * dispatch extension says for itself.
  */
 function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, deferSocket, db }: Config): {
 	agents: AgentPort;
 	dormant: () => Promise<readonly string[]>;
+	handover?: AgentHandover;
 } {
 	const none = async () => [];
 	const cap = hangarCap === undefined ? {} : { cap: hangarCap };
@@ -73,15 +78,16 @@ function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, deferSocket,
 	// on, since the agent's own may be one its project pins.
 	const env = { SOMA_SOCKET: deferSocket, SOMA_NODE: process.execPath };
 	const path = join(dirname(dirname(fileURLToPath(import.meta.url))), "bin");
-	if (agentAdapter === "rex") {
-		// resolveConfig sets rex exactly when it is selected.
-		if (rex === undefined) throw new Error("agentAdapter is rex but the config holds no rex settings");
+	const rexPort = ({ socket, sessionId }: NonNullable<Config["rex"]>) => {
 		const onError = (error: Error) => console.error("[soma] rex:", error.message);
-		const client = createRexClient({ socketPath: rex.socket, onError });
-		return {
-			agents: createRexAgentPort({ client, sessionId: rex.sessionId, onError, env, path, ...cap }),
-			dormant: none,
-		};
+		const client = createRexClient({ socketPath: socket, onError });
+		return createRexAgentPort({ client, sessionId, onError, env, path, ...cap });
+	};
+	const notAcp = noHandover("not_acp", `this soma runs its jobs on ${agentAdapter}, not over ACP`);
+	if (agentAdapter === "rex") {
+		// resolveConfig sets rex whenever it is selected.
+		if (rex === undefined) throw new Error("agentAdapter is rex but the config holds no rex settings");
+		return { agents: rexPort(rex), dormant: none, handover: notAcp };
 	}
 	if (agentAdapter === "acp") {
 		const onError = (error: Error) => console.error("[soma] acp:", error.message);
@@ -89,18 +95,22 @@ function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, deferSocket,
 		// the agents of the last soma it finds there dormant, and starts none until a prompt needs one.
 		const sessionsFile = resolve(`${db}.acp-sessions.json`);
 		const acp = createAcpAgentPort({ env: process.env, vars: env, path, sessionsFile, onError, ...cap });
-		return { agents: acp, dormant: acp.dormant };
+		if (rex === undefined) return { agents: acp, dormant: acp.dormant };
+		const both = createHandoverAgentPort({ from: acp, to: rexPort(rex) });
+		return { agents: both, dormant: acp.dormant, handover: both };
 	}
 	if (agentAdapter === "tty") {
 		const onError = (error: Error) => console.error("[soma] tty:", error.message);
-		return { agents: createTtyAgentPort({ spawn: spawnPty, env: process.env, onError, ...cap }), dormant: none };
+		const agents = createTtyAgentPort({ spawn: spawnPty, env: process.env, onError, ...cap });
+		return { agents, dormant: none, handover: notAcp };
 	}
 	return {
 		agents: createHerdrAgentPort({ client: createHerdrClient({ socketPath: herdrSocket }), ...cap }),
 		dormant: none,
+		handover: notAcp,
 	};
 }
-const { agents, dormant } = openAgentPort(config);
+const { agents, dormant, handover } = openAgentPort(config);
 const digests = digest(agents);
 // A job a deferral's rerun makes due again is reclaimed after the reconcile, which may otherwise skip it while the
 // rerun still has it `sending`, or take that reclaim's `stopping` for one a crash cut short and stop the agent twice.
@@ -139,7 +149,7 @@ const extensions = [
 	sleeper,
 	memory,
 	schedule((id, c) => harness.abortTask(id, c)),
-	dispatchExtension(agents, readCard),
+	dispatchExtension(agents, readCard, handover),
 	digests.extension,
 	defers.extension,
 	...(config.reflection ? [reflections.extension] : []),

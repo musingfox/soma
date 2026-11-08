@@ -3,7 +3,7 @@ import type { Conversation } from "@earendil-works/pi-durable";
 import type { AgentPort, AgentState, AgentStatusEvent } from "../../../ports/agent.ts";
 import { complete, observe } from "../../domain/bridge.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
-import { reconcile } from "../../domain/reconcile.ts";
+import { CUT, dormantNotice, reconcile, turning, unfinished } from "../../domain/reconcile.ts";
 import { resultNotice, urgent } from "../../domain/report.ts";
 import { dispatchSignal, reblockSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
@@ -173,8 +173,16 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
  * finished in the gap is recorded and a block that was already handed to the model is not handed
  * over again. A job left `stopping` by the last process is settled, and one `due` whose agent is at
  * rest is stopped, so a reclaim a crash cut short neither leaves its window open nor reads as a vanished agent.
+ * `dormant` names the agents the agent side lists with no process, since they ended with soma, and no status, so their
+ * jobs keep the last one soma recorded. A job among them that was in a turn lost it: the turn is recorded over, once,
+ * as one with no outcome. The human is told once of those that were not done or failed, with which had a turn cut.
  */
-export async function reconcileDispatches(conversation: Conversation, agents: AgentPort, context: Context) {
+export async function reconcileDispatches(
+	conversation: Conversation,
+	agents: AgentPort,
+	context: Context,
+	dormant: readonly string[] = [],
+) {
 	// Only jobs the listing could have seen: one dispatched while it ran is missing from it, not gone.
 	const known = await conversation.commit(
 		async (tx) => new Set((await tx.doc(Dispatches, conversation.id)).jobs.map((job) => job.agent)),
@@ -201,6 +209,27 @@ export async function reconcileDispatches(conversation: Conversation, agents: Ag
 				kind: JOB_DONE,
 				data: { agent: job.agent, card: job.card, state: "error", outcome: "失敗", notified: true },
 			});
+		}
+		// In the same commit, so the restart tells it once, and the next one finds the cut turn over and records no more.
+		const asleep = doc.jobs
+			.filter((job) => known.has(job.agent) && dormant.includes(job.agent) && unfinished(job.status))
+			.map((job) => ({ agent: job.agent, card: job.card, cut: turning(job.status) }));
+		const cut = asleep.filter((job) => job.cut);
+		for (const { agent, card } of cut) {
+			const index = doc.jobs.findIndex((job) => job.agent === agent);
+			const { handedOver: _forgotten, ...rest } = doc.jobs[index] as Job;
+			doc.jobs[index] = { ...rest, status: CUT, outcome: "未知" };
+			// Told by the notice below, which names it cut.
+			await tx.appendEntry(conversation.id, {
+				kind: JOB_DONE,
+				data: { agent, card, state: "done", outcome: "未知", notified: true },
+			});
+		}
+		if (asleep.length > 0) {
+			await tx.appendEntry(
+				conversation.id,
+				noticeEntry("report", cut.length > 0 ? "action" : "ambient", dormantNotice(asleep, cut)),
+			);
 		}
 		return doc.jobs
 			.filter((job) => job.reclaim?.phase === "due" || job.reclaim?.phase === "stopping")

@@ -1,5 +1,5 @@
-import type { AgentListing } from "../../ports/agent.ts";
-import type { DispatchList } from "./dispatch.ts";
+import type { AgentListing, AgentState } from "../../ports/agent.ts";
+import type { DispatchList, Job } from "./dispatch.ts";
 
 /**
  * Brings each job's status up to what the agent side lists now. The listing is the
@@ -31,4 +31,32 @@ export function reconcile(jobs: DispatchList, listed: readonly AgentListing[]): 
 		const { handedOver: _forgotten, ...rest } = job;
 		return { ...rest, status: agent.status };
 	});
+}
+
+/** Whether a job in this status had a turn running, which an agent that ended with soma lost. */
+export const turning = (status: AgentState) =>
+	status.state === "working" || (status.state === "blocked" && status.kind !== "auth");
+
+/** Whether a job in this status still had work to go on with: one that was neither done nor failed. */
+export const unfinished = (status: AgentState) => status.state !== "done" && status.state !== "error";
+
+/** The status of a job whose turn a restart cut short: over, with no reply to read an outcome from. */
+export const CUT: AgentState = { state: "done", msg: "the turn was cut short when soma restarted" };
+
+/**
+ * The one notice of a restart whose agent side left unfinished jobs dormant, naming each and the ones whose turn the
+ * restart cut short; each goes on in its session with a reply.
+ */
+export function dormantNotice(
+	jobs: readonly Pick<Job, "agent" | "card">[],
+	cut: readonly Pick<Job, "agent" | "card">[],
+): string {
+	const named = (each: readonly Pick<Job, "agent" | "card">[]) =>
+		each.map((job) => `agent ${job.agent}（卡片 ${job.card}）`).join("、");
+	const head =
+		`soma 重新啟動後，${jobs.length} 件工作的 agent 停著，session 都還在：${named(jobs)}。` +
+		"回覆其中一件，它就在原本的 session 裡接著做，之前的對話都還在。";
+	return cut.length === 0
+		? `${head}沒有哪一輪被重啟打斷。`
+		: `${head}其中 ${named(cut)}正在做的那一輪被重啟打斷了，沒有做完；要它接著做，就回覆它。`;
 }

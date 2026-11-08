@@ -59,8 +59,15 @@ try {
 const context = BACKGROUND_CONTEXT;
 const models = createModels({ authContext: anthropicAuthContext(config.anthropicApiKey) });
 models.setProvider(anthropicProvider());
-/** The one place the agent-side adapter is chosen, by the config's `agentAdapter`. */
-function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, deferSocket, db }: Config): AgentPort {
+/**
+ * The one place the agent-side adapter is chosen, by the config's `agentAdapter`, with the agents it found dormant as it
+ * was made, which only ACP has: rex and herdr host theirs past soma, and tty's end with it.
+ */
+function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, deferSocket, db }: Config): {
+	agents: AgentPort;
+	dormant: () => Promise<readonly string[]>;
+} {
+	const none = async () => [];
 	const cap = hangarCap === undefined ? {} : { cap: hangarCap };
 	// What `soma defer` needs in an agent's shell: this release's bin/soma on PATH, the socket, and the node soma runs
 	// on, since the agent's own may be one its project pins.
@@ -71,21 +78,29 @@ function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, deferSocket,
 		if (rex === undefined) throw new Error("agentAdapter is rex but the config holds no rex settings");
 		const onError = (error: Error) => console.error("[soma] rex:", error.message);
 		const client = createRexClient({ socketPath: rex.socket, onError });
-		return createRexAgentPort({ client, sessionId: rex.sessionId, onError, env, path, ...cap });
+		return {
+			agents: createRexAgentPort({ client, sessionId: rex.sessionId, onError, env, path, ...cap }),
+			dormant: none,
+		};
 	}
 	if (agentAdapter === "acp") {
 		const onError = (error: Error) => console.error("[soma] acp:", error.message);
-		// Next to the db, as the defer socket is: one soma per db, so prod and a dev instance keep their own.
+		// Next to the db, as the defer socket is: one soma per db, so prod and a dev instance keep their own. The port lists
+		// the agents of the last soma it finds there dormant, and starts none until a prompt needs one.
 		const sessionsFile = resolve(`${db}.acp-sessions.json`);
-		return createAcpAgentPort({ env: process.env, vars: env, path, sessionsFile, onError, ...cap });
+		const acp = createAcpAgentPort({ env: process.env, vars: env, path, sessionsFile, onError, ...cap });
+		return { agents: acp, dormant: acp.dormant };
 	}
 	if (agentAdapter === "tty") {
 		const onError = (error: Error) => console.error("[soma] tty:", error.message);
-		return createTtyAgentPort({ spawn: spawnPty, env: process.env, onError, ...cap });
+		return { agents: createTtyAgentPort({ spawn: spawnPty, env: process.env, onError, ...cap }), dormant: none };
 	}
-	return createHerdrAgentPort({ client: createHerdrClient({ socketPath: herdrSocket }), ...cap });
+	return {
+		agents: createHerdrAgentPort({ client: createHerdrClient({ socketPath: herdrSocket }), ...cap }),
+		dormant: none,
+	};
 }
-const agents = openAgentPort(config);
+const { agents, dormant } = openAgentPort(config);
 const digests = digest(agents);
 // A job a deferral's rerun makes due again is reclaimed after the reconcile, which may otherwise skip it while the
 // rerun still has it `sending`, or take that reclaim's `stopping` for one a crash cut short and stop the agent twice.
@@ -162,7 +177,7 @@ const human = await startCore(
 		...(config.reflection ? [() => reflections.startReflection(root, REFLECTION_PERIOD_MS, context)] : []),
 	],
 );
-await reconcileDispatches(root, agents, context);
+await reconcileDispatches(root, agents, context, await dormant());
 reconciled();
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
 // Its first look at the foreign agents is at once, so a prompt that appeared while soma was down is pushed now.

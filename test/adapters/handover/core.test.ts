@@ -7,13 +7,18 @@ import type { Harness, TaskId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
 import { RexTransportError } from "../../../src/adapters/rex/client.ts";
 import { deferExtension } from "../../../src/core/extensions/defer/index.ts";
-import { eventBridge, JOB_DONE, reconcileDispatches } from "../../../src/core/extensions/dispatch/bridge.ts";
+import {
+	eventBridge,
+	handoverBridge,
+	JOB_DONE,
+	reconcileDispatches,
+} from "../../../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../../../src/core/extensions/dispatch/index.ts";
 import { reclaimer } from "../../../src/core/extensions/dispatch/reclaim.ts";
 import { openHarness } from "../../../src/core/harness.ts";
 import { NOTICE } from "../../../src/core/notice.ts";
 import { cleanUp } from "../acp/fake.ts";
-import type { Block, Session } from "../rex/fake.ts";
+import { type Block, HANGAR, type Session } from "../rex/fake.ts";
 import { AT_IDLE, fakeClock, sides, sleep } from "./fake.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -97,9 +102,15 @@ async function core(
 	harness.resume();
 	await reconcileDispatches(root, both.agents, context, await both.agents.dormant());
 	reconciled();
-	const off = eventBridge(root, both.agents, context).listen((error) => {
+	const quietOnceClosed = (error: unknown) => {
 		if (open.includes(harness)) throw error;
-	});
+	};
+	const offEvents = eventBridge(root, both.agents, context).listen(quietOnceClosed);
+	const offSettled = handoverBridge(root, both.agents, context).listen(quietOnceClosed);
+	const off = () => {
+		offEvents();
+		offSettled();
+	};
 	const job = async (agent = "card-a") =>
 		(await harness.snapshot(Dispatches, root.id, context))?.jobs.find((each) => each.agent === agent);
 	const entries = async (kind: string) =>
@@ -313,12 +324,12 @@ test("a job that is working when the human asks is refused, with no notice, and 
  * A soma that went down with the job's handover in progress: the entry marked and the ACP process gone. `window`: its
  * window opened first.
  */
-async function leftMidHandover(window: boolean) {
+async function leftMidHandover(window: boolean, mark: Record<string, unknown> = { handingOver: true }) {
 	const soma = await core();
 	await dispatched(soma);
 	await soma.rest();
 	const entry = await soma.entry();
-	await writeFile(soma.acp.sessionsFile, `${JSON.stringify({ "card-a": { ...entry, handingOver: true } })}\n`);
+	await writeFile(soma.acp.sessionsFile, `${JSON.stringify({ "card-a": { ...entry, ...mark } })}\n`);
 	await soma.end();
 	if (window) {
 		soma.blocks.push({
@@ -359,7 +370,6 @@ test("a restart that finds a handover cut short with its window open has the job
 
 	expect((await soma.entry()).handedOver).toBe(true);
 	expect(await soma.job()).toMatchObject({ status: { state: "idle" } });
-	expect(await soma.notices()).toEqual([]);
 	expect(await soma.agents.list()).toMatchObject([{ name: "card-a", sessionId: entry.acpSessionId }]);
 	await soma.say("回覆 card-a the word again");
 	expect(soma.results.at(-1)).toEqual({ sent: true });
@@ -486,5 +496,221 @@ test("a window whose reply was lost is handed over all the same: the core tells 
 	expect((await soma.job())?.sessionId).toBe(acpSessionId);
 	await soma.say("回覆 card-a go on");
 	expect(soma.typed()).toEqual(["go on"]);
+	soma.off();
+});
+
+const onRex = "its window is card-a in session hangar";
+const backOnAcp = "is back on ACP";
+const counted = (notices: string[], text: string) => notices.filter((notice) => notice.includes(text)).length;
+
+/** The next soma on what `soma` left, after a kill: its agents gone, its db closed. */
+async function again(soma: Soma, options: Parameters<typeof core>[0] = {}) {
+	await soma.end();
+	return core({ restartOf: soma.acp.cwd, blocks: soma.blocks, ...options });
+}
+
+/** One notice names the window and its session, and block label, listing and job all hold the claude session. */
+async function toldOnRexOnce(soma: Soma, acpSessionId: string) {
+	await soma.until(async () => counted(await soma.notices(), onRex) === 1, "the notice of the move");
+	await soma.until(async () => (await soma.job())?.sessionId === acpSessionId, "the job to take the session");
+	expect(soma.blocks.at(-1)?.label).toBe(acpSessionId);
+	expect(await soma.agents.list()).toMatchObject([{ name: "card-a", sessionId: acpSessionId }]);
+}
+
+test("a crash landing on rex found at startup tells the human once, across restarts, and the job takes the session", async () => {
+	const { cwd, blocks, entry } = await leftMidHandover(true);
+
+	const soma = await core({ restartOf: cwd, blocks });
+
+	await toldOnRexOnce(soma, entry.acpSessionId);
+	expect(await soma.notices()).toEqual([expect.stringContaining("Its handover was cut short and ended there")]);
+
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), onRex)).toBe(1);
+	expect((await next.job())?.sessionId).toBe(entry.acpSessionId);
+	const last = await again(next);
+	await sleep(50);
+	expect(counted(await last.notices(), onRex)).toBe(1);
+	last.off();
+});
+
+test("a soma killed after the final mark and before the commit: the next one tells the human, once", async () => {
+	const { cwd, blocks, entry } = await leftMidHandover(true, { handedOver: true });
+
+	const soma = await core({ restartOf: cwd, blocks });
+
+	await toldOnRexOnce(soma, entry.acpSessionId);
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), onRex)).toBe(1);
+	next.off();
+});
+
+test("a window found by a later look, with rex back: the human is told once and the job takes the session", async () => {
+	const { cwd, blocks, entry } = await leftMidHandover(true);
+	const soma = await core({ restartOf: cwd, blocks, rexDown: true });
+	expect(await soma.notices()).toEqual([]);
+	soma.rexUp();
+
+	await soma.say("回覆 card-a go on");
+
+	expect(soma.typed()).toEqual(["go on"]);
+	await toldOnRexOnce(soma, entry.acpSessionId);
+	await soma.agents.list();
+	await sleep(50);
+	expect(counted(await soma.notices(), onRex)).toBe(1);
+
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), onRex)).toBe(1);
+	next.off();
+});
+
+/** A running soma whose show_job on card-a gave up on `session.new_window`, whose window has not opened. */
+async function showGaveUp(options: Parameters<typeof core>[0] = {}) {
+	const soma = await core(options);
+	await dispatched(soma);
+	const entry = await soma.entry();
+	const original = soma.hangar.client.call.bind(soma.hangar.client);
+	soma.hangar.client.call = async (method, payload, schema) => {
+		if (method === "session.new_window") throw new RexTransportError("no response within 10000 ms");
+		return original(method, payload, schema);
+	};
+	await soma.say("看 card-a");
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: false, reason: expect.stringContaining("undecided") });
+	return { soma, entry };
+}
+
+const lateWindow = (soma: Soma, { acpSessionId, cwd }: { acpSessionId: string; cwd: string }) =>
+	soma.blocks.push({
+		name: "card-a",
+		block: "block:late",
+		label: acpSessionId,
+		argv0: "claude",
+		cwd,
+		records: [AT_IDLE],
+	});
+
+test("a window that opens within the grace period, in a running soma: the next reply goes to it, and the human is told once", async () => {
+	const clock = fakeClock();
+	const { soma, entry } = await showGaveUp({ clock });
+	clock.advance(59_000);
+	lateWindow(soma, entry);
+
+	await soma.say("回覆 card-a go on");
+
+	expect(soma.typed()).toEqual(["go on"]);
+	await toldOnRexOnce(soma, entry.acpSessionId);
+	expect(counted(await soma.notices(), backOnAcp)).toBe(0);
+	soma.off();
+});
+
+test("a window that never opens, in a running soma: back on ACP at the next look past the end, the human told once", async () => {
+	const clock = fakeClock();
+	const { soma, entry } = await showGaveUp({ clock });
+	clock.advance(60_000);
+
+	await soma.agents.list();
+
+	await soma.until(async () => counted(await soma.notices(), backOnAcp) === 1, "the notice of the return");
+	expect(await soma.notices()).toEqual([expect.stringContaining("agent card-a (card card-a) is back on ACP")]);
+	expect((await soma.job())?.sessionId).not.toBe(entry.acpSessionId);
+	await soma.agents.list();
+	await soma.say("回覆 card-a RECALL");
+	expect(soma.results.at(-1)).toEqual({ sent: true });
+	await soma.until(async () => (await soma.pids()).length === 2, "ACP to start again");
+	expect(counted(await soma.notices(), backOnAcp)).toBe(1);
+
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), backOnAcp)).toBe(1);
+	next.off();
+});
+
+test("with no one asking, the end of the grace period tells the human where the job is: back on ACP", async () => {
+	const { soma } = await showGaveUp({ graceMs: 40 });
+
+	await soma.until(async () => counted(await soma.notices(), backOnAcp) === 1, "the notice of the return");
+	soma.off();
+});
+
+test("with no one asking, the end of the grace period tells the human where the job is: on rex", async () => {
+	const { soma, entry } = await showGaveUp({ graceMs: 40 });
+	lateWindow(soma, entry);
+
+	await toldOnRexOnce(soma, entry.acpSessionId);
+	soma.off();
+});
+
+test("a job waiting out the rest of the grace period at a restart is not gone, and its return is told once", async () => {
+	const clock = fakeClock();
+	const { cwd, blocks } = await leftMidHandover(false, {
+		handingOver: true,
+		hangar: HANGAR,
+		handingOverAt: clock.now(),
+	});
+
+	const soma = await core({ restartOf: cwd, blocks, clock });
+
+	expect(await soma.notices()).toEqual([]);
+	expect(await soma.job()).toMatchObject({ status: { state: "idle" } });
+	expect((await soma.turns()).filter((turn) => turn.outcome === "失敗")).toEqual([]);
+	await soma.say("回覆 card-a too soon");
+	expect(soma.results.at(-1)).toEqual(expect.stringContaining("grace period"));
+	clock.advance(60_000);
+
+	await soma.say("回覆 card-a RECALL");
+
+	expect(soma.results.at(-1)).toEqual({ sent: true });
+	await soma.until(async () => counted(await soma.notices(), backOnAcp) === 1, "the notice of the return");
+	soma.off();
+});
+
+test("a startup look that gives the job back tells once, by the reconcile, and not again as a return", async () => {
+	const { cwd, blocks } = await leftMidHandover(false);
+
+	const soma = await core({ restartOf: cwd, blocks });
+
+	await sleep(50);
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining("agent card-a（卡片 card-a）")]);
+	expect(counted(notices, backOnAcp)).toBe(0);
+	soma.off();
+});
+
+test("a job moved by show_job is told once, and no restart tells it again", async () => {
+	const soma = await core();
+	await dispatched(soma);
+	await soma.say("看 card-a");
+	const { acpSessionId } = await soma.entry();
+	expect(counted(await soma.notices(), onRex)).toBe(1);
+
+	const next = await again(soma);
+
+	await sleep(50);
+	expect(counted(await next.notices(), onRex)).toBe(1);
+	expect((await next.job())?.sessionId).toBe(acpSessionId);
+	next.off();
+});
+
+test("a job never handed over reaches rex in no way at startup, through the real core, whatever bears its label", async () => {
+	const first = await core();
+	await dispatched(first);
+	const { acpSessionId } = await first.entry();
+	first.blocks.push({ name: "card-a", block: "block:namesake", label: acpSessionId, argv0: "claude" });
+
+	const soma = await again(first);
+
+	await sleep(50);
+	// The status watch reads the hangar, as it does for any soma, and drops what it finds: nothing looks for the job or acts.
+	const methods = soma.hangar.methods();
+	for (const method of ["session.list_blocks", "session.attach_all", "session.new_window", "block.event"]) {
+		expect(methods).not.toContain(method);
+	}
+	expect(methods).not.toContain("com.superlogical.terminal.write");
+	expect(await soma.agents.list()).toEqual([{ name: "card-a", sessionId: (await soma.job())?.sessionId }]);
+	expect(counted(await soma.notices(), onRex)).toBe(0);
+	expect((await soma.job())?.sessionId).not.toBe(acpSessionId);
 	soma.off();
 });

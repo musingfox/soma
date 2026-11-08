@@ -1,6 +1,7 @@
 import type { Context } from "@earendil-works/chord/context";
 import type { Conversation } from "@earendil-works/pi-durable";
 import type { AgentPort, AgentState, AgentStatusEvent } from "../../../ports/agent.ts";
+import type { HandoverSettling, Settled } from "../../../ports/handover.ts";
 import { complete, observe } from "../../domain/bridge.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
 import { CUT, dormantNotice, reconcile, turning, unfinished } from "../../domain/reconcile.ts";
@@ -8,7 +9,7 @@ import { resultNotice, urgent } from "../../domain/report.ts";
 import { dispatchSignal, reblockSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
 import { recordFact } from "../memory/index.ts";
-import { Dispatches } from "./index.ts";
+import { commitMove, Dispatches } from "./index.ts";
 import { reclaimer } from "./reclaim.ts";
 
 /** Entry kind of a turn the bridge recorded as finished; it carries no model message. */
@@ -163,6 +164,46 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 		/** Feeds every status the agent side reports from now on; returns the unsubscribe. */
 		listen(onError: (error: unknown) => void): () => void {
 			return agents.onStatus((event) => void handle(event).catch(onError));
+		},
+	};
+}
+
+/**
+ * What the agent side settled with no `show_job` to record it: a handover cut short, or one whose soma died before its
+ * commit. A job on rex takes the session its window runs and the human is told, in one commit, so a job that already
+ * holds that session has been told, by `show_job` or by this, in this soma or one before. A job given back to ACP by a
+ * later look is told once as it happens; one the startup's look gave back is told by the reconcile.
+ */
+export function handoverBridge(conversation: Conversation, settling: HandoverSettling, context: Context) {
+	async function apply(settled: Settled): Promise<void> {
+		await conversation.commit(async (tx) => {
+			const doc = await tx.doc(Dispatches, conversation.id);
+			const job = doc.jobs.find((each) => each.agent === settled.agent);
+			if (job === undefined) return;
+			const { agent, card } = job;
+			if (settled.onto === "acp") {
+				await tx.appendEntry(
+					conversation.id,
+					noticeEntry(
+						"report",
+						"outcome",
+						`agent ${agent} (card ${card}) is back on ACP: its handover was cut short and no window of it opened. ` +
+							"A reply goes on in the same session.",
+					),
+				);
+				return;
+			}
+			if (job.sessionId === settled.sessionId) return;
+			await commitMove(tx, conversation.id, { agent, card }, settled, " Its handover was cut short and ended there.");
+		}, context);
+	}
+	let queue = Promise.resolve();
+	return {
+		/** Feeds every job the agent side settles from now on, and those it settled before; returns the unsubscribe. */
+		listen(onError: (error: unknown) => void): () => void {
+			return settling.onSettled((settled) => {
+				queue = queue.then(() => apply(settled)).catch(onError);
+			});
 		},
 	};
 }

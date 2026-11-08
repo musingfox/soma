@@ -13,7 +13,7 @@ import { anthropicAuthContext, type Config, ConfigError, configPath, loadConfig 
 import { clock } from "./core/extensions/clock/index.ts";
 import { deferExtension } from "./core/extensions/defer/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
-import { eventBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
+import { eventBridge, handoverBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
 import { foreignBridge } from "./core/extensions/dispatch/foreign.ts";
 import { reclaimer } from "./core/extensions/dispatch/reclaim.ts";
 import { inspectExtension } from "./core/extensions/inspect/index.ts";
@@ -130,6 +130,9 @@ const human = await startCore(
 await reconcileDispatches(root, agents, context, await dormant());
 reconciled();
 const unlisten = eventBridge(root, agents, context).listen((error) => console.error("[soma] event bridge:", error));
+const unlistenSettled =
+	side.settling &&
+	handoverBridge(root, side.settling, context).listen((error) => console.error("[soma] handover bridge:", error));
 // Its first look at the foreign agents is at once, so a prompt that appeared while soma was down is pushed now.
 const unlistenForeign = foreignBridge(root, agents, context).listen((error) =>
 	console.error("[soma] foreign bridge:", error),
@@ -168,6 +171,7 @@ const webPage =
 	));
 const shutdown = () => {
 	unlisten();
+	unlistenSettled?.();
 	unlistenForeign();
 	stopTelegram.abort();
 	void Promise.all([telegramDone, webPage?.close(), deferServer?.close()])

@@ -32,6 +32,28 @@ export interface AgentHandover {
 	handOver(agent: string): Promise<HandoverOutcome>;
 }
 
+/**
+ * A job on a side no `handOver` answered for. rex: its window is `window` in the session labelled `session`, and it runs
+ * the claude session `sessionId`. acp: a look gave it back, and its next prompt goes on in its session.
+ */
+export type Settled =
+	| {
+			readonly agent: string;
+			readonly onto: "rex";
+			readonly window: string;
+			readonly session: string;
+			readonly sessionId: string;
+	  }
+	| { readonly agent: string; readonly onto: "acp" };
+
+/** Beside AgentHandover: tells whoever keeps the jobs what no `handOver` answered. */
+export interface HandoverSettling {
+	// Each job as a look settles it, and what settled before the listener came, the startup's look included but for a job
+	// `dormant()` names. Every job on rex at startup is said again, since a soma can die between its final mark and the
+	// listener's commit: the listener tells a job from one it has told by the session the job holds.
+	onSettled(listener: (settled: Settled) => void): () => void;
+}
+
 /** The claude session an agent runs, as the side that holds it recorded it. */
 export interface HeldSession {
 	readonly name: string;
@@ -90,6 +112,8 @@ export class TakeRefused extends Error {}
 export interface SessionTaker {
 	// The id of the session `take` opens windows in and `list` reads them from.
 	readonly hangar: string;
+	// That session's label, as the human sees it. Reads only; throws when this side cannot answer.
+	label(): Promise<string>;
 	// Why `take` would refuse now, with nothing done; undefined when it would not.
 	takeable(session: HeldSession): Promise<string | undefined>;
 	// Opens the session where the human can see it, and waits a bounded time for its claude to come up. Throws TakeRefused

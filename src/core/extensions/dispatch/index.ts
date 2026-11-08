@@ -140,6 +140,35 @@ export async function answerJob(
 	return outcome;
 }
 
+/**
+ * In the commit of the move, so the human is told once. The session id is what the window runs and a later resume names;
+ * the brief, had it not gone, would be sent again at the window's first idle, and its transcript says it did.
+ */
+export async function commitMove(
+	tx: Tx,
+	conversationId: Conversation["id"],
+	{ agent, card }: Pick<Job, "agent" | "card">,
+	{ window, session, sessionId }: { window: string; session: string; sessionId: string },
+	after: string,
+): Promise<void> {
+	const doc = await tx.doc(Dispatches, conversationId);
+	const index = doc.jobs.findIndex((each) => each.agent === agent);
+	const current = doc.jobs[index];
+	if (current !== undefined) {
+		const { launch: _sent, ...rest } = current;
+		doc.jobs[index] = { ...rest, sessionId };
+	}
+	await tx.appendEntry(
+		conversationId,
+		noticeEntry(
+			"report",
+			"outcome",
+			`agent ${agent} (card ${card}) moved to rex: its window is ${window} in session ${session}, ` +
+				`where you can watch it and type into it. It goes on in the same conversation.${after}`,
+		),
+	);
+}
+
 /** A soma given no handover has no rex hangar to hand over to. */
 const NO_HANGAR: AgentHandover = {
 	handOver: async () => ({
@@ -468,28 +497,8 @@ export function dispatchExtension(
 				return refuse("cannot_resume", (error as Error).message);
 			}
 			if (!moved.handedOver) return text(moved);
-			const { window, session, sessionId, ready } = moved;
-			// In the commit of the move, so the human is told once. The session id is what the window runs and a later resume
-			// names; the brief, had it not gone, would be sent again at the window's first idle, and its transcript says it did.
-			await api.commit(async (tx) => {
-				const doc = await tx.doc(Dispatches, api.conversationId);
-				const index = doc.jobs.findIndex((each) => each.card === name);
-				const current = doc.jobs[index];
-				if (current !== undefined) {
-					const { launch: _sent, ...rest } = current;
-					doc.jobs[index] = { ...rest, sessionId };
-				}
-				await tx.appendEntry(
-					api.conversationId,
-					noticeEntry(
-						"report",
-						"outcome",
-						`agent ${job.agent} (card ${name}) moved to rex: its window is ${window} in session ${session}, ` +
-							"where you can watch it and type into it. It goes on in the same conversation." +
-							(ready ? "" : " claude has not reported itself up in the window yet, so look at the window."),
-					),
-				);
-			}, context);
+			const after = moved.ready ? "" : " claude has not reported itself up in the window yet, so look at the window.";
+			await api.commit((tx) => commitMove(tx, api.conversationId, job, moved, after), context);
 			return text(moved);
 		},
 	});

@@ -11,7 +11,7 @@ import { spawnPty } from "./adapters/tty/pty.ts";
 import type { Config } from "./config.ts";
 import { dispatchExtension } from "./core/extensions/dispatch/index.ts";
 import type { AgentPort } from "./ports/agent.ts";
-import type { AgentHandover } from "./ports/handover.ts";
+import type { AgentHandover, HandoverSettling } from "./ports/handover.ts";
 
 /** The dispatch extension over a side as `openAgentPort` opened it, its handover with it: without one, every show_job answers no_hangar. */
 export function dispatchOver(
@@ -31,6 +31,7 @@ export function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, defer
 	agents: AgentPort;
 	dormant: () => Promise<readonly string[]>;
 	handover?: AgentHandover;
+	settling?: HandoverSettling;
 } {
 	const none = async () => [];
 	const cap = hangarCap === undefined ? {} : { cap: hangarCap };
@@ -57,7 +58,7 @@ export function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, defer
 		const acp = createAcpAgentPort({ env: process.env, vars: env, path, sessionsFile, onError, ...cap });
 		if (rex === undefined) return { agents: acp, dormant: acp.dormant };
 		const both = createHandoverAgentPort({ from: acp, to: rexPort(rex), onError });
-		return { agents: both, dormant: both.dormant, handover: both };
+		return { agents: both, dormant: both.dormant, handover: both, settling: both };
 	}
 	if (agentAdapter === "tty") {
 		const onError = (error: Error) => console.error("[soma] tty:", error.message);

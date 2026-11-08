@@ -5,9 +5,11 @@ import {
 	type HandingOver,
 	type HandoverOutcome,
 	type HandoverRefusal,
+	type HandoverSettling,
 	type HeldSession,
 	type SessionGiver,
 	type SessionTaker,
+	type Settled,
 	type Taken,
 	TakeRefused,
 } from "../../ports/handover.ts";
@@ -58,7 +60,7 @@ export function createHandoverAgentPort({
 	onError = (error) => console.warn(`[handover] ${error.message}`),
 	graceMs = HANDOVER_GRACE_MS,
 	now = Date.now,
-}: HandoverAgentPortOptions): AgentPort & AgentHandover & { dormant(): Promise<readonly string[]> } {
+}: HandoverAgentPortOptions): AgentPort & AgentHandover & HandoverSettling & { dormant(): Promise<readonly string[]> } {
 	const moved = new Map<string, HeldSession>();
 	const moving = new Map<string, HeldSession>();
 	const undecided = new Map<string, Undecided>();
@@ -103,11 +105,36 @@ export function createHandoverAgentPort({
 			undecided.delete(name);
 			await from.confirm(name);
 			onError(new Error(`${name} was left mid-handover and its window is open: it is on rex`));
+			tell({ agent: name, onto: "rex", sessionId: session.claudeSession });
 			return;
 		}
 		await from.reinstate(name);
 		undecided.delete(name);
 		onError(new Error(`${name} was left mid-handover and no window of it is open: it is dormant on ACP`));
+		if (started) tell({ agent: name, onto: "acp" });
+		else back.push(name);
+	}
+
+	/** A settled job, its window's place still to be read off rex, which only one on rex needs and only once it is told. */
+	type Telling =
+		| { readonly agent: string; readonly onto: "acp" }
+		| Omit<Extract<Settled, { onto: "rex" }>, "window" | "session">;
+	const listeners = new Set<(settled: Settled) => void>();
+	const unheard: Telling[] = [];
+	async function deliver(telling: Telling): Promise<void> {
+		const settled: Settled =
+			telling.onto === "acp"
+				? telling
+				: {
+						...telling,
+						window: telling.agent,
+						session: await to.label().catch(() => to.hangar),
+					};
+		for (const listener of listeners) listener(settled);
+	}
+	function tell(telling: Telling): void {
+		if (listeners.size === 0) unheard.push(telling);
+		else void deliver(telling).catch(onError);
 	}
 
 	let looking: Promise<unknown> | undefined;
@@ -133,12 +160,15 @@ export function createHandoverAgentPort({
 
 	// The names the startup's look gave back to `from`: dormant as those it found itself are, to the core's reconcile.
 	const back: string[] = [];
+	let started = false;
 	const loading = (async () => {
-		for (const session of await from.released()) moved.set(session.name, session);
-		const left = await from.handingOver();
-		for (const session of left) undecided.set(session.name, { ...session, why: "rex" });
+		for (const session of await from.released()) {
+			moved.set(session.name, session);
+			tell({ agent: session.name, onto: "rex", sessionId: session.claudeSession });
+		}
+		for (const session of await from.handingOver()) undecided.set(session.name, { ...session, why: "rex" });
 		await look();
-		back.push(...left.map(({ name }) => name).filter((name) => !moved.has(name) && !undecided.has(name)));
+		started = true;
 	})();
 	const side = async (agent: string) => {
 		await loading;
@@ -192,7 +222,7 @@ export function createHandoverAgentPort({
 				"cannot_resume",
 				`${error.message}. Its ACP process has ended, and rex does not answer (${there.message}), so whether its ` +
 					"window opened is not known: the job is undecided, and takes no prompt until rex answers, then goes on on " +
-					"the side it is on",
+					"the side it is on, and the human is told which in a notice",
 			);
 		}
 		hold(job, there === "loose" ? "loose" : "grace");
@@ -200,7 +230,7 @@ export function createHandoverAgentPort({
 		return refused(
 			"cannot_resume",
 			`${error.message}. Its ACP process has ended and the job is undecided: ${stillMoving(agent)}. It takes no ` +
-				"prompt until it is known which side it is on, then goes on on that side",
+				"prompt until it is known which side it is on, then goes on on that side, and the human is told which in a notice",
 		);
 	}
 
@@ -237,6 +267,12 @@ export function createHandoverAgentPort({
 		dormant: async () => {
 			await loading;
 			return [...(await from.dormant()), ...back];
+		},
+
+		onSettled(listener) {
+			listeners.add(listener);
+			void loading.then(() => Promise.all(unheard.splice(0).map(deliver))).catch(onError);
+			return () => listeners.delete(listener);
 		},
 
 		handOver(agent: string): Promise<HandoverOutcome> {

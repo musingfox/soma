@@ -897,11 +897,20 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 				onError(error);
 				return false;
 			});
-		const label = await client.call("session.attach_all", { event_scope: "session" }, AttachAllResultSchema).then(
-			({ sessions: all }) => all?.find((each) => each.session_id === sessionId)?.label,
-			(error: Error) => onError(error),
+		const session = await hangarLabel().catch((error: Error) => {
+			onError(error);
+			return sessionId;
+		});
+		return { window: name, session, ready };
+	}
+
+	async function hangarLabel(): Promise<string> {
+		const { sessions: all } = await client.call(
+			"session.attach_all",
+			{ event_scope: "session" },
+			AttachAllResultSchema,
 		);
-		return { window: name, session: label ?? sessionId, ready };
+		return all?.find((each) => each.session_id === sessionId)?.label ?? sessionId;
 	}
 
 	const listeners = new Set<(event: AgentStatusEvent) => void>();
@@ -1078,6 +1087,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 
 	return {
 		hangar: sessionId,
+		label: hangarLabel,
 
 		async start(request: StartRequest): Promise<void> {
 			// Built first, so a card the command cannot hold leaves git and rex alone.

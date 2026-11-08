@@ -77,6 +77,7 @@ test("main.ts builds its dispatch extension from the whole side it opened, as th
 	expect(main).toContain("const side = openAgentPort(config);");
 	expect(main).toContain("dispatchOver(side, readCard),");
 	expect(main).not.toContain("dispatchExtension");
+	expect(main).toContain("handoverBridge(root, side.settling, context)");
 });
 
 test("acp with a hangar named runs its jobs on two sides, and with none handed over asks rex nothing", async () => {
@@ -92,6 +93,12 @@ test("acp with a hangar named runs its jobs on two sides, and with none handed o
 	});
 	// Foreign agents are rex's, and no rex is there.
 	await expect(agents.listForeign()).rejects.toThrow();
+});
+
+test("only acp with a hangar settles anything", () => {
+	expect(opened({ agentAdapter: "acp", rex: hangar }).settling).toBeDefined();
+	expect(opened({ agentAdapter: "acp" }).settling).toBeUndefined();
+	expect(opened({ agentAdapter: "rex", rex: hangar }).settling).toBeUndefined();
 });
 
 test("acp alone hands nothing over, which the dispatch extension says for itself, and asks no rex for anything", async () => {

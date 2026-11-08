@@ -342,6 +342,20 @@ test("the trust dialog a handover answers never reaches the core, and what the w
 	off();
 });
 
+test("a handover whose claude leaves its window says not ready at once, with the job handed over", async () => {
+	const both = await sides({ opened: { records: [], screen: "$ claude --resume" }, takeMs: 60_000 });
+	await both.ran();
+	const moving = both.agents.handOver("card-a");
+	for (const deadline = Date.now() + 5_000; both.blocks.length === 0; await sleep(5)) {
+		expect(Date.now()).toBeLessThan(deadline);
+	}
+	await sleep(30);
+	(both.blocks[0] as Block).argv0 = "-fish";
+
+	expect(await moving).toMatchObject({ handedOver: true, ready: false });
+	expect((await both.entry()).handedOver).toBe(true);
+});
+
 test("a job not handed over has nothing on rex: no window, no call for its listing, no status, and nothing foreign", async () => {
 	const human: Block = { name: "mine", block: "block:human", argv0: "claude", cwd: "/home/me", records: [AT_IDLE] };
 	const namesake: Block = { name: "card-a", block: "block:namesake", argv0: "claude", records: [AT_IDLE] };

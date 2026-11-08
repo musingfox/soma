@@ -845,16 +845,22 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 
 	/**
 	 * Waits for claude to report itself up in a window `take` opened: true once the block has a root record, which it
-	 * reports with no dialog in its way, false when takeMs passes first. The CLI asks for workspace trust where ACP never
-	 * does, and has reported nothing while it asks, so a dialog on screen is answered yes, with the checks `respond`
-	 * makes, until an answer is sent: the job has run in this worktree all along, and only the human's asking brought it
-	 * here.
+	 * reports with no dialog in its way, false when takeMs passes first or as soon as a claude seen in the block has left
+	 * it, since no record comes then. The CLI asks for workspace trust where ACP never does, and has reported nothing
+	 * while it asks, so a dialog on screen is answered yes, with the checks `respond` makes, until an answer is sent: the
+	 * job has run in this worktree all along, and only the human's asking brought it here.
 	 */
 	async function comeUp(blockId: string): Promise<boolean> {
 		let answered = false;
+		let arrived = false;
 		for (const deadline = now() + takeMs; now() < deadline; await new Promise((done) => setTimeout(done, redrawMs))) {
-			const { records } = await blockCall("program_status", blockId, ProgramStatusResultSchema);
+			const [{ records }, claude] = await Promise.all([
+				blockCall("program_status", blockId, ProgramStatusResultSchema),
+				isClaude(blockId),
+			]);
 			if (records.some(isRoot)) return true;
+			if (arrived && !claude) return false;
+			arrived = claude;
 			if (answered) continue;
 			const screen = await readScreen(blockId);
 			const yes = screen.prompt?.options.find((option) => /^yes\b.*trust this folder/i.test(option.label));

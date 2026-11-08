@@ -9,6 +9,7 @@ import { type AgentPort, type AgentResult, type AgentStatusEvent, PromptRefused 
 import { AT, AT_US, type Block, fixture, git, HANGAR, rex, SESSION } from "./fake.ts";
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 // A claude whose start ps cannot tell: no unit test runs ps.
 const unstarted = async () => undefined;
 const request = { name: "card-a", card: "card-a", cwd: "/nonexistent/repo", sessionId: SESSION };
@@ -1561,7 +1562,7 @@ describe("taking over a session another side ran", () => {
 	}
 
 	/** A port on an in-memory rex whose new window becomes the block `opened` says, with the rest of `blocks`. */
-	function port(projectsDir: string, opened: Partial<Block> = { records: [idle] }, blocks: Block[] = []) {
+	function port(projectsDir: string, opened: Partial<Block> = { records: [idle] }, blocks: Block[] = [], takeMs = 200) {
 		const fake = rex(blocks);
 		fake.replace("session.new_window", ({ window_label, layout }) => {
 			const { label, options } = (layout as { block: { label: string; options: { cwd: string } } }).block;
@@ -1576,7 +1577,7 @@ describe("taking over a session another side ran", () => {
 			projectsDir,
 			redrawMs: 5,
 			keyGapMs: 1,
-			takeMs: 200,
+			takeMs,
 			env: { SOMA_SOCKET: "/run/soma.sock" },
 			path: "/opt/soma/bin",
 			onError: () => {},
@@ -1724,6 +1725,37 @@ describe("taking over a session another side ran", () => {
 		expect(await created.take(session)).toMatchObject({ ready: true });
 
 		expect(pressed).toEqual(["arrow_down", "arrow_down", "enter"]);
+		rmSync(projectsDir, { recursive: true, force: true });
+	});
+
+	test("take stops waiting as soon as a claude seen in the window has left it", async () => {
+		const { projectsDir, session } = held();
+		const { blocks, created } = port(projectsDir, { records: [], screen: "$ claude --resume" }, [], 60_000);
+		const taking = created.take(session);
+		await until(() => blocks.length > 0);
+		await sleep(30);
+		(blocks[0] as Block).argv0 = "-fish";
+		const started = Date.now();
+
+		expect(await taking).toEqual({ window: "card-a", session: "hangar", ready: false });
+
+		expect(Date.now() - started).toBeLessThan(5_000);
+		expect(blocks).toHaveLength(1);
+		rmSync(projectsDir, { recursive: true, force: true });
+	});
+
+	test("take waits through the shell a window opens on, for the claude it types", async () => {
+		const { projectsDir, session } = held();
+		const { blocks, created } = port(projectsDir, { records: [], argv0: "-fish", screen: "$" }, [], 60_000);
+		const taking = created.take(session);
+		await until(() => blocks.length > 0);
+		await sleep(30);
+		const block = blocks[0] as Block;
+		block.argv0 = "claude";
+		await sleep(30);
+		block.records?.push(idle);
+
+		expect(await taking).toMatchObject({ ready: true });
 		rmSync(projectsDir, { recursive: true, force: true });
 	});
 

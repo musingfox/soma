@@ -20,6 +20,7 @@ export async function sides(
 		others?: Session[];
 		opened?: Partial<Block>;
 		fake?: Record<string, string>;
+		takeMs?: number;
 	} = {},
 ) {
 	const acp = await acpHarness({ cwd: options.restartOf, ...(options.fake ? { fake: options.fake } : {}) });
@@ -53,7 +54,7 @@ export async function sides(
 		recheckMs: 50,
 		redrawMs: 5,
 		keyGapMs: 1,
-		takeMs: 200,
+		takeMs: options.takeMs ?? 200,
 		onError: () => {},
 	});
 	const agents = createHandoverAgentPort({ from: acp.port, to: onRex });

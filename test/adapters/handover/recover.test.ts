@@ -34,9 +34,10 @@ function aroundWindow(both: Sides, around: (open: () => Promise<unknown>) => Pro
  * opens, or `after`, before the final mark. Nothing of it runs on: its take hangs where the kill would have fallen, and
  * what the next soma finds is the sessions file, the transcripts and the hangar.
  */
-async function died(when: "before" | "after") {
+async function died(when: "before" | "after", alongside?: string) {
 	const first = await sides();
 	await first.ran();
+	if (alongside !== undefined) await first.ran(alongside);
 	const [pid] = await first.pids();
 	if (when === "after") {
 		aroundWindow(first, async (open) => {
@@ -364,8 +365,13 @@ async function heldOff(both: Sides, pids: readonly number[]) {
 	expect(await both.agents.respond("card-a", { option: "1", fingerprint: "f" })).toEqual({
 		sent: false,
 		refusal: "not_blocked",
+		reason: expect.stringContaining("being handed over"),
 	});
-	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: false, refusal: "cannot_resume" });
+	expect(await both.agents.handOver("card-a")).toMatchObject({
+		handedOver: false,
+		refusal: "cannot_resume",
+		reason: expect.stringContaining("being handed over"),
+	});
 	expect(await both.pids()).toEqual(pids);
 	expect((await both.entry()).handingOver).toBe(true);
 	expect((await both.entry()).handedOver).toBeUndefined();
@@ -438,6 +444,121 @@ test.each([
 		else await goesOnOverAcp(both, first);
 	},
 );
+
+test.each([
+	["its window open", "after", true],
+	["no window", "before", false],
+] as const)(
+	"rex back with %s: the very next prompt goes on the side the look finds, with no listing",
+	async (_name, when, inWindow) => {
+		const first = await died(when);
+		const both = await restarted(first, { rexDown: true });
+		await expect(both.agents.prompt("card-a", "too soon")).rejects.toThrow("rex does not answer");
+		both.rexUp();
+		const from = both.acp.events.length;
+
+		await both.agents.prompt("card-a", "RECALL");
+
+		if (inWindow) {
+			expect(both.typed()).toEqual(["RECALL"]);
+			expect((await both.entry()).handedOver).toBe(true);
+		} else {
+			await both.acp.until("done", from);
+			expect((await both.agents.readResult("card-a"))?.text).toBe("recall: the word is KIWI");
+			expect(both.typed()).toEqual([]);
+		}
+	},
+);
+
+test.each([
+	["its window open", "after", true],
+	["no window", "before", false],
+] as const)(
+	"rex back with %s: the very next answer goes to the side the look finds, with no listing",
+	async (_name, when, inWindow) => {
+		const first = await died(when);
+		const both = await restarted(first, { rexDown: true });
+		const answer = { option: "1", fingerprint: "f" };
+		expect(await both.agents.respond("card-a", answer)).toEqual({
+			sent: false,
+			refusal: "not_blocked",
+			reason: expect.stringContaining("rex does not answer"),
+		});
+		both.rexUp();
+
+		expect(await both.agents.respond("card-a", answer)).toEqual({ sent: false, refusal: "not_blocked" });
+
+		expect((await both.entry()).handingOver).toBeUndefined();
+		expect(both.hangar.methods().includes("com.superlogical.terminal.program_status")).toBe(inWindow);
+	},
+);
+
+test("rex back with its window open: the very next handover says it is on rex, opening nothing", async () => {
+	const first = await died("after");
+	const both = await restarted(first, { rexDown: true });
+	expect(await both.agents.handOver("card-a")).toMatchObject({
+		refusal: "cannot_resume",
+		reason: expect.stringContaining("rex does not answer"),
+	});
+	both.rexUp();
+
+	expect(await both.agents.handOver("card-a")).toMatchObject({ refusal: "not_acp" });
+
+	expect(both.windowsOpened()).toEqual([]);
+});
+
+test("rex back with no window: the very next handover goes through from ACP", async () => {
+	const first = await died("before");
+	const both = await restarted(first, { rexDown: true });
+	both.rexUp();
+
+	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: true });
+
+	expect(both.windowsOpened()).toHaveLength(1);
+	expect((await both.entry()).handedOver).toBe(true);
+});
+
+test("a refusal names the reason the look just found, not the one before it", async () => {
+	const first = await died("after");
+	const both = await restarted(first, { rexDown: true });
+	await expect(both.agents.prompt("card-a", "now")).rejects.toThrow("rex does not answer");
+	(first.blocks[0] as Block).detached = true;
+	both.rexUp();
+
+	const refusal = await both.agents.prompt("card-a", "now").catch((error: Error) => error);
+
+	expect(refusal).toBeInstanceOf(PromptRefused);
+	expect((refusal as Error).message).toContain("in no window");
+	expect((refusal as Error).message).not.toContain("does not answer");
+});
+
+test("two prompts at once look once, and neither looks again for the other", async () => {
+	const first = await died("after");
+	const both = await restarted(first, { rexDown: true });
+	both.rexUp();
+	const looks = () => both.hangar.methods().filter((method) => method === "session.list_blocks").length;
+
+	await Promise.allSettled([both.agents.prompt("card-a", "one"), both.agents.prompt("card-a", "two")]);
+
+	expect(looks()).toBe(1);
+});
+
+test("a prompt to another job looks at nothing, and goes on though rex is away", async () => {
+	const first = await died("before", "card-b");
+	const both = await restarted(first, { rexDown: true });
+	let asked = 0;
+	both.hangar.client.attach = () => {
+		asked++;
+		return Promise.reject(new Error("rex is away"));
+	};
+	const from = both.acp.events.length;
+
+	await both.agents.prompt("card-b", "RECALL");
+
+	await both.acp.until("done", from, "card-b");
+	expect(asked).toBe(0);
+	expect((await both.entry()).handingOver).toBe(true);
+});
 
 test("a hangar rex says does not exist holds no window: the job goes back to ACP, though any other error of rex leaves it undecided", async () => {
 	const first = await died("before");

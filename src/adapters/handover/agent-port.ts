@@ -1,6 +1,7 @@
 import { type AgentListing, type AgentPort, type AgentStatusEvent, PromptRefused } from "../../ports/agent.ts";
 import type {
 	AgentHandover,
+	AnswerHeld,
 	HandingOver,
 	HandoverOutcome,
 	HandoverRefusal,
@@ -37,7 +38,8 @@ type Undecided = HandingOver & { readonly why: Why };
  *
  * A handover cut short leaves `from`'s mark of one in progress, and only a look at `to` ends it: a window there, the job
  * is on `to`; `to` answers and no block of it there, it goes back to `from`. While `to` cannot answer, or holds a block of
- * it that is in no window yet, the job is undecided: as one under way, and looked at again at the next listing.
+ * it that is in no window yet, the job is undecided: as one under way, and looked at again at the next listing, prompt,
+ * answer or handover of it, each of which goes on on the side the look finds or refuses saying why.
  */
 export function createHandoverAgentPort({
 	from,
@@ -90,7 +92,7 @@ export function createHandoverAgentPort({
 	}
 
 	let looking: Promise<unknown> | undefined;
-	/** One look at a time: a second listing waits for the one under way rather than settling the same job twice. */
+	/** One look at a time: a second caller waits for the one under way rather than settling the same job twice. */
 	function look(): Promise<unknown> {
 		if (undecided.size === 0) return Promise.resolve();
 		looking ??= Promise.all([...undecided.values()].map(settle)).finally(() => {
@@ -163,6 +165,7 @@ export function createHandoverAgentPort({
 
 	async function handOver(agent: string): Promise<HandoverOutcome> {
 		await loading;
+		if (undecided.has(agent)) await look();
 		if (moved.has(agent)) return refused("not_acp", `${agent} is on rex already, in its window of the same name`);
 		if (undecided.has(agent)) return refused("cannot_resume", stillMoving(agent));
 		const held = await from.releasable(agent);
@@ -235,6 +238,7 @@ export function createHandoverAgentPort({
 
 		async prompt(agent, text) {
 			await loading;
+			if (undecided.has(agent)) await look();
 			if (inHand(agent)) throw new PromptRefused(stillMoving(agent));
 			return (await side(agent)).prompt(agent, text);
 		},
@@ -261,7 +265,11 @@ export function createHandoverAgentPort({
 
 		async respond(agent, answer) {
 			await loading;
-			if (inHand(agent)) return { sent: false, refusal: "not_blocked" };
+			if (undecided.has(agent)) await look();
+			if (inHand(agent)) {
+				const held: AnswerHeld = { sent: false, refusal: "not_blocked", reason: stillMoving(agent) };
+				return held;
+			}
 			return (await side(agent)).respond(agent, answer);
 		},
 

@@ -265,6 +265,7 @@ test("while a job moves it is listed with no status and takes no prompt, and a s
 	expect(await both.agents.respond("card-a", { option: "1", fingerprint: "f" })).toEqual({
 		sent: false,
 		refusal: "not_blocked",
+		reason: "card-a is being handed over",
 	});
 	expect((await both.agents.readResult("card-a"))?.text).toBe("echo: the word is KIWI");
 

@@ -423,7 +423,10 @@ test.each([
 		expect(await soma.pids()).toEqual([]);
 
 		soma.rexUp();
-		await soma.agents.list();
+		const before = soma.hangar.calls.length;
+		await soma.say("工作");
+		expect(soma.results.at(-1)).toMatchObject([{ card: "card-a", status: { state: "idle" } }]);
+		expect(soma.hangar.calls.length).toBe(before);
 
 		await soma.say("回覆 card-a now");
 		expect(soma.results.at(-1)).toEqual({ sent: true });

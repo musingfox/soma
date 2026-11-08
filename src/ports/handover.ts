@@ -1,3 +1,5 @@
+import type { AnswerOutcome } from "./agent.ts";
+
 /**
  * unknown: there is no such job. no_hangar: this soma has no rex hangar to hand over to. not_acp: the job does not run
  * over ACP, as one already handed over. not_at_rest: it is working, blocked or stopped. cannot_resume: the session
@@ -19,6 +21,9 @@ export type HandoverOutcome =
 			readonly ready: boolean;
 	  }
 	| ({ readonly handedOver: false } & Refused);
+
+/** A `respond` refused because the agent's side is not known yet: a refusal as any other, with why beside it. */
+export type AnswerHeld = Extract<AnswerOutcome, { sent: false }> & { readonly reason: string };
 
 /** Beside AgentPort: moves an agent at rest to an agent side the human can see, for good. */
 export interface AgentHandover {

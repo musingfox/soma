@@ -6,6 +6,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { Conversation, Harness, TaskId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
+import type { AcpAgentPort } from "../../../src/adapters/acp/agent-port.ts";
 import { HANDOVER_GRACE_MS } from "../../../src/adapters/handover/agent-port.ts";
 import { type createRexAgentPort, seqOf } from "../../../src/adapters/rex/agent-port.ts";
 import { RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
@@ -143,6 +144,12 @@ async function core(
 			return reply.id;
 		},
 		outcome: async (id: string) => (await harness.waitForTask(Number(id) as TaskId, context)).state.outcome,
+		/** The job's last finished turn stated this. */
+		stated: (outcome: "完成") =>
+			root.commit(async (tx) => {
+				const doc = await tx.doc(Dispatches, root.id);
+				doc.jobs = doc.jobs.map((each) => ({ ...each, outcome }));
+			}, context),
 		/** The job's status becomes `idle`, as after a cancelled turn: one a reconcile would report gone if it is not listed. */
 		rest: () =>
 			root.commit(async (tx) => {
@@ -743,6 +750,160 @@ test.each([
 		next.off();
 	},
 );
+
+/** Reads of the transcript through the ACP side wait while `gate.shut` holds one: a slow read of a turn just ended. */
+function slowReads(gate: { shut?: Promise<void>; waiting?: boolean }) {
+	return (port: AcpAgentPort): AcpAgentPort => ({
+		...port,
+		readResult: async (agent) => {
+			if (gate.shut !== undefined) {
+				gate.waiting = true;
+				await gate.shut;
+			}
+			return port.readResult(agent);
+		},
+	});
+}
+
+/** Shuts `gate`, and returns what opens it. */
+function shut(gate: { shut?: Promise<void> }) {
+	let open = () => {};
+	gate.shut = new Promise((resolve) => {
+		open = resolve;
+	});
+	return () => {
+		gate.shut = undefined;
+		open();
+	};
+}
+
+test("a bridge apply in flight across a move leaves the move's session id, and the turn that finished is recorded once, saying nothing", async () => {
+	const gate: { shut?: Promise<void>; waiting?: boolean } = {};
+	const soma = await core({ from: slowReads(gate) });
+	await dispatched(soma);
+	const { acpSessionId } = await soma.entry();
+	await soma.stated("完成");
+	const turns = (await soma.turns()).length;
+	const open = shut(gate);
+	await soma.say("回覆 card-a hello");
+	await soma.until(() => gate.waiting === true, "the turn's end to be reading its result");
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true, sessionId: acpSessionId });
+	const moved = await soma.job();
+	expect(moved?.sessionId).toBe(acpSessionId);
+	open();
+	await soma.until(async () => (await soma.turns()).length === turns + 1, "the turn that finished");
+	await sleep(50);
+	const job = await soma.job();
+	expect(job?.sessionId).toBe(acpSessionId);
+	expect(job?.resultId).toBe(moved?.resultId);
+	expect(job?.status.state).toBe("idle");
+	expect(job?.seq).toBe(seqOf(AT_IDLE));
+	expect(job?.outcome).toBe("未知");
+	expect((await soma.turns()).slice(turns)).toMatchObject([{ outcome: "未知", notified: false }]);
+	expect(await soma.notices()).toEqual([expect.stringContaining(onRex)]);
+
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), onRex)).toBe(1);
+	expect((await next.notices()).join()).not.toContain("cut short");
+	expect((await next.job())?.sessionId).toBe(acpSessionId);
+	next.off();
+});
+
+test("a turn's end in flight across a move tells nothing read off what a turn cut since left, and leaves the move's record", async () => {
+	const gate: { shut?: Promise<void>; waiting?: boolean } = {};
+	const soma = await core({ from: slowReads(gate) });
+	const { turns } = await busy(soma, "SPIN");
+	const { acpSessionId } = await soma.entry();
+	// The end of the turn before this one, still reading its result as this turn is cut.
+	const open = shut(gate);
+	const handling = soma.bridge.handle({ agent: "card-a", status: { state: "done" }, seq: 1 });
+	await soma.until(() => gate.waiting === true, "the status to be reading its result");
+
+	await soma.say("看 card-a");
+	const moved = await soma.job();
+	expect(moved?.sessionId).toBe(acpSessionId);
+	open();
+	await handling;
+
+	const job = await soma.job();
+	expect(job?.sessionId).toBe(acpSessionId);
+	expect(job?.resultId).toBe(moved?.resultId);
+	expect(job?.status).toEqual(moved?.status);
+	expect(job?.seq).toBe(moved?.seq);
+	const seq = settles(soma, "09");
+	await soma.until(async () => (await soma.job())?.seq === seq, "the window's idle");
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: false }]);
+	expect(await soma.notices()).toEqual([expect.stringContaining(cutTurn)]);
+	soma.off();
+});
+
+test("a brief going out as a job in its first turn moves is not sent again in the window", async () => {
+	let hold: Promise<void> | undefined;
+	const soma = await core({
+		brief: "QUIET the word is KIWI",
+		fake: { FAKE_ACP_MODEL: "fake-alias" },
+		from: (port) => ({
+			...port,
+			prompt: async (agent, text) => {
+				await port.prompt(agent, text);
+				await hold;
+			},
+		}),
+	});
+	let open = () => {};
+	hold = new Promise((resolve) => {
+		open = resolve;
+	});
+	await soma.say("派 card-a");
+	await soma.until(async () => (await soma.agents.readResult("card-a")) !== undefined, "the brief to be written");
+	expect((await soma.job())?.launch).toBeDefined();
+	const { acpSessionId } = await soma.entry();
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true, sessionId: acpSessionId, cut: {} });
+	open();
+	await sleep(50);
+	const seq = settles(soma, "09");
+	await soma.until(async () => (await soma.job())?.seq === seq, "the window's idle");
+	expect(soma.typed()).toEqual([]);
+	expect((await soma.job())?.launch).toBeUndefined();
+	expect((await soma.job())?.sessionId).toBe(acpSessionId);
+	soma.off();
+});
+
+test("a bridge apply in flight as a return is told leaves that return's time, so no restart tells it again", async () => {
+	const gate: { shut?: Promise<void>; waiting?: boolean } = {};
+	const soma = await core({ from: slowReads(gate) });
+	await dispatched(soma);
+	failsWindow(soma, new RexRpcError("session.new_window", "refused", "no window for you", 400));
+	await soma.say("看 card-a");
+	const first = (await soma.job())?.toldBack;
+	expect(first).toEqual(expect.any(Number));
+	const turns = (await soma.turns()).length;
+	const open = shut(gate);
+	await soma.say("回覆 card-a hello");
+	await soma.until(() => gate.waiting === true, "the turn's end to be reading its result");
+	await sleep(5);
+
+	await soma.say("看 card-a");
+
+	const second = (await soma.job())?.toldBack;
+	expect(second).toBeGreaterThan(first as number);
+	open();
+	await soma.until(async () => (await soma.turns()).length === turns + 1, "the turn that finished");
+	expect((await soma.job())?.toldBack).toBe(second);
+	const told = counted(await soma.notices(), backOnAcp);
+
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), backOnAcp)).toBe(told);
+	next.off();
+});
 
 test("a turn that does not stop in time: refused with the reason, nothing closed or opened, working, and no notice", async () => {
 	const soma = await core({ cutMs: 50 });

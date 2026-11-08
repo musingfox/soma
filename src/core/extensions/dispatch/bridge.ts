@@ -105,10 +105,15 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			const current = doc.jobs[index];
 			if (current === undefined || current.seq === event.seq) return;
 			// Decisions come from the current job, not the one read above: a respond tool may have added one since, and
-			// so may the reclaim, which a defer may have armed since.
+			// so may the reclaim, which a defer may have armed since, and the time of a return told since. A job that moved
+			// since is the window's: of what was read, only that a turn finished is still true of it, and its reply cannot be
+			// told from what a turn cut since left, so it says nothing.
+			const moved = current.sessionId !== job.sessionId;
 			const { launch: _held, handedOver: _handed, resultUnread: _unread, ...kept } = current;
-			const { decisions: _read, reclaim: _armed, ...fields } = next;
-			doc.jobs[index] = { ...kept, ...fields };
+			const { decisions: _read, reclaim: _armed, toldBack: _told, ...fields } = next;
+			const outcome = moved ? "未知" : (next.outcome ?? "未知");
+			const written = moved ? { ...current, ...(action === "complete" ? { outcome } : {}) } : { ...kept, ...fields };
+			doc.jobs[index] = written;
 			if (action === "escalate") {
 				const decision: Decision = {
 					at: new Date().toISOString(),
@@ -116,7 +121,7 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 					action: "escalated",
 					reason: "kind=auth 一律轉給人，事件橋沒有叫醒模型",
 				};
-				doc.jobs[index] = { ...kept, ...fields, decisions: [...kept.decisions, decision] };
+				doc.jobs[index] = { ...written, decisions: [...kept.decisions, decision] };
 				const msg = event.status.msg ? `\n${event.status.msg}` : "";
 				await tx.appendEntry(
 					conversation.id,
@@ -133,7 +138,6 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 				if (signal !== undefined) await recordFact(tx, signal);
 			}
 			if (action === "complete") {
-				const outcome = next.outcome ?? "未知";
 				// Told now, in the commit of its seq, so a resent event or a restart tells it once; the report skips it.
 				const notified = reply !== undefined && urgent(outcome, current, Date.now());
 				if (notified) {

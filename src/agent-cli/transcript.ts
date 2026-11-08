@@ -159,6 +159,28 @@ export async function readSessionCwd(path: string, firstWindowBytes = 64 * 1024)
 	}
 }
 
+/**
+ * The conversation's records in the last `bytes` of the transcript, oldest first: claude's user and assistant records,
+ * less the sub-agent, injected and compaction ones. A record the window cut short is left out; `whole` says the window
+ * is the file. Most of a transcript's bytes are claude's other records (API requests, attachments, snapshots), so a
+ * window holds far fewer conversation records than its size suggests.
+ */
+export async function readConversationTail(
+	path: string,
+	bytes = 64 * 1024,
+): Promise<{ records: unknown[]; whole: boolean }> {
+	const file = await open(path, "r");
+	try {
+		const { size } = await file.stat();
+		const start = Math.max(0, size - bytes);
+		const window = Buffer.alloc(size - start);
+		await file.read(window, 0, window.length, start);
+		return { records: parseWindow(window, start === 0).filter(isConversation), whole: start === 0 };
+	} finally {
+		await file.close();
+	}
+}
+
 /** The text of the last assistant message; undefined when it has none. */
 export async function readFinalAnswer(path: string, firstWindowBytes = 64 * 1024): Promise<string | undefined> {
 	return (await windowed(path, firstWindowBytes, lastMessage))?.text || undefined;

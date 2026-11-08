@@ -31,6 +31,8 @@
 // $FAKE_ACP_LOAD_AUTH and $FAKE_ACP_LOAD_EXIT, comma-separated agent names, have the agent whose SOMA_AGENT is named
 // refuse session/load with -32000 or exit with code 4 during it. Each agent appends "<SOMA_AGENT> <pid>" to $FAKE_ACP_PIDS.
 // $FAKE_ACP_LOAD_MS delays session/load. $FAKE_ACP_IGNORE_TERM has the agent live through SIGTERM.
+// $FAKE_ACP_HELD, comma-separated among new, load and stop, holds session/new, session/load or a cancelled SPIN's end until
+// the file $FAKE_ACP_PROJECTS/release-<that> exists, so a test holds one as long as it needs, whatever the machine's load.
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -48,6 +50,10 @@ const projects = process.env.FAKE_ACP_PROJECTS ?? "/nonexistent";
 const sessions = new Map<string, { cwd: string; last?: string; prompts: string[] }>();
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const named = (variable: string | undefined) => (variable ?? "").split(",").includes(process.env.SOMA_AGENT ?? "");
+async function released(what: "new" | "load" | "stop"): Promise<void> {
+	if (!(process.env.FAKE_ACP_HELD ?? "").split(",").includes(what)) return;
+	while (!existsSync(join(projects, `release-${what}`))) await sleep(5);
+}
 const transcriptOf = (sessionId: string, cwd: string) =>
 	join(projects, cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${sessionId}.jsonl`);
 if (process.env.FAKE_ACP_IGNORE_TERM) process.on("SIGTERM", () => {});
@@ -94,6 +100,7 @@ const app = agent({ name: "fake-acp" })
 	}))
 	.onRequest(methods.agent.session.new, async ({ params }) => {
 		await sleep(Number(process.env.FAKE_ACP_NEW_MS ?? 0));
+		await released("new");
 		if (process.env.FAKE_ACP_NEW_AUTH) throw RequestError.authRequired();
 		const sessionId = randomUUID();
 		sessions.set(sessionId, { cwd: params.cwd, prompts: [] });
@@ -118,6 +125,7 @@ const app = agent({ name: "fake-acp" })
 	})
 	.onRequest(methods.agent.session.load, async ({ params, client }) => {
 		await sleep(Number(process.env.FAKE_ACP_LOAD_MS ?? 0));
+		await released("load");
 		if (named(process.env.FAKE_ACP_LOAD_EXIT)) process.exit(4);
 		if (named(process.env.FAKE_ACP_LOAD_AUTH)) throw RequestError.authRequired();
 		const { sessionId, cwd } = params;
@@ -169,6 +177,7 @@ const app = agent({ name: "fake-acp" })
 			reply(sessionId, "結果：失敗\npartial, read as nothing");
 			await untilCancelled(sessionId);
 			await sleep(Number(process.env.FAKE_ACP_STOP_MS ?? 50));
+			await released("stop");
 			return { stopReason: "cancelled" };
 		}
 		if (text.includes("FINISH")) {

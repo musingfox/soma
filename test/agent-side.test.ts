@@ -82,6 +82,21 @@ test("main.ts builds its dispatch extension from the whole side it opened, as th
 	expect(main.indexOf("reconcileDispatches(")).toBeGreaterThan(main.indexOf("await side.settling?.heard();"));
 });
 
+test("main.ts starts in the order the reconcile needs: moves told first, then the reconcile, and only then statuses", () => {
+	const main = readFileSync(join(import.meta.dirname, "../src/main.ts"), "utf8");
+
+	const order = [
+		"handoverBridge(root, side.settling, context).listen(",
+		"await side.settling?.heard();",
+		"await reconcileDispatches(root, agents, context, await dormant());",
+		"\nreconciled();",
+		"eventBridge(root, agents, context).listen(",
+	].map((line) => main.indexOf(line));
+
+	expect(order).not.toContain(-1);
+	expect(order).toEqual(order.toSorted((one, other) => one - other));
+});
+
 test("acp with a hangar named runs its jobs on two sides, and with none handed over asks rex nothing", async () => {
 	const { agents, dormant, handover } = opened({ agentAdapter: "acp", rex: hangar });
 

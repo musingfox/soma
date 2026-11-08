@@ -560,24 +560,28 @@ test.each([
 );
 
 test("at the end of the grace period a look is made with no caller: no window, back on ACP", async () => {
-	const both = await sides({ graceMs: 40 });
+	const clock = fakeClock();
+	const both = await sides({ clock, graceMs: 40 });
 	await both.ran();
 	aroundWindow(both, () => Promise.reject(new RexTransportError("no response within 10000 ms")));
 
 	await both.agents.handOver("card-a");
 	expect((await both.entry()).handingOver).toBe(true);
+	clock.advance(40);
 
 	await until(async () => (await both.entry()).handingOver === undefined, "the look at the end of the grace period");
 	expect((await both.entry()).handedOver).toBeUndefined();
 });
 
 test("at the end of the grace period a look is made with no caller: a window opened within it, on rex", async () => {
-	const both = await sides({ graceMs: 40 });
+	const clock = fakeClock();
+	const both = await sides({ clock, graceMs: 40 });
 	await both.ran();
 	aroundWindow(both, () => Promise.reject(new RexTransportError("no response within 10000 ms")));
 
 	await both.agents.handOver("card-a");
 	await opensLate(both);
+	clock.advance(40);
 
 	await until(async () => (await both.entry()).handedOver === true, "the look at the end of the grace period");
 	expect(await both.agents.list()).toMatchObject([{ name: "card-a", status: { state: "idle" } }]);
@@ -619,12 +623,14 @@ test("a restart inside the grace period waits out the rest, and one past it is r
 });
 
 test("a restart inside the grace period looks at the end of it, with no caller", async () => {
-	const first = await died("before");
+	const clock = fakeClock();
+	const first = await died("before", { clock });
 
-	const both = await restarted(first, { graceMs: 1_500 });
+	const both = await restarted(first, { clock, graceMs: 200 });
 
 	expect(await both.agents.dormant()).toEqual([]);
 	expect((await both.entry()).handingOver).toBe(true);
+	clock.advance(200);
 	await until(async () => (await both.entry()).handingOver === undefined, "the look at the end of the grace period");
 	expect(await both.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
 });
@@ -678,15 +684,21 @@ test("a mark an hour ahead of the clock counts as now: the job waits out one gra
 });
 
 test("a mark further ahead than a timer can count does not spin the grace timer: one look at the end of the period", async () => {
-	const first = await died("before");
-	const ahead = { ...(await first.entry()), handingOverAt: Date.now() + 30 * 24 * 3_600_000 };
+	const clock = fakeClock();
+	const first = await died("before", { clock });
+	const ahead = { ...(await first.entry()), handingOverAt: clock.now() + 30 * 24 * 3_600_000 };
 	await writeFile(first.acp.sessionsFile, `${JSON.stringify({ "card-a": ahead })}\n`);
 
-	const both = await restarted(first, { graceMs: 200 });
+	const both = await restarted(first, { clock, graceMs: 200 });
+	const started = Date.now();
 
 	expect((await both.entry()).handingOver).toBe(true);
+	await sleep(300);
+	// One look at startup, then one per timer of the whole period, however slow the machine: a timer that overflowed fires
+	// every millisecond.
+	expect(looked(both).length).toBeLessThanOrEqual(2 + (Date.now() - started) / 200);
+	clock.advance(200);
 	await until(async () => (await both.entry()).handingOver === undefined, "the look at the end of the grace period");
-	expect(looked(both).length).toBeLessThanOrEqual(2);
 });
 
 /** Everything the core could ask of an undecided card-a is held off, and nothing starts for it over ACP. */

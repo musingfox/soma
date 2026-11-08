@@ -1,5 +1,5 @@
 import { appendFileSync, mkdirSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AcpAgentPort } from "../../../src/adapters/acp/agent-port.ts";
 import { createHandoverAgentPort, HANDOVER_GRACE_MS } from "../../../src/adapters/handover/agent-port.ts";
@@ -134,6 +134,11 @@ export async function sides(
 				givenBack?: number;
 				model?: string;
 			},
+		/** Lets go of what `FAKE_ACP_HELD` holds. */
+		release: async (what: "new" | "load" | "stop") => {
+			await mkdir(projects, { recursive: true });
+			await writeFile(join(projects, `release-${what}`), "");
+		},
 		closed: () => readFile(join(projects, "closed"), "utf8").catch(() => ""),
 		cancelled: () => readFile(join(projects, "cancelled"), "utf8").catch(() => ""),
 		pids: async () =>

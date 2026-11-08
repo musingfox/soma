@@ -418,13 +418,14 @@ test("blocked with a turn that will not stop once its prompt is cancelled: refus
 });
 
 test("a second handover of a turn still stopping sends no second cancel, and one after it stopped goes through", async () => {
-	const both = await sides({ cutMs: 40, fake: { FAKE_ACP_STOP_MS: "300" } });
+	const both = await sides({ cutMs: 40, fake: { FAKE_ACP_HELD: "stop" } });
 	const from = await inTurn(both, "SPIN");
 	const { acpSessionId } = await both.entry();
 
 	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: false, refusal: "not_at_rest" });
 	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: false, refusal: "not_at_rest" });
 	expect(await both.cancelled()).toBe(`${acpSessionId}\n`);
+	await both.release("stop");
 	await both.acp.until("idle", from);
 
 	const outcome = await both.agents.handOver("card-a");
@@ -541,7 +542,7 @@ test("a job waking is still refused, with nothing cancelled", async () => {
 	const first = await sides();
 	await first.ran();
 	await first.acp.end();
-	const both = await sides({ restartOf: first.acp.cwd, blocks: first.blocks, fake: { FAKE_ACP_LOAD_MS: "200" } });
+	const both = await sides({ restartOf: first.acp.cwd, blocks: first.blocks, fake: { FAKE_ACP_HELD: "load" } });
 	const prompting = both.agents.prompt("card-a", "RECALL");
 	await sleep(50);
 
@@ -553,11 +554,12 @@ test("a job waking is still refused, with nothing cancelled", async () => {
 
 	expect(await both.cancelled()).toBe("");
 	expect(both.windowsOpened()).toEqual([]);
+	await both.release("load");
 	await prompting;
 });
 
 test("a job being resumed is still refused, with nothing cancelled", async () => {
-	const both = await sides({ fake: { FAKE_ACP_LOAD_MS: "200" } });
+	const both = await sides({ fake: { FAKE_ACP_HELD: "load" } });
 	await both.ran();
 	await both.agents.stop("card-a");
 	const resuming = both.agents.resume({ name: "card-a", card: "card-a", sessionId: SESSION });
@@ -570,11 +572,12 @@ test("a job being resumed is still refused, with nothing cancelled", async () =>
 	});
 
 	expect(await both.cancelled()).toBe("");
+	await both.release("load");
 	await resuming;
 });
 
 test("a session not yet open is still refused, with nothing cancelled", async () => {
-	const both = await sides({ fake: { FAKE_ACP_NEW_MS: "300" } });
+	const both = await sides({ fake: { FAKE_ACP_HELD: "new" } });
 	await both.acp.start();
 
 	expect(await both.agents.handOver("card-a")).toMatchObject({
@@ -588,7 +591,7 @@ test("a session not yet open is still refused, with nothing cancelled", async ()
 });
 
 test("while a turn is being cut it takes no prompt or answer, and is listed with no status", async () => {
-	const both = await sides({ cutMs: 2_000, fake: { FAKE_ACP_STOP_MS: "300" } });
+	const both = await sides({ fake: { FAKE_ACP_HELD: "stop" } });
 	await inTurn(both, "SPIN");
 
 	const moving = both.agents.handOver("card-a");
@@ -601,6 +604,7 @@ test("while a turn is being cut it takes no prompt or answer, and is listed with
 		refusal: "not_blocked",
 		reason: "card-a is being handed over",
 	});
+	await both.release("stop");
 	expect(await moving).toMatchObject({ handedOver: true });
 });
 

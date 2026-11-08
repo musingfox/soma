@@ -1832,8 +1832,10 @@ test("with no one asking, the end of the grace period tells the human where the 
 });
 
 test("with no one asking, the end of the grace period tells the human where the job is: on rex", async () => {
-	const { soma, entry } = await showGaveUp({ graceMs: 40 });
+	const clock = fakeClock();
+	const { soma, entry } = await showGaveUp({ clock, graceMs: 40 });
 	lateWindow(soma, entry);
+	clock.advance(40);
 
 	await toldOnRexOnce(soma, entry.acpSessionId);
 	soma.off();
@@ -1979,6 +1981,27 @@ test("a job never handed over gets nothing new at a restart, done by a real turn
 	expect((await soma.job())?.toldBack).toBeUndefined();
 	expect((await soma.entry()).givenBack).toBeUndefined();
 	soma.off();
+});
+
+test("a new mark takes the last return off: one never told is not told after the job has landed", async () => {
+	const soma = await core();
+	await dispatched(soma);
+	const call = soma.hangar.client.call;
+	failsWindow(soma, new RexRpcError("session.new_window", "refused", "no window for you", 400));
+	await soma.agents.handOver("card-a", () => Promise.reject(new Error("the db is away")));
+	expect((await soma.entry()).givenBack).toEqual(expect.any(Number));
+	expect(await soma.notices()).toEqual([]);
+	soma.hangar.client.call = call;
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true });
+	expect((await soma.entry()).givenBack).toBeUndefined();
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), onRex)).toBe(1);
+	expect(counted(await next.notices(), backOnAcp)).toBe(0);
+	next.off();
 });
 
 test("a job moved by show_job is told once, and no restart tells it again", async () => {

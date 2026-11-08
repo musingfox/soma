@@ -1,30 +1,20 @@
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import type { Harness } from "@earendil-works/pi-durable";
-import { createAcpAgentPort } from "./adapters/acp/agent-port.ts";
 import { serveDefer } from "./adapters/defer-socket/index.ts";
-import { createHandoverAgentPort, noHandover } from "./adapters/handover/agent-port.ts";
-import { createHerdrAgentPort } from "./adapters/herdr/agent-port.ts";
-import { createHerdrClient } from "./adapters/herdr/client.ts";
 import { createCard, readCard } from "./adapters/obsidian/card.ts";
-import { createRexAgentPort } from "./adapters/rex/agent-port.ts";
-import { createRexClient } from "./adapters/rex/client.ts";
 import { runTelegram, ENTRY_KIND as TELEGRAM_KIND } from "./adapters/telegram/index.ts";
 import { runTerminal, ENTRY_KIND as TERMINAL_KIND } from "./adapters/terminal/index.ts";
-import { createTtyAgentPort } from "./adapters/tty/agent-port.ts";
-import { spawnPty } from "./adapters/tty/pty.ts";
 import { SERVE_HOST, startWeb, ENTRY_KIND as WEB_KIND } from "./adapters/web/index.ts";
+import { dispatchOver, openAgentPort } from "./agent-side.ts";
 import { anthropicAuthContext, type Config, ConfigError, configPath, loadConfig } from "./config.ts";
 import { clock } from "./core/extensions/clock/index.ts";
 import { deferExtension } from "./core/extensions/defer/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
 import { foreignBridge } from "./core/extensions/dispatch/foreign.ts";
-import { dispatchExtension } from "./core/extensions/dispatch/index.ts";
 import { reclaimer } from "./core/extensions/dispatch/reclaim.ts";
 import { inspectExtension } from "./core/extensions/inspect/index.ts";
 import { language } from "./core/extensions/language/index.ts";
@@ -37,8 +27,6 @@ import { web } from "./core/extensions/web/index.ts";
 import { acquireDbLock, DbLockedError, openHarness, openStorage } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
 import { startCore } from "./core/startup.ts";
-import type { AgentPort } from "./ports/agent.ts";
-import type { AgentHandover } from "./ports/handover.ts";
 import { skillsExtensions } from "./skills.ts";
 import { vaultExtensions } from "./vault.ts";
 
@@ -61,56 +49,8 @@ try {
 const context = BACKGROUND_CONTEXT;
 const models = createModels({ authContext: anthropicAuthContext(config.anthropicApiKey) });
 models.setProvider(anthropicProvider());
-/**
- * The one place the agent-side adapter is chosen, by the config's `agentAdapter`, with the agents it found dormant as it
- * was made, which only ACP has: rex and herdr host theirs past soma, and tty's end with it. ACP with a hangar named runs
- * its jobs on two sides, and is the one that can hand a job over; ACP without one hands over to nothing, which the
- * dispatch extension says for itself.
- */
-function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, deferSocket, db }: Config): {
-	agents: AgentPort;
-	dormant: () => Promise<readonly string[]>;
-	handover?: AgentHandover;
-} {
-	const none = async () => [];
-	const cap = hangarCap === undefined ? {} : { cap: hangarCap };
-	// What `soma defer` needs in an agent's shell: this release's bin/soma on PATH, the socket, and the node soma runs
-	// on, since the agent's own may be one its project pins.
-	const env = { SOMA_SOCKET: deferSocket, SOMA_NODE: process.execPath };
-	const path = join(dirname(dirname(fileURLToPath(import.meta.url))), "bin");
-	const rexPort = ({ socket, sessionId }: NonNullable<Config["rex"]>) => {
-		const onError = (error: Error) => console.error("[soma] rex:", error.message);
-		const client = createRexClient({ socketPath: socket, onError });
-		return createRexAgentPort({ client, sessionId, onError, env, path, ...cap });
-	};
-	const notAcp = noHandover("not_acp", `this soma runs its jobs on ${agentAdapter}, not over ACP`);
-	if (agentAdapter === "rex") {
-		// resolveConfig sets rex whenever it is selected.
-		if (rex === undefined) throw new Error("agentAdapter is rex but the config holds no rex settings");
-		return { agents: rexPort(rex), dormant: none, handover: notAcp };
-	}
-	if (agentAdapter === "acp") {
-		const onError = (error: Error) => console.error("[soma] acp:", error.message);
-		// Next to the db, as the defer socket is: one soma per db, so prod and a dev instance keep their own. The port lists
-		// the agents of the last soma it finds there dormant, and starts none until a prompt needs one.
-		const sessionsFile = resolve(`${db}.acp-sessions.json`);
-		const acp = createAcpAgentPort({ env: process.env, vars: env, path, sessionsFile, onError, ...cap });
-		if (rex === undefined) return { agents: acp, dormant: acp.dormant };
-		const both = createHandoverAgentPort({ from: acp, to: rexPort(rex) });
-		return { agents: both, dormant: acp.dormant, handover: both };
-	}
-	if (agentAdapter === "tty") {
-		const onError = (error: Error) => console.error("[soma] tty:", error.message);
-		const agents = createTtyAgentPort({ spawn: spawnPty, env: process.env, onError, ...cap });
-		return { agents, dormant: none, handover: notAcp };
-	}
-	return {
-		agents: createHerdrAgentPort({ client: createHerdrClient({ socketPath: herdrSocket }), ...cap }),
-		dormant: none,
-		handover: notAcp,
-	};
-}
-const { agents, dormant, handover } = openAgentPort(config);
+const side = openAgentPort(config);
+const { agents, dormant } = side;
 const digests = digest(agents);
 // A job a deferral's rerun makes due again is reclaimed after the reconcile, which may otherwise skip it while the
 // rerun still has it `sending`, or take that reclaim's `stopping` for one a crash cut short and stop the agent twice.
@@ -149,7 +89,7 @@ const extensions = [
 	sleeper,
 	memory,
 	schedule((id, c) => harness.abortTask(id, c)),
-	dispatchExtension(agents, readCard, handover),
+	dispatchOver(side, readCard),
 	digests.extension,
 	defers.extension,
 	...(config.reflection ? [reflections.extension] : []),

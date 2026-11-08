@@ -82,6 +82,8 @@ test("the tool says it interrupts a running job and cancels a pending prompt, so
 	expect(tool?.description).toMatch(/interrupts a running job/);
 	expect(tool?.description).toMatch(/cancels a pending prompt/);
 	expect(tool?.description).toMatch(/use it only when the human asks/);
+	expect(tool?.description).toMatch(/A deferred instruction the job sets as it moves is cancelled/);
+	expect(tool?.description).toMatch(/in a notice quoting the reason: do not repeat either/);
 });
 
 test("a soma with no rex hangar refuses, saying so, with nothing done", async () => {

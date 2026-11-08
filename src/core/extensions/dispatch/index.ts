@@ -524,8 +524,8 @@ export function dispatchExtension(
 			"window, for good: it cannot be handed back. Afterwards jobs, screen, reply and respond work on it under the same " +
 			"card, and what runs in it may have more tools than it had. Refused, with nothing done and the reason: an unknown " +
 			"card, a job not on ACP (one already handed over or on another agent side), one blocked on a login, waking, with " +
-			"no session open yet or waiting on a deferred instruction, and any job when no rex hangar is configured. A " +
-			"deferred instruction the job sets as it moves is cancelled, and the human told. Refused " +
+			"no session open yet, no conversation written yet or waiting on a deferred instruction, and any job when no rex " +
+			"hangar is configured. A deferred instruction the job sets as it moves is cancelled, and the human told. Refused " +
 			"with its turn cancelled: a turn that does not stop in time, which leaves the job on ACP with nothing closed. On " +
 			"success the human has been told in a notice naming the window and what was cut, and on a refusal that cut a " +
 			"turn or says the job stays on ACP with its process ended, in a notice quoting the reason: do not repeat either.",

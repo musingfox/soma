@@ -6,17 +6,18 @@
 //        working  it runs a long Bash `sleep`, which the repo's settings allow, behind an `echo`, since claude's Bash tool
 //                 refuses a command that begins with a long sleep, and the sleep is seen running;
 //        blocked  it runs a Bash `touch` that asks permission, and the job is recorded blocked, with the model woken;
+//     or, as first-turn, no second prompt: the brief itself runs that sleep before any reply, so the job has finished no turn;
 //   4. the model's show_job cuts the turn: the cut comes before the mark, nothing is left under this process and no sleep
 //      runs anywhere, one window is open, showing no prompt and running `--resume` on the session, the job is neither
 //      working nor blocked, no turn is recorded of what was cut, and the human is told once, the notice saying the turn was
 //      cut or quoting the prompt. In `blocked` the model's pending wake is refused, and nothing was touched;
 //   5. the model's reply goes into the pane and asks for the word, which is in no prompt since the brief: it comes back, as
 //      a turn the bridge records, from the one transcript the session has.
-// Three prompts run on haiku. It logs where things stood before its cleanup removes them. It destroys its rex session,
+// Up to three prompts run on haiku. It logs where things stood before its cleanup removes them. It destroys its rex session,
 // removes its repo, what claude keeps for the repo and its worktrees under ~/.claude/projects and its db, and kills what
 // is left of its own by PID, also on failure. ~/.claude.json keeps the trust entry claude wrote for the repo, which is
 // printed; nothing else is read out of that file.
-//   node smoke/acp-handover-busy.ts working|blocked
+//   node smoke/acp-handover-busy.ts working|blocked|first-turn
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -40,7 +41,7 @@ import {
 	TERMINAL,
 	ViewSchema,
 } from "../src/adapters/rex/schema.ts";
-import { projectDirNameFor, readLastRecord } from "../src/agent-cli/transcript.ts";
+import { projectDirNameFor, readLastRecord, readSessionModel } from "../src/agent-cli/transcript.ts";
 import { runGit } from "../src/agent-cli/worktree.ts";
 import type { Job } from "../src/core/domain/dispatch.ts";
 import { eventBridge, handoverBridge, JOB_DONE, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
@@ -51,7 +52,9 @@ import { delay } from "./driver.ts";
 
 const context = BACKGROUND_CONTEXT;
 const scenario = process.argv[2];
-if (scenario !== "working" && scenario !== "blocked") throw new Error("usage: acp-handover-busy.ts working|blocked");
+if (scenario !== "working" && scenario !== "blocked" && scenario !== "first-turn") {
+	throw new Error("usage: acp-handover-busy.ts working|blocked|first-turn");
+}
 const tag = randomBytes(4).toString("hex");
 const card = `smoke-${tag}`;
 const word = `KUMQUAT-${tag}`;
@@ -131,6 +134,7 @@ const entry = async () =>
 		cwd: string;
 		handedOver?: true;
 		handingOver?: true;
+		model?: string;
 	};
 let paneClaude: number | undefined;
 let acpAgents: () => Promise<void> = async () => {};
@@ -218,8 +222,9 @@ try {
 		});
 	});
 
+	const sleeping = `Run this exact command with the Bash tool, in the foreground, with a timeout of 600000 ms, and wait for it: echo started && ${sleepCommand}`;
 	// soma's model: dispatches, replies and shows on ask. A wake is left unanswered in `blocked`, with its fingerprint kept
-	// for the answer to come, and answered yes in `working`, should claude ask for the sleep after all.
+	// for the answer to come, and otherwise answered yes, should claude ask for the sleep after all.
 	const results: unknown[] = [];
 	let pending: string | undefined;
 	const faux = fauxProvider();
@@ -254,10 +259,7 @@ try {
 				});
 			}
 			if (text.includes("忙起來")) {
-				const busy =
-					scenario === "working"
-						? `Run this exact command with the Bash tool, in the foreground, with a timeout of 600000 ms, and wait for it: echo started && ${sleepCommand}`
-						: `Run this exact command with the Bash tool: touch ${touched}`;
+				const busy = scenario === "blocked" ? `Run this exact command with the Bash tool: touch ${touched}` : sleeping;
 				return call("reply", { card, text: busy, reason });
 			}
 			if (text.includes("回覆")) {
@@ -274,7 +276,10 @@ try {
 	);
 	const models = createModels();
 	models.setProvider(faux.provider);
-	const brief = `Use no tool. Remember this word for later: ${word}. End your turn with exactly one line: 結果：完成`;
+	const brief =
+		scenario === "first-turn"
+			? `Remember this word for later: ${word}. Before you write any text: ${sleeping}. End your turn with exactly one line: 結果：完成`
+			: `Use no tool. Remember this word for later: ${word}. End your turn with exactly one line: 結果：完成`;
 	harness = await openHarness(
 		join(directory, "soma.sqlite"),
 		[dispatchExtension(agents, async () => `# ${card}\n\n${brief}`, agents)],
@@ -322,24 +327,30 @@ try {
 	});
 
 	await say("派工");
-	await until("the brief's turn to be recorded", 180_000, async () =>
-		(await entries(JOB_DONE)).length > 0 ? true : undefined,
-	);
-	await root.waitForIdle(context);
-	const { acpSessionId, cwd } = await entry();
+	if (scenario !== "first-turn") {
+		await until("the brief's turn to be recorded", 180_000, async () =>
+			(await entries(JOB_DONE)).length > 0 ? true : undefined,
+		);
+		await root.waitForIdle(context);
+	} else await until("the session to open", 60_000, async () => (await entry().catch(() => undefined))?.acpSessionId);
+	const { acpSessionId, cwd, model: reported } = await entry();
 	log("over acp", {
 		job: await job(),
 		reply: await agents.readResult(card),
 		acpSessionId,
 		cwd,
+		reported,
 		blocksInHangar: (await blocks()).length,
 	});
+	check(reported === "haiku", `session/new is recorded as having reported ${reported}`);
 	check((await blocks()).length === 0, "the hangar holds a block before the handover");
 
 	let asked = "";
-	await say("忙起來");
-	check(JSON.stringify(results.at(-1)) === '{"sent":true}', `the second prompt: ${JSON.stringify(results.at(-1))}`);
-	if (scenario === "working") {
+	if (scenario !== "first-turn") {
+		await say("忙起來");
+		check(JSON.stringify(results.at(-1)) === '{"sent":true}', `the second prompt: ${JSON.stringify(results.at(-1))}`);
+	}
+	if (scenario !== "blocked") {
 		await until("the sleep to run", 180_000, async () => {
 			const running = mine().filter(({ command }) => command.includes(sleepCommand));
 			for (const { pid } of running) sleeps.add(pid);
@@ -362,10 +373,14 @@ try {
 	}
 	const turnsBefore = (await entries(JOB_DONE)).length;
 	const outcomeBefore = (await job())?.outcome;
+	if (scenario === "first-turn") check(turnsBefore === 0, "the job finished a turn before it was shown");
 	const under = mine();
+	const transcript = join(projects, projectDirNameFor(cwd), `${acpSessionId}.jsonl`);
 	log("before", {
 		turnsBefore,
 		outcomeBefore,
+		named: await readSessionModel(transcript),
+		reply: (await readLastRecord(transcript))?.text,
 		processes: under.map(({ pid, command }) => ({ pid, command: command.slice(0, 120) })),
 	});
 
@@ -447,6 +462,7 @@ try {
 	check(handed?.sessionId === acpSessionId, "the job does not go by the session its window runs");
 	check(handed?.handedOver === undefined, "the job still holds the block handed over before the move");
 	check(handed?.outcome === outcomeBefore, `the cut turn set the outcome to ${handed?.outcome}`);
+	check(handed?.launch === undefined, "the job still holds a brief for the window");
 	check(turnsAfter.length === turnsBefore, `${turnsAfter.length - turnsBefore} turns were recorded of the cut turn`);
 	check(!/^(working|blocked)$/.test(handed?.status.state ?? ""), `jobs reads ${handed?.status.state} after the move`);
 	check(jobs[0]?.status.state === handed?.status.state, "the jobs tool reads another state");
@@ -454,7 +470,7 @@ try {
 	check(notices.length === 1, `${notices.length} notices were written`);
 	const notice = String((notices[0]?.data as { content?: string } | undefined)?.content);
 	check(notice.includes(`its window is ${card} in session ${label}`), "the notice names no window");
-	if (scenario === "working") {
+	if (scenario !== "blocked") {
 		check(notice.includes("Its running turn was cut"), "the notice does not say the turn was cut");
 	} else {
 		check(notice.includes("was cancelled") && notice.includes(asked), "the notice does not quote the prompt");

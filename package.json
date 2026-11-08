@@ -18,6 +18,7 @@
 		"smoke:rex-bridge": "node smoke/rex-bridge.ts",
 		"smoke:rex-defer": "node smoke/rex-defer.ts",
 		"smoke:rex-screen": "node smoke/rex-screen.ts",
+		"smoke:acp-dispatch": "node smoke/acp-dispatch.ts",
 		"smoke:tty": "node smoke/tty.ts",
 		"smoke:push": "node smoke/push.ts",
 		"smoke:push-summary": "node smoke/push-summary.ts",

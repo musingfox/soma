@@ -160,6 +160,21 @@ export async function readSessionCwd(path: string, firstWindowBytes = 64 * 1024)
 }
 
 /**
+ * The model of the session's last reply, off the `message.model` claude stamps on its assistant records; undefined when
+ * no reply names one. A sub-agent's records are left out, and so is the `<synthetic>` claude stamps on a message no
+ * model wrote, as an API error's.
+ */
+export async function readSessionModel(path: string, firstWindowBytes = 64 * 1024): Promise<string | undefined> {
+	return windowed<string | undefined>(path, firstWindowBytes, (records, whole) => {
+		const model = records
+			.flatMap((record) => asAssistant(record) ?? [])
+			.map((record) => (record.message as { model?: unknown }).model)
+			.findLast((each): each is string => typeof each === "string" && each !== "" && !each.startsWith("<"));
+		return model ?? (whole ? undefined : GROW);
+	});
+}
+
+/**
  * The conversation's records in the last `bytes` of the transcript, oldest first: claude's user and assistant records,
  * less the sub-agent, injected and compaction ones. A record the window cut short is left out; `whole` says the window
  * is the file. Most of a transcript's bytes are claude's other records (API requests, attachments, snapshots), so a

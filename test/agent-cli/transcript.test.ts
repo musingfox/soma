@@ -7,6 +7,7 @@ import {
 	readFinalAnswer,
 	readLastRecord,
 	readSessionCwd,
+	readSessionModel,
 	resolveTranscriptPath,
 } from "../../src/agent-cli/transcript.ts";
 
@@ -223,4 +224,18 @@ test("the directory a session ran in is the first absolute cwd on its records, r
 	expect(await readSessionCwd(await transcript(at("") + at("relative") + at(7) + at("/wt/card-a")))).toBe("/wt/card-a");
 	expect(await readSessionCwd(await transcript(owner + user("go")), 64)).toBeUndefined();
 	expect(await readSessionCwd(await transcript(""))).toBeUndefined();
+});
+
+test("a session's model is its last reply's, past a sub-agent's, a message no model wrote and a window that holds none", async () => {
+	const reply = (model: unknown, extra = {}) =>
+		line({ type: "assistant", uuid: "a-1", ...extra, message: { id: "m", role: "assistant", model, content: [] } });
+	const padding = line({ type: "attachment", attachment: { content: "x".repeat(200) } });
+	expect(await readSessionModel(await transcript(reply("claude-one") + reply("claude-two")))).toBe("claude-two");
+	expect(await readSessionModel(await transcript(reply("claude-one") + padding), 64)).toBe("claude-one");
+	expect(await readSessionModel(await transcript(reply("claude-one") + reply("<synthetic>")))).toBe("claude-one");
+	expect(await readSessionModel(await transcript(reply("claude-one") + reply("sub", { isSidechain: true })))).toBe(
+		"claude-one",
+	);
+	expect(await readSessionModel(await transcript(user("go") + reply(undefined)))).toBeUndefined();
+	expect(await readSessionModel(await transcript(""))).toBeUndefined();
 });

@@ -10,7 +10,13 @@ import {
 	readBlockedScreen,
 } from "../../agent-cli/permission/blocked-screen.ts";
 import { readProcessSession } from "../../agent-cli/process-session.ts";
-import { awaitingReply, readLastRecord, readSessionCwd, resolveTranscriptPath } from "../../agent-cli/transcript.ts";
+import {
+	awaitingReply,
+	readLastRecord,
+	readSessionCwd,
+	readSessionModel,
+	resolveTranscriptPath,
+} from "../../agent-cli/transcript.ts";
 import { type Git, mainCheckout, openWorktree, runGit } from "../../agent-cli/worktree.ts";
 import {
 	type AgentListing,
@@ -27,6 +33,7 @@ import {
 	type ResumeRequest,
 	type StartRequest,
 } from "../../ports/agent.ts";
+import type { HeldSession, SessionTaker } from "../../ports/handover.ts";
 import type { RexClient } from "./client.ts";
 import { type ProcessStart, readProcessStart } from "./process-start.ts";
 import {
@@ -74,6 +81,8 @@ export interface RexAgentPortOptions {
 	readonly recheckMs?: number;
 	/** Pause between reads of a blocked screen that did not parse yet; claude may still be drawing it. */
 	readonly redrawMs?: number;
+	/** How long `take` waits, a redrawMs at a time, for claude to report itself up in the window it opened. */
+	readonly takeMs?: number;
 	/** How often the foreign agents are looked at, for a status that changed or a pane a rex app began or ceased to show. */
 	readonly foreignMs?: number;
 	readonly now?: () => number;
@@ -116,13 +125,15 @@ const VIEW_EVENTS = new Set(["session_view_changed", "window_created", "window_c
  * claude's launch command, typed into the block's shell. rex takes no env on creation, so the variables are prefix
  * assignments, which sh, bash, zsh and fish all read; fish joins a quoted `$PATH` with colons, as the others keep it.
  * A value goes in single quotes, which no shell expands, so one holding a quote or a backslash, which fish reads
- * differently from the others, is refused. With `resume`, claude goes on with the session instead of starting it.
+ * differently from the others, is refused. With `resume`, claude goes on with the session instead of starting it. With
+ * `model`, it runs that one rather than the CLI's default.
  */
 export function launchCommand(
 	request: Pick<StartRequest, "card" | "sessionId">,
 	env: Readonly<Record<string, string>> = {},
 	path?: string,
 	resume = false,
+	model?: string,
 ) {
 	const quote = (value: string) => {
 		// biome-ignore lint/suspicious/noControlCharactersInRegex: a control character would end or garble the command
@@ -134,7 +145,8 @@ export function launchCommand(
 		return `${name}=${quote(value)}`;
 	});
 	if (path !== undefined) assignments.push(`PATH=${quote(path)}:"$PATH"`);
-	return `${assignments.join(" ")} claude ${resume ? "--resume" : "--session-id"} ${request.sessionId}\n`;
+	const chosen = model === undefined ? "" : ` --model ${quote(model)}`;
+	return `${assignments.join(" ")} claude ${resume ? "--resume" : "--session-id"} ${request.sessionId}${chosen}\n`;
 }
 
 const isRoot = (record: StatusRecord) => record.id === undefined || record.id === "";
@@ -207,7 +219,7 @@ function paneOf(window: RexWindow): Pane | undefined {
  * Dispatches each card's claude into a window of the hangar rex session, in its own `fleet/<card>` worktree.
  * ARCHITECTURE.md "The rex implementation" is the design.
  */
-export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
+export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & SessionTaker {
 	const { client, sessionId } = options;
 	const git = options.git ?? runGit;
 	const confirmMs = options.confirmMs ?? 3_000;
@@ -218,6 +230,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 	const replyMs = options.replyMs ?? 2_000;
 	const recheckMs = options.recheckMs ?? 10_000;
 	const redrawMs = options.redrawMs ?? 500;
+	const takeMs = options.takeMs ?? 30_000;
 	const foreignMs = options.foreignMs ?? 15_000;
 	const onError = options.onError ?? ((error: Error) => console.warn(`[rex] ${error.message}`));
 	const cap = options.cap ?? resolveHangarCapWithSource(undefined, readPerfCoresViaSysctl).cap;
@@ -746,10 +759,11 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 
 	/**
 	 * A window named `name` whose one block is an interactive shell typing `launch`, so the block outlives claude
-	 * exiting, as a herdr pane does. The block's label keeps the session id, which nothing else in rex records.
+	 * exiting, as a herdr pane does. The block's label keeps the session id, which nothing else in rex records. Returns
+	 * the block's id when rex names it.
 	 */
-	async function openWindow(name: string, session: string, cwd: string, launch: string): Promise<void> {
-		await client.call(
+	async function openWindow(name: string, session: string, cwd: string, launch: string): Promise<string | undefined> {
+		const { block_ids: blocks } = await client.call(
 			"session.new_window",
 			{
 				session_id: sessionId,
@@ -759,6 +773,58 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 			},
 			NewWindowResultSchema,
 		);
+		return blocks?.find((block) => block !== null) ?? undefined;
+	}
+
+	/**
+	 * The line that goes on with a session another side ran, or why it cannot go on here: a session with no transcript or
+	 * no reply, a worktree gone, or a window of the name already open. The model is the one the session last ran on, since
+	 * the CLI's own default may be another. Reads only.
+	 */
+	async function takeLine(session: HeldSession): Promise<{ launch: string } | { refused: string }> {
+		const { name, card, claudeSession, cwd } = session;
+		if (!SESSION_ID.test(claudeSession)) {
+			return { refused: `not a claude session id: ${JSON.stringify(claudeSession)}` };
+		}
+		const transcript = await resolveTranscriptPath(claudeSession, cwd, options.projectsDir);
+		if (transcript === undefined) {
+			return { refused: `claude session ${claudeSession} has no transcript, so it never ran a prompt` };
+		}
+		const model = await readSessionModel(transcript);
+		if (model === undefined) return { refused: `no reply of claude session ${claudeSession} names its model` };
+		const directory = await stat(cwd).catch(() => undefined);
+		if (!directory?.isDirectory()) {
+			return { refused: `the worktree ${cwd} claude session ${claudeSession} ran in no longer exists` };
+		}
+		let launch: string;
+		try {
+			launch = launchCommand({ card, sessionId: claudeSession }, options.env, options.path, true, model);
+		} catch (error) {
+			return { refused: (error as Error).message };
+		}
+		if ((await panes()).has(name)) return { refused: `rex hangar ${sessionId} already has a window named ${name}` };
+		return { launch };
+	}
+
+	/**
+	 * Waits for claude to report itself up in a window `take` opened: true once the block has a root record, which it
+	 * reports with no dialog in its way, false when takeMs passes first. The CLI asks for workspace trust where ACP never
+	 * does, and has reported nothing while it asks, so a dialog on screen is answered yes, once, with the checks `respond`
+	 * makes: the job has run in this worktree all along, and only the human's asking brought it here.
+	 */
+	async function comeUp(blockId: string): Promise<boolean> {
+		let answered = false;
+		for (const deadline = now() + takeMs; now() < deadline; await new Promise((done) => setTimeout(done, redrawMs))) {
+			const { records } = await blockCall("program_status", blockId, ProgramStatusResultSchema);
+			if (records.some(isRoot)) return true;
+			if (answered) continue;
+			const screen = await readScreen(blockId);
+			const yes = screen.prompt?.options.find((option) => /^yes\b.*trust this folder/i.test(option.label));
+			if (screen.prompt === undefined || yes === undefined || !isTrustDialog(screen)) continue;
+			const answer = { option: yes.id, fingerprint: screen.prompt.fingerprint };
+			answered = (await answerOn(sessionId, blockId, answer, true)).sent;
+		}
+		return false;
 	}
 
 	const listeners = new Set<(event: AgentStatusEvent) => void>();
@@ -975,6 +1041,33 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort {
 				throw new Error(`rex hangar ${sessionId} already has a window named ${request.name}`);
 			}
 			await openWindow(request.name, request.sessionId, cwd, launch);
+		},
+
+		async takeable(session: HeldSession): Promise<string | undefined> {
+			const line = await takeLine(session);
+			return "refused" in line ? line.refused : undefined;
+		},
+
+		/**
+		 * A window of the hangar running `claude --resume` on the session, with the dispatch's environment and the model it
+		 * last ran on, labelled as `start` and `resume` label theirs, so from here on it is a job of this hangar. Not held
+		 * to the cap: the human asked for this one. Throws what `takeable` would have said; past the window's opening,
+		 * nothing throws, so a claude slow to come up or a read that fails leaves the window and says `ready: false`.
+		 */
+		async take(session: HeldSession) {
+			const line = await takeLine(session);
+			if ("refused" in line) throw new Error(line.refused);
+			const { name, claudeSession, cwd } = session;
+			const opened = await openWindow(name, claudeSession, cwd, line.launch);
+			const ready = await (async () => comeUp(opened ?? only(await panes(), name).blockId))().catch((error: Error) => {
+				onError(error);
+				return false;
+			});
+			const label = await client.call("session.attach_all", { event_scope: "session" }, AttachAllResultSchema).then(
+				({ sessions: all }) => all?.find((each) => each.session_id === sessionId)?.label,
+				(error: Error) => onError(error),
+			);
+			return { window: name, session: label ?? sessionId, ready };
 		},
 
 		async list(): Promise<readonly AgentListing[]> {

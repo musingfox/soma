@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, expect, test } from "vitest";
+import { afterAll, describe, expect, test } from "vitest";
 import { createRexAgentPort, launchCommand, seqOf, stateOf } from "../../../src/adapters/rex/agent-port.ts";
 import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
 import { type AgentPort, type AgentResult, type AgentStatusEvent, PromptRefused } from "../../../src/ports/agent.ts";
@@ -1456,4 +1456,163 @@ test("seq is updated_at in microseconds, so reports 800 µs apart are two observ
 
 	expect(seen.map((event) => event.status.state)).toEqual(["working", "blocked"]);
 	expect(new Set(seen.map((event) => event.seq)).size).toBe(2);
+});
+
+describe("taking over a session another side ran", () => {
+	const TRUST_SCREEN = fixture("claude-trust-dialog-2.1.302.txt");
+	const CLAUDE = "5b1c0d2e-3f40-4a51-8b62-7c83d94e0a15";
+	const idle = { state: "idle", updated_at: AT };
+
+	/** A session claude ran in the worktree, whose reply names `model`, with the projects directory holding it. */
+	function held(model = "claude-haiku-9") {
+		const projectsDir = mkdtempSync(join(tmpdir(), "soma-rex-take-"));
+		const directory = join(projectsDir, worktree.replace(/[^a-zA-Z0-9]/g, "-"));
+		mkdirSync(directory);
+		const reply = { role: "assistant", id: "m", content: [{ type: "text", text: "ok" }], ...(model && { model }) };
+		writeFileSync(
+			join(directory, `${CLAUDE}.jsonl`),
+			`${JSON.stringify({ type: "assistant", uuid: "a-1", cwd: worktree, message: reply })}\n`,
+		);
+		const session = { name: "card-a", card: "card-a", sessionId: SESSION, claudeSession: CLAUDE, cwd: worktree };
+		return { projectsDir, session };
+	}
+
+	/** A port on an in-memory rex whose new window becomes the block `opened` says, with the rest of `blocks`. */
+	function port(projectsDir: string, opened: Partial<Block> = { records: [idle] }, blocks: Block[] = []) {
+		const fake = rex(blocks);
+		fake.replace("session.new_window", ({ window_label, layout }) => {
+			const { label, options } = (layout as { block: { label: string; options: { cwd: string } } }).block;
+			const name = window_label as string;
+			blocks.push({ name, block: "block:new", label, argv0: "claude", cwd: options.cwd, ...opened });
+			return { window_id: "window:new", block_ids: ["block:new"], revision: 2 };
+		});
+		const created = createRexAgentPort({
+			processStart: unstarted,
+			client: fake.client,
+			sessionId: HANGAR,
+			projectsDir,
+			redrawMs: 5,
+			keyGapMs: 1,
+			takeMs: 200,
+			env: { SOMA_SOCKET: "/run/soma.sock" },
+			path: "/opt/soma/bin",
+			onError: () => {},
+		});
+		return { fake, blocks, created };
+	}
+
+	test("the launch line names the model, quoted as a value is", () => {
+		expect(launchCommand({ card: "card-a", sessionId: CLAUDE }, {}, undefined, true, "claude-opus-5-5")).toBe(
+			`SOMA_AGENT='card-a' claude --resume ${CLAUDE} --model 'claude-opus-5-5'\n`,
+		);
+		expect(() => launchCommand({ card: "card-a", sessionId: CLAUDE }, {}, undefined, true, "it's")).toThrow(
+			"cannot put",
+		);
+	});
+
+	test("take opens one window labelled as a job's, running claude --resume with the session's last model, in its directory", async () => {
+		const { projectsDir, session } = held();
+		const { fake, created } = port(projectsDir);
+
+		expect(await created.takeable(session)).toBeUndefined();
+		expect(await created.take(session)).toEqual({ window: "card-a", session: "hangar", ready: true });
+
+		expect(fake.calls.filter((call) => call.method === "session.new_window").map((call) => call.payload)).toEqual([
+			{
+				session_id: HANGAR,
+				window_label: "card-a",
+				focus: false,
+				layout: {
+					block: {
+						flavor: "com.superlogical.terminal.shell",
+						label: CLAUDE,
+						options: {
+							cwd: worktree,
+							initial_input: `SOMA_SOCKET='/run/soma.sock' SOMA_AGENT='card-a' PATH='/opt/soma/bin':"$PATH" claude --resume ${CLAUDE} --model 'claude-haiku-9'\n`,
+						},
+					},
+				},
+			},
+		]);
+		// The window is a job of the hangar, so it is listed by the label and is no foreign agent.
+		expect(await created.list()).toEqual([
+			{ name: "card-a", sessionId: CLAUDE, status: { state: "idle" }, seq: AT_US },
+		]);
+		expect(await created.listForeign()).toEqual([]);
+		rmSync(projectsDir, { recursive: true, force: true });
+	});
+
+	test("takeable and take refuse, opening no window, what claude could not go on with", async () => {
+		const fit = held();
+		const cases: { session: typeof fit.session; projectsDir: string; blocks?: Block[]; error: string }[] = [
+			{ session: fit.session, projectsDir: worktree, error: `claude session ${CLAUDE} has no transcript` },
+			{ ...held(""), error: "names its model" },
+			{
+				session: { ...fit.session, cwd: join(worktree, "gone") },
+				projectsDir: fit.projectsDir,
+				error: "no longer exists",
+			},
+			{
+				session: { ...fit.session, claudeSession: "x; rm -rf ~" },
+				projectsDir: fit.projectsDir,
+				error: "not a claude session id",
+			},
+			{ session: { ...fit.session, card: "it's" }, projectsDir: fit.projectsDir, error: "cannot put" },
+			{
+				...fit,
+				blocks: [{ name: "card-a", block: "block:a" }],
+				error: `rex hangar ${HANGAR} already has a window named card-a`,
+			},
+		];
+		for (const { session, projectsDir, blocks, error } of cases) {
+			const { fake, created } = port(projectsDir, undefined, blocks);
+			expect(await created.takeable(session)).toContain(error);
+			await expect(created.take(session)).rejects.toThrow(error);
+			expect(fake.methods()).not.toContain("session.new_window");
+		}
+	});
+
+	test("take answers the workspace trust dialog yes, once, from the cursor, and is ready at claude's first record", async () => {
+		const { projectsDir, session } = held();
+		const { fake, blocks, created } = port(projectsDir, { records: [], screen: TRUST_SCREEN });
+		const pressed: string[] = [];
+		fake.replace("block.event", ({ event }) => {
+			const { key, action } = (event as { payload: { key: string; action: string } }).payload;
+			if (action === "press") pressed.push(key);
+			// The dialog stays drawn a while after the Enter that answered it, and then claude reports.
+			if (action === "press" && key === "enter") setTimeout(() => (blocks[0] as Block).records?.push(idle), 40);
+			return {};
+		});
+
+		expect(await created.take(session)).toMatchObject({ ready: true });
+
+		expect(pressed).toEqual(["arrow_down", "enter"]);
+		rmSync(projectsDir, { recursive: true, force: true });
+	});
+
+	test("take leaves the window open and not ready when claude never comes up, or the reads fail, and presses nothing but a dialog's keys", async () => {
+		const { projectsDir, session } = held();
+		const quiet = port(projectsDir, { records: [], screen: "$ claude --resume\nLoading" });
+		expect(await quiet.created.take(session)).toEqual({ window: "card-a", session: "hangar", ready: false });
+		expect(quiet.blocks).toHaveLength(1);
+		expect(quiet.fake.methods()).not.toContain("block.event");
+
+		const failing = port(projectsDir, { records: [] });
+		failing.fake.replace("com.superlogical.terminal.program_status", () => {
+			throw new Error("the block went away");
+		});
+		expect(await failing.created.take(session)).toMatchObject({ ready: false });
+		expect(failing.blocks).toHaveLength(1);
+		rmSync(projectsDir, { recursive: true, force: true });
+	});
+
+	test("take names the hangar by its id when its label cannot be read", async () => {
+		const { projectsDir, session } = held();
+		const { fake, created } = port(projectsDir);
+		fake.replace("session.attach_all", () => {
+			throw new Error("no answer");
+		});
+		expect(await created.take(session)).toMatchObject({ session: HANGAR, ready: true });
+		rmSync(projectsDir, { recursive: true, force: true });
+	});
 });

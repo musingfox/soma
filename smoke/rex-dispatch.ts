@@ -8,7 +8,8 @@
 //   5. a reopened core reconciles: the job's status must be rex's, and the finished turn is recorded once, with the
 //      outcome read off claude's transcript.
 // It destroys its rex session and removes the card's worktree and branch at the end, also on failure.
-//   node smoke/rex-dispatch.ts [repo]    (default the current directory, which claude already trusts)
+//   node smoke/rex-dispatch.ts [repo]    (default the fixed smoke repo, smoke/smoke-repo.ts, which claude must trust;
+//                                         any other repo must be trusted already, as this smoke answers no dialog)
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -30,9 +31,10 @@ import { readLastRecord, resolveTranscriptPath } from "../src/agent-cli/transcri
 import type { Job } from "../src/core/domain/dispatch.ts";
 import { outcomeOf } from "../src/core/domain/report.ts";
 import { delay, run } from "./driver.ts";
+import { fixedSmokeRepo } from "./smoke-repo.ts";
 
 const CHILD = fileURLToPath(new URL("./rex-dispatch-child.ts", import.meta.url));
-const repo = process.argv[2] ?? process.cwd();
+const repo = process.argv[2] ?? (await fixedSmokeRepo(homedir()));
 const tag = Date.now().toString(36);
 const card = `smoke-${tag}`;
 const socketPath = process.env.SOMA_REX_SOCKET ?? defaultRexSocket(homedir());

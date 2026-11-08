@@ -15,8 +15,8 @@
 //      receive the instruction exactly once; no notice says it was not sent or that the agent vanished, the reopened
 //      core called no model, the root conversation holds no input but the dispatch, and the job's reclaim is cleared.
 // It destroys its rex session and removes the card's worktree and branch at the end, also on failure.
-//   node smoke/rex-defer.ts [repo]    (default the current directory, which claude must already trust: a repo it does
-//                                      not stops at the trust dialog, which this smoke does not answer)
+//   node smoke/rex-defer.ts [repo]    (default the fixed smoke repo, smoke/smoke-repo.ts, which claude must trust; any
+//                                      other repo must be trusted already, as this smoke answers no dialog)
 import { execFile, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
@@ -38,6 +38,7 @@ import {
 import { readLastRecord, resolveTranscriptPath } from "../src/agent-cli/transcript.ts";
 import type { Job } from "../src/core/domain/dispatch.ts";
 import { type Child, delay, run } from "./driver.ts";
+import { fixedSmokeRepo } from "./smoke-repo.ts";
 
 const CHILD = fileURLToPath(new URL("./rex-defer-child.ts", import.meta.url));
 const BIN = join(dirname(dirname(fileURLToPath(import.meta.url))), "bin");
@@ -52,8 +53,8 @@ function check(ok: boolean, message: string): void {
 	if (!ok) throw new Error(message);
 }
 
+const repo = process.argv[2] ?? (await fixedSmokeRepo(homedir()));
 const directory = await mkdtemp(join(tmpdir(), "soma-rex-defer-"));
-const repo = process.argv[2] ?? process.cwd();
 const created = await client.call(
 	"session.create",
 	{ label: `soma-smoke-${tag}` },

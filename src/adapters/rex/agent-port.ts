@@ -814,9 +814,10 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	}
 
 	/**
-	 * The line that goes on with a session another side ran, or why it cannot go on here: a session with no transcript or
-	 * no reply, a worktree gone, or a window of the name already open. The model is the one the session last ran on, since
-	 * the CLI's own default may be another. Reads only.
+	 * The line that goes on with a session another side ran, or why it cannot go on here: a session with no transcript, or
+	 * one holding no conversation yet, of which `claude --resume` says it finds none, a worktree gone, or a window of the
+	 * name already open. The model is the one the session last ran on, since the CLI's own default may be another, or before
+	 * any reply names one, the one it reported when it was created. Reads only.
 	 */
 	async function takeLine(session: HeldSession): Promise<{ launch: string } | { refused: string }> {
 		const { name, card, claudeSession, cwd } = session;
@@ -827,8 +828,13 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		if (transcript === undefined) {
 			return { refused: `claude session ${claudeSession} has no transcript, so it never ran a prompt` };
 		}
-		const model = await readSessionModel(transcript);
-		if (model === undefined) return { refused: `no reply of claude session ${claudeSession} names its model` };
+		if ((await readLastRecord(transcript)) === undefined) {
+			return { refused: `claude session ${claudeSession} has written no conversation yet: ask again in a moment` };
+		}
+		const model = (await readSessionModel(transcript)) ?? session.model;
+		if (model === undefined) {
+			return { refused: `neither a reply of claude session ${claudeSession} nor its creation names its model` };
+		}
 		const directory = await stat(cwd).catch(() => undefined);
 		if (!directory?.isDirectory()) {
 			return { refused: `the worktree ${cwd} claude session ${claudeSession} ran in no longer exists` };

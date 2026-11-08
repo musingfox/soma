@@ -4,8 +4,8 @@ import type { AnswerOutcome } from "./agent.ts";
  * unknown: there is no such job. no_hangar: this soma has no rex hangar to hand over to. not_acp: the job does not run
  * over ACP, as one already handed over. not_at_rest: nothing can be cut to move it, as one blocked on a login, waking, or
  * with no session open yet, or one soma stopped; or its turn did not stop when cancelled, or ended by itself as the
- * cancel went out. cannot_resume: the session cannot go on on the other side, as one that never ran a prompt, or one whose
- * move could not be recorded.
+ * cancel went out. cannot_resume: the session cannot go on on the other side, as one that never ran a prompt or has
+ * written none of it yet, or one whose move could not be recorded.
  */
 export type HandoverRefusal = "unknown" | "no_hangar" | "not_acp" | "not_at_rest" | "cannot_resume";
 
@@ -86,6 +86,8 @@ export interface HeldSession {
 	readonly claudeSession: string;
 	// The directory's realpath, which claude names the transcript's directory after.
 	readonly cwd: string;
+	// What the session reported as its model when it was created: all there is before a reply names one.
+	readonly model?: string;
 }
 
 /**

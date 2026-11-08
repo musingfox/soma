@@ -498,6 +498,62 @@ test("a window blocked as the move ends reaches the model as any block does", as
 	soma.off();
 });
 
+test("a job in its first turn is handed over: its brief is not sent again, nothing is recorded of it, and the next turn is", async () => {
+	const soma = await core({ brief: "QUIET the word is KIWI", fake: { FAKE_ACP_MODEL: "fake-alias" } });
+	await soma.say("派 card-a");
+	await soma.until(async () => (await soma.job())?.status.state === "working", "the brief to run");
+	await soma.until(async () => (await soma.job())?.launch === undefined, "the brief to go");
+	await soma.until(async () => (await soma.agents.readResult("card-a")) !== undefined, "the brief to be written");
+	const { acpSessionId } = await soma.entry();
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true, sessionId: acpSessionId, cut: {} });
+	expect(JSON.stringify(soma.windowsOpened()[0]?.payload)).toContain(`--resume ${acpSessionId} --model 'fake-alias'`);
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining("its window is card-a in session hangar")]);
+	expect(notices[0]).toContain(cutTurn);
+	await sleep(50);
+	const window = soma.blocks[0] as Block;
+	const settled = { state: "idle", updated_at: "2026-10-27T01:02:09.000000+08:00" };
+	window.records = [settled];
+	soma.hangar.emit(soma.hangar.status(window.block, settled));
+	await soma.until(async () => (await soma.job())?.seq === seqOf(settled), "the window's idle");
+	await sleep(50);
+	expect(await soma.turns()).toEqual([]);
+	expect(await soma.notices()).toEqual(notices);
+	expect(soma.typed()).toEqual([]);
+	const job = await soma.job();
+	expect(job).toMatchObject({ sessionId: acpSessionId, status: { state: "idle" } });
+	expect(job?.launch).toBeUndefined();
+	expect(job?.outcome).toBeUndefined();
+
+	await soma.say("回覆 card-a go on");
+	expect(soma.typed()).toEqual(["go on"]);
+	await turn(soma, "結果：完成\nKIWI");
+	await soma.until(async () => (await soma.job())?.outcome === "完成", "the window's turn");
+	expect(await soma.turns()).toMatchObject([{ outcome: "完成" }]);
+	soma.off();
+});
+
+test("a job just dispatched whose transcript holds no conversation yet is refused, and its brief goes on as if nothing was asked", async () => {
+	const soma = await core({ brief: "UNWRITTEN the word is KIWI", fake: { FAKE_ACP_MODEL: "fake-alias" } });
+	await soma.say("派 card-a");
+	await soma.until(async () => (await soma.job())?.status.state === "working", "the brief to run");
+	const { acpSessionId, cwd } = await soma.entry();
+	const written = join(soma.acp.cwd, "..", "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${acpSessionId}.jsonl`);
+	await soma.until(async () => (await readFile(written, "utf8").catch(() => "")) !== "", "claude's first record");
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: false, refusal: "cannot_resume" });
+	expect(await soma.cancelled()).toBe("");
+	expect(soma.windowsOpened()).toEqual([]);
+	expect(await soma.notices()).toEqual([]);
+	expect((await soma.job())?.status.state).toBe("working");
+	soma.off();
+});
+
 test("a turn that does not stop in time: refused with the reason, nothing closed or opened, working, and no notice", async () => {
 	const soma = await core({ cutMs: 50 });
 	const { turns, told } = await busy(soma, "HANG");

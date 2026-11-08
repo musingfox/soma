@@ -15,6 +15,7 @@ import {
 	PROTOCOL_VERSION,
 	type PromptResponse,
 	RequestError,
+	type SessionConfigOption,
 	type ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
 import { agentEnv } from "../../agent-cli/env.ts";
@@ -132,6 +133,8 @@ type Session = {
 	readonly sessionId: string;
 	readonly acpSessionId: string;
 	readonly cwd: string;
+	/** What session/new reported as its model: all there is to go on with until a reply names one. */
+	readonly model?: string;
 	/** soma stopped the agent, so a restart lists it no more; a resume starts it again and takes this off. */
 	readonly stopped?: true;
 	/** The session went on another agent side: nothing here lists, wakes, resumes or starts this name again. */
@@ -225,6 +228,12 @@ function askedMsg(toolCall: ToolCallUpdate, options: readonly PermissionOption[]
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** The model a session/new reports: claude-agent-acp's alias, as `--model` takes it. */
+function reportedModel(options: readonly SessionConfigOption[] | null | undefined): string | undefined {
+	const option = options?.find(({ category }) => category === "model");
+	return option?.type === "select" ? option.currentValue : undefined;
+}
 
 /** The tail of the transcript at `path`, drawn, from a window that grows until it draws SCREEN_LINES lines. */
 async function drawTail(path: string): Promise<string> {
@@ -417,12 +426,19 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 	/** Opens the agent's session; its idle tells the core the session takes the brief. */
 	async function open(agent: Agent): Promise<void> {
 		try {
-			const { sessionId } = await agent.connection.agent.request(methods.agent.session.new, {
+			const { sessionId, configOptions } = await agent.connection.agent.request(methods.agent.session.new, {
 				cwd: agent.cwd,
 				mcpServers: [],
 			});
 			agent.session = sessionId;
-			const session = { card: agent.card, sessionId: agent.sessionId, acpSessionId: sessionId, cwd: agent.cwd };
+			const model = reportedModel(configOptions);
+			const session = {
+				card: agent.card,
+				sessionId: agent.sessionId,
+				acpSessionId: sessionId,
+				cwd: agent.cwd,
+				...(model === undefined ? {} : { model }),
+			};
 			sessions.set(agent.name, session);
 			// A stop that came while the session opened found none to mark.
 			await record(agent.name, agent.stopped ? { ...session, stopped: true } : session);
@@ -519,6 +535,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		sessionId: session.sessionId,
 		claudeSession: session.acpSessionId,
 		cwd: session.cwd,
+		...(session.model === undefined ? {} : { model: session.model }),
 	});
 
 	/** What a cut and a release of the agent would give up now; a refusal, with why, unless it has a session open. */

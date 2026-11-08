@@ -18,13 +18,16 @@
 //   FINISH runs until session/cancel, then ends by itself with a reply, as a turn the cancel came too late for
 //   LATEASK runs until session/cancel, then asks permission, and ends cancelled once answered
 //   ASKHANG asks permission, and once answered never ends the turn
+//   QUIET  runs until session/cancel with no reply written, leaving what claude leaves for an interrupted first request
+//   UNWRITTEN never ends the turn, its transcript holding only the record claude writes before the prompt
 //   anything else is echoed.
 // An ASK or TWICE answered cancelled with session/cancel out ends cancelled, leaving what claude leaves for an interrupted
 // tool call. session/cancel appends the session's id to $FAKE_ACP_PROJECTS/cancelled. session/close appends the session's
 // id to $FAKE_ACP_PROJECTS/closed. session/load reads the session's transcript
 // back, as claude-agent-acp does, replaying its prompts, and appends "<session id> <cwd>" to $FAKE_ACP_PROJECTS/loaded;
 // a session with no transcript is refused with -32002, as one that never ran a prompt is.
-// $FAKE_ACP_NEW_MS delays session/new, as claude's CLI start does; $FAKE_ACP_NEW_AUTH refuses it with -32000.
+// $FAKE_ACP_NEW_MS delays session/new, as claude's CLI start does; $FAKE_ACP_NEW_AUTH refuses it with -32000;
+// $FAKE_ACP_MODEL has it report that model, as claude-agent-acp's configOptions do.
 // $FAKE_ACP_LOAD_AUTH and $FAKE_ACP_LOAD_EXIT, comma-separated agent names, have the agent whose SOMA_AGENT is named
 // refuse session/load with -32000 or exit with code 4 during it. Each agent appends "<SOMA_AGENT> <pid>" to $FAKE_ACP_PIDS.
 // $FAKE_ACP_LOAD_MS delays session/load. $FAKE_ACP_IGNORE_TERM has the agent live through SIGTERM.
@@ -94,7 +97,24 @@ const app = agent({ name: "fake-acp" })
 		if (process.env.FAKE_ACP_NEW_AUTH) throw RequestError.authRequired();
 		const sessionId = randomUUID();
 		sessions.set(sessionId, { cwd: params.cwd, prompts: [] });
-		return { sessionId };
+		const model = process.env.FAKE_ACP_MODEL;
+		if (model === undefined) return { sessionId };
+		const mode = { type: "select" as const, id: "mode", name: "Mode", category: "mode", currentValue: "default" };
+		const value = { value: model, name: model };
+		return {
+			sessionId,
+			configOptions: [
+				{ ...mode, options: [{ value: "default", name: "Default" }] },
+				{
+					type: "select" as const,
+					id: "model",
+					name: "Model",
+					category: "model",
+					currentValue: model,
+					options: [value],
+				},
+			],
+		};
 	})
 	.onRequest(methods.agent.session.load, async ({ params, client }) => {
 		await sleep(Number(process.env.FAKE_ACP_LOAD_MS ?? 0));
@@ -133,7 +153,18 @@ const app = agent({ name: "fake-acp" })
 		if (text.includes("AUTH")) throw RequestError.authRequired();
 		const earlier = [...(sessions.get(sessionId)?.prompts ?? [])];
 		sessions.get(sessionId)?.prompts.push(text);
+		if (text.includes("UNWRITTEN")) {
+			const path = transcriptOf(sessionId, sessions.get(sessionId)?.cwd ?? "");
+			mkdirSync(join(path, ".."), { recursive: true });
+			appendFileSync(path, `${JSON.stringify({ type: "session-owner", sessionId })}\n`);
+			await new Promise(() => {});
+		}
 		write(sessionId, "user", text);
+		if (text.includes("QUIET")) {
+			await untilCancelled(sessionId);
+			write(sessionId, "user", [{ type: "text", text: "[Request interrupted by user]" }]);
+			return { stopReason: "cancelled" };
+		}
 		if (text.includes("SPIN")) {
 			reply(sessionId, "結果：失敗\npartial, read as nothing");
 			await untilCancelled(sessionId);

@@ -207,13 +207,97 @@ test("a working job has its turn cancelled, and it has stopped before the mark g
 	expect(both.windowsOpened()).toHaveLength(1);
 });
 
-test("a job in its first turn, with no reply yet naming a model, is refused before anything is cancelled", async () => {
-	const both = await sides({ cutMs: 50 });
+/** card-a has started and runs its first prompt, `prompt`, which is still in a turn as this returns. */
+async function firstTurn(both: Sides, prompt: string) {
 	await both.acp.start();
 	await both.acp.until("idle");
-	await both.agents.prompt("card-a", "HANG");
+	await both.agents.prompt("card-a", prompt);
 	await both.acp.until("working");
-	while (!(await both.acp.port.readScreen("card-a")).includes("> HANG")) await sleep(10);
+	const { acpSessionId, cwd } = await both.entry();
+	const transcript = join(both.acp.cwd, "..", "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${acpSessionId}.jsonl`);
+	while (
+		!(await readFile(transcript, "utf8").catch(() => "")).includes(prompt.includes("UNWRITTEN") ? "owner" : prompt)
+	) {
+		await sleep(10);
+	}
+}
+
+const openedWith = (both: Sides) =>
+	both.windowsOpened().map((call) => JSON.stringify(call.payload).match(/claude --resume \S+ --model '([^']+)'/)?.[1]);
+
+test("a job in its first turn, with no reply yet naming a model: cut, and it goes on in a window on the model its session reported", async () => {
+	const both = await sides({ fake: { FAKE_ACP_MODEL: "fake-alias" } });
+	await firstTurn(both, "QUIET");
+	const { acpSessionId, model } = await both.entry();
+	expect(model).toBe("fake-alias");
+
+	expect(await both.agents.handOver("card-a")).toEqual({
+		handedOver: true,
+		window: "card-a",
+		session: "hangar",
+		sessionId: acpSessionId,
+		ready: true,
+		cut: {},
+	});
+
+	expect(await both.cancelled()).toBe(`${acpSessionId}\n`);
+	expect(openedWith(both)).toEqual(["fake-alias"]);
+});
+
+test("a reply that names a model wins over what the session reported when it was created", async () => {
+	const both = await sides({ fake: { FAKE_ACP_MODEL: "fake-alias" } });
+	await both.ran();
+
+	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: true });
+
+	expect((await both.entry()).model).toBe("fake-alias");
+	expect(openedWith(both)).toEqual(["claude-fake-1"]);
+});
+
+test("a job handed over in its first turn and stopped goes on after a restart on the model its entry holds", async () => {
+	const first = await sides({ fake: { FAKE_ACP_MODEL: "fake-alias" } });
+	await firstTurn(first, "QUIET");
+	await first.agents.handOver("card-a");
+	await first.agents.stop("card-a");
+	await first.acp.end();
+
+	const both = await sides({ restartOf: first.acp.cwd, blocks: first.blocks });
+	await both.agents.resume({ name: "card-a", card: "card-a", sessionId: SESSION });
+
+	expect(openedWith(both)).toEqual(["fake-alias"]);
+});
+
+test.each([
+	["no transcript yet", "", "never ran a prompt"],
+	["a transcript holding no conversation yet", "UNWRITTEN", "no conversation yet"],
+])(
+	"a job whose session reported a model, with %s, is refused before anything is cancelled",
+	async (_case, prompt, why) => {
+		const both = await sides({ fake: { FAKE_ACP_MODEL: "fake-alias" } });
+		if (prompt === "") {
+			await both.acp.start();
+			await both.acp.until("idle");
+		} else await firstTurn(both, prompt);
+		const [pid] = await both.pids();
+
+		expect(await both.agents.handOver("card-a")).toMatchObject({
+			handedOver: false,
+			refusal: "cannot_resume",
+			reason: expect.stringContaining(why),
+		});
+
+		expect(await both.cancelled()).toBe("");
+		expect(await both.closed()).toBe("");
+		expect(both.windowsOpened()).toEqual([]);
+		expect(alive(pid as number)).toBe(true);
+		expect((await both.entry()).handingOver).toBeUndefined();
+		expect(await both.agents.list()).toMatchObject([{ status: { state: prompt === "" ? "idle" : "working" } }]);
+	},
+);
+
+test("a job in its first turn whose session reported no model either is refused before anything is cancelled", async () => {
+	const both = await sides();
+	await firstTurn(both, "QUIET");
 
 	expect(await both.agents.handOver("card-a")).toMatchObject({
 		handedOver: false,

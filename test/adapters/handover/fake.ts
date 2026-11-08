@@ -132,6 +132,7 @@ export async function sides(
 				hangar?: string;
 				handingOverAt?: number;
 				givenBack?: number;
+				model?: string;
 			},
 		closed: () => readFile(join(projects, "closed"), "utf8").catch(() => ""),
 		cancelled: () => readFile(join(projects, "cancelled"), "utf8").catch(() => ""),

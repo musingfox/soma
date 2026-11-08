@@ -178,3 +178,24 @@ describe("complete a transcript that ends without a reply", () => {
 		expect(complete({ job: { ...interrupted.job, seq: 5 }, action: "complete" }, { id: "u-2" }).action).toBe("none");
 	});
 });
+
+test("a job whose move could not read its last record takes the first it reads as that record, and records no turn", () => {
+	const moved: Job = { ...job({ state: "idle" }, 1), outcome: "完成", resultId: "old", resultUnread: true };
+	const observed = observe(moved, { state: "idle" }, 2);
+	expect(observed.action).toBe("complete");
+
+	const { job: next, action } = complete(observed, { id: "cut", text: "結果：失敗\npartial" });
+
+	expect(action).toBe("none");
+	expect(next).toMatchObject({ resultId: "cut", outcome: "完成", seq: 2 });
+	expect(next.resultUnread).toBeUndefined();
+});
+
+test("a job whose move could not read its last record, and that reads nothing now, goes on waiting to read it", () => {
+	const moved: Job = { ...job({ state: "idle" }, 1), resultId: "old", resultUnread: true };
+
+	const { job: next, action } = complete(observe(moved, { state: "idle" }, 2), undefined);
+
+	expect(action).toBe("none");
+	expect(next).toMatchObject({ resultId: "old", resultUnread: true });
+});

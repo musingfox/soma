@@ -62,11 +62,17 @@ export function observe(job: Job, status: AgentState, seq: number): Observed {
  * Settles a `complete` against what the agent's transcript ends on. The last record already recorded
  * is the same turn observed again, so only the observation is kept. A new one is a finished turn with
  * the outcome its reply's first line states, 未知 when it ends without one; so is a transcript that
- * could not be read at all, which leaves the recorded id alone.
+ * could not be read at all, which leaves the recorded id alone. A job whose move could not read its last record takes the
+ * first it reads as that record, with no turn of it, since nothing can tell what ended on it from what a cut turn left.
  */
 export function complete(observed: Observed, result: AgentResult | undefined): Observed {
 	if (observed.action !== "complete") return observed;
 	const { job } = observed;
+	if (job.resultUnread) {
+		if (result === undefined) return { job, action: "none" };
+		const { resultUnread: _read, ...rest } = job;
+		return { job: { ...rest, resultId: result.id }, action: "none" };
+	}
 	if (result !== undefined && result.id === job.resultId) return { job, action: "none" };
 	const outcome = outcomeOf(result?.text);
 	return {

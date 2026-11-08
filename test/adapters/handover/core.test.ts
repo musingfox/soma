@@ -3,9 +3,9 @@ import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { Harness, TaskId } from "@earendil-works/pi-durable";
+import type { Conversation, Harness, TaskId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
-import { seqOf } from "../../../src/adapters/rex/agent-port.ts";
+import { type createRexAgentPort, seqOf } from "../../../src/adapters/rex/agent-port.ts";
 import { RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
 import { deferExtension } from "../../../src/core/extensions/defer/index.ts";
 import {
@@ -39,7 +39,9 @@ afterEach(async () => {
  * the foreign agents and 選 <card> <fingerprint> answers a prompt, as a wake it had pending would. It does nothing for a
  * wake itself. `results` holds every tool result the model was handed.
  */
-async function core(options: Parameters<typeof sides>[0] & { brief?: string } = {}) {
+async function core(
+	options: Parameters<typeof sides>[0] & { brief?: string; settledOn?: (root: Conversation) => Conversation } = {},
+) {
 	const both = await sides(options);
 	const results: unknown[] = [];
 	const faux = fauxProvider();
@@ -98,7 +100,9 @@ async function core(options: Parameters<typeof sides>[0] & { brief?: string } = 
 	const quietOnceClosed = (error: unknown) => {
 		if (open.includes(harness)) throw error;
 	};
-	const offSettled = handoverBridge(root, both.agents, context).listen(quietOnceClosed);
+	const offSettled = options.settledOn
+		? handoverBridge(options.settledOn(root), both.agents, context).listen(() => {})
+		: handoverBridge(root, both.agents, context).listen(quietOnceClosed);
 	await both.agents.heard();
 	await reconcileDispatches(root, both.agents, context, await both.agents.dormant());
 	reconciled();
@@ -553,6 +557,190 @@ test("a job just dispatched whose transcript holds no conversation yet is refuse
 	expect((await soma.job())?.status.state).toBe("working");
 	soma.off();
 });
+
+/** A window's idle that says nothing new, under a seq of its own, as the window's claude settling reports it. */
+function settles(soma: Soma, at: string) {
+	const window = soma.blocks.at(-1) as Block;
+	const settled = { state: "idle", updated_at: `2026-10-27T01:02:${at}.000000+08:00` };
+	window.records = [settled];
+	soma.hangar.emit(soma.hangar.status(window.block, settled));
+	return seqOf(settled);
+}
+
+/** Its next `times` reads of the transcript through the window answer `read` instead. */
+const readsFail =
+	(times: { left: number }, read: () => Promise<undefined>) => (port: ReturnType<typeof createRexAgentPort>) => ({
+		...port,
+		readResult: (agent: string) => {
+			if (times.left === 0) return port.readResult(agent);
+			times.left--;
+			return read();
+		},
+	});
+
+/** The conversation as the handover bridge sees it: its next `times` commits fail. */
+const commitsFail = (times: { left: number }) => (root: Conversation) =>
+	({
+		id: root.id,
+		commit: (change: never, on: never) =>
+			times.left-- > 0 ? Promise.reject(new Error("the db is away")) : root.commit(change, on),
+	}) as unknown as Conversation;
+
+test.each([
+	["rejects", () => Promise.reject(new Error("rex hiccup"))],
+	["answers nothing", () => Promise.resolve(undefined)],
+] as const)(
+	"a transcript read that %s at the commit: no turn of the cut, no false notice, and the session is the window's",
+	async (_name, read) => {
+		const times = { left: 0 };
+		const soma = await core({ to: readsFail(times, read) });
+		const { turns, before } = await busy(soma, "SPIN");
+		const { acpSessionId } = await soma.entry();
+		times.left = 1;
+
+		await soma.say("看 card-a");
+
+		expect(soma.results.at(-1)).toMatchObject({ handedOver: true, cut: {} });
+		expect(times.left).toBe(0);
+		await soma.until(async () => (await soma.job())?.resultUnread === undefined, "the window's first idle");
+		const job = await soma.job();
+		expect(job).toMatchObject({ sessionId: acpSessionId, status: { state: "idle" }, outcome: before?.outcome });
+		expect(job?.resultId).toBe((await soma.agents.readResult("card-a"))?.id);
+		expect(await soma.turns()).toEqual(turns);
+		const notices = await soma.notices();
+		expect(notices).toEqual([expect.stringContaining(cutTurn)]);
+
+		// The next idle finds the record it holds, and the next turn is recorded as any is.
+		const seq = settles(soma, "09");
+		await soma.until(async () => (await soma.job())?.seq === seq, "the settling idle");
+		expect(await soma.turns()).toEqual(turns);
+		await soma.say("回覆 card-a go on");
+		await turn(soma, "結果：完成\nKIWI");
+		await soma.until(async () => (await soma.job())?.outcome === "完成", "the window's turn");
+		expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "完成" }]);
+		soma.off();
+	},
+);
+
+test("a window read that keeps failing at its first idle records nothing, and its next idle that reads takes the record", async () => {
+	const times = { left: 0 };
+	const soma = await core({ to: readsFail(times, () => Promise.resolve(undefined)) });
+	const { turns } = await busy(soma, "SPIN");
+	times.left = 2;
+
+	await soma.say("看 card-a");
+
+	await soma.until(() => times.left === 0, "the window's first idle to read");
+	expect((await soma.job())?.resultUnread).toBe(true);
+	expect(await soma.turns()).toEqual(turns);
+	const seq = settles(soma, "09");
+	await soma.until(async () => (await soma.job())?.seq === seq, "the settling idle");
+	expect((await soma.job())?.resultUnread).toBeUndefined();
+	expect(await soma.turns()).toEqual(turns);
+	expect(await soma.notices()).toHaveLength(1);
+	soma.off();
+});
+
+test("a transcript read that fails as a landing is told at a restart: no turn of the cut, and the session is the window's", async () => {
+	const first = await core();
+	const { turns } = await busy(first, "SPIN");
+	const { acpSessionId } = await first.entry();
+	hangsAfterWindow(first);
+	void first.agents.handOver("card-a");
+	await first.until(() => first.blocks.length === 1, "the window");
+	await sleep(50);
+
+	const soma = await again(first, { to: readsFail({ left: 1 }, () => Promise.reject(new Error("rex hiccup"))) });
+
+	await toldOnRexOnce(soma, acpSessionId);
+	await sleep(100);
+	expect(await soma.turns()).toEqual(turns);
+	expect(await soma.notices()).toHaveLength(1);
+	soma.off();
+});
+
+test("a record that fails: the job takes the window's session and is told once, as moved, with no turn of the cut", async () => {
+	const soma = await core();
+	const { turns, before } = await busy(soma, "SPIN");
+	const { acpSessionId } = await soma.entry();
+
+	const outcome = await soma.agents.handOver("card-a", () => Promise.reject(new Error("the db is away")));
+
+	expect(outcome).toMatchObject({ handedOver: true, cut: {} });
+	expect(soma.said).toContain("the db is away");
+	await toldOnRexOnce(soma, acpSessionId);
+	await sleep(100);
+	const [notice] = await soma.notices();
+	expect(notice).toContain(cutTurn);
+	expect(notice).not.toContain("cut short");
+	expect(await soma.notices()).toHaveLength(1);
+	expect(await soma.turns()).toEqual(turns);
+	expect(await soma.job()).toMatchObject({ status: { state: "idle" }, outcome: before?.outcome });
+
+	await soma.say("回覆 card-a go on");
+	await turn(soma, "結果：完成\nKIWI");
+	await soma.until(async () => (await soma.job())?.outcome === "完成", "the window's turn");
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), onRex)).toBe(1);
+	next.off();
+});
+
+test("a record that fails, and so does the commit after it: what the window says records nothing, and the next soma tells it once", async () => {
+	const soma = await core({ settledOn: commitsFail({ left: 1 }) });
+	const { turns, before } = await busy(soma, "SPIN");
+	const { acpSessionId } = await soma.entry();
+
+	const outcome = await soma.agents.handOver("card-a", () => Promise.reject(new Error("the db is away")));
+
+	expect(outcome).toMatchObject({ handedOver: true, cut: {} });
+	await soma.until(() => soma.said.includes("the db is away") && soma.said.length > 1, "the commit to fail");
+	settles(soma, "09");
+	await sleep(100);
+	expect(await soma.notices()).toEqual([]);
+	expect(await soma.turns()).toEqual(turns);
+	expect((await soma.job())?.sessionId).toBe(before?.sessionId);
+	expect((await soma.agents.list())[0]?.status).toBeUndefined();
+
+	const next = await again(soma);
+
+	await toldOnRexOnce(next, acpSessionId);
+	await sleep(100);
+	expect(await next.notices()).toHaveLength(1);
+	expect(await next.turns()).toEqual(turns);
+	next.off();
+});
+
+test.each([
+	["before the final mark", (first: Soma) => hangsAfterWindow(first)],
+	["after the final mark", (first: Soma) => first.off()],
+])(
+	"a commit that fails as a job killed %s lands at a restart: the reconcile takes no status of it, and the next soma tells it once",
+	async (_name, arrange) => {
+		const first = await core();
+		const { turns } = await busy(first, "SPIN");
+		const { acpSessionId } = await first.entry();
+		arrange(first);
+		const moving = first.agents.handOver("card-a");
+		await first.until(() => first.blocks.length === 1, "the window");
+		await Promise.race([moving, sleep(50)]);
+
+		const soma = await again(first, { settledOn: commitsFail({ left: 1 }) });
+
+		await sleep(100);
+		expect(await soma.notices()).toEqual([]);
+		expect(await soma.turns()).toEqual(turns);
+		expect((await soma.job())?.status.state).toBe("working");
+
+		const next = await again(soma);
+
+		await toldOnRexOnce(next, acpSessionId);
+		await sleep(100);
+		expect(await next.notices()).toHaveLength(1);
+		expect(await next.turns()).toEqual(turns);
+		next.off();
+	},
+);
 
 test("a turn that does not stop in time: refused with the reason, nothing closed or opened, working, and no notice", async () => {
 	const soma = await core({ cutMs: 50 });

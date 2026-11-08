@@ -62,6 +62,8 @@ export type Settled =
 			readonly sessionId: string;
 			// The record the transcript ends on as the window is told: no turn of what ran before it.
 			readonly lastRecord?: string;
+			// A `handOver` answered for it, whole, and only its record failed: its handover was not cut short.
+			readonly answered?: true;
 	  }
 	| { readonly agent: string; readonly onto: "acp"; readonly at: number; readonly startup: boolean }
 	| { readonly agent: string; readonly onto: "gone"; readonly sessionId: string };
@@ -70,7 +72,9 @@ export type Settled =
 export interface HandoverSettling {
 	// Each job as a look settles it, and what settled before the listener came. Every job on rex at startup and every job
 	// given back and not handed over since is said again, since a soma can die before the listener's commit: the listener
-	// tells a job on rex it has told by the session the job holds, and a return it has told by its `at`.
+	// tells a job on rex it has told by the session the job holds, and a return it has told by its `at`. So is a job a
+	// `record` that failed could not keep. A listener that rejects has not recorded a job on rex: its window reports nothing
+	// from then on, for what it says would read as the end of a turn on a job recorded as it was before the move.
 	onSettled(listener: (settled: Settled) => void | Promise<void>): () => void;
 	// Once what settled before the listener came has been said and the listener has answered.
 	heard(): Promise<void>;

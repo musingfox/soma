@@ -106,7 +106,7 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			if (current === undefined || current.seq === event.seq) return;
 			// Decisions come from the current job, not the one read above: a respond tool may have added one since, and
 			// so may the reclaim, which a defer may have armed since.
-			const { launch: _held, handedOver: _handed, ...kept } = current;
+			const { launch: _held, handedOver: _handed, resultUnread: _unread, ...kept } = current;
 			const { decisions: _read, reclaim: _armed, ...fields } = next;
 			doc.jobs[index] = { ...kept, ...fields };
 			if (action === "escalate") {
@@ -184,7 +184,8 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
  * by `show_job` or by this, in this soma or one before. A job given back is told once, by its return's time, kept with
  * the job in the commit of the notice: unfinished at a startup, by the restart's notice, which never names a done one. A
  * job whose window closed before its move was recorded takes the session too, with no claim of a window: one the
- * reconcile will report gone is told by that, and a done one, which it leaves alone, is told here.
+ * reconcile will report gone is told by that, and a done one, which it leaves alone, is told here. A commit that fails
+ * fails the listener, so the agent side holds what that job's window says until a later soma's commit.
  */
 export function handoverBridge(conversation: Conversation, settling: HandoverSettling, context: Context) {
 	async function apply(settled: Settled): Promise<void> {
@@ -220,7 +221,8 @@ export function handoverBridge(conversation: Conversation, settling: HandoverSet
 				return;
 			}
 			const cut = cutOf(job.status);
-			const after = ` Its handover was cut short and ended there.${cut === undefined ? "" : cutInWindow(cut)}`;
+			const what = cut === undefined ? "" : cutInWindow(cut);
+			const after = settled.answered ? what : ` Its handover was cut short and ended there.${what}`;
 			await commitMove(tx, conversation.id, { agent, card }, settled, after);
 		}, context);
 	}
@@ -229,8 +231,9 @@ export function handoverBridge(conversation: Conversation, settling: HandoverSet
 		/** Feeds every job the agent side settles from now on, and those it settled before; returns the unsubscribe. */
 		listen(onError: (error: unknown) => void): () => void {
 			return settling.onSettled((settled) => {
-				queue = queue.then(() => apply(settled)).catch(onError);
-				return queue;
+				const run = queue.then(() => apply(settled));
+				queue = run.catch(onError);
+				return run;
 			});
 		},
 	};

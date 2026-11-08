@@ -67,7 +67,8 @@ export function createHandoverAgentPort({
 	const moved = new Map<string, HeldSession>();
 	const moving = new Map<string, HeldSession>();
 	const undecided = new Map<string, Undecided>();
-	// Jobs a look put on rex whose landing the listeners have not answered yet: what their window says waits for that.
+	// Jobs on rex whose landing the listeners have not answered yet, or whose answer failed: what their window says waits
+	// for that, and in a soma where it failed, for the next soma to say it again.
 	const unrecorded = new Set<string>();
 	// Why each job was last told undecided: once per reason, however many looks find it the same.
 	const told = new Map<string, Why>();
@@ -79,6 +80,7 @@ export function createHandoverAgentPort({
 	 * has nothing to say, or does not answer, says nothing; the core reads a seq it holds as the observation it recorded.
 	 */
 	async function passOn(agent: string): Promise<void> {
+		if (unrecorded.has(agent)) return;
 		heard.delete(agent);
 		const listed = await (moved.has(agent) ? to : from).list().catch(() => []);
 		const { status, seq } = listed.find(({ name }) => name === agent) ?? {};
@@ -146,13 +148,14 @@ export function createHandoverAgentPort({
 				readonly onto: "rex";
 				readonly sessionId: string;
 				readonly released?: HeldSession;
+				readonly answered?: true;
 		  };
 	const listeners = new Set<(settled: Settled) => void | Promise<void>>();
 	const unheard: Telling[] = [];
 	/** Throws when rex cannot say whether a released job's window is there: the job is then told by the next soma. */
 	async function settledOf(telling: Telling): Promise<Settled> {
 		if (telling.onto === "acp") return telling;
-		const { agent, sessionId, released } = telling;
+		const { agent, sessionId, released, answered } = telling;
 		if (released !== undefined && (await to.holds(released, to.hangar)) !== "window") {
 			return { agent, onto: "gone", sessionId };
 		}
@@ -164,11 +167,17 @@ export function createHandoverAgentPort({
 			window: agent,
 			session: await to.label().catch(() => to.hangar),
 			...(last === undefined ? {} : { lastRecord: last.id }),
+			...(answered ? { answered } : {}),
 		};
 	}
 	async function deliver(telling: Telling): Promise<void> {
-		const settled = await settledOf(telling);
-		await Promise.all([...listeners].map((listener) => listener(settled)));
+		try {
+			const settled = await settledOf(telling);
+			await Promise.all([...listeners].map((listener) => listener(settled)));
+		} catch (error) {
+			if (telling.onto === "rex") unrecorded.add(telling.agent);
+			throw error;
+		}
 		if (unrecorded.delete(telling.agent)) await passOn(telling.agent);
 	}
 	function tell(telling: Telling): void {
@@ -317,7 +326,14 @@ export function createHandoverAgentPort({
 		try {
 			const outcome = await move(agent, held);
 			const toKeep = outcome.handedOver || outcome.cut !== undefined || outcome.back !== undefined;
-			if (toKeep) await record?.(outcome).catch(onError);
+			if (toKeep) {
+				await record?.(outcome).catch((error: Error) => {
+					onError(error);
+					if (!outcome.handedOver) return;
+					unrecorded.add(agent);
+					tell({ agent, onto: "rex", sessionId: outcome.sessionId, answered: true });
+				});
+			}
 			return outcome;
 		} finally {
 			moving.delete(agent);
@@ -374,7 +390,14 @@ export function createHandoverAgentPort({
 			const [all, there] = await Promise.all([from.list(), moved.size === 0 ? [] : to.list()]);
 			// One whose turn is being cut is still in `from`'s answer.
 			const here = all.filter((agent) => !moving.has(agent.name));
-			const onRex = there.filter((agent) => moved.has(agent.name));
+			// A status of a job whose landing is not recorded would read as the end of a turn on it as it was recorded before.
+			const onRex = there
+				.filter((agent) => moved.has(agent.name))
+				.map(({ status, seq, ...agent }) =>
+					(listeners.size > 0 && unrecorded.has(agent.name)) || status === undefined
+						? agent
+						: { ...agent, status, seq },
+				);
 			const named = new Set([...here, ...onRex].map((agent) => agent.name));
 			return [
 				...here,

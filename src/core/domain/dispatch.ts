@@ -49,6 +49,9 @@ export type Job = {
 	// The id of the transcript's last record when a finished turn was last recorded; the same record observed again is
 	// no new turn (src/ports/agent.ts, AgentResult).
 	readonly resultId?: string;
+	// A move's commit could not read what the transcript ended on, so `resultId` may name a record before what a cut turn
+	// left there: the next `complete` takes what it reads as `resultId` and records no turn.
+	readonly resultUnread?: true;
 	// The prompt of the last block handed to the model or the human, until a status other than blocked is seen: the
 	// same prompt observed again is not handed over twice. `status` cannot tell, since reconcile writes it unobserved.
 	readonly handedOver?: HandedOver;

@@ -147,9 +147,10 @@ export async function answerJob(
 /**
  * In the commit of the move, so the human is told once. The session id is what the window runs and a later resume names;
  * the brief, had it not gone, would be sent again at the window's first idle, and its transcript says it did. `lastRecord`
- * is what that transcript ends on, whatever a cut turn left there, so the window's first idle records no turn; a block
- * handed over before the move is forgotten, so the same prompt in the window is handed over; and a status from before is
- * no longer true of a job that was in a turn: the window's own reaches the bridge once this is committed.
+ * is what that transcript ends on, whatever a cut turn left there, so the window's first idle records no turn, and with
+ * none read that idle takes what it reads as the same (`resultUnread`); a block handed over before the move is forgotten,
+ * so the same prompt in the window is handed over; and a status from before is no longer true of a job that was in a
+ * turn: the window's own reaches the bridge once this is committed.
  */
 export async function commitMove(
 	tx: Tx,
@@ -172,7 +173,7 @@ export async function commitMove(
 			...rest,
 			sessionId,
 			...(turning(current.status) ? { status: { state: "idle" as const } } : {}),
-			...(lastRecord === undefined ? {} : { resultId: lastRecord }),
+			...(lastRecord === undefined ? { resultUnread: true as const } : { resultId: lastRecord }),
 		};
 	}
 	await tx.appendEntry(

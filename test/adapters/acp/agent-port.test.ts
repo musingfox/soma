@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { readFile, realpath } from "node:fs/promises";
+import { readFile, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
 import { type AgentStatusEvent, NotImplemented, PromptRefused } from "../../../src/ports/agent.ts";
@@ -371,7 +371,7 @@ test("Authentication required on session/new leaves a job with no session, which
 		state: "blocked",
 		kind: "auth",
 		msg: expect.stringMatching(
-			/^configuration error: claude-agent-acp refused session\/new with -32000 Authentication required, so this job has no session: it takes no reply.*HOME=\/home\/someone and USER=someone\..*does not survive a restart yet\.$/,
+			/^configuration error: claude-agent-acp refused session\/new with -32000 Authentication required, so this job has no session: it takes no reply.*HOME=\/home\/someone and USER=someone\..*no session to load again, so after the restart it is reported gone\.$/,
 		),
 	});
 	expect(blocked.status.state === "blocked" && blocked.status.msg).not.toMatch(/reply to the job/);
@@ -428,3 +428,235 @@ test("resume is not implemented yet, and there are no foreign agents", async () 
 	expect(await acp.port.listForeign()).toEqual([]);
 	await expect(acp.port.promptForeign("x", "hi")).rejects.toThrow(PromptRefused);
 });
+
+/** The ACP session each agent ran, as the sessions file records it. */
+const recorded = async (acp: { sessionsFile: string }) =>
+	JSON.parse(await readFile(acp.sessionsFile, "utf8")) as Record<
+		string,
+		{ acpSessionId: string; cwd: string; stopped?: true }
+	>;
+
+/** Every agent process the port ran, by the name it ran for; none when it ran none. */
+const spawned = async (acp: { cwd: string; instance: number }) =>
+	(await readFile(join(acp.cwd, "..", `pids-${acp.instance}`), "utf8").catch(() => ""))
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => line.split(" ") as [string, string]);
+
+const alive = (pid: string) => {
+	try {
+		process.kill(Number(pid), 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+
+/** A soma that ran a prompt in each named agent, then ended with them. */
+async function ranThenEnded(names: readonly string[], options: Parameters<typeof harness>[0] = {}) {
+	const first = await harness({ cap: 8, ...options });
+	for (const name of names) {
+		await first.start(name);
+		await first.until("idle", 0, name);
+		const from = first.events.length;
+		await first.port.prompt(name, `hello ${name}`);
+		await first.until("done", from, name);
+	}
+	return first;
+}
+
+test("after a restart, each agent soma did not stop and that ran a prompt is listed dormant, with no process and no status", async () => {
+	const first = await ranThenEnded(["card-a", "card-b"]);
+	// card-c never runs a prompt, so it has no transcript to load.
+	await first.start("card-c");
+	await first.until("idle", 0, "card-c");
+	await first.port.stop("card-b");
+	await first.end();
+
+	const second = await harness({ cwd: first.cwd });
+	expect(await second.port.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	expect(await second.port.dormant()).toEqual(["card-a"]);
+	expect(await spawned(second)).toEqual([]);
+	const sessions = await recorded(first);
+	expect(sessions["card-b"]?.stopped).toBe(true);
+	expect(sessions["card-a"]).not.toHaveProperty("stopped");
+	expect(second.errors.map((error) => error.message)).toEqual([
+		`agent card-c is not listed after the restart: ACP session ${sessions["card-c"]?.acpSessionId} in ` +
+			`${sessions["card-c"]?.cwd} has no transcript, so it never ran a prompt`,
+	]);
+	await expect(second.port.prompt("card-c", "hi")).rejects.toThrow(PromptRefused);
+	// Waiting changes nothing: no process is started behind the listing.
+	await sleep(300);
+	expect(await spawned(second)).toEqual([]);
+});
+
+test("a dormant agent counts against the hangar cap only once it has a process", async () => {
+	const first = await ranThenEnded(["card-a"], { cap: 1 });
+	await first.end();
+
+	const second = await harness({ cwd: first.cwd, cap: 1 });
+	await second.start("card-b");
+	await second.until("idle", 0, "card-b");
+	const refused = second.port.prompt("card-a", "RECALL");
+	await expect(refused).rejects.toThrow(PromptRefused);
+	await expect(refused).rejects.toThrow("acp agent card-a is dormant: hangar is full: 1 of 1 agents running");
+	expect((await spawned(second)).map(([name]) => name)).toEqual(["card-b"]);
+	// Refused by the cap, it is still dormant, and woken once there is room.
+	await second.port.stop("card-b");
+	const from = second.events.length;
+	await second.port.prompt("card-a", "RECALL");
+	await second.until("done", from);
+	await expect(second.start("card-c")).rejects.toThrow("hangar is full: 1 of 1 agents running");
+});
+
+test("the first prompt to a dormant agent starts it with session/load of its recorded session and cwd, and it answers from its earlier context", async () => {
+	const first = await harness();
+	await first.start();
+	await first.until("idle");
+	await first.port.prompt("card-a", "the word is KIWI");
+	await first.until("done");
+	await first.end();
+	const loaded = join(first.cwd, "..", "projects", "loaded");
+
+	const second = await harness({ cwd: first.cwd });
+	await second.port.list();
+	await expect(readFile(loaded, "utf8")).rejects.toThrow(/ENOENT/);
+	const from = second.events.length;
+	// Both wait for the same wake; whichever goes second finds the turn under way.
+	const both = await Promise.allSettled([
+		second.port.prompt("card-a", "RECALL"),
+		second.port.prompt("card-a", "RECALL again"),
+	]);
+	expect(both.map((each) => each.status).sort()).toEqual(["fulfilled", "rejected"]);
+	expect(both.find((each) => each.status === "rejected")).toMatchObject({ reason: expect.any(PromptRefused) });
+	await second.until("done", from);
+	expect((await second.port.readResult("card-a"))?.text).toBe("recall: the word is KIWI");
+	const { acpSessionId, cwd } = (await recorded(first))["card-a"] ?? { acpSessionId: "", cwd: "" };
+	expect(await readFile(loaded, "utf8")).toBe(`${acpSessionId} ${cwd}\n`);
+	expect((await spawned(second)).map(([name]) => name)).toEqual(["card-a"]);
+	expect((await second.port.list()).map(({ name, status }) => ({ name, status }))).toEqual([
+		{ name: "card-a", status: { state: "done" } },
+	]);
+	// A process of the second port's own, still soma's child.
+	const next = second.events.length;
+	await second.port.prompt("card-a", "ENV");
+	await second.until("done", next);
+	expect((await second.port.readResult("card-a"))?.text).toBe(
+		`SOMA_AGENT=card-a ppid=${process.pid} cwd=${cwd} session=${cwd}`,
+	);
+});
+
+test("an agent whose turn the restart cut short is dormant like any other, and a prompt goes on in its session", async () => {
+	const first = await harness();
+	await first.start();
+	await first.until("idle");
+	await first.port.prompt("card-a", "HANG");
+	// Working is reported as the prompt goes; the turn is under way once claude wrote it.
+	while (!(await first.port.readScreen("card-a")).includes("> HANG")) await sleep(10);
+	await first.end();
+
+	const second = await harness({ cwd: first.cwd });
+	expect(await second.port.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	const from = second.events.length;
+	await second.port.prompt("card-a", "RECALL");
+	await second.until("done", from);
+	expect((await second.port.readResult("card-a"))?.text).toBe("recall: HANG");
+});
+
+test("a dormant agent whose session cannot be loaded refuses the prompt with the reason, reports it as an error and logs it", async () => {
+	const first = await ranThenEnded(["card-a", "card-b", "card-c"]);
+	await first.end();
+	const sessions = await recorded(first);
+	await rm(sessions["card-c"]?.cwd ?? "", { recursive: true, force: true });
+
+	const second = await harness({
+		cwd: first.cwd,
+		fake: { FAKE_ACP_LOAD_AUTH: "card-a", FAKE_ACP_LOAD_EXIT: "card-b" },
+	});
+	const load = (name: string) =>
+		`session/load of ACP session ${sessions[name]?.acpSessionId} in ${sessions[name]?.cwd} failed: `;
+	const why = {
+		"card-a": new RegExp(`^${literal(load("card-a"))}-32000 Authentication required$`),
+		"card-b": new RegExp(`^${literal(load("card-b"))}.*; the process exited with code 4$`),
+		"card-c": new RegExp(`^its worktree ${literal(sessions["card-c"]?.cwd ?? "")} is gone$`),
+	};
+	for (const [name, reason] of Object.entries(why)) {
+		const refused = await second.port.prompt(name, "hi").then(
+			() => undefined,
+			(error: Error) => error,
+		);
+		expect(refused).toBeInstanceOf(PromptRefused);
+		expect(refused?.message.replace(`acp agent ${name} is not woken: `, "")).toMatch(reason);
+		const error = await second.until("error", 0, name);
+		expect(error.status.msg).toMatch(reason);
+		expect(second.errors.map((each) => each.message).filter((each) => each.startsWith(`agent ${name} `))).toEqual([
+			`agent ${name} is not woken: ${error.status.msg}`,
+		]);
+	}
+	// Each stays listed, with its error, and none of the processes started for them is left.
+	expect((await second.port.list()).map(({ name, status }) => [name, status?.state])).toEqual([
+		["card-a", "error"],
+		["card-b", "error"],
+		["card-c", "error"],
+	]);
+	expect((await spawned(second)).map(([name]) => name).sort()).toEqual(["card-a", "card-b"]);
+	await sleep(200);
+	expect((await spawned(second)).filter(([, pid]) => alive(pid))).toEqual([]);
+});
+
+test("readResult, readScreen and stop of a dormant agent read its transcript and record the stop without a process", async () => {
+	const first = await ranThenEnded(["card-a"]);
+	await first.end();
+
+	const second = await harness({ cwd: first.cwd });
+	expect((await second.port.readResult("card-a"))?.text).toBe("echo: hello card-a");
+	expect(await second.port.readScreen("card-a")).toContain("> hello card-a");
+	expect(await second.port.respond("card-a", { option: "1", fingerprint: "x" })).toEqual({
+		sent: false,
+		refusal: "not_blocked",
+	});
+	await second.port.stop("card-a");
+	expect(await second.port.list()).toEqual([]);
+	expect((await recorded(first))["card-a"]?.stopped).toBe(true);
+	// Read off the session it ran, as a stopped agent's is.
+	expect((await second.port.readResult("card-a"))?.text).toBe("echo: hello card-a");
+	expect(await spawned(second)).toEqual([]);
+	await second.end();
+
+	const third = await harness({ cwd: first.cwd });
+	expect(await third.port.list()).toEqual([]);
+});
+
+test("a stop and a first prompt to a dormant agent in the same tick leave no process: the prompt is refused, the stop holds", async () => {
+	const first = await ranThenEnded(["card-a"]);
+	await first.end();
+
+	const second = await harness({ cwd: first.cwd });
+	const from = second.events.length;
+	const stopped = second.port.stop("card-a");
+	// Caught at once: the prompt is refused before the stop has recorded.
+	const prompted = second.port.prompt("card-a", "RECALL").then(
+		() => undefined,
+		(error: Error) => error,
+	);
+	await stopped;
+	const refused = await prompted;
+	expect(refused).toBeInstanceOf(PromptRefused);
+	expect(refused?.message).toBe("acp agent card-a was stopped as it woke");
+	expect((await recorded(first))["card-a"]?.stopped).toBe(true);
+	expect(await second.port.list()).toEqual([]);
+	expect(second.events.slice(from)).toEqual([]);
+	// The stop landed before the wake spawned anything.
+	expect(await spawned(second)).toEqual([]);
+});
+
+test("start refuses the name of a dormant agent, whose session goes on with a reply", async () => {
+	const first = await ranThenEnded(["card-a"]);
+	await first.end();
+	const second = await harness({ cwd: first.cwd });
+	await expect(second.start("card-a")).rejects.toThrow("acp holds a dormant agent named card-a");
+	expect(await spawned(second)).toEqual([]);
+});
+
+const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

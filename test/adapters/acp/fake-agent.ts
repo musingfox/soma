@@ -11,11 +11,17 @@
 //   CANCEL ends the turn as cancelled, with no reply written
 //   LONG   stops at max_tokens
 //   BULKY  writes a 600 KiB record that is no part of the conversation, as claude's API request records are
+//   RECALL replies with every earlier prompt of the session, the ones session/load read back included
+//   HANG   never ends the turn
 //   anything else is echoed.
-// session/close appends the session's id to $FAKE_ACP_PROJECTS/closed.
+// session/close appends the session's id to $FAKE_ACP_PROJECTS/closed. session/load reads the session's transcript
+// back, as claude-agent-acp does, replaying its prompts, and appends "<session id> <cwd>" to $FAKE_ACP_PROJECTS/loaded;
+// a session with no transcript is refused with -32002, as one that never ran a prompt is.
 // $FAKE_ACP_NEW_MS delays session/new, as claude's CLI start does; $FAKE_ACP_NEW_AUTH refuses it with -32000.
+// $FAKE_ACP_LOAD_AUTH and $FAKE_ACP_LOAD_EXIT, comma-separated agent names, have the agent whose SOMA_AGENT is named
+// refuse session/load with -32000 or exit with code 4 during it. Each agent appends "<SOMA_AGENT> <pid>" to $FAKE_ACP_PIDS.
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -28,19 +34,23 @@ import {
 } from "@agentclientprotocol/sdk";
 
 const projects = process.env.FAKE_ACP_PROJECTS ?? "/nonexistent";
-const sessions = new Map<string, { cwd: string; last?: string }>();
+const sessions = new Map<string, { cwd: string; last?: string; prompts: string[] }>();
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const named = (variable: string | undefined) => (variable ?? "").split(",").includes(process.env.SOMA_AGENT ?? "");
+const transcriptOf = (sessionId: string, cwd: string) =>
+	join(projects, cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${sessionId}.jsonl`);
+if (process.env.FAKE_ACP_PIDS) appendFileSync(process.env.FAKE_ACP_PIDS, `${process.env.SOMA_AGENT} ${process.pid}\n`);
 
 /** Appends one record to the session's transcript, chained to the one before, as claude writes them. */
 function write(sessionId: string, type: "user" | "assistant", content: unknown): void {
 	const session = sessions.get(sessionId);
 	if (session === undefined) throw new Error(`no session ${sessionId}`);
-	const directory = join(projects, session.cwd.replace(/[^a-zA-Z0-9]/g, "-"));
-	mkdirSync(directory, { recursive: true });
+	const path = transcriptOf(sessionId, session.cwd);
+	mkdirSync(join(path, ".."), { recursive: true });
 	const uuid = randomUUID();
 	const message = type === "user" ? { role: "user", content } : { id: `msg-${uuid}`, role: "assistant", content };
 	const record = { type, uuid, parentUuid: session.last ?? null, sessionId, cwd: session.cwd, message };
-	appendFileSync(join(directory, `${sessionId}.jsonl`), `${JSON.stringify(record)}\n`);
+	appendFileSync(path, `${JSON.stringify(record)}\n`);
 	session.last = uuid;
 }
 
@@ -56,8 +66,32 @@ const app = agent({ name: "fake-acp" })
 		await sleep(Number(process.env.FAKE_ACP_NEW_MS ?? 0));
 		if (process.env.FAKE_ACP_NEW_AUTH) throw RequestError.authRequired();
 		const sessionId = randomUUID();
-		sessions.set(sessionId, { cwd: params.cwd });
+		sessions.set(sessionId, { cwd: params.cwd, prompts: [] });
 		return { sessionId };
+	})
+	.onRequest(methods.agent.session.load, async ({ params, client }) => {
+		if (named(process.env.FAKE_ACP_LOAD_EXIT)) process.exit(4);
+		if (named(process.env.FAKE_ACP_LOAD_AUTH)) throw RequestError.authRequired();
+		const { sessionId, cwd } = params;
+		const path = transcriptOf(sessionId, cwd);
+		if (!existsSync(path)) throw RequestError.resourceNotFound();
+		const records = readFileSync(path, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { type: string; uuid: string; message?: { content: unknown } });
+		const prompts = records.flatMap((record) =>
+			record.type === "user" && typeof record.message?.content === "string" ? [record.message.content] : [],
+		);
+		for (const text of prompts) {
+			await client.notify(methods.client.session.update, {
+				sessionId,
+				update: { sessionUpdate: "user_message_chunk", content: { type: "text", text } },
+			});
+		}
+		sessions.set(sessionId, { cwd, last: records.at(-1)?.uuid, prompts });
+		mkdirSync(projects, { recursive: true });
+		appendFileSync(join(projects, "loaded"), `${sessionId} ${cwd}\n`);
+		return {};
 	})
 	.onRequest(methods.agent.session.close, ({ params }) => {
 		mkdirSync(projects, { recursive: true });
@@ -68,7 +102,14 @@ const app = agent({ name: "fake-acp" })
 		const text = params.prompt.map((block) => (block.type === "text" ? block.text : "")).join("");
 		const { sessionId } = params;
 		if (text.includes("AUTH")) throw RequestError.authRequired();
+		const earlier = [...(sessions.get(sessionId)?.prompts ?? [])];
+		sessions.get(sessionId)?.prompts.push(text);
 		write(sessionId, "user", text);
+		if (text.includes("HANG")) await new Promise(() => {});
+		if (text.includes("RECALL")) {
+			reply(sessionId, `recall: ${earlier.join(" | ")}`);
+			return { stopReason: "end_turn" };
+		}
 		if (text.includes("EXIT")) process.exit(3);
 		if (text.includes("CANCEL")) return { stopReason: "cancelled" };
 		const touch = (file: string, toolCallId: string): RequestPermissionRequest => ({
@@ -145,10 +186,8 @@ const app = agent({ name: "fake-acp" })
 			return { stopReason: "end_turn" };
 		}
 		if (text.includes("BULKY")) {
-			const session = sessions.get(sessionId);
-			const directory = join(projects, (session?.cwd ?? "").replace(/[^a-zA-Z0-9]/g, "-"));
 			const blob = { type: "api-request-blob", uuid: randomUUID(), blob: "x".repeat(600 * 1024) };
-			appendFileSync(join(directory, `${sessionId}.jsonl`), `${JSON.stringify(blob)}\n`);
+			appendFileSync(transcriptOf(sessionId, sessions.get(sessionId)?.cwd ?? ""), `${JSON.stringify(blob)}\n`);
 			reply(sessionId, "bulky reply");
 			return { stopReason: "end_turn" };
 		}

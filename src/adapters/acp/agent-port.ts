@@ -1,7 +1,8 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { constants } from "node:fs";
-import { copyFile, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { access, copyFile, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -53,9 +54,13 @@ export interface AcpAgentPortOptions {
 	/** Where claude keeps its transcripts; defaults to ~/.claude/projects. */
 	readonly projectsDir?: string;
 	readonly git?: Git;
-	/** Where each agent's ACP session id and cwd are kept for a later session/load; kept nowhere when unset. */
+	/**
+	 * Where each agent's ACP session id and cwd are kept, and whether soma stopped it. As it is made, the port lists each
+	 * agent it holds that soma did not stop and that ran a prompt as dormant, with no process; the first prompt to one
+	 * starts it in the session it ran, with session/load. Kept nowhere when unset.
+	 */
 	readonly sessionsFile?: string;
-	/** How long the agent may take to answer initialize before start gives up. */
+	/** How long the agent may take to answer initialize, and a restarted one session/load, before it is given up. */
 	readonly startMs?: number;
 	/** How long stop waits for session/close before it ends the process anyway. */
 	readonly closeMs?: number;
@@ -116,6 +121,27 @@ type Session = {
 	readonly sessionId: string;
 	readonly acpSessionId: string;
 	readonly cwd: string;
+	/** soma stopped the agent, so a restart does not start it again. */
+	readonly stopped?: true;
+};
+
+/**
+ * An agent soma did not stop, found in the sessions file as the port was made: listed, with no process and no status,
+ * until a prompt wakes it in its session.
+ */
+type Dormant = {
+	readonly name: string;
+	readonly session: Session;
+	/** What the adapter last emitted for it: the error of a wake that failed. */
+	seen?: { readonly status: AgentState; readonly seq: number };
+	/** The wake under way, which the hangar cap counts as a process. */
+	waking?: Promise<Agent>;
+};
+
+/** The ACP AgentPort, and the agents it found dormant as it was made. */
+export type AcpAgentPort = AgentPort & {
+	/** The names of the agents the port listed dormant as it was made, from the soma before it; empty when none. */
+	dormant(): Promise<readonly string[]>;
 };
 
 const AUTH_REQUIRED = RequestError.authRequired().code;
@@ -148,11 +174,15 @@ export function authMessage(env: Readonly<Record<string, string>>, method: "sess
 		method === "session/new"
 			? ""
 			: " If claude is not logged in, log it in, then reply to the job: the session is open and takes the reply.";
+	const restart =
+		method === "session/new"
+			? "this job has no session to load again, so after the restart it is reported gone."
+			: "after the restart, a reply starts this job's agent again in its session, unless no prompt of it ever ran, " +
+				"which leaves no session to load and the job reported gone.";
 	return (
 		`${head} It finds the machine's Claude Code login through HOME and USER, and soma started it with ` +
-		`${named("HOME")} and ${named("USER")}.${after} A changed HOME or USER reaches only an agent started after ` +
-		"soma restarts with it (under launchd, the LaunchAgent's EnvironmentVariables), and an ACP job does not survive " +
-		"a restart yet."
+		`${named("HOME")} and ${named("USER")}.${after} A changed HOME or USER reaches an agent only when soma starts ` +
+		`it, after soma restarts with it (under launchd, the LaunchAgent's EnvironmentVariables): ${restart}`
 	);
 }
 
@@ -180,10 +210,11 @@ async function drawTail(path: string): Promise<string> {
 /**
  * Runs each card's agent over the Agent Client Protocol: one claude-agent-acp process per job, a child of soma, with
  * one session in the card's `fleet/<card>` worktree. Its permission requests are structured, so `respond` reads no
- * screen; it has no pane, so `readScreen` draws its claude transcript. The agents end with soma (ARCHITECTURE.md
- * "How agent-side adapters differ").
+ * screen; it has no pane, so `readScreen` draws its claude transcript. The agents end with soma; the next soma's port
+ * lists each one soma did not stop as dormant, and its first prompt starts it again with session/load (ARCHITECTURE.md
+ * "The ACP implementation").
  */
-export function createAcpAgentPort(options: AcpAgentPortOptions): AgentPort {
+export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 	const { command, args } =
 		options.command === undefined ? defaultAcpCommand() : { command: options.command, args: options.args ?? [] };
 	const git = options.git ?? runGit;
@@ -196,6 +227,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AgentPort {
 	const cap = options.cap ?? resolveHangarCapWithSource(undefined, readPerfCoresViaSysctl).cap;
 
 	const agents = new Map<string, Agent>();
+	const dormant = new Map<string, Dormant>();
 	// The session each agent ran, kept past its stop, so its transcript is still read.
 	const sessions = new Map<string, Session>();
 	const listeners = new Set<(event: AgentStatusEvent) => void>();
@@ -206,7 +238,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AgentPort {
 		return lastSeq;
 	};
 
-	function emit(agent: Agent, status: AgentState): void {
+	function emit(agent: Pick<Agent, "name" | "seen" | "recheck">, status: AgentState): void {
 		const seq = nextSeq();
 		agent.seen = { status, seq };
 		if (status.state === "working" || status.state === "blocked") clearTimeout(agent.recheck);
@@ -344,7 +376,8 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AgentPort {
 			agent.session = sessionId;
 			const session = { card: agent.card, sessionId: agent.sessionId, acpSessionId: sessionId, cwd: agent.cwd };
 			sessions.set(agent.name, session);
-			await record(agent.name, session);
+			// A stop that came while the session opened found none to mark.
+			await record(agent.name, agent.stopped ? { ...session, stopped: true } : session);
 			if (!agent.exited && !agent.stopped) announce(agent);
 		} catch (error) {
 			// A closed connection is the process's exit, which reports itself.
@@ -410,14 +443,150 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AgentPort {
 		agent.recheck.unref();
 	}
 
+	const lastStderr = (agent: Agent) => {
+		const last = agent.stderr.trimEnd().split("\n").at(-1);
+		return last ? `: ${last}` : "";
+	};
+
+	/** The agents that hold a process, or are getting one: what the hangar cap counts. */
+	const running = () =>
+		[...agents.values()].filter((agent) => !agent.exited).length +
+		[...dormant.values()].filter((asleep) => asleep.waking !== undefined).length;
+
+	/**
+	 * Gives a dormant agent its process: a new claude-agent-acp, with session/load of its ACP session in its cwd, which
+	 * claude answers from the session's transcript. Held to the hangar cap, as start is. A wake that fails ends the job
+	 * error with the reason and leaves the agent dormant, so a later prompt tries again. A stop that came while no wake
+	 * was under way to wait for took the agent off the dormant ones: the wake then refuses the prompt, and its process,
+	 * if it has one yet, ends.
+	 */
+	async function wake(name: string, asleep: Dormant): Promise<Agent> {
+		const count = running();
+		if (count >= cap)
+			throw new PromptRefused(`acp agent ${name} is dormant: hangar is full: ${count} of ${cap} agents running`);
+		const { session } = asleep;
+		const stopped = () => dormant.get(name) !== asleep;
+		const refusal = () => new PromptRefused(`acp agent ${name} was stopped as it woke`);
+		const failed = (why: string): never => {
+			onError(new Error(`agent ${name} is not woken: ${why}`));
+			emit(asleep, { state: "error", msg: why });
+			throw new PromptRefused(`acp agent ${name} is not woken: ${why}`);
+		};
+		// Spawned in a cwd that is gone, the process fails with an ENOENT that names node, not the cwd.
+		const gone = await access(session.cwd).then(
+			() => false,
+			() => true,
+		);
+		// A stop that looked before this wake began has taken the agent off the dormant ones by now, so none is spawned.
+		if (stopped()) throw refusal();
+		if (gone) return failed(`its worktree ${session.cwd} is gone`);
+		const agent = launch({ name, card: session.card, cwd: session.cwd, sessionId: session.sessionId }, session.cwd);
+		// Each request has startMs of its own.
+		const cancel = () => ({ cancellationSignal: AbortSignal.timeout(startMs), stopWaitingOnCancel: true });
+		try {
+			const { agentCapabilities } = await agent.connection.agent.request(
+				methods.agent.initialize,
+				{ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {}, clientInfo: { name: "soma", version: "0" } },
+				cancel(),
+			);
+			if (agentCapabilities?.loadSession !== true) throw new Error("the agent does not offer session/load");
+			await agent.connection.agent.request(
+				methods.agent.session.load,
+				{ sessionId: session.acpSessionId, cwd: session.cwd, mcpServers: [] },
+				cancel(),
+			);
+		} catch (error) {
+			agent.stopped = true;
+			// A process that died closed the connection first: its exit names how it died.
+			if (agent.connection.signal.aborted && !agent.exited)
+				await Promise.race([once(agent.child, "exit"), sleep(1000)]);
+			agent.child.kill();
+			const code = error instanceof RequestError ? `${error.code} ` : "";
+			const exit = agent.exited
+				? `; the process exited with ${agent.child.signalCode ?? `code ${agent.child.exitCode}`}`
+				: "";
+			return failed(
+				`session/load of ACP session ${session.acpSessionId} in ${session.cwd} failed: ` +
+					`${code}${(error as Error).message}${exit}${lastStderr(agent)}`,
+			);
+		}
+		// A stop that saw the wake waits for it, so this holds unless that changes: only the dormant agent goes live.
+		if (stopped()) {
+			agent.stopped = true;
+			agent.child.kill();
+			throw refusal();
+		}
+		// Between the load's answer and here, an exit would have reported to no one.
+		if (agent.exited) return failed(`it exited once its session was loaded${lastStderr(agent)}`);
+		agent.session = session.acpSessionId;
+		dormant.delete(name);
+		agents.set(name, agent);
+		return agent;
+	}
+
+	/** The agent's process, woken first when it is dormant; a second prompt while it wakes waits for the same wake. */
+	function awake(name: string): Promise<Agent> {
+		const target = agents.get(name);
+		if (target !== undefined) return Promise.resolve(target);
+		const asleep = dormant.get(name);
+		if (asleep === undefined) return Promise.reject(new PromptRefused(`acp has no agent named ${name}`));
+		if (asleep.waking === undefined) {
+			asleep.waking = wake(name, asleep);
+			asleep.waking.catch(() => {}).finally(() => (asleep.waking = undefined));
+		}
+		return asleep.waking;
+	}
+
+	/**
+	 * Every session the file holds that soma did not stop and that ran a prompt, made dormant: listed, with no process.
+	 * One with no transcript never ran its brief, and claude refuses to load it, so it is left out and the
+	 * reconciliation takes its job for gone.
+	 */
+	async function findDormant(file: string): Promise<readonly string[]> {
+		try {
+			const text = await readFile(file, "utf8").catch((error: NodeJS.ErrnoException) => {
+				if (error.code === "ENOENT") return "{}";
+				throw error;
+			});
+			const kept = Object.entries(JSON.parse(text) as Record<string, Session>).filter(([, s]) => s.stopped !== true);
+			const ran = await Promise.all(kept.map(async ([, session]) => (await transcriptOf(session)) !== undefined));
+			const found: string[] = [];
+			for (const [index, [name, session]] of kept.entries()) {
+				if (!ran[index]) {
+					onError(
+						new Error(
+							`agent ${name} is not listed after the restart: ACP session ${session.acpSessionId} in ` +
+								`${session.cwd} has no transcript, so it never ran a prompt`,
+						),
+					);
+					continue;
+				}
+				sessions.set(name, session);
+				dormant.set(name, { name, session });
+				found.push(name);
+			}
+			return found;
+		} catch (error) {
+			onError(new Error(`acp sessions file ${file}: ${(error as Error).message}; no agent is listed from it`));
+			return [];
+		}
+	}
+
+	const loading = options.sessionsFile === undefined ? Promise.resolve([]) : findDormant(options.sessionsFile);
+
 	return {
+		dormant: () => loading,
+
 		async start(request: StartRequest): Promise<void> {
+			await loading;
 			const existing = agents.get(request.name);
 			if (existing !== undefined && !existing.exited) {
 				throw new Error(`acp already runs an agent named ${request.name}`);
 			}
-			const running = [...agents.values()].filter((agent) => !agent.exited).length;
-			if (running >= cap) throw new Error(`hangar is full: ${running} of ${cap} agents running`);
+			// Its session goes on with a reply; a new one would take its place in the sessions file.
+			if (dormant.has(request.name)) throw new Error(`acp holds a dormant agent named ${request.name}`);
+			const count = running();
+			if (count >= cap) throw new Error(`hangar is full: ${count} of ${cap} agents running`);
 			const path = await openWorktree(git, request.cwd, request.card);
 			// obw finds its vault through this untracked file, which a fresh worktree lacks.
 			await copyFile(join(request.cwd, ".obsidian.yaml"), join(path, ".obsidian.yaml"), constants.COPYFILE_EXCL).catch(
@@ -428,7 +597,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AgentPort {
 			// claude names the transcript's directory after the cwd's realpath, which a later session/load must match.
 			const cwd = await realpath(path);
 			// Checked again: another start of the same name may have got here while git ran.
-			if (agents.get(request.name)?.exited === false) {
+			if (agents.get(request.name)?.exited === false || dormant.has(request.name)) {
 				throw new Error(`acp already runs an agent named ${request.name}`);
 			}
 			const agent = launch(request, cwd);
@@ -443,30 +612,37 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AgentPort {
 				agents.delete(request.name);
 				agent.stopped = true;
 				agent.child.kill();
-				const last = agent.stderr.trimEnd().split("\n").at(-1);
 				throw new Error(
-					`the ACP agent for ${request.name} did not initialize: ${(error as Error).message}${last ? `: ${last}` : ""}`,
+					`the ACP agent for ${request.name} did not initialize: ${(error as Error).message}${lastStderr(agent)}`,
 				);
 			}
 			// The CLI starts while the session opens, which takes seconds: the job is in the dispatch list by its idle.
 			void open(agent);
 		},
 
-		// Restart recovery and resume over session/load are the next milestones (card acp-agent-adapter).
+		// Resuming a stopped agent over session/load is a later milestone (card acp-agent-adapter).
 		resume: () => Promise.reject(new NotImplemented("acp AgentPort: resume is not implemented")),
 
+		/** Every agent, a dormant one with no status: no turn of its runs, and what ran last is the core's to know. */
 		async list(): Promise<readonly AgentListing[]> {
-			return [...agents.values()].map((agent) => ({
-				name: agent.name,
-				sessionId: agent.sessionId,
-				...(agent.seen === undefined ? {} : agent.seen),
-			}));
+			await loading;
+			return [
+				...[...agents.values()].map((agent) => ({ name: agent.name, sessionId: agent.sessionId, ...agent.seen })),
+				...[...dormant.values()].map((asleep) => ({
+					name: asleep.name,
+					sessionId: asleep.session.sessionId,
+					...asleep.seen,
+				})),
+			];
 		},
 
-		/** Sends the prompt as the session's next turn; it returns once sent, and the turn's end comes as its status. */
+		/**
+		 * Sends the prompt as the session's next turn; it returns once sent, and the turn's end comes as its status. A
+		 * dormant agent is woken first, which a full hangar or a failed session/load refuses.
+		 */
 		async prompt(agent: string, text: string): Promise<void> {
-			const target = agents.get(agent);
-			if (target === undefined) throw new PromptRefused(`acp has no agent named ${agent}`);
+			await loading;
+			const target = await awake(agent);
 			const refused = busy(target);
 			if (refused !== undefined) throw new PromptRefused(`acp agent ${agent} ${refused}`);
 			const session = sessions.get(agent);
@@ -510,6 +686,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AgentPort {
 		 * end, as for a re-stamp, it is read at once. A stopped agent's is read off the session it ran.
 		 */
 		async readResult(agent: string): Promise<AgentResult | undefined> {
+			await loading;
 			const session = sessions.get(agent);
 			if (session === undefined) return undefined;
 			const target = agents.get(agent);
@@ -535,16 +712,18 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AgentPort {
 		 * the permission request it waits on below it, read at every call. Empty before its first turn is written.
 		 */
 		async readScreen(agent: string): Promise<string> {
-			const target = only(agent);
+			await loading;
+			const target = dormant.has(agent) ? undefined : only(agent);
 			const session = sessions.get(agent);
 			const path = session && (await transcriptOf(session));
 			const drawn = path === undefined ? "" : await drawTail(path);
-			const asked = target.asked[0]?.status.msg;
+			const asked = target?.asked[0]?.status.msg;
 			return asked === undefined ? drawn : `${drawn}${drawn === "" ? "" : "\n\n"}● ${asked.replaceAll("\n", "\n  ")}`;
 		},
 
 		/** Answers the permission request the agent waits on, the one its blocked status shows, by option number. */
 		async respond(agent: string, answer: Answer): Promise<AnswerOutcome> {
+			await loading;
 			const target = agents.get(agent);
 			if (target === undefined || target.exited) return { sent: false, refusal: "not_blocked" };
 			const asked = target.asked[0];
@@ -563,12 +742,26 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AgentPort {
 			return { sent: true };
 		},
 
-		/** Closes the session, then ends the process; what session/load needs stays recorded. */
+		/**
+		 * Records that soma stopped the agent, so no restart lists it again, then closes the session and ends the process,
+		 * which a dormant agent has none of; what session/load needs stays recorded.
+		 */
 		async stop(agent: string): Promise<void> {
+			await loading;
+			const asleep = dormant.get(agent);
+			// A wake under way ends first; one that begins after this finds the agent stopped.
+			await asleep?.waking?.catch(() => {});
+			if (asleep !== undefined && dormant.get(agent) === asleep) {
+				dormant.delete(agent);
+				await record(agent, { ...asleep.session, stopped: true });
+				return;
+			}
 			const target = only(agent);
 			agents.delete(agent);
 			target.stopped = true;
 			clearTimeout(target.recheck);
+			const session = sessions.get(agent);
+			if (session !== undefined) await record(agent, { ...session, stopped: true });
 			if (target.exited) return;
 			if (target.session !== undefined) {
 				await target.connection.agent

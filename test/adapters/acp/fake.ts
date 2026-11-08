@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AcpAgentPortOptions, createAcpAgentPort } from "../../../src/adapters/acp/agent-port.ts";
@@ -52,10 +52,20 @@ export async function repo(): Promise<string> {
 	return path;
 }
 
-/** An ACP port that runs the fake agent, with every status it emitted and every error it logged. */
-export async function harness(options: Partial<AcpAgentPortOptions> & { fake?: Record<string, string> } = {}) {
-	const cwd = await repo();
+let instances = 0;
+
+/**
+ * An ACP port that runs the fake agent, with every status it emitted and every error it logged. Given the `cwd` of
+ * another harness, it is that soma restarted: the same repo, sessions file and claude projects.
+ */
+export async function harness(
+	options: Partial<AcpAgentPortOptions> & { fake?: Record<string, string>; cwd?: string } = {},
+) {
+	const { fake, cwd: shared, ...overrides } = options;
+	const cwd = shared ?? (await repo());
 	const projects = join(cwd, "..", "projects");
+	const instance = ++instances;
+	const pids = join(cwd, "..", `pids-${instance}`);
 	const errors: Error[] = [];
 	const port = createAcpAgentPort({
 		command: process.execPath,
@@ -65,7 +75,8 @@ export async function harness(options: Partial<AcpAgentPortOptions> & { fake?: R
 			HOME: "/home/someone",
 			USER: "someone",
 			FAKE_ACP_PROJECTS: projects,
-			...options.fake,
+			FAKE_ACP_PIDS: pids,
+			...fake,
 		},
 		projectsDir: projects,
 		sessionsFile: join(cwd, "..", "acp-sessions.json"),
@@ -75,20 +86,47 @@ export async function harness(options: Partial<AcpAgentPortOptions> & { fake?: R
 		recheckMs: 50,
 		closeMs: 500,
 		onError: (error) => errors.push(error),
-		...options,
+		...overrides,
 	});
 	const events: AgentStatusEvent[] = [];
-	port.onStatus((event) => events.push(event));
+	const off = port.onStatus((event) => events.push(event));
 	const started: string[] = [];
 	cleanups.push(async () => {
-		for (const name of started) await port.stop(name).catch(() => {});
+		// The agents it started again are listed, not started.
+		const listed = (await port.list()).map((agent) => agent.name);
+		for (const name of new Set([...started, ...listed])) await port.stop(name).catch(() => {});
 	});
 	return {
 		port,
 		cwd,
+		instance,
 		events,
 		errors,
 		sessionsFile: join(cwd, "..", "acp-sessions.json"),
+		/**
+		 * Ends every agent process this port ran, as soma's exit does, recording nothing: what a restarted soma finds is
+		 * the sessions file and the transcripts. Its listeners are dropped first, so the exits it sees go nowhere.
+		 */
+		end: async () => {
+			off();
+			const text = await readFile(pids, "utf8").catch(() => "");
+			const alive = (pid: number) => {
+				try {
+					process.kill(pid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			};
+			for (const pid of text
+				.trim()
+				.split("\n")
+				.filter(Boolean)
+				.map((line) => Number(line.split(" ")[1]))) {
+				if (alive(pid)) process.kill(pid, "SIGTERM");
+				while (alive(pid)) await sleep(10);
+			}
+		},
 		start: async (name = "card-a") => {
 			started.push(name);
 			await port.start({ name, card: name, cwd, sessionId: SESSION });

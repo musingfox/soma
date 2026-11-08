@@ -97,6 +97,7 @@ export async function sides(
 				cwd: string;
 				handedOver?: true;
 				handingOver?: true;
+				hangar?: string;
 			},
 		closed: () => readFile(join(projects, "closed"), "utf8").catch(() => ""),
 		pids: async () =>

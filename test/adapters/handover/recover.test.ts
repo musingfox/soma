@@ -5,7 +5,7 @@ import { createHandoverAgentPort } from "../../../src/adapters/handover/agent-po
 import { RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
 import { PromptRefused } from "../../../src/ports/agent.ts";
 import { cleanUp, SESSION } from "../acp/fake.ts";
-import { type Block, fixture } from "../rex/fake.ts";
+import { type Block, fixture, HANGAR, type Session } from "../rex/fake.ts";
 import { alive, sides, sleep } from "./fake.ts";
 
 afterEach(cleanUp);
@@ -57,7 +57,7 @@ async function died(when: "before" | "after") {
 }
 
 /** The soma after `first`, once its startup has looked at whatever was left in progress. */
-async function restarted(first: Sides, more: { rexDown?: boolean } = {}) {
+async function restarted(first: Sides, more: { rexDown?: boolean; others?: Session[] } = {}) {
 	const both = await sides({ restartOf: first.acp.cwd, blocks: first.blocks, ...more });
 	await both.agents.dormant();
 	return both;
@@ -94,7 +94,7 @@ async function goesOnInWindow(both: Sides) {
 test("the mark of a handover in progress is on disk before the session closes, and the window opens only after", async () => {
 	const both = await sides();
 	await both.ran();
-	const marks: { handingOver?: true; handedOver?: true }[] = [];
+	const marks: { handingOver?: true; handedOver?: true; hangar?: string }[] = [];
 	const closedThen: string[] = [];
 	aroundWindow(both, async (open) => {
 		marks.push(await both.entry());
@@ -104,12 +104,13 @@ test("the mark of a handover in progress is on disk before the session closes, a
 
 	await both.agents.handOver("card-a");
 
-	expect(marks).toMatchObject([{ handingOver: true }]);
+	expect(marks).toMatchObject([{ handingOver: true, hangar: HANGAR }]);
 	expect(marks[0]?.handedOver).toBeUndefined();
 	expect(closedThen).toEqual([expect.stringContaining((await both.entry()).acpSessionId)]);
 	const final = await both.entry();
 	expect(final.handedOver).toBe(true);
 	expect(final.handingOver).toBeUndefined();
+	expect(final.hangar).toBeUndefined();
 });
 
 test("a soma killed after the mark and before the window: the next one has the job dormant on ACP, and it goes on in its session", async () => {
@@ -450,6 +451,100 @@ test("a hangar rex says does not exist holds no window: the job goes back to ACP
 	expect((await both.entry()).handingOver).toBeUndefined();
 	both.rexUp();
 	await goesOnOverAcp(both, first);
+});
+
+/** card-a's mark as a soma with `hangar` configured wrote it, or as one from before marks recorded a hangar. */
+async function markedIn(first: Sides, hangar?: string) {
+	const { hangar: _written, ...entry } = await first.entry();
+	const mark = hangar === undefined ? entry : { ...entry, hangar };
+	await writeFile(first.acp.sessionsFile, `${JSON.stringify({ "card-a": mark })}\n`);
+}
+
+/** Which sessions the looks of this soma asked for their blocks. */
+const looked = (both: Sides) =>
+	both.hangar.calls.filter(({ method }) => method === "session.list_blocks").map(({ payload }) => payload.session_id);
+
+test("a window in the hangar the mark records, the config naming another: undecided, naming both, until it closes", async () => {
+	const first = await died("after");
+	const inOld = first.blocks.splice(0);
+	await markedIn(first, "session:old");
+
+	const both = await restarted(first, { others: [{ id: "session:old", label: "old", blocks: inOld }] });
+
+	const left = await both.entry();
+	expect(left.handingOver).toBe(true);
+	expect(left.handedOver).toBeUndefined();
+	expect(left.hangar).toBe("session:old");
+	expect(await both.agents.dormant()).toEqual([]);
+	await heldOff(both, []);
+	await expect(both.agents.prompt("card-a", "now")).rejects.toThrow(/session:old.*session:hangar/);
+	expect(both.said).toEqual([expect.stringMatching(/card-a is undecided: .*session:old.*session:hangar/)]);
+	expect(both.typed()).toEqual([]);
+	expect(new Set(looked(both))).toEqual(new Set(["session:old"]));
+	// Read, not joined: an attach would be made again on every later connection.
+	expect(both.hangar.attached).not.toContain("session:old");
+	const methods = both.hangar.methods();
+	expect(methods.indexOf("session.attach_all")).toBeLessThan(methods.indexOf("session.list_blocks"));
+
+	inOld.length = 0;
+	expect(await both.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	expect((await both.entry()).handingOver).toBeUndefined();
+	expect((await both.entry()).hangar).toBeUndefined();
+	await goesOnOverAcp(both, first);
+});
+
+test("a labelled block in no window in the hangar the mark records: undecided, for that reason", async () => {
+	const first = await died("after");
+	const inOld = first.blocks.splice(0);
+	(inOld[0] as Block).detached = true;
+	await markedIn(first, "session:old");
+
+	const both = await restarted(first, { others: [{ id: "session:old", label: "old", blocks: inOld }] });
+
+	expect((await both.entry()).handingOver).toBe(true);
+	expect(both.said).toEqual([expect.stringContaining("is in rex session session:old, but in no window")]);
+});
+
+test("no block in the hangar the mark records is no window, though the configured hangar holds a block of its label", async () => {
+	const first = await died("after");
+	await markedIn(first, "session:old");
+
+	const both = await restarted(first, { others: [{ id: "session:old", label: "old", blocks: [] }] });
+
+	expect(await both.agents.dormant()).toEqual(["card-a"]);
+	expect((await both.entry()).handingOver).toBeUndefined();
+	expect((await both.entry()).handedOver).toBeUndefined();
+	expect(looked(both)).toEqual(["session:old"]);
+});
+
+test.each([
+	["session_not_found", "no window: the job goes back to ACP", true],
+	["conflict", "nothing either way: the job stays undecided", false],
+])("rex answering %s for the hangar the mark records says %s", async (code, _name, back) => {
+	const first = await died("after");
+	await markedIn(first, "session:old");
+	const both = await restarted(first, { rexDown: true });
+	both.hangar.replace("session.list_blocks", (payload) => {
+		if (payload.session_id === "session:old") throw new RexRpcError("session.list_blocks", code, "no", 404);
+		return both.hangar.original("session.list_blocks")(payload);
+	});
+	both.rexUp();
+
+	await both.agents.list();
+
+	expect((await both.entry()).handingOver).toBe(back ? undefined : true);
+	expect((await both.entry()).handedOver).toBeUndefined();
+	expect(looked(both)).toEqual(["session:old"]);
+});
+
+test("a mark with no recorded hangar looks in the configured one", async () => {
+	const first = await died("after");
+	await markedIn(first);
+
+	const both = await restarted(first);
+
+	expect((await both.entry()).handedOver).toBe(true);
+	expect(looked(both)).toEqual([HANGAR]);
 });
 
 test("two listings at once look once, so a job going back to ACP is not put back twice", async () => {

@@ -872,13 +872,16 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	}
 
 	/**
-	 * The hangar's block labelled with the claude session, placed in a window or not. A hangar rex says does not exist
-	 * holds none; any other failure says nothing either way, and throws.
+	 * The block of `hangar` labelled with the claude session, placed in a window or not. A hangar rex says does not exist
+	 * holds none; any other failure says nothing either way, and throws. Another hangar than this port's is read through
+	 * attach_all, as `foreign` reads every session: an attach would be made again on every later connection, and one to a
+	 * hangar gone since would fail them all.
 	 */
-	async function labelled(claudeSession: string) {
+	async function labelled(claudeSession: string, hangar = sessionId) {
 		try {
-			await client.attach(sessionId);
-			const { blocks } = await client.call("session.list_blocks", { session_id: sessionId }, BlockListSchema);
+			if (hangar === sessionId) await client.attach(sessionId);
+			else await client.call("session.attach_all", { event_scope: "session" }, AttachAllResultSchema);
+			const { blocks } = await client.call("session.list_blocks", { session_id: hangar }, BlockListSchema);
 			return blocks?.find((block) => block.label === claudeSession);
 		} catch (error) {
 			if (error instanceof RexRpcError && error.code === "session_not_found") return undefined;
@@ -1074,6 +1077,8 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	}
 
 	return {
+		hangar: sessionId,
+
 		async start(request: StartRequest): Promise<void> {
 			// Built first, so a card the command cannot hold leaves git and rex alone.
 			const launch = launchCommand(request, options.env, options.path);
@@ -1140,10 +1145,10 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		 * The label is set as the window opens, so it answers for a window whose `session.new_window` reply was lost. The
 		 * window is the one `list` would read the agent from, so a job put on rex by it is never then missing from a listing.
 		 */
-		async holds({ name, claudeSession }: HeldSession): Promise<Holding> {
-			const block = await labelled(claudeSession);
+		async holds({ name, claudeSession }: HeldSession, hangar: string): Promise<Holding> {
+			const block = await labelled(claudeSession, hangar);
 			if (block === undefined) return "none";
-			const { windows } = await client.call("session.view", { session_id: sessionId }, ViewSchema);
+			const { windows } = await client.call("session.view", { session_id: hangar }, ViewSchema);
 			const listed = (windows ?? []).map(paneOf).some((pane) => pane?.name === name && pane.blockId === block.block_id);
 			return listed ? "window" : "loose";
 		},

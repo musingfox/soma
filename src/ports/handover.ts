@@ -39,13 +39,19 @@ export interface HeldSession {
 	readonly cwd: string;
 }
 
+/** What the mark of a handover in progress records: the rex session id of the hangar its window goes to. */
+export type HandoverMark = { readonly hangar: string };
+
+/** A session whose handover is in progress. No hangar on a mark from before marks recorded it. */
+export type HandingOver = HeldSession & Partial<HandoverMark>;
+
 /** The side a session moves away from. */
 export interface SessionGiver {
 	// What `release` would give up now, with nothing done.
 	releasable(agent: string): Promise<HeldSession | Refused>;
 	// Records that a handover of the agent is in progress, then ends its process: from then on this side, and the next
 	// soma's, takes the agent up only when `reinstate` says so.
-	release(agent: string): Promise<HeldSession | Refused>;
+	release(agent: string, mark: HandoverMark): Promise<HeldSession | Refused>;
 	// The other side holds the session: the handover is over, for good. A write that fails is logged, and leaves it in
 	// progress for the next soma to look at.
 	confirm(agent: string): Promise<void>;
@@ -55,7 +61,7 @@ export interface SessionGiver {
 	// Every session this side gave up for good, a soma before this one's too.
 	released(): Promise<readonly HeldSession[]>;
 	// Every session whose handover neither `confirm` nor `reinstate` ended, a soma before this one's too.
-	handingOver(): Promise<readonly HeldSession[]>;
+	handingOver(): Promise<readonly HandingOver[]>;
 	// The names of the agents this side listed with no process as it was made, from the soma before it.
 	dormant(): Promise<readonly string[]>;
 }
@@ -69,13 +75,15 @@ export type Holding = "window" | "loose" | "none";
 
 /** The side a session moves to. */
 export interface SessionTaker {
+	// The id of the session `take` opens windows in and `list` reads them from.
+	readonly hangar: string;
 	// Why `take` would refuse now, with nothing done; undefined when it would not.
 	takeable(session: HeldSession): Promise<string | undefined>;
 	// Opens the session where the human can see it, and waits a bounded time for its claude to come up.
 	take(session: HeldSession): Promise<Taken>;
-	// Where this side holds the session, whether or not its claude still runs. Reads only; throws when this side cannot
-	// answer, which says nothing either way.
-	holds(session: HeldSession): Promise<Holding>;
+	// Where `hangar`, which need not be this side's own, holds the session, whether or not its claude still runs. A hangar
+	// that does not exist holds nothing. Reads only; throws when this side cannot answer, which says nothing either way.
+	holds(session: HeldSession, hangar: string): Promise<Holding>;
 	// What `take` waits for and says, of a window `holds` found: one a `take` opened whose answer never came.
 	adopt(session: HeldSession): Promise<Taken>;
 }

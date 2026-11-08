@@ -1,6 +1,7 @@
 import { type AgentListing, type AgentPort, type AgentStatusEvent, PromptRefused } from "../../ports/agent.ts";
 import type {
 	AgentHandover,
+	HandingOver,
 	HandoverOutcome,
 	HandoverRefusal,
 	HeldSession,
@@ -23,13 +24,8 @@ export const noHandover = (refusal: HandoverRefusal, reason: string): AgentHando
 });
 
 /** Why a job whose handover was cut short is on neither side yet. */
-type Why = "rex" | "loose";
-type Undecided = HeldSession & { readonly why: Why };
-
-const WHY: Record<Why, string> = {
-	rex: "rex does not answer to say which side it is on",
-	loose: "a block labelled with its session is in the hangar, but in no window a listing reads as the job",
-};
+type Why = "rex" | "loose" | "elsewhere";
+type Undecided = HandingOver & { readonly why: Why };
 
 /**
  * Jobs on two agent sides at once, below the core, which goes on seeing one AgentPort: each job runs on `from` until it
@@ -54,10 +50,18 @@ export function createHandoverAgentPort({
 	// Why each job was last told undecided: once per reason, however many looks find it the same.
 	const told = new Map<string, Why>();
 
-	const whyUndecided = ({ why }: Undecided) => WHY[why];
+	const hangarOf = ({ hangar }: HandingOver) => hangar ?? to.hangar;
+	const WHY: Record<Why, (job: HandingOver) => string> = {
+		rex: () => "rex does not answer to say which side it is on",
+		loose: (job) =>
+			`a block labelled with its session is in rex session ${hangarOf(job)}, but in no window a listing reads as the job`,
+		elsewhere: (job) =>
+			`its window is in rex session ${hangarOf(job)}, and this soma's hangar is ${to.hangar}, so neither side lists it`,
+	};
+	const whyUndecided = (job: Undecided) => WHY[job.why](job);
 
 	/** The job stays undecided, for this reason from now on. */
-	function hold(session: HeldSession, why: Why, detail = ""): void {
+	function hold(session: HandingOver, why: Why, detail = ""): void {
 		const { name } = session;
 		const job = { ...session, why };
 		undecided.set(name, job);
@@ -67,9 +71,11 @@ export function createHandoverAgentPort({
 
 	async function settle(session: Undecided): Promise<void> {
 		const { name } = session;
-		const there = await to.holds(session).catch((error: Error) => error);
+		const hangar = hangarOf(session);
+		const there = await to.holds(session, hangar).catch((error: Error) => error);
 		if (there instanceof Error) return hold(session, "rex", `: ${there.message}`);
 		if (there === "loose") return hold(session, "loose");
+		if (there === "window" && hangar !== to.hangar) return hold(session, "elsewhere");
 		told.delete(name);
 		if (there === "window") {
 			moved.set(name, session);
@@ -132,7 +138,7 @@ export function createHandoverAgentPort({
 
 	/** A `take` that threw may have opened the window all the same, as when the reply to its opening was lost. */
 	async function afterFailedTake(agent: string, session: HeldSession, error: Error): Promise<HandoverOutcome> {
-		const there = await to.holds(session).catch((failure: Error) => failure);
+		const there = await to.holds(session, to.hangar).catch((failure: Error) => failure);
 		if (there instanceof Error) {
 			hold(session, "rex", `: ${there.message}`);
 			return refused(
@@ -147,7 +153,7 @@ export function createHandoverAgentPort({
 			hold(session, "loose");
 			return refused(
 				"cannot_resume",
-				`${error.message}. Its ACP process has ended and the job is undecided: ${WHY.loose}. It takes no prompt until ` +
+				`${error.message}. Its ACP process has ended and the job is undecided: ${stillMoving(agent)}. It takes no prompt until ` +
 					"that block is in its window or gone",
 			);
 		}
@@ -166,7 +172,7 @@ export function createHandoverAgentPort({
 		moving.set(agent, held);
 		try {
 			try {
-				const released = await from.release(agent);
+				const released = await from.release(agent, { hangar: to.hangar });
 				if ("refusal" in released) return refused(released.refusal, released.reason);
 			} catch (error) {
 				await from.reinstate(agent);

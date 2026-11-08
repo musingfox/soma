@@ -58,7 +58,7 @@ export interface RexConfig {
 	readonly socket: string;
 }
 
-// Checked only when rex is selected, so a herdr setup never trips over a rex block it does not use.
+// Checked only when rex or acp is selected, so a herdr setup never trips over a rex block it does not use.
 const RexFileConfig = z
 	.object({ sessionId: z.string().min(1), socket: z.string().min(1) })
 	.partial()

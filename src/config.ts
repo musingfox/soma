@@ -113,7 +113,10 @@ export type FileConfig = z.infer<typeof FileConfig>;
 export interface Config {
 	readonly agentAdapter: AgentAdapter;
 	readonly herdrSocket: string;
-	/** Set exactly when `agentAdapter` is rex. */
+	/**
+	 * Set when `agentAdapter` is rex, and when it is acp and a hangar session is named: then jobs run over ACP and one
+	 * the human asks to see is handed over to that hangar.
+	 */
 	readonly rex?: RexConfig;
 	readonly mcpConfig: string;
 	readonly db: string;
@@ -284,7 +287,9 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		// Unset, the checkout this code runs from; a release directory is not a git repo, so prod sets it.
 		repo: fromEnv("SOMA_REPO") ?? file?.repo ?? dirname(dirname(fileURLToPath(import.meta.url))),
 		reflection: reflection ?? true,
-		...(agentAdapter === "rex" && { rex: resolveRex(file, fromEnv, home, path) }),
+		...((agentAdapter === "rex" || (agentAdapter === "acp" && namesHangar(file, fromEnv, path))) && {
+			rex: resolveRex(file, fromEnv, home, path),
+		}),
 		...(hangarCap !== undefined && { hangarCap }),
 		...(programStatus !== undefined && { programStatus }),
 		...(anthropicApiKey !== undefined && { anthropicApiKey }),
@@ -352,7 +357,17 @@ function resolveWeb(
 	return port === undefined ? undefined : { host: SERVE_HOST, port, serve: { origin: canonical, login } };
 }
 
-/** Read only when rex is selected, so a herdr setup never trips over them. */
+/** Whether a hangar session is named: without one, acp runs alone and hands nothing over. */
+function namesHangar(
+	file: FileConfig | undefined,
+	fromEnv: (name: string) => string | undefined,
+	path: string,
+): boolean {
+	const rex = file?.rex === undefined ? undefined : parseOrThrow(RexFileConfig, file.rex, path, ["rex"]);
+	return (fromEnv("SOMA_REX_SESSION_ID") ?? rex?.sessionId) !== undefined;
+}
+
+/** Read only when rex is selected, or named beside acp, so a herdr setup never trips over them. */
 function resolveRex(
 	file: FileConfig | undefined,
 	fromEnv: (name: string) => string | undefined,

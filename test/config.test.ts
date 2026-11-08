@@ -419,6 +419,30 @@ describe("the agent-side adapter", () => {
 		expect(config.agentAdapter).toBe("acp");
 		expect(config.rex).toBeUndefined();
 	});
+	test("acp with a hangar session named takes the rex settings, from the file or the environment", () => {
+		const file: FileConfig = { agentAdapter: "acp", rex: { sessionId: "session:file", socket: "/tmp/rex.sock" } };
+		expect(resolveConfig(file, {}, HOME)).toMatchObject({
+			agentAdapter: "acp",
+			rex: { sessionId: "session:file", socket: "/tmp/rex.sock" },
+		});
+		const config = resolveConfig(undefined, { SOMA_AGENT_ADAPTER: "acp", SOMA_REX_SESSION_ID: "session:env" }, HOME);
+		expect(config.rex?.sessionId).toBe("session:env");
+		expect(config.rex?.socket).toBe("/home/me/Library/Application Support/rex/server.sock");
+	});
+	test("acp with a socket and no hangar session runs alone", () => {
+		expect(resolveConfig({ agentAdapter: "acp", rex: { socket: "/tmp/rex.sock" } }, {}, HOME).rex).toBeUndefined();
+	});
+	test("acp with a rex block it cannot use throws, naming the field", () => {
+		const session = write(JSON.stringify({ agentAdapter: "acp", rex: { sessionId: "fleet" } }));
+		expect(() => loadConfig(session, {}, HOME)).toThrow(`${session}: rex.sessionId: Expected a rex session id`);
+		const key = write(JSON.stringify({ agentAdapter: "acp", rex: { session: "session:hangar" } }));
+		expect(() => loadConfig(key, {}, HOME)).toThrow(`${key}: rex.session: Unrecognized key`);
+	});
+	test("a hangar session named under herdr or tty sets no rex settings", () => {
+		const rex = { sessionId: "session:hangar" };
+		expect(resolveConfig({ rex }, {}, HOME).rex).toBeUndefined();
+		expect(resolveConfig({ agentAdapter: "tty", rex }, {}, HOME).rex).toBeUndefined();
+	});
 	test("an unknown one in the file throws with the path and the field", () => {
 		const path = write(JSON.stringify({ agentAdapter: "tmux" }));
 		expect(() => loadConfig(path, {}, HOME)).toThrow(ConfigError);

@@ -23,6 +23,7 @@
 		"smoke:acp-defer": "node smoke/acp-defer.ts",
 		"smoke:acp-handover": "node smoke/acp-handover.ts",
 		"smoke:acp-handover-crash": "node smoke/acp-handover-crash.ts",
+		"smoke:acp-handover-busy": "node smoke/acp-handover-busy.ts",
 		"smoke:tty": "node smoke/tty.ts",
 		"smoke:push": "node smoke/push.ts",
 		"smoke:push-summary": "node smoke/push-summary.ts",

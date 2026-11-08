@@ -1,10 +1,12 @@
-import { mkdir, readFile, rmdir, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm, rmdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { Conversation, Harness, TaskId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
+import { HANDOVER_GRACE_MS } from "../../../src/adapters/handover/agent-port.ts";
 import { type createRexAgentPort, seqOf } from "../../../src/adapters/rex/agent-port.ts";
 import { RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
 import { deferExtension } from "../../../src/core/extensions/defer/index.ts";
@@ -926,7 +928,9 @@ test("a turn cut and a mark that will not write: the turn is over, told once wit
 	soma.off();
 });
 
-test("a plain refusal gives a done job back, told by the refusal: no restart tells it again", async () => {
+const didNotLand = "Its handover did not land";
+
+test("a plain refusal gives a done job back, told by a notice in the commit of its return: no restart tells it again", async () => {
 	const soma = await core();
 	await dispatched(soma);
 	failsWindow(soma, new RexRpcError("session.new_window", "refused", "no window for you", 400));
@@ -937,11 +941,83 @@ test("a plain refusal gives a done job back, told by the refusal: no restart tel
 		handedOver: false,
 		reason: expect.stringContaining("stays on ACP"),
 	});
-	expect(await soma.notices()).toEqual([]);
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining(didNotLand)]);
+	expect(notices[0]).toContain("no window for you");
+	expect(notices[0]).not.toContain("cut");
 	const next = await again(soma);
 	await sleep(50);
-	expect(await next.notices()).toEqual([]);
+	expect(await next.notices()).toEqual(notices);
 	next.off();
+});
+
+test("a plain refusal killed after its record and before the tool's result: its notice stands, and no restart tells it again", async () => {
+	let hang = false;
+	let release: () => void = () => {};
+	const soma = await core({
+		from: (port) => ({
+			...port,
+			list: async () => {
+				if (hang) await new Promise<void>((resolve) => (release = resolve));
+				return port.list();
+			},
+			reinstate: async (agent) => {
+				await port.reinstate(agent);
+				hang = true;
+			},
+		}),
+	});
+	await dispatched(soma);
+	failsWindow(soma, new RexRpcError("session.new_window", "refused", "no window for you", 400));
+	const saying = soma.say("看 card-a");
+	await soma.until(async () => (await soma.job())?.toldBack !== undefined, "the record");
+	// The db as a kill at this moment leaves it, the tool's result not yet committed.
+	const path = join(soma.acp.cwd, "..", "soma.sqlite");
+	const copy = `${path}.killed`;
+	const db = new DatabaseSync(path, { readOnly: true });
+	db.exec(`VACUUM INTO '${copy}'`);
+	db.close();
+	hang = false;
+	release();
+	await saying;
+	await soma.end();
+	for (const suffix of ["", "-wal", "-shm"]) await rm(path + suffix, { force: true });
+	await copyFile(copy, path);
+
+	const next = await core({ restartOf: soma.acp.cwd, blocks: soma.blocks });
+
+	await next.until(() => next.results.length > 0, "the model to hear of the interrupted call");
+	const notices = await next.notices();
+	expect(notices).toEqual([expect.stringContaining(didNotLand)]);
+	const last = await again(next);
+	await sleep(50);
+	expect(await last.notices()).toEqual(notices);
+	last.off();
+});
+
+test("a mark ahead of the clock given back by a later look is told once, and a next restart tells nothing", async () => {
+	const clock = fakeClock();
+	const first = await core({ clock, to: (port) => ({ ...port, take: () => new Promise(() => {}) }) });
+	await dispatched(first);
+	first.off();
+	void first.agents.handOver("card-a");
+	await first.until(async () => (await first.entry()).handingOver === true, "the mark");
+	const ahead = clock.now() + 3_600_000;
+	const entry = { ...(await first.entry()), handingOverAt: ahead };
+	await writeFile(first.acp.sessionsFile, `${JSON.stringify({ "card-a": entry })}\n`);
+
+	const second = await again(first, { clock, to: (port) => port });
+	expect(await second.notices()).toEqual([]);
+	clock.advance(HANDOVER_GRACE_MS);
+	await second.agents.list();
+	await second.until(async () => counted(await second.notices(), backOnAcp) === 1, "the notice of the return");
+	expect((await second.entry()).givenBack).toBe(ahead);
+	expect((await second.job())?.toldBack).toBe(ahead);
+
+	const third = await again(second, { clock });
+	await sleep(50);
+	expect(counted(await third.notices(), backOnAcp)).toBe(1);
+	third.off();
 });
 
 test("a plain refusal whose soma dies before anything records it: the next one tells the return, once", async () => {

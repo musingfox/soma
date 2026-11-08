@@ -181,8 +181,8 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
  * What the agent side settled with no `show_job` to record it: a handover cut short, or one whose soma died before its
  * commit. Listening before the reconcile, as main.ts does, the reconcile finds each move recorded. A job on rex takes the
  * session its window runs and the human is told, in one commit, so a job that already holds that session has been told,
- * by `show_job` or by this, in this soma or one before. A job given back is told once, by its return's time, kept with
- * the job in the commit of the notice: unfinished at a startup, by the restart's notice, which never names a done one. A
+ * by `show_job` or by this, in this soma or one before. A job given back is told by its return's time, kept with the job
+ * in the commit of the notice: unfinished at a startup, by the restart's notice, which never names a done one. A
  * job whose window closed before its move was recorded takes the session too, with no claim of a window: one the
  * reconcile will report gone is told by that, and a done one, which it leaves alone, is told here. A commit that fails
  * fails the listener, so the agent side holds what that job's window says until a later soma's commit.

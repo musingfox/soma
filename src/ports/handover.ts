@@ -31,7 +31,7 @@ export type HandoverOutcome =
 			readonly handedOver: false;
 			// What was cut before the handover failed: the turn is over all the same.
 			readonly cut?: Cut;
-			// The job was given back to ACP, and this names the return, as `at` of a Settled does.
+			// The job was given back to ACP, and this names the return, as `at` of a Settled and `givenBack` do.
 			readonly back?: number;
 	  } & Refused);
 

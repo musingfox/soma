@@ -88,6 +88,8 @@ export function createHandoverAgentPort({
 		for (const listener of statusListeners) listener({ agent, status, seq });
 	}
 
+	/** What names a return of the agent, as `givenBack` says it at every startup: the one value a return is told by. */
+	const returnOf = async (agent: string) => (await from.givenBack()).find(({ name }) => name === agent)?.at ?? 0;
 	const hangarOf = ({ hangar }: HandingOver) => hangar ?? to.hangar;
 	// A mark that records no time is from before they did, and older than any grace period.
 	const graceEnds = ({ at }: HandingOver) => (at ?? 0) + graceMs;
@@ -133,7 +135,7 @@ export function createHandoverAgentPort({
 		await from.reinstate(name);
 		undecided.delete(name);
 		onError(new Error(`${name} was left mid-handover and no window of it is open: it is dormant on ACP`));
-		if (started) tell({ agent: name, onto: "acp", at: session.at ?? 0, startup: false });
+		if (started) tell({ agent: name, onto: "acp", at: await returnOf(name), startup: false });
 		else back.push(name);
 	}
 
@@ -263,7 +265,7 @@ export function createHandoverAgentPort({
 		const plain = error instanceof TakeRefused;
 		if (there === "none" && plain) {
 			await from.reinstate(agent);
-			return backOnAcp(error, session.at ?? 0);
+			return backOnAcp(error, await returnOf(agent));
 		}
 		let job = session;
 		if (!plain) {
@@ -300,7 +302,7 @@ export function createHandoverAgentPort({
 			if ("refusal" in released) return { ...refused(released.refusal, released.reason), ...cut };
 		} catch (error) {
 			await from.reinstate(agent);
-			return { ...backOnAcp(error as Error, mark.at), ...cut };
+			return { ...backOnAcp(error as Error, await returnOf(agent)), ...cut };
 		}
 		const taken = await to.take(held).catch((error: Error) => error);
 		const outcome =

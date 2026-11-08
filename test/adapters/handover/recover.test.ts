@@ -346,6 +346,25 @@ test("a new_window whose reply was lost, in a window whose claude has exited: th
 	expect(both.typed()).toEqual([]);
 });
 
+test("a release that throws past its mark gives the job back, and names the return as its entry does", async () => {
+	const both = await sides({
+		from: (port) => ({
+			...port,
+			release: async (agent, mark) => {
+				await port.release(agent, mark);
+				throw new Error("the close went wrong");
+			},
+		}),
+	});
+	await both.ran();
+
+	const outcome = await both.agents.handOver("card-a");
+
+	const { givenBack } = await both.entry();
+	expect(givenBack).toEqual(expect.any(Number));
+	expect(outcome).toMatchObject({ handedOver: false, refusal: "cannot_resume", back: givenBack });
+});
+
 test("a new_window rex plainly refuses, with no window open: back on ACP at once, with today's refusal, and it goes on in its session", async () => {
 	const clock = fakeClock();
 	const both = await sides({ clock });

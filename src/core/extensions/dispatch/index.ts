@@ -511,7 +511,8 @@ export function dispatchExtension(
 			"card, a job not on ACP (one already handed over or on another agent side), one blocked on a login, waking, with " +
 			"no session open yet or waiting on a deferred instruction, and any job when no rex hangar is configured. Refused " +
 			"with its turn cancelled: a turn that does not stop in time, which leaves the job on ACP with nothing closed. On " +
-			"success the human has been told in a notice naming the window and what was cut, so do not repeat it.",
+			"success the human has been told in a notice naming the window and what was cut, and on a refusal that cut a " +
+			"turn or says the job stays on ACP with its process ended, in a notice quoting the reason: do not repeat either.",
 		parameters: obj({ card: str({ description: "The job's card, as jobs lists it" }) }),
 		// Not replayed: a crash mid-call reports it interrupted rather than moving the job a second time.
 		replay: "unsafe",
@@ -542,18 +543,19 @@ export function dispatchExtension(
 					);
 					return;
 				}
+				if (outcome.cut === undefined && outcome.back === undefined) return;
+				// One commit: a soma killed before the tool's result still told the human, and the next tells it no more.
 				await api.commit(async (tx) => {
-					if (outcome.cut !== undefined) {
-						await commitCut(tx, api.conversationId, job);
-						await tx.appendEntry(
-							api.conversationId,
-							noticeEntry(
-								"report",
-								"action",
-								`agent ${job.agent} (card ${job.card}): ${cutSentence(outcome.cut)} Its handover did not land: ${outcome.reason}`,
-							),
-						);
-					}
+					if (outcome.cut !== undefined) await commitCut(tx, api.conversationId, job);
+					const cut = outcome.cut === undefined ? "" : `${cutSentence(outcome.cut)} `;
+					await tx.appendEntry(
+						api.conversationId,
+						noticeEntry(
+							"report",
+							outcome.cut === undefined ? "outcome" : "action",
+							`agent ${job.agent} (card ${job.card}): ${cut}Its handover did not land: ${outcome.reason}`,
+						),
+					);
 					if (outcome.back === undefined) return;
 					const doc = await tx.doc(Dispatches, api.conversationId);
 					const index = doc.jobs.findIndex((each) => each.agent === job.agent);

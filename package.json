@@ -20,6 +20,7 @@
 		"smoke:rex-screen": "node smoke/rex-screen.ts",
 		"smoke:acp-dispatch": "node smoke/acp-dispatch.ts",
 		"smoke:acp-restart": "node smoke/acp-restart.ts",
+		"smoke:acp-defer": "node smoke/acp-defer.ts",
 		"smoke:tty": "node smoke/tty.ts",
 		"smoke:push": "node smoke/push.ts",
 		"smoke:push-summary": "node smoke/push-summary.ts",

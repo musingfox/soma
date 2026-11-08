@@ -34,8 +34,8 @@ import {
 	type ResumeRequest,
 	type StartRequest,
 } from "../../ports/agent.ts";
-import type { HeldSession, SessionTaker } from "../../ports/handover.ts";
-import type { RexClient } from "./client.ts";
+import type { HeldSession, Holding, SessionTaker, Taken } from "../../ports/handover.ts";
+import { type RexClient, RexRpcError } from "./client.ts";
 import { type ProcessStart, readProcessStart } from "./process-start.ts";
 import {
 	AttachAllResultSchema,
@@ -871,6 +871,36 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		return false;
 	}
 
+	/**
+	 * The hangar's block labelled with the claude session, placed in a window or not. A hangar rex says does not exist
+	 * holds none; any other failure says nothing either way, and throws.
+	 */
+	async function labelled(claudeSession: string) {
+		try {
+			await client.attach(sessionId);
+			const { blocks } = await client.call("session.list_blocks", { session_id: sessionId }, BlockListSchema);
+			return blocks?.find((block) => block.label === claudeSession);
+		} catch (error) {
+			if (error instanceof RexRpcError && error.code === "session_not_found") return undefined;
+			throw error;
+		}
+	}
+
+	/** What a handover says of a window once it is open; nothing here throws, so a read that fails says `ready: false`. */
+	async function brought(name: string, block: () => Promise<string>): Promise<Taken> {
+		const ready = await block()
+			.then(comeUp)
+			.catch((error: Error) => {
+				onError(error);
+				return false;
+			});
+		const label = await client.call("session.attach_all", { event_scope: "session" }, AttachAllResultSchema).then(
+			({ sessions: all }) => all?.find((each) => each.session_id === sessionId)?.label,
+			(error: Error) => onError(error),
+		);
+		return { window: name, session: label ?? sessionId, ready };
+	}
+
 	const listeners = new Set<(event: AgentStatusEvent) => void>();
 	let unwatch: (() => void) | undefined;
 
@@ -1103,15 +1133,27 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			if ("refused" in line) throw new Error(line.refused);
 			const { name, claudeSession, cwd } = session;
 			const opened = await openWindow(name, claudeSession, cwd, line.launch);
-			const ready = await (async () => comeUp(opened ?? only(await panes(), name).blockId))().catch((error: Error) => {
-				onError(error);
-				return false;
+			return brought(name, async () => opened ?? only(await panes(), name).blockId);
+		},
+
+		/**
+		 * The label is set as the window opens, so it answers for a window whose `session.new_window` reply was lost. The
+		 * window is the one `list` would read the agent from, so a job put on rex by it is never then missing from a listing.
+		 */
+		async holds({ name, claudeSession }: HeldSession): Promise<Holding> {
+			const block = await labelled(claudeSession);
+			if (block === undefined) return "none";
+			const { windows } = await client.call("session.view", { session_id: sessionId }, ViewSchema);
+			const listed = (windows ?? []).map(paneOf).some((pane) => pane?.name === name && pane.blockId === block.block_id);
+			return listed ? "window" : "loose";
+		},
+
+		async adopt({ name, claudeSession }: HeldSession) {
+			return brought(name, async () => {
+				const id = (await labelled(claudeSession))?.block_id;
+				if (id == null) throw new Error(`rex hangar ${sessionId} has no block labelled ${claudeSession}`);
+				return id;
 			});
-			const label = await client.call("session.attach_all", { event_scope: "session" }, AttachAllResultSchema).then(
-				({ sessions: all }) => all?.find((each) => each.session_id === sessionId)?.label,
-				(error: Error) => onError(error),
-			);
-			return { window: name, session: label ?? sessionId, ready };
 		},
 
 		async list(): Promise<readonly AgentListing[]> {

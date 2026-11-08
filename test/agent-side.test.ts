@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -9,6 +9,7 @@ import { afterAll, afterEach, expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { dispatchOver, openAgentPort } from "../src/agent-side.ts";
 import { type FileConfig, resolveConfig } from "../src/config.ts";
+import { PromptRefused } from "../src/ports/agent.ts";
 import type { AgentHandover } from "../src/ports/handover.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "soma-agent-side-"));
@@ -110,4 +111,27 @@ test.each([
 		refusal: "not_acp",
 		reason: `this soma runs its jobs on ${adapter}, not over ACP`,
 	});
+});
+
+test("as main.ts opens it, with rex not there, a job left mid-handover is undecided and a job handed over fails the listing", async () => {
+	const db = join(dir, "left.sqlite");
+	const sessions = `${db}.acp-sessions.json`;
+	const entry = { card: "card-a", sessionId: "s", acpSessionId: "a", cwd: dir };
+	const said = console.error;
+	console.error = () => {};
+	try {
+		writeFileSync(sessions, JSON.stringify({ "card-a": { ...entry, handingOver: true } }));
+		const left = opened({ agentAdapter: "acp", rex: hangar, db });
+		// The port's own, which counts a job its startup look gave back to ACP, not the ACP side's alone.
+		expect((left.agents as unknown as { dormant: unknown }).dormant).toBe(left.dormant);
+		expect(await left.dormant()).toEqual([]);
+		expect(await left.agents.list()).toEqual([{ name: "card-a", sessionId: "s" }]);
+		await expect(left.agents.prompt("card-a", "now")).rejects.toThrow(PromptRefused);
+
+		writeFileSync(sessions, JSON.stringify({ "card-a": { ...entry, handedOver: true } }));
+		const handed = opened({ agentAdapter: "acp", rex: hangar, db });
+		await expect(handed.agents.list()).rejects.toThrow();
+	} finally {
+		console.error = said;
+	}
 });

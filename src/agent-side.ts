@@ -56,8 +56,8 @@ export function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, defer
 		const sessionsFile = resolve(`${db}.acp-sessions.json`);
 		const acp = createAcpAgentPort({ env: process.env, vars: env, path, sessionsFile, onError, ...cap });
 		if (rex === undefined) return { agents: acp, dormant: acp.dormant };
-		const both = createHandoverAgentPort({ from: acp, to: rexPort(rex) });
-		return { agents: both, dormant: acp.dormant, handover: both };
+		const both = createHandoverAgentPort({ from: acp, to: rexPort(rex), onError });
+		return { agents: both, dormant: both.dormant, handover: both };
 	}
 	if (agentAdapter === "tty") {
 		const onError = (error: Error) => console.error("[soma] tty:", error.message);

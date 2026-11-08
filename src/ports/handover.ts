@@ -22,7 +22,8 @@ export type HandoverOutcome =
 
 /** Beside AgentPort: moves an agent at rest to an agent side the human can see, for good. */
 export interface AgentHandover {
-	// A refusal has done nothing, unless its reason says the agent's process ended and the job stays where it was.
+	// A refusal has done nothing, unless its reason says the agent's process ended: the job then stays where it was, or
+	// waits, taking no prompt, for the other side to answer which side it is on.
 	handOver(agent: string): Promise<HandoverOutcome>;
 }
 
@@ -42,18 +43,42 @@ export interface HeldSession {
 export interface SessionGiver {
 	// What `release` would give up now, with nothing done.
 	releasable(agent: string): Promise<HeldSession | Refused>;
-	// Ends the agent's process and records that this side never takes the agent up again, unless `reinstate` says so.
+	// Records that a handover of the agent is in progress, then ends its process: from then on this side, and the next
+	// soma's, takes the agent up only when `reinstate` says so.
 	release(agent: string): Promise<HeldSession | Refused>;
-	// A release the other side could not follow up: the agent is this side's again, with no process.
+	// The other side holds the session: the handover is over, for good. A write that fails is logged, and leaves it in
+	// progress for the next soma to look at.
+	confirm(agent: string): Promise<void>;
+	// The other side does not hold the session: the agent is this side's again, with no process. A write that fails is
+	// logged, and leaves it in progress for the next soma to look at.
 	reinstate(agent: string): Promise<void>;
-	// Every session this side gave up and did not take back, a soma before this one's too.
+	// Every session this side gave up for good, a soma before this one's too.
 	released(): Promise<readonly HeldSession[]>;
+	// Every session whose handover neither `confirm` nor `reinstate` ended, a soma before this one's too.
+	handingOver(): Promise<readonly HeldSession[]>;
+	// The names of the agents this side listed with no process as it was made, from the soma before it.
+	dormant(): Promise<readonly string[]>;
 }
+
+/**
+ * window: a window the listing reads as the agent's. loose: a block labelled with the session that the listing cannot
+ * read as the agent's, placed in no window, as between a window's block being made and placed, or in a window of another
+ * name. none: no block labelled with the session.
+ */
+export type Holding = "window" | "loose" | "none";
 
 /** The side a session moves to. */
 export interface SessionTaker {
 	// Why `take` would refuse now, with nothing done; undefined when it would not.
 	takeable(session: HeldSession): Promise<string | undefined>;
 	// Opens the session where the human can see it, and waits a bounded time for its claude to come up.
-	take(session: HeldSession): Promise<{ readonly window: string; readonly session: string; readonly ready: boolean }>;
+	take(session: HeldSession): Promise<Taken>;
+	// Where this side holds the session, whether or not its claude still runs. Reads only; throws when this side cannot
+	// answer, which says nothing either way.
+	holds(session: HeldSession): Promise<Holding>;
+	// What `take` waits for and says, of a window `holds` found: one a `take` opened whose answer never came.
+	adopt(session: HeldSession): Promise<Taken>;
 }
+
+/** The window a session went on in. */
+export type Taken = { readonly window: string; readonly session: string; readonly ready: boolean };

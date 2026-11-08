@@ -128,7 +128,14 @@ type Session = {
 	readonly stopped?: true;
 	/** The session went on another agent side: nothing here lists, wakes, resumes or starts this name again. */
 	readonly handedOver?: true;
+	/**
+	 * A handover is in progress, and only a look at the other side tells whether the session went there: `confirm` or
+	 * `reinstate` ends it, in this soma or the next. Until then this side treats it as `handedOver`.
+	 */
+	readonly handingOver?: true;
 };
+
+const givenUp = (session?: Session) => session?.handedOver === true || session?.handingOver === true;
 
 /**
  * An agent soma did not stop, found in the sessions file as the port was made: listed, with no process and no status,
@@ -144,11 +151,7 @@ type Dormant = {
 };
 
 /** The ACP AgentPort, and the agents it found dormant as it was made. */
-export type AcpAgentPort = AgentPort &
-	SessionGiver & {
-		/** The names of the agents the port listed dormant as it was made, from the soma before it; empty when none. */
-		dormant(): Promise<readonly string[]>;
-	};
+export type AcpAgentPort = AgentPort & SessionGiver;
 
 const AUTH_REQUIRED = RequestError.authRequired().code;
 const STDERR_BYTES = 4096;
@@ -495,7 +498,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 	function holdOf(name: string): HeldSession | Refused {
 		const session = sessions.get(name);
 		const refused = (refusal: Refused["refusal"], reason: string) => ({ refusal, reason: `${name} ${reason}` });
-		if (session?.handedOver) return refused("not_acp", "was handed over: it no longer runs over ACP");
+		if (givenUp(session)) return refused("not_acp", "was handed over: it no longer runs over ACP");
 		if (resuming.has(name)) return refused("not_at_rest", "is being started again for a deferred instruction");
 		const asleep = dormant.get(name);
 		if (asleep?.waking !== undefined) return refused("not_at_rest", "is waking for a prompt");
@@ -633,7 +636,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		try {
 			const all = Object.entries(await readSessions(file));
 			for (const [name, session] of all) sessions.set(name, session);
-			const kept = all.filter(([, s]) => s.stopped !== true && s.handedOver !== true);
+			const kept = all.filter(([, s]) => s.stopped !== true && !givenUp(s));
 			const ran = await Promise.all(kept.map(async ([, session]) => (await transcriptOf(session)) !== undefined));
 			const found: string[] = [];
 			for (const [index, [name, session]] of kept.entries()) {
@@ -671,7 +674,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			if (dormant.has(request.name)) throw new Error(`acp holds a dormant agent named ${request.name}`);
 			if (resuming.has(request.name)) throw new Error(`acp is starting an agent named ${request.name} again`);
 			// A new session would take its entry's place, and the other side's window would still run the old one.
-			if (sessions.get(request.name)?.handedOver) throw new Error(`acp handed over the agent named ${request.name}`);
+			if (givenUp(sessions.get(request.name))) throw new Error(`acp handed over the agent named ${request.name}`);
 			const count = running();
 			if (count >= cap) throw new Error(`hangar is full: ${count} of ${cap} agents running`);
 			const path = await openWorktree(git, request.cwd, request.card);
@@ -723,7 +726,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 				throw new Error(`acp already lists an agent named ${name}`);
 			}
 			const found = sessions.get(name);
-			if (found === undefined || found.sessionId !== sessionId || found.handedOver) {
+			if (found === undefined || found.sessionId !== sessionId || givenUp(found)) {
 				throw new NotImplemented(`acp holds no session ${sessionId} of agent ${name} to start again`);
 			}
 			const { stopped: _resumed, ...session } = found;
@@ -895,19 +898,19 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		},
 
 		/**
-		 * Records the agent handed over, so no restart lists it again, then closes the session and ends the process, and
-		 * returns only once the process is gone: the side that takes the session must not write its transcript beside it.
-		 * A dormant agent has none to end. Refuses, with nothing done, what `releasable` would refuse now: the check and
-		 * the taking of the agent off this side are one synchronous step, so no turn can begin between them. A mark that
-		 * does not reach the file puts the agent back and refuses too, since after a restart a prompt would wake it here
-		 * beside the other side's claude, two writers on one transcript.
+		 * Records the handover in progress, so no restart lists the agent until a look at the other side says where it is,
+		 * then closes the session and ends the process, and returns only once the process is gone: the side that takes the
+		 * session must not write its transcript beside it. A dormant agent has none to end. Refuses, with nothing done,
+		 * what `releasable` would refuse now: the check and the taking of the agent off this side are one synchronous step,
+		 * so no turn can begin between them. A mark that does not reach the file puts the agent back and refuses too, since
+		 * after a restart a prompt would wake it here beside the other side's claude, two writers on one transcript.
 		 */
 		async release(agent: string): Promise<HeldSession | Refused> {
 			await loading;
 			const held = holdOf(agent);
 			if ("refusal" in held) return held;
 			const before = sessions.get(agent) as Session;
-			const session = { ...before, handedOver: true as const };
+			const session = { ...before, handingOver: true as const };
 			const asleep = dormant.get(agent);
 			const target = agents.get(agent);
 			sessions.set(agent, session);
@@ -940,12 +943,23 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			return held;
 		},
 
+		/** The window exists, so the session is the other side's for good. */
+		async confirm(agent: string): Promise<void> {
+			await loading;
+			const found = sessions.get(agent);
+			if (!found?.handingOver) return;
+			const { handingOver: _over, ...rest } = found;
+			const session = { ...rest, handedOver: true as const };
+			sessions.set(agent, session);
+			await record(agent, session);
+		},
+
 		/** The agent is listed dormant again, and goes on with its session at its next prompt, as after a restart. */
 		async reinstate(agent: string): Promise<void> {
 			await loading;
 			const found = sessions.get(agent);
-			if (!found?.handedOver) return;
-			const { handedOver: _reinstated, ...session } = found;
+			if (!found?.handingOver) return;
+			const { handingOver: _reinstated, ...session } = found;
 			sessions.set(agent, session);
 			dormant.set(agent, { name: agent, session });
 			await record(agent, session);
@@ -954,6 +968,11 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		async released(): Promise<readonly HeldSession[]> {
 			await loading;
 			return [...sessions].flatMap(([name, session]) => (session.handedOver ? [heldOf(name, session)] : []));
+		},
+
+		async handingOver(): Promise<readonly HeldSession[]> {
+			await loading;
+			return [...sessions].flatMap(([name, session]) => (session.handingOver ? [heldOf(name, session)] : []));
 		},
 
 		// Every agent is a process soma holds; there is no pane of anyone else's.

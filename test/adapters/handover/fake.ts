@@ -21,6 +21,8 @@ export async function sides(
 		opened?: Partial<Block>;
 		fake?: Record<string, string>;
 		takeMs?: number;
+		/** Rex answers nothing from the start, until the `rexUp` of the result. */
+		rexDown?: boolean;
 	} = {},
 ) {
 	const acp = await acpHarness({ cwd: options.restartOf, ...(options.fake ? { fake: options.fake } : {}) });
@@ -42,6 +44,17 @@ export async function sides(
 		);
 		return { block_id, revision: 3 };
 	});
+	const { call, attach } = hangar.client;
+	const away = () => Promise.reject(new Error("rex is away"));
+	const rexDown = () => {
+		hangar.client.call = away;
+		hangar.client.attach = away;
+	};
+	const rexUp = () => {
+		hangar.client.call = call;
+		hangar.client.attach = attach;
+	};
+	if (options.rexDown) rexDown();
 	const onRex = createRexAgentPort({
 		client: hangar.client,
 		sessionId: HANGAR,
@@ -57,13 +70,19 @@ export async function sides(
 		takeMs: options.takeMs ?? 200,
 		onError: () => {},
 	});
-	const agents = createHandoverAgentPort({ from: acp.port, to: onRex });
+	const said: string[] = [];
+	const onError = (error: Error) => said.push(error.message);
+	const agents = createHandoverAgentPort({ from: acp.port, to: onRex, onError });
 	return {
 		acp,
 		agents,
 		hangar,
 		blocks,
 		onRex,
+		rexDown,
+		rexUp,
+		said,
+		onError,
 		windowsOpened: () => hangar.calls.filter((call) => call.method === "session.new_window"),
 		typed: () =>
 			hangar.calls
@@ -77,6 +96,7 @@ export async function sides(
 				acpSessionId: string;
 				cwd: string;
 				handedOver?: true;
+				handingOver?: true;
 			},
 		closed: () => readFile(join(projects, "closed"), "utf8").catch(() => ""),
 		pids: async () =>

@@ -166,7 +166,11 @@ export function createHandoverAgentPort({
 			moved.set(session.name, session);
 			tell({ agent: session.name, onto: "rex", sessionId: session.claudeSession });
 		}
-		for (const session of await from.handingOver()) undecided.set(session.name, { ...session, why: "rex" });
+		for (const session of await from.handingOver()) {
+			// A time ahead of this clock, one set back since it was written, would hold the job for as long, or overflow a timer.
+			const at = session.at === undefined ? {} : { at: Math.min(session.at, now()) };
+			undecided.set(session.name, { ...session, ...at, why: "rex" });
+		}
 		await look();
 		started = true;
 	})();

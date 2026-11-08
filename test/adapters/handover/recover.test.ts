@@ -595,6 +595,32 @@ test("a mark from before marks had a time is older than the grace period: resolv
 	expect((await both.entry()).handingOver).toBeUndefined();
 });
 
+test("a mark an hour ahead of the clock counts as now: the job waits out one grace period, not 3660 s", async () => {
+	const clock = fakeClock();
+	const first = await died("before", { clock });
+	const ahead = { ...(await first.entry()), handingOverAt: clock.now() + 3_600_000 };
+	await writeFile(first.acp.sessionsFile, `${JSON.stringify({ "card-a": ahead })}\n`);
+
+	const both = await restarted(first, { clock });
+
+	await expect(both.agents.prompt("card-a", "now")).rejects.toThrow("grace period, 60 s from now");
+	clock.advance(60_000);
+	expect(await both.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	expect((await both.entry()).handingOver).toBeUndefined();
+});
+
+test("a mark further ahead than a timer can count does not spin the grace timer: one look at the end of the period", async () => {
+	const first = await died("before");
+	const ahead = { ...(await first.entry()), handingOverAt: Date.now() + 30 * 24 * 3_600_000 };
+	await writeFile(first.acp.sessionsFile, `${JSON.stringify({ "card-a": ahead })}\n`);
+
+	const both = await restarted(first, { graceMs: 200 });
+
+	expect((await both.entry()).handingOver).toBe(true);
+	await until(async () => (await both.entry()).handingOver === undefined, "the look at the end of the grace period");
+	expect(looked(both).length).toBeLessThanOrEqual(2);
+});
+
 /** Everything the core could ask of an undecided card-a is held off, and nothing starts for it over ACP. */
 async function heldOff(both: Sides, pids: readonly number[]) {
 	expect(await both.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);

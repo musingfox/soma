@@ -905,8 +905,8 @@ test("release gives up a dormant agent with no process, and refuses, with nothin
 	from = acp.events.length;
 	await acp.port.prompt("card-b", "ASK");
 	await acp.until("blocked", from, "card-b");
-	expect(await acp.port.releasable("card-b")).toMatchObject({ refusal: "not_at_rest", reason: /is blocked/ });
-	expect(await acp.port.release("card-b", MARK)).toMatchObject({ refusal: "not_at_rest" });
+	expect(await acp.port.releasable("card-b")).toMatchObject({ name: "card-b" });
+	expect(await acp.port.release("card-b", MARK)).toMatchObject({ refusal: "not_at_rest", reason: /is blocked/ });
 	expect((await acp.port.list()).map(({ name }) => name)).toEqual(["card-b"]);
 
 	await acp.start("card-c");

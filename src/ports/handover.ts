@@ -2,12 +2,17 @@ import type { AnswerOutcome } from "./agent.ts";
 
 /**
  * unknown: there is no such job. no_hangar: this soma has no rex hangar to hand over to. not_acp: the job does not run
- * over ACP, as one already handed over. not_at_rest: it is working, blocked or stopped. cannot_resume: the session
- * cannot go on on the other side, as one that never ran a prompt, or one whose move could not be recorded.
+ * over ACP, as one already handed over. not_at_rest: nothing can be cut to move it, as one blocked on a login, waking, or
+ * with no session open yet, or one soma stopped; or its turn did not stop when cancelled, or ended by itself as the
+ * cancel went out. cannot_resume: the session cannot go on on the other side, as one that never ran a prompt, or one whose
+ * move could not be recorded.
  */
 export type HandoverRefusal = "unknown" | "no_hangar" | "not_acp" | "not_at_rest" | "cannot_resume";
 
 export type Refused = { readonly refusal: HandoverRefusal; readonly reason: string };
+
+/** What a handover cut to move a job that was not at rest: its running turn, with the permission prompt it waited on. */
+export type Cut = { readonly prompt?: string };
 
 export type HandoverOutcome =
 	| {
@@ -19,17 +24,27 @@ export type HandoverOutcome =
 			readonly sessionId: string;
 			// Whether claude reported itself up in the window before the handover stopped waiting for it.
 			readonly ready: boolean;
+			// Absent for a job that was at rest.
+			readonly cut?: Cut;
 	  }
-	| ({ readonly handedOver: false } & Refused);
+	| ({
+			readonly handedOver: false;
+			// What was cut before the handover failed: the turn is over all the same.
+			readonly cut?: Cut;
+			// The job was given back to ACP, and this names the return, as `at` of a Settled does.
+			readonly back?: number;
+	  } & Refused);
 
 /** A `respond` refused because the agent's side is not known yet: a refusal as any other, with why beside it. */
 export type AnswerHeld = Extract<AnswerOutcome, { sent: false }> & { readonly reason: string };
 
-/** Beside AgentPort: moves an agent at rest to an agent side the human can see, for good. */
+/** Beside AgentPort: moves an agent to an agent side the human can see, for good, cutting the turn it runs if it runs one. */
 export interface AgentHandover {
-	// A refusal has done nothing, unless its reason says the agent's process ended: the job then stays where it was, or
-	// waits, taking no prompt, for the other side to answer which side it is on.
-	handOver(agent: string): Promise<HandoverOutcome>;
+	// A refusal has done nothing, unless it says something was cut or its reason says the agent's process ended: the job
+	// then stays where it was, or waits, taking no prompt, for the other side to answer which side it is on. `record` keeps
+	// an outcome that landed the job, cut a turn or gave it back, before anything else of the job reaches the caller: while
+	// the job moves, no status of it does.
+	handOver(agent: string, record?: (outcome: HandoverOutcome) => Promise<void>): Promise<HandoverOutcome>;
 }
 
 /**
@@ -45,6 +60,8 @@ export type Settled =
 			readonly window: string;
 			readonly session: string;
 			readonly sessionId: string;
+			// The record the transcript ends on as the window is told: no turn of what ran before it.
+			readonly lastRecord?: string;
 	  }
 	| { readonly agent: string; readonly onto: "acp"; readonly at: number; readonly startup: boolean }
 	| { readonly agent: string; readonly onto: "gone"; readonly sessionId: string };
@@ -82,10 +99,14 @@ export type HandingOver = HeldSession & Partial<HandoverMark>;
 
 /** The side a session moves away from. */
 export interface SessionGiver {
-	// What `release` would give up now, with nothing done.
+	// What `cut` and `release` would give up now, with nothing done: a turn running is no refusal, since `cut` ends it.
 	releasable(agent: string): Promise<HeldSession | Refused>;
+	// Ends the turn the agent runs, if it runs one, cancelling any permission prompt it waits on, and answers once the turn
+	// has stopped; undefined when no turn ran. A refusal closed nothing: the turn would not stop within a bounded wait, with
+	// the cancel still out, or it ended by itself as the cancel went out, with nothing cut.
+	cut(agent: string): Promise<Cut | Refused | undefined>;
 	// Records that a handover of the agent is in progress, then ends its process: from then on this side, and the next
-	// soma's, takes the agent up only when `reinstate` says so.
+	// soma's, takes the agent up only when `reinstate` says so. Refuses an agent in a turn.
 	release(agent: string, mark: HandoverMark): Promise<HeldSession | Refused>;
 	// The mark now counts from `at`. A write that fails is logged, and leaves the time it had for the next soma.
 	markedAt(agent: string, at: number): Promise<void>;

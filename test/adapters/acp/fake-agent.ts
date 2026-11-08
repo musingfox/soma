@@ -14,8 +14,14 @@
 //   RECALL replies with every earlier prompt of the session, the ones session/load read back included
 //   HANG   never ends the turn
 //   SLOW   echoes 500 ms later, a turn long enough for a test to act while it runs
+//   SPIN   writes a partial reply and runs until session/cancel, ending cancelled $FAKE_ACP_STOP_MS later (50 by default)
+//   FINISH runs until session/cancel, then ends by itself with a reply, as a turn the cancel came too late for
+//   LATEASK runs until session/cancel, then asks permission, and ends cancelled once answered
+//   ASKHANG asks permission, and once answered never ends the turn
 //   anything else is echoed.
-// session/close appends the session's id to $FAKE_ACP_PROJECTS/closed. session/load reads the session's transcript
+// An ASK or TWICE answered cancelled with session/cancel out ends cancelled, leaving what claude leaves for an interrupted
+// tool call. session/cancel appends the session's id to $FAKE_ACP_PROJECTS/cancelled. session/close appends the session's
+// id to $FAKE_ACP_PROJECTS/closed. session/load reads the session's transcript
 // back, as claude-agent-acp does, replaying its prompts, and appends "<session id> <cwd>" to $FAKE_ACP_PROJECTS/loaded;
 // a session with no transcript is refused with -32002, as one that never ran a prompt is.
 // $FAKE_ACP_NEW_MS delays session/new, as claude's CLI start does; $FAKE_ACP_NEW_AUTH refuses it with -32000.
@@ -61,6 +67,21 @@ function write(sessionId: string, type: "user" | "assistant", content: unknown):
 }
 
 const reply = (sessionId: string, text: string) => write(sessionId, "assistant", [{ type: "text", text }]);
+
+const cancelled = new Set<string>();
+const cancelling = new Map<string, () => void>();
+const untilCancelled = (sessionId: string) =>
+	new Promise<void>((resolve) => {
+		if (cancelled.has(sessionId)) resolve();
+		else cancelling.set(sessionId, resolve);
+	});
+/** Whether the turn is over by session/cancel, which may reach this agent just after its answer. */
+async function wasCancelled(sessionId: string): Promise<boolean> {
+	await sleep(10);
+	if (!cancelled.has(sessionId)) return false;
+	write(sessionId, "user", [{ type: "text", text: "[Request interrupted by user for tool use]" }]);
+	return true;
+}
 
 const app = agent({ name: "fake-acp" })
 	.onRequest(methods.agent.initialize, () => ({
@@ -108,11 +129,23 @@ const app = agent({ name: "fake-acp" })
 	.onRequest(methods.agent.session.prompt, async ({ params, client }) => {
 		const text = params.prompt.map((block) => (block.type === "text" ? block.text : "")).join("");
 		const { sessionId } = params;
+		cancelled.delete(sessionId);
 		if (text.includes("AUTH")) throw RequestError.authRequired();
 		const earlier = [...(sessions.get(sessionId)?.prompts ?? [])];
 		sessions.get(sessionId)?.prompts.push(text);
 		write(sessionId, "user", text);
-		if (text.includes("HANG")) await new Promise(() => {});
+		if (text.includes("SPIN")) {
+			reply(sessionId, "結果：失敗\npartial, read as nothing");
+			await untilCancelled(sessionId);
+			await sleep(Number(process.env.FAKE_ACP_STOP_MS ?? 50));
+			return { stopReason: "cancelled" };
+		}
+		if (text.includes("FINISH")) {
+			await untilCancelled(sessionId);
+			reply(sessionId, "結果：完成\nfinished by itself");
+			return { stopReason: "end_turn" };
+		}
+		if (text.includes("HANG") && !text.includes("ASK")) await new Promise(() => {});
 		if (text.includes("SLOW")) await sleep(500);
 		if (text.includes("RECALL")) {
 			reply(sessionId, `recall: ${earlier.join(" | ")}`);
@@ -135,6 +168,7 @@ const app = agent({ name: "fake-acp" })
 			const chosen = (await Promise.all(asked)).map(({ outcome }) =>
 				outcome.outcome === "selected" ? outcome.optionId : "cancelled",
 			);
+			if (await wasCancelled(sessionId)) return { stopReason: "cancelled" };
 			reply(sessionId, `permission ${chosen.join(" ")}`);
 			return { stopReason: "end_turn" };
 		}
@@ -157,6 +191,15 @@ const app = agent({ name: "fake-acp" })
 			reply(sessionId, "abandoned");
 			return { stopReason: "end_turn" };
 		}
+		if (text.includes("LATEASK")) {
+			await untilCancelled(sessionId);
+			const { outcome } = await client.request(
+				methods.client.session.requestPermission,
+				touch("late.txt", "toolu_late"),
+			);
+			reply(sessionId, `asked once cancelled: ${outcome.outcome}`);
+			return { stopReason: "cancelled" };
+		}
 		if (text.includes("ASK")) {
 			const toolUseId = `toolu_${randomUUID()}`;
 			write(sessionId, "assistant", [
@@ -176,6 +219,8 @@ const app = agent({ name: "fake-acp" })
 					{ optionId: "reject", name: "No", kind: "reject_once" },
 				],
 			});
+			if (text.includes("ASKHANG")) await new Promise(() => {});
+			if (outcome.outcome === "cancelled" && (await wasCancelled(sessionId))) return { stopReason: "cancelled" };
 			const chosen = outcome.outcome === "selected" ? outcome.optionId : "cancelled";
 			write(sessionId, "user", [{ type: "tool_result", tool_use_id: toolUseId, content: `chosen ${chosen}` }]);
 			reply(sessionId, `結果：完成\npermission ${chosen}`);
@@ -206,7 +251,12 @@ const app = agent({ name: "fake-acp" })
 		reply(sessionId, `echo: ${text}`);
 		return { stopReason: "end_turn" };
 	})
-	.onNotification(methods.agent.session.cancel, () => {});
+	.onNotification(methods.agent.session.cancel, ({ params }) => {
+		mkdirSync(projects, { recursive: true });
+		appendFileSync(join(projects, "cancelled"), `${params.sessionId}\n`);
+		cancelled.add(params.sessionId);
+		cancelling.get(params.sessionId)?.();
+	});
 
 app.connect(
 	ndJsonStream(

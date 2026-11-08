@@ -14,7 +14,11 @@ import type { AgentHandover, HandoverOutcome, HandoverRefusal } from "../../../p
 import type { Choices, HumanAnswerOutcome } from "../../../ports/human.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
 import { composeLaunchPrompt, composeTicketPrompt } from "../../domain/launch-prompt.ts";
+import { cutInWindow, cutSentence, HANDOVER_CUT, turning } from "../../domain/reconcile.ts";
 import { FORWARDED, noticeEntry } from "../../notice.ts";
+
+/** Entry kind of a turn the bridge recorded as finished; it carries no model message. */
+export const JOB_DONE = "soma.dispatch.done";
 
 /** Every job dispatched from this conversation; one per card. */
 export const Dispatches = defineDoc<{ jobs: Job[] }>({
@@ -142,21 +146,34 @@ export async function answerJob(
 
 /**
  * In the commit of the move, so the human is told once. The session id is what the window runs and a later resume names;
- * the brief, had it not gone, would be sent again at the window's first idle, and its transcript says it did.
+ * the brief, had it not gone, would be sent again at the window's first idle, and its transcript says it did. `lastRecord`
+ * is what that transcript ends on, whatever a cut turn left there, so the window's first idle records no turn; a block
+ * handed over before the move is forgotten, so the same prompt in the window is handed over; and a status from before is
+ * no longer true of a job that was in a turn: the window's own reaches the bridge once this is committed.
  */
 export async function commitMove(
 	tx: Tx,
 	conversationId: Conversation["id"],
 	{ agent, card }: Pick<Job, "agent" | "card">,
-	{ window, session, sessionId }: { window: string; session: string; sessionId: string },
+	{
+		window,
+		session,
+		sessionId,
+		lastRecord,
+	}: { window: string; session: string; sessionId: string; lastRecord?: string },
 	after: string,
 ): Promise<void> {
 	const doc = await tx.doc(Dispatches, conversationId);
 	const index = doc.jobs.findIndex((each) => each.agent === agent);
 	const current = doc.jobs[index];
 	if (current !== undefined) {
-		const { launch: _sent, ...rest } = current;
-		doc.jobs[index] = { ...rest, sessionId };
+		const { launch: _sent, handedOver: _forgotten, ...rest } = current;
+		doc.jobs[index] = {
+			...rest,
+			sessionId,
+			...(turning(current.status) ? { status: { state: "idle" as const } } : {}),
+			...(lastRecord === undefined ? {} : { resultId: lastRecord }),
+		};
 	}
 	await tx.appendEntry(
 		conversationId,
@@ -167,6 +184,24 @@ export async function commitMove(
 				`where you can watch it and type into it. It goes on in the same conversation.${after}`,
 		),
 	);
+}
+
+/** The turn a handover cut on a job that did not land is over, with no outcome: told by a notice the caller appends with it. */
+export async function commitCut(
+	tx: Tx,
+	conversationId: Conversation["id"],
+	{ agent, card }: Pick<Job, "agent" | "card">,
+): Promise<void> {
+	const doc = await tx.doc(Dispatches, conversationId);
+	const index = doc.jobs.findIndex((each) => each.agent === agent);
+	const current = doc.jobs[index];
+	if (current === undefined) return;
+	const { handedOver: _forgotten, ...rest } = current;
+	doc.jobs[index] = { ...rest, status: HANDOVER_CUT, outcome: "未知" };
+	await tx.appendEntry(conversationId, {
+		kind: JOB_DONE,
+		data: { agent, card, state: "done", outcome: "未知", notified: true },
+	});
 }
 
 /** A soma given no handover has no rex hangar to hand over to. */
@@ -467,13 +502,15 @@ export function dispatchExtension(
 		name: "show_job",
 		description:
 			"Hand a job soma runs over ACP over to a window of soma's rex hangar, where the human can watch it and type " +
-			"into it. Use it when the human asks to see, show or take over a job. A job over ACP has no terminal pane until " +
-			"this is called. Its ACP session is closed and the same conversation goes on in the window, for good: it cannot " +
-			"be handed back. Afterwards jobs, screen, reply and respond work on it under the same card, and what runs in it " +
-			"may have more tools than it had. Refused, with nothing done and the reason: an unknown card, a job not on ACP " +
-			"(one already handed over or on another agent side), one working, blocked or waiting on a deferred instruction, " +
-			"and any job when no rex hangar is configured. On success the human has been told in a notice naming the window, " +
-			"so do not repeat it.",
+			"into it. It interrupts a running job, cutting its turn where it stands, and cancels a pending prompt, which the " +
+			"window will not ask again, so use it only when the human asks to see, show or take over a job. A job over ACP " +
+			"has no terminal pane until this is called. Its ACP session is closed and the same conversation goes on in the " +
+			"window, for good: it cannot be handed back. Afterwards jobs, screen, reply and respond work on it under the same " +
+			"card, and what runs in it may have more tools than it had. Refused, with nothing done and the reason: an unknown " +
+			"card, a job not on ACP (one already handed over or on another agent side), one blocked on a login, waking, with " +
+			"no session open yet or waiting on a deferred instruction, and any job when no rex hangar is configured. Refused " +
+			"with its turn cancelled: a turn that does not stop in time, which leaves the job on ACP with nothing closed. On " +
+			"success the human has been told in a notice naming the window and what was cut, so do not repeat it.",
 		parameters: obj({ card: str({ description: "The job's card, as jobs lists it" }) }),
 		// Not replayed: a crash mid-call reports it interrupted rather than moving the job a second time.
 		replay: "unsafe",
@@ -490,16 +527,48 @@ export function dispatchExtension(
 			if (phase !== undefined && phase !== "failed") {
 				return refuse("not_at_rest", `a deferred instruction holds ${name} (${phase}): ask again once it has gone out`);
 			}
+			// Inside the move, so nothing the window or the cut turn reports reaches the bridge before this is committed.
+			const record = async (outcome: HandoverOutcome) => {
+				if (outcome.handedOver) {
+					const last = await agents.readResult(job.agent).catch(() => undefined);
+					const after =
+						(outcome.cut === undefined ? "" : cutInWindow(outcome.cut)) +
+						(outcome.ready ? "" : " claude has not reported itself up in the window yet, so look at the window.");
+					const lastRecord = last === undefined ? {} : { lastRecord: last.id };
+					await api.commit(
+						(tx) => commitMove(tx, api.conversationId, job, { ...outcome, ...lastRecord }, after),
+						context,
+					);
+					return;
+				}
+				await api.commit(async (tx) => {
+					if (outcome.cut !== undefined) {
+						await commitCut(tx, api.conversationId, job);
+						await tx.appendEntry(
+							api.conversationId,
+							noticeEntry(
+								"report",
+								"action",
+								`agent ${job.agent} (card ${job.card}): ${cutSentence(outcome.cut)} Its handover did not land: ${outcome.reason}`,
+							),
+						);
+					}
+					if (outcome.back === undefined) return;
+					const doc = await tx.doc(Dispatches, api.conversationId);
+					const index = doc.jobs.findIndex((each) => each.agent === job.agent);
+					const current = doc.jobs[index];
+					if (current !== undefined) doc.jobs[index] = { ...current, toldBack: outcome.back };
+				}, context);
+			};
 			let moved: HandoverOutcome;
 			try {
-				moved = await handover.handOver(job.agent);
+				moved = await handover.handOver(job.agent, record);
 			} catch (error) {
 				return refuse("cannot_resume", (error as Error).message);
 			}
-			if (!moved.handedOver) return text(moved);
-			const after = moved.ready ? "" : " claude has not reported itself up in the window yet, so look at the window.";
-			await api.commit((tx) => commitMove(tx, api.conversationId, job, moved, after), context);
-			return text(moved);
+			if (moved.handedOver) return text(moved);
+			const { back: _recorded, ...answer } = moved;
+			return text(answer);
 		},
 	});
 

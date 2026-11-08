@@ -4,16 +4,25 @@ import type { AgentPort, AgentState, AgentStatusEvent } from "../../../ports/age
 import type { HandoverSettling, Settled } from "../../../ports/handover.ts";
 import { complete, observe } from "../../domain/bridge.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
-import { CUT, dormantNotice, reconcile, turning, unfinished } from "../../domain/reconcile.ts";
+import {
+	CUT,
+	cutInWindow,
+	cutOf,
+	cutSentence,
+	dormantNotice,
+	reconcile,
+	turning,
+	unfinished,
+} from "../../domain/reconcile.ts";
 import { resultNotice, urgent } from "../../domain/report.ts";
 import { dispatchSignal, reblockSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
 import { recordFact } from "../memory/index.ts";
-import { commitMove, Dispatches } from "./index.ts";
+import { commitCut, commitMove, Dispatches, JOB_DONE } from "./index.ts";
 import { reclaimer } from "./reclaim.ts";
 
-/** Entry kind of a turn the bridge recorded as finished; it carries no model message. */
-export const JOB_DONE = "soma.dispatch.done";
+export { JOB_DONE };
+
 /** Entry kind of the input that wakes the model for a blocked agent. */
 export const AGENT_BLOCKED = "soma.dispatch.blocked";
 
@@ -188,11 +197,14 @@ export function handoverBridge(conversation: Conversation, settling: HandoverSet
 			const report = (content: string) => tx.appendEntry(conversation.id, noticeEntry("report", "outcome", content));
 			if (settled.onto === "acp") {
 				if (job.toldBack === settled.at) return;
+				const cut = cutOf(job.status);
+				const startedUnfinished = settled.startup && unfinished(job.status);
 				doc.jobs[index] = { ...job, toldBack: settled.at };
-				if (settled.startup && unfinished(job.status)) return;
+				if (startedUnfinished) return;
+				if (cut !== undefined) await commitCut(tx, conversation.id, { agent, card });
 				await report(
 					`agent ${agent} (card ${card}) is back on ACP: its handover was cut short and no window of it opened. ` +
-						"A reply goes on in the same session.",
+						`${cut === undefined ? "" : `${cutSentence(cut)} `}A reply goes on in the same session.`,
 				);
 				return;
 			}
@@ -207,7 +219,9 @@ export function handoverBridge(conversation: Conversation, settling: HandoverSet
 				}
 				return;
 			}
-			await commitMove(tx, conversation.id, { agent, card }, settled, " Its handover was cut short and ended there.");
+			const cut = cutOf(job.status);
+			const after = ` Its handover was cut short and ended there.${cut === undefined ? "" : cutInWindow(cut)}`;
+			await commitMove(tx, conversation.id, { agent, card }, settled, after);
 		}, context);
 	}
 	let queue = Promise.resolve();

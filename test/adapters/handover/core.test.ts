@@ -1,13 +1,15 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rmdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { Harness, TaskId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
-import { RexTransportError } from "../../../src/adapters/rex/client.ts";
+import { seqOf } from "../../../src/adapters/rex/agent-port.ts";
+import { RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
 import { deferExtension } from "../../../src/core/extensions/defer/index.ts";
 import {
+	AGENT_BLOCKED,
 	eventBridge,
 	handoverBridge,
 	JOB_DONE,
@@ -17,9 +19,10 @@ import { Dispatches, dispatchExtension } from "../../../src/core/extensions/disp
 import { reclaimer } from "../../../src/core/extensions/dispatch/reclaim.ts";
 import { openHarness } from "../../../src/core/harness.ts";
 import { NOTICE } from "../../../src/core/notice.ts";
+import type { AgentState } from "../../../src/ports/agent.ts";
 import { cleanUp } from "../acp/fake.ts";
-import { type Block, HANGAR, type Session } from "../rex/fake.ts";
-import { AT_IDLE, fakeClock, sides, sleep } from "./fake.ts";
+import { type Block, fixture, HANGAR } from "../rex/fake.ts";
+import { AT_IDLE, alive, fakeClock, sides, sleep } from "./fake.ts";
 
 const context = BACKGROUND_CONTEXT;
 // A request id goes with the db: the soma after this one must not get its words back as already said.
@@ -32,21 +35,11 @@ afterEach(async () => {
 
 /**
  * The real core over both sides, started as main.ts starts it, with a faux model that takes the human's words: 派 <card>
- * dispatches, 看 <card> shows the job, 回覆 <card> <text> replies, 畫面 <card> reads its screen, 工作 lists the jobs and 外面
- * the foreign agents. `results` holds every tool result the model was handed.
+ * dispatches, 看 <card> shows the job, 回覆 <card> <text> replies, 畫面 <card> reads its screen, 工作 lists the jobs, 外面
+ * the foreign agents and 選 <card> <fingerprint> answers a prompt, as a wake it had pending would. It does nothing for a
+ * wake itself. `results` holds every tool result the model was handed.
  */
-async function core(
-	options: {
-		others?: Session[];
-		opened?: Partial<Block>;
-		brief?: string;
-		blocks?: Block[];
-		restartOf?: string;
-		rexDown?: boolean;
-		clock?: ReturnType<typeof fakeClock>;
-		graceMs?: number;
-	} = {},
-) {
+async function core(options: Parameters<typeof sides>[0] & { brief?: string } = {}) {
 	const both = await sides(options);
 	const results: unknown[] = [];
 	const faux = fauxProvider();
@@ -60,8 +53,9 @@ async function core(
 				results.push(/^[[{]|^null$/.test(answer) ? JSON.parse(answer) : answer);
 				return fauxAssistantMessage("好。");
 			}
+			if (JSON.stringify(last?.content ?? "").includes("[bridge]")) return fauxAssistantMessage("好。");
 			const [, verb, card = "", rest = ""] =
-				/(派|看|回覆|畫面|工作|外面) ?([a-z0-9-]*) ?([^"]*)/.exec(JSON.stringify(last?.content ?? "")) ?? [];
+				/(派|看|回覆|畫面|工作|外面|選) ?([a-z0-9-]*) ?([^"]*)/.exec(JSON.stringify(last?.content ?? "")) ?? [];
 			const call = (name: string, args: Record<string, string>) =>
 				fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
 			if (verb === "派") return call("dispatch", { card, repo: both.acp.cwd });
@@ -70,6 +64,7 @@ async function core(
 			if (verb === "畫面") return call("screen", { card });
 			if (verb === "工作") return call("jobs", {});
 			if (verb === "外面") return call("foreign_agents", {});
+			if (verb === "選") return call("respond", { card, option: "1", fingerprint: rest, reason: "its wake" });
 			return fauxAssistantMessage("好。");
 		}),
 	);
@@ -107,7 +102,8 @@ async function core(
 	await both.agents.heard();
 	await reconcileDispatches(root, both.agents, context, await both.agents.dormant());
 	reconciled();
-	const offEvents = eventBridge(root, both.agents, context).listen(quietOnceClosed);
+	const bridge = eventBridge(root, both.agents, context);
+	const offEvents = bridge.listen(quietOnceClosed);
 	const off = () => {
 		offEvents();
 		offSettled();
@@ -121,8 +117,10 @@ async function core(
 		off,
 		results,
 		job,
+		bridge,
+		wakes: async () => (await entries(AGENT_BLOCKED)).length,
 		notices: async () => (await entries(NOTICE)).map((entry) => (entry.data as { content: string }).content),
-		turns: async () => (await entries(JOB_DONE)).map((entry) => entry.data as { outcome: string }),
+		turns: async () => (await entries(JOB_DONE)).map((entry) => entry.data as { outcome: string; notified: boolean }),
 		say: async (content: string) => {
 			const submission = await root.submit({ type: "input", content, requestId: `t:${said++}` }, context);
 			expect((await submission.wait(context)).status).toBe("done");
@@ -203,7 +201,12 @@ test("the human asks to see a job: it moves, they are told once naming the windo
 	const notices = await soma.notices();
 	expect(notices).toEqual([expect.stringContaining("its window is card-a in session hangar")]);
 	expect(soma.windowsOpened()).toHaveLength(1);
-	expect(await soma.job()).toEqual({ ...before, sessionId: acpSessionId, status: expect.anything() });
+	expect(await soma.job()).toEqual({
+		...before,
+		sessionId: acpSessionId,
+		status: { state: "idle" },
+		seq: seqOf(AT_IDLE),
+	});
 	await soma.say("工作");
 	expect(soma.results.at(-1)).toMatchObject([{ card: "card-a", agent: "card-a", sessionId: acpSessionId }]);
 
@@ -307,19 +310,568 @@ test("foreign_agents names the human's panes, never a job over ACP or a job hand
 	soma.off();
 });
 
-test("a job that is working when the human asks is refused, with no notice, and goes on over ACP", async () => {
-	const soma = await core({ brief: "HANG" });
-	await soma.say("派 card-a");
-	await soma.until(async () => (await soma.job())?.status.state === "working", "the job at work");
+/** card-a has finished its brief, and now runs `prompt`, a turn still going as this returns, in `state`. */
+async function busy(soma: Soma, prompt: string, state: "working" | "blocked" = "working") {
+	await dispatched(soma);
+	const told = await soma.notices();
+	const turns = await soma.turns();
+	const before = await soma.job();
+	await soma.say(`回覆 card-a ${prompt}`);
+	await soma.until(async () => (await soma.job())?.status.state === state, `the job ${state}`);
+	return { told, turns, before };
+}
+
+const blockedOn = async (soma: Soma) => (await soma.job())?.status as Extract<AgentState, { state: "blocked" }>;
+
+const cutTurn = "Its running turn was cut.";
+const prompted = "approve touch probe.txt\nCreate probe.txt";
+
+test("a working job: the human asks, its turn is cut and it moves, told once, and nothing of the cut turn is recorded", async () => {
+	const soma = await core();
+	const { turns, before } = await busy(soma, "SPIN");
+	const { acpSessionId } = await soma.entry();
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toEqual({
+		handedOver: true,
+		window: "card-a",
+		session: "hangar",
+		sessionId: acpSessionId,
+		ready: true,
+		cut: {},
+	});
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining("its window is card-a in session hangar")]);
+	expect(notices[0]).toContain(cutTurn);
+	expect(notices[0]).toContain("Tell it in the window how to go on");
+	expect(notices[0]).not.toContain("will not ask again");
+	expect(notices[0]).not.toContain("partial");
+	await sleep(100);
+	expect(await soma.turns()).toEqual(turns);
+	expect(await soma.notices()).toEqual(notices);
+	const job = await soma.job();
+	expect(job?.outcome).toBe(before?.outcome);
+	expect(job?.outcome).toBe("未知");
+	expect(job?.sessionId).toBe(acpSessionId);
+	expect(job?.resultId).toBe((await soma.agents.readResult("card-a"))?.id);
+	expect(job?.resultId).not.toBe(before?.resultId);
+	soma.off();
+});
+
+test("after the cut, the window's idles record no turn, and jobs lists the window's state", async () => {
+	const soma = await core();
+	const { turns } = await busy(soma, "SPIN");
+	await soma.say("看 card-a");
+
+	const window = soma.blocks[0] as Block;
+	const settled = { state: "idle", updated_at: "2026-10-27T01:02:09.000000+08:00" };
+	window.records = [settled];
+	soma.hangar.emit(soma.hangar.status(window.block, settled));
+	await soma.until(async () => (await soma.job())?.seq === seqOf(settled), "the window's idle");
+	await sleep(50);
+
+	expect(await soma.turns()).toEqual(turns);
+	await soma.say("工作");
+	expect(soma.results.at(-1)).toMatchObject([{ card: "card-a", status: { state: "idle" }, seq: seqOf(settled) }]);
+	soma.off();
+});
+
+test("after the cut, the next turn in the window is recorded as any turn is, told by its reply", async () => {
+	const soma = await core();
+	const { turns } = await busy(soma, "SPIN");
+	await soma.say("看 card-a");
+
+	await soma.say("回覆 card-a go on");
+	expect(soma.typed()).toEqual(["go on"]);
+	await turn(soma, "結果：完成\nKIWI");
+
+	await soma.until(async () => (await soma.job())?.outcome === "完成", "the window's turn");
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "完成" }]);
+	expect(await soma.job()).toMatchObject({ status: { state: "done" }, resultId: expect.any(String) });
+	soma.off();
+});
+
+test("a window still working as the move ends: jobs reads that, not the status from before", async () => {
+	const working = { state: "working", updated_at: "2026-10-27T01:02:05.000000+08:00" };
+	const soma = await core({ opened: { records: [working] } });
+	await busy(soma, "SPIN");
+
+	await soma.say("看 card-a");
+
+	await soma.until(async () => (await soma.job())?.seq === seqOf(working), "the window's state");
+	expect((await soma.job())?.status.state).toBe("working");
+	soma.off();
+});
+
+test("a window with no claude up as the move ends: the job is no longer working, and the notice says to look", async () => {
+	const soma = await core({ opened: { records: [], screen: "$ claude --resume" } });
+	await busy(soma, "SPIN");
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true, ready: false, cut: {} });
+	expect((await soma.job())?.status).toEqual({ state: "idle" });
+	const [notice] = await soma.notices();
+	expect(notice).toContain(cutTurn);
+	expect(notice).toContain("has not reported itself up");
+	soma.off();
+});
+
+test("a blocked job: the prompt is cancelled and quoted once, the job is no longer blocked, and nothing is recorded of it", async () => {
+	const soma = await core();
+	const { turns } = await busy(soma, "ASK", "blocked");
+	expect(await soma.wakes()).toBe(1);
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true, cut: { prompt: expect.stringContaining("touch") } });
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining("its window is card-a in session hangar")]);
+	expect(notices[0]).toContain(`was cancelled, and its turn with it: "${prompted}`);
+	expect(notices[0]).not.toContain("1. Yes");
+	expect(notices[0]).toContain("will not ask again");
+	const job = await soma.job();
+	expect(job?.status.state).toBe("idle");
+	expect(job?.handedOver).toBeUndefined();
+	await sleep(50);
+	expect(await soma.turns()).toEqual(turns);
+	expect(await soma.notices()).toEqual(notices);
+	soma.off();
+});
+
+test("the model's pending wake answers nothing into the window: refused not blocked, and no key is pressed", async () => {
+	const soma = await core();
+	await busy(soma, "ASK", "blocked");
+	const { fingerprint } = await blockedOn(soma);
+	await soma.say("看 card-a");
+	const before = soma.hangar.methods().filter((method) => method === "block.event").length;
+
+	await soma.say(`選 card-a ${fingerprint}`);
+
+	expect(soma.results.at(-1)).toEqual({ sent: false, refusal: "not_blocked" });
+	expect(soma.hangar.methods().filter((method) => method === "block.event")).toHaveLength(before);
+	expect((await soma.job())?.decisions.filter((each) => each.action === "answered")).toEqual([]);
+	soma.off();
+});
+
+test("the model's pending wake with another prompt on the window's screen: refused stale, and no key is pressed", async () => {
+	const soma = await core();
+	await busy(soma, "ASK", "blocked");
+	const { fingerprint } = await blockedOn(soma);
+	await soma.say("看 card-a");
+	const window = soma.blocks[0] as Block;
+	window.records = [{ state: "blocked", kind: "permission", updated_at: "2026-10-27T01:02:09.000000+08:00" }];
+	window.screen = fixture("claude-bash-prompt-2.1.302.txt");
+	const before = soma.hangar.methods().filter((method) => method === "block.event").length;
+
+	await soma.say(`選 card-a ${fingerprint}`);
+
+	expect(soma.results.at(-1)).toEqual({ sent: false, refusal: "stale" });
+	expect(soma.hangar.methods().filter((method) => method === "block.event")).toHaveLength(before);
+	soma.off();
+});
+
+test("a block handed over before the move is forgotten, so an identical prompt in the window is handed over", async () => {
+	const soma = await core({ opened: { records: [], screen: "$ claude --resume" } });
+	await busy(soma, "ASK", "blocked");
+	const status = await blockedOn(soma);
+	await soma.say("看 card-a");
+	expect(await soma.wakes()).toBe(1);
+
+	await soma.bridge.handle({ agent: "card-a", status, seq: Number.MAX_SAFE_INTEGER });
+
+	expect(await soma.wakes()).toBe(2);
+	expect((await soma.job())?.handedOver).toEqual({ fingerprint: status.fingerprint, msg: status.msg });
+	soma.off();
+});
+
+test("a window blocked as the move ends reaches the model as any block does", async () => {
+	const blocked = { state: "blocked", kind: "permission", updated_at: "2026-10-27T01:02:05.000000+08:00" };
+	const soma = await core({ opened: { records: [blocked], screen: fixture("claude-bash-prompt-2.1.302.txt") } });
+	await busy(soma, "ASK", "blocked");
+
+	await soma.say("看 card-a");
+
+	await soma.until(async () => (await soma.wakes()) === 2, "the window's block to wake the model");
+	expect((await soma.job())?.status.state).toBe("blocked");
+	soma.off();
+});
+
+test("a turn that does not stop in time: refused with the reason, nothing closed or opened, working, and no notice", async () => {
+	const soma = await core({ cutMs: 50 });
+	const { turns, told } = await busy(soma, "HANG");
+	const [pid] = await soma.pids();
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toEqual({
+		handedOver: false,
+		refusal: "not_at_rest",
+		reason: expect.stringContaining("did not stop"),
+	});
+	expect(await soma.closed()).toBe("");
+	expect(soma.windowsOpened()).toEqual([]);
+	expect(alive(pid as number)).toBe(true);
+	expect((await soma.entry()).handingOver).toBeUndefined();
+	expect((await soma.job())?.status.state).toBe("working");
+	expect(await soma.turns()).toEqual(turns);
+	expect(await soma.notices()).toEqual(told);
+	soma.off();
+});
+
+test("blocked, with a turn that does not stop: refused, and the job is working with the block forgotten, its wake answering nothing", async () => {
+	const soma = await core({ cutMs: 50 });
+	await busy(soma, "ASKHANG", "blocked");
+	const { fingerprint } = await blockedOn(soma);
 
 	await soma.say("看 card-a");
 
 	expect(soma.results.at(-1)).toMatchObject({ handedOver: false, refusal: "not_at_rest" });
-	expect(await soma.notices()).toEqual([]);
-	expect(soma.windowsOpened()).toEqual([]);
-	expect(await soma.closed()).toBe("");
+	await soma.until(async () => (await soma.job())?.status.state === "working", "the job no longer blocked");
+	expect((await soma.job())?.handedOver).toBeUndefined();
+	await soma.say(`選 card-a ${fingerprint}`);
+	expect(soma.results.at(-1)).toEqual({ sent: false, refusal: "not_blocked" });
 	soma.off();
 });
+
+test("a cancelled turn that stops after the refusal: idle, recorded with no outcome read off its partial text, and no notice", async () => {
+	const soma = await core({ cutMs: 20, fake: { FAKE_ACP_STOP_MS: "150" } });
+	const { turns, told } = await busy(soma, "SPIN");
+
+	await soma.say("看 card-a");
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: false, refusal: "not_at_rest" });
+
+	await soma.until(async () => (await soma.job())?.status.state === "idle", "the turn to stop");
+	await soma.until(async () => (await soma.turns()).length > turns.length, "the turn's end");
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: false }]);
+	expect((await soma.job())?.outcome).toBe("未知");
+	expect(await soma.notices()).toEqual(told);
+	soma.off();
+});
+
+test("a turn that ends by itself as the cancel goes out: refused, with nothing cut, and recorded with the outcome it states", async () => {
+	const soma = await core();
+	const { turns } = await busy(soma, "FINISH");
+
+	await soma.say("看 card-a");
+
+	const told = soma.results.at(-1) as object;
+	expect(told).toMatchObject({ handedOver: false, refusal: "not_at_rest" });
+	expect(told).not.toHaveProperty("cut");
+	await soma.until(async () => (await soma.job())?.outcome === "完成", "the turn it finished");
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "完成" }]);
+	expect(counted(await soma.notices(), "moved to rex")).toBe(0);
+	await soma.say("看 card-a");
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true });
+	expect(soma.results.at(-1)).not.toHaveProperty("cut");
+	soma.off();
+});
+
+test("a job blocked on a login is refused, with nothing cancelled and the human's question standing", async () => {
+	const soma = await core();
+	await busy(soma, "AUTH", "blocked");
+	const before = await soma.job();
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({
+		handedOver: false,
+		refusal: "not_at_rest",
+		reason: expect.stringContaining("is blocked on a login"),
+	});
+	expect(await soma.cancelled()).toBe("");
+	expect(await soma.job()).toEqual(before);
+	soma.off();
+});
+
+test("a working job a deferral holds is refused, with nothing cancelled, and goes on over ACP", async () => {
+	const soma = await core();
+	await busy(soma, "SPIN");
+	await soma.defer("PT1H", "later");
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: false, refusal: "not_at_rest" });
+	expect(await soma.cancelled()).toBe("");
+	expect(soma.windowsOpened()).toEqual([]);
+	expect((await soma.job())?.status.state).toBe("working");
+	soma.off();
+});
+
+/** The rex side refuses the window plainly, or as a client that gave up on it, with nothing opened. */
+function failsWindow(soma: Soma, failure: Error) {
+	const original = soma.hangar.client.call.bind(soma.hangar.client);
+	soma.hangar.client.call = async (method, payload, schema) => {
+		if (method === "session.new_window") throw failure;
+		return original(method, payload, schema);
+	};
+}
+
+test("a turn cut and a window rex refuses: the turn is over, told once with why, and the job goes on on ACP", async () => {
+	const soma = await core();
+	const { turns } = await busy(soma, "SPIN");
+	failsWindow(soma, new RexRpcError("session.new_window", "refused", "no window for you", 400));
+
+	await soma.say("看 card-a");
+
+	const told = soma.results.at(-1) as object;
+	expect(told).toMatchObject({ handedOver: false, refusal: "cannot_resume", cut: {} });
+	expect(told).not.toHaveProperty("back");
+	const notices = await soma.notices();
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain(cutTurn);
+	expect(notices[0]).toContain("no window for you");
+	expect(notices[0]).toContain("stays on ACP");
+	expect(await soma.job()).toMatchObject({ status: { state: "done", msg: expect.any(String) }, outcome: "未知" });
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: true }]);
+	await soma.say("回覆 card-a RECALL");
+	expect(soma.results.at(-1)).toEqual({ sent: true });
+
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), backOnAcp)).toBe(0);
+	next.off();
+});
+
+test("a turn cut and a take that gave up: told once, then where the job ended without telling the cut again", async () => {
+	const clock = fakeClock();
+	const soma = await core({ clock });
+	const { turns } = await busy(soma, "SPIN");
+	failsWindow(soma, new RexTransportError("no response within 10000 ms"));
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({
+		handedOver: false,
+		cut: {},
+		reason: expect.stringContaining("undecided"),
+	});
+	expect(await soma.notices()).toEqual([expect.stringContaining(cutTurn)]);
+	expect((await soma.job())?.status.state).toBe("done");
+	clock.advance(60_000);
+	await soma.agents.list();
+
+	await soma.until(async () => counted(await soma.notices(), backOnAcp) === 1, "the notice of the return");
+	expect(counted(await soma.notices(), cutTurn)).toBe(1);
+	expect((await soma.turns()).slice(turns.length)).toHaveLength(1);
+	soma.off();
+});
+
+test("a turn cut and a mark that will not write: the turn is over, told once with why, and the job sits idle on ACP", async () => {
+	const soma = await core();
+	const { turns } = await busy(soma, "SPIN");
+	const [pid] = await soma.pids();
+	await mkdir(`${soma.acp.sessionsFile}.tmp`);
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: false, refusal: "cannot_resume", cut: {} });
+	const notices = await soma.notices();
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain(cutTurn);
+	expect(notices[0]).toContain("could not be recorded");
+	expect(alive(pid as number)).toBe(true);
+	expect(await soma.closed()).toBe("");
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: true }]);
+	await soma.until(async () => (await soma.job())?.status.state === "idle", "the idle the turn ended on");
+	await sleep(50);
+	expect(await soma.notices()).toEqual(notices);
+	expect((await soma.turns()).slice(turns.length)).toHaveLength(1);
+	await rmdir(`${soma.acp.sessionsFile}.tmp`);
+	soma.off();
+});
+
+test("a plain refusal gives a done job back, told by the refusal: no restart tells it again", async () => {
+	const soma = await core();
+	await dispatched(soma);
+	failsWindow(soma, new RexRpcError("session.new_window", "refused", "no window for you", 400));
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({
+		handedOver: false,
+		reason: expect.stringContaining("stays on ACP"),
+	});
+	expect(await soma.notices()).toEqual([]);
+	const next = await again(soma);
+	await sleep(50);
+	expect(await next.notices()).toEqual([]);
+	next.off();
+});
+
+test("a plain refusal whose soma dies before anything records it: the next one tells the return, once", async () => {
+	const soma = await core();
+	await dispatched(soma);
+	failsWindow(soma, new RexRpcError("session.new_window", "refused", "no window for you", 400));
+	soma.off();
+	await soma.agents.handOver("card-a");
+
+	const next = await again(soma);
+
+	expect(await next.notices()).toEqual([expect.stringContaining(backOnAcp)]);
+	const last = await again(next);
+	await sleep(50);
+	expect(await last.notices()).toEqual([expect.stringContaining(backOnAcp)]);
+	last.off();
+});
+
+const interrupted = "被重啟打斷";
+
+test.each([
+	["working", "SPIN", "working"],
+	["blocked", "ASK", "blocked"],
+] as const)(
+	"a job %s killed after the cancel and before the mark: dormant with a cut turn, told by the restart's notice",
+	async (_name, prompt, state) => {
+		const first = await core({ from: (port) => ({ ...port, release: () => new Promise(() => {}) }) });
+		const { turns, before } = await busy(first, prompt, state);
+		const from = first.acp.events.length;
+		void first.agents.handOver("card-a");
+		await first.acp.until("idle", from);
+		await sleep(50);
+		// What the cancelled turn emitted reached the core as nothing.
+		expect((await first.job())?.status.state).toBe(state);
+		expect(await first.cancelled()).not.toBe("");
+		expect((await first.entry()).handingOver).toBeUndefined();
+
+		const soma = await again(first, { from: (port) => port });
+
+		const notices = await soma.notices();
+		expect(notices).toEqual([expect.stringContaining(interrupted)]);
+		expect(await soma.agents.dormant()).toEqual(["card-a"]);
+		expect(await soma.agents.list()).toEqual([{ name: "card-a", sessionId: before?.sessionId }]);
+		expect(await soma.pids()).toEqual([]);
+		expect(await soma.job()).toMatchObject({ status: { state: "done", msg: expect.any(String) }, outcome: "未知" });
+		expect((await soma.job())?.handedOver).toBeUndefined();
+		expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: true }]);
+		expect(soma.windowsOpened()).toEqual([]);
+		await soma.say("回覆 card-a RECALL");
+		expect(soma.results.at(-1)).toEqual({ sent: true });
+		soma.off();
+	},
+);
+
+test("a job killed after the mark with no window, past the grace period: dormant with a cut turn, told once by the restart's notice", async () => {
+	const first = await core({ to: (port) => ({ ...port, take: () => new Promise(() => {}) }) });
+	const { turns } = await busy(first, "SPIN");
+	void first.agents.handOver("card-a");
+	await first.until(async () => (await first.entry()).handingOver === true, "the mark");
+
+	const soma = await again(first, { to: (port) => port });
+
+	expect(await soma.notices()).toEqual([expect.stringContaining(interrupted)]);
+	expect((await soma.entry()).handingOver).toBeUndefined();
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: true }]);
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), backOnAcp)).toBe(0);
+	next.off();
+});
+
+test("a job killed after the mark with no window, within the grace period: undecided, then back on ACP with its cut told once", async () => {
+	const clock = fakeClock();
+	const first = await core({ clock, to: (port) => ({ ...port, take: () => new Promise(() => {}) }) });
+	const { turns } = await busy(first, "SPIN");
+	void first.agents.handOver("card-a");
+	await first.until(async () => (await first.entry()).handingOver === true, "the mark");
+
+	const soma = await again(first, { clock, to: (port) => port });
+
+	expect(await soma.notices()).toEqual([]);
+	expect((await soma.entry()).handingOver).toBe(true);
+	clock.advance(60_000);
+	await soma.agents.list();
+	await soma.until(async () => counted(await soma.notices(), backOnAcp) === 1, "the notice of the return");
+	const notices = await soma.notices();
+	expect(notices).toHaveLength(1);
+	expect(notices[0]).toContain(cutTurn);
+	expect(await soma.job()).toMatchObject({ status: { state: "done", msg: expect.any(String) }, outcome: "未知" });
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: true }]);
+	soma.off();
+});
+
+test.each([
+	["before the final mark", (first: Soma) => hangsAfterWindow(first)],
+	["after the final mark, before the commit", (first: Soma) => first.off()],
+])(
+	"a job killed with its window open, %s: on rex, told once with the cut, and no turn recorded of it",
+	async (_name, arrange) => {
+		const first = await core();
+		const { turns, before } = await busy(first, "SPIN");
+		const { acpSessionId } = await first.entry();
+		arrange(first);
+		const moving = first.agents.handOver("card-a");
+		await first.until(() => first.blocks.length === 1, "the window");
+		await Promise.race([moving, sleep(50)]);
+		expect((await first.job())?.status.state).toBe("working");
+
+		const soma = await again(first);
+
+		await toldOnRexOnce(soma, acpSessionId);
+		const notices = await soma.notices();
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("Its handover was cut short and ended there");
+		expect(notices[0]).toContain(cutTurn);
+		await sleep(50);
+		expect(await soma.turns()).toEqual(turns);
+		const job = await soma.job();
+		expect(job?.outcome).toBe(before?.outcome);
+		expect(job?.status.state).toBe("idle");
+		expect(job?.resultId).toBe((await soma.agents.readResult("card-a"))?.id);
+		await soma.say("回覆 card-a go on");
+		await turn(soma, "結果：完成\nKIWI");
+		await soma.until(async () => (await soma.job())?.outcome === "完成", "the window's turn");
+		soma.off();
+	},
+);
+
+test("a blocked job killed with its window open: told once, with the cancelled prompt quoted from what it was last recorded", async () => {
+	const first = await core();
+	await busy(first, "ASK", "blocked");
+	hangsAfterWindow(first);
+	void first.agents.handOver("card-a");
+	await first.until(() => first.blocks.length === 1, "the window");
+
+	const soma = await again(first);
+
+	await soma.until(async () => (await soma.notices()).length === 1, "the notice of the move");
+	const [notice] = await soma.notices();
+	expect(notice).toContain("its window is card-a");
+	expect(notice).toContain(prompted);
+	expect(notice).not.toContain("1. Yes");
+	expect((await soma.job())?.handedOver).toBeUndefined();
+	soma.off();
+});
+
+test("a job never handed over reaches rex in no way when a handover of another job cuts its turn", async () => {
+	const soma = await core();
+	await busy(soma, "SPIN");
+	await soma.say("派 card-b");
+	await soma.until(async () => (await soma.job("card-b"))?.outcome !== undefined, "the brief's turn");
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true });
+	expect(soma.windowsOpened()).toHaveLength(1);
+	expect((await soma.entry("card-b")).handingOver).toBeUndefined();
+	expect((await soma.entry("card-b")).handedOver).toBeUndefined();
+	expect(await soma.cancelled()).toBe(`${(await soma.entry()).acpSessionId}\n`);
+	await soma.say("回覆 card-b over ACP");
+	expect(soma.results.at(-1)).toEqual({ sent: true });
+	expect(soma.typed()).toEqual([]);
+	soma.off();
+});
+
+/** Rex answers no `session.new_window` from now on, and opens its window all the same. */
+function hangsAfterWindow(soma: Soma): void {
+	const original = soma.hangar.client.call.bind(soma.hangar.client);
+	soma.hangar.client.call = async (method, payload, schema) => {
+		const reply = await original(method, payload, schema);
+		if (method === "session.new_window") await new Promise(() => {});
+		return reply;
+	};
+}
 
 /**
  * A soma that went down with the job's handover in progress: the entry marked and the ACP process gone. `window`: its

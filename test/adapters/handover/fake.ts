@@ -1,6 +1,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { AcpAgentPort } from "../../../src/adapters/acp/agent-port.ts";
 import { createHandoverAgentPort, HANDOVER_GRACE_MS } from "../../../src/adapters/handover/agent-port.ts";
 import { createRexAgentPort } from "../../../src/adapters/rex/agent-port.ts";
 import { harness as acpHarness, sleep } from "../acp/fake.ts";
@@ -38,9 +39,18 @@ export async function sides(
 		clock?: ReturnType<typeof fakeClock>;
 		/** None by default, so a job with no window goes back to ACP at the first look. */
 		graceMs?: number;
+		/** How long a cut waits for a turn to stop. */
+		cutMs?: number;
+		/** Each side as the handover sees it, to hang or fail one of its calls. */
+		from?: (port: AcpAgentPort) => AcpAgentPort;
+		to?: (port: ReturnType<typeof createRexAgentPort>) => ReturnType<typeof createRexAgentPort>;
 	} = {},
 ) {
-	const acp = await acpHarness({ cwd: options.restartOf, ...(options.fake ? { fake: options.fake } : {}) });
+	const acp = await acpHarness({
+		cwd: options.restartOf,
+		...(options.fake ? { fake: options.fake } : {}),
+		...(options.cutMs === undefined ? {} : { cutMs: options.cutMs }),
+	});
 	const projects = join(acp.cwd, "..", "projects");
 	const blocks = options.blocks ?? [];
 	const hangar = rex(blocks, options.others ?? []);
@@ -89,8 +99,8 @@ export async function sides(
 	const onError = (error: Error) => said.push(error.message);
 	const { clock, graceMs = clock === undefined ? 0 : HANDOVER_GRACE_MS } = options;
 	const agents = createHandoverAgentPort({
-		from: acp.port,
-		to: onRex,
+		from: options.from?.(acp.port) ?? acp.port,
+		to: options.to?.(onRex) ?? onRex,
 		onError,
 		graceMs,
 		...(clock === undefined ? {} : { now: clock.now }),
@@ -124,6 +134,7 @@ export async function sides(
 				givenBack?: number;
 			},
 		closed: () => readFile(join(projects, "closed"), "utf8").catch(() => ""),
+		cancelled: () => readFile(join(projects, "cancelled"), "utf8").catch(() => ""),
 		pids: async () =>
 			(await readFile(join(acp.cwd, "..", `pids-${acp.instance}`), "utf8").catch(() => ""))
 				.trim()

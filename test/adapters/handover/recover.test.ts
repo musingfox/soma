@@ -2,8 +2,9 @@ import { mkdir, readFile, rmdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
 import { createHandoverAgentPort, HANDOVER_GRACE_MS } from "../../../src/adapters/handover/agent-port.ts";
+import { seqOf } from "../../../src/adapters/rex/agent-port.ts";
 import { RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
-import { PromptRefused } from "../../../src/ports/agent.ts";
+import { type AgentStatusEvent, PromptRefused } from "../../../src/ports/agent.ts";
 import { cleanUp, SESSION } from "../acp/fake.ts";
 import { type Block, fixture, HANGAR } from "../rex/fake.ts";
 import { AT_IDLE, alive, fakeClock, sides, sleep } from "./fake.ts";
@@ -357,6 +358,7 @@ test("a new_window rex plainly refuses, with no window open: back on ACP at once
 		reason:
 			"session.new_window: refused: no window for you. Its ACP process has ended and the job stays on ACP: its next " +
 			"prompt starts it again in its session",
+		back: clock.now(),
 	});
 
 	const entry = await both.entry();
@@ -462,6 +464,32 @@ test.each([
 		expect(both.said).toEqual([expect.stringContaining("card-a is undecided: its window may still open")]);
 	},
 );
+
+test("a window a later look finds says nothing until the listener has recorded the landing, then what it says now, once", async () => {
+	const clock = fakeClock();
+	const { both } = await gaveUp(clock);
+	const heard: AgentStatusEvent[] = [];
+	const off = both.agents.onStatus((event) => heard.push(event));
+	const working = { state: "working", updated_at: "2026-10-27T01:02:06.000000+08:00" };
+	let during: AgentStatusEvent[] | undefined;
+	const offSettled = both.agents.onSettled(async (settled) => {
+		if (settled.onto !== "rex") return;
+		const window = both.blocks[0] as Block;
+		window.records = [working];
+		both.hangar.emit(both.hangar.status(window.block, working));
+		await sleep(30);
+		during = [...heard];
+	});
+	await opensLate(both);
+
+	await both.agents.list();
+	await until(() => during !== undefined && heard.length > 0, "what the window says");
+
+	expect(during).toEqual([]);
+	expect(heard).toEqual([{ agent: "card-a", status: { state: "working" }, seq: seqOf(working) }]);
+	off();
+	offSettled();
+});
 
 test("the grace period is 60 s", () => {
 	expect(HANDOVER_GRACE_MS).toBe(60_000);

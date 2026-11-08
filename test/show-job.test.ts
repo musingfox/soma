@@ -59,8 +59,9 @@ function stub(outcome: HandoverOutcome) {
 	const asked: string[] = [];
 	return {
 		asked,
-		handOver: async (agent: string) => {
+		handOver: async (agent: string, record?: (outcome: HandoverOutcome) => Promise<void>) => {
 			asked.push(agent);
+			await record?.(outcome);
 			return outcome;
 		},
 	};
@@ -72,6 +73,15 @@ test("the tool tells the model to use it when the human asks to see, show or tak
 	);
 	expect(tool?.description).toMatch(/when the human asks to see, show or take over a job/);
 	expect(tool?.replay).toBe("unsafe");
+});
+
+test("the tool says it interrupts a running job and cancels a pending prompt, so is only for when the human asks", () => {
+	const tool = (dispatchExtension(new FakeAgentPort(), async () => "").tools ?? []).find(
+		(each) => each.name === "show_job",
+	);
+	expect(tool?.description).toMatch(/interrupts a running job/);
+	expect(tool?.description).toMatch(/cancels a pending prompt/);
+	expect(tool?.description).toMatch(/use it only when the human asks/);
 });
 
 test("a soma with no rex hangar refuses, saying so, with nothing done", async () => {

@@ -39,7 +39,7 @@ import {
 	type ResumeRequest,
 	type StartRequest,
 } from "../../ports/agent.ts";
-import type { HandingOver, HandoverMark, HeldSession, Refused, SessionGiver } from "../../ports/handover.ts";
+import type { Cut, HandingOver, HandoverMark, HeldSession, Refused, SessionGiver } from "../../ports/handover.ts";
 import { drawTranscript } from "./screen.ts";
 
 export interface AcpAgentPortOptions {
@@ -67,6 +67,8 @@ export interface AcpAgentPortOptions {
 	readonly startMs?: number;
 	/** How long stop waits for session/close before it ends the process anyway. */
 	readonly closeMs?: number;
+	/** How long a cut waits for the turn to stop once cancelled. Set in tests; TURN_STOP_MS otherwise. */
+	readonly cutMs?: number;
 	/** How long readResult waits for claude to write the reply to a turn the agent reported over. */
 	readonly replyMs?: number;
 	/**
@@ -112,6 +114,12 @@ type Agent = {
 	asked: Asked[];
 	/** How many permission requests it made, so a request asked again has its own fingerprint. */
 	requests: number;
+	/** A cancel is out for the running turn, with what it cut. */
+	cutting?: Cut;
+	/** Told when the running turn ends, whatever ended it; set by a cut waiting for that. */
+	turnOver?: () => void;
+	/** The last turn ended cancelled by a cut: what it wrote is no reply. */
+	cut: boolean;
 	exited: boolean;
 	stopped: boolean;
 	/** The tail of what the process wrote to stderr, for the error of an exit. */
@@ -159,6 +167,11 @@ type Dormant = {
 /** The ACP AgentPort, and the agents it found dormant as it was made. */
 export type AcpAgentPort = AgentPort & SessionGiver;
 
+/**
+ * How long a cut waits for a turn to stop. An interrupt takes milliseconds; claude-agent-acp forces a wedged one over
+ * after 30 s (DEFAULT_FORCE_CANCEL_GRACE_MS in its dist/acp-agent.js), so this gives that its chance first.
+ */
+export const TURN_STOP_MS = 35_000;
 const AUTH_REQUIRED = RequestError.authRequired().code;
 const STDERR_BYTES = 4096;
 // As many lines as the screen tool shows at most, and the tail window that is read for them, which grows until it
@@ -235,6 +248,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 	const git = options.git ?? runGit;
 	const startMs = options.startMs ?? 30_000;
 	const closeMs = options.closeMs ?? 3_000;
+	const cutMs = options.cutMs ?? TURN_STOP_MS;
 	const replyMs = options.replyMs ?? 2_000;
 	const recheckMs = options.recheckMs ?? 10_000;
 	const now = options.now ?? Date.now;
@@ -264,10 +278,13 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 
 	/** The end of the agent's turn, whatever ended it: no permission request outlives the turn that made it. */
 	function settle(agent: Agent, status: AgentState): void {
-		agent.ended = agent.turning && (status.state === "done" || status.state === "idle");
+		agent.cut = agent.cutting !== undefined && status.state === "idle";
+		agent.ended = agent.turning && !agent.cut && (status.state === "done" || status.state === "idle");
+		agent.cutting = undefined;
 		agent.turning = false;
 		for (const asked of agent.asked.splice(0)) asked.answer();
 		emit(agent, status);
+		agent.turnOver?.();
 	}
 
 	const readSessions = async (file: string) =>
@@ -310,6 +327,8 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		const app = client({ name: "soma" })
 			.onRequest(methods.client.session.requestPermission, ({ params, signal }) => {
 				const agent = holder.agent as Agent;
+				// A turn being cut gets no one to ask: the cancel is its answer.
+				if (agent.cutting !== undefined) return Promise.resolve({ outcome: { outcome: "cancelled" as const } });
 				const number = ++agent.requests;
 				const fingerprint = createHash("sha256")
 					.update(`${params.sessionId}\n${number}\n${params.toolCall.toolCallId}\n${JSON.stringify(params.options)}`)
@@ -357,6 +376,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			ended: false,
 			asked: [],
 			requests: 0,
+			cut: false,
 			exited: false,
 			stopped: false,
 			stderr: "",
@@ -372,6 +392,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			clearTimeout(agent.recheck);
 			connection.close();
 			for (const asked of agent.asked.splice(0)) asked.answer();
+			agent.turnOver?.();
 			if (agents.get(agent.name) !== agent || agent.stopped) return;
 			const last = agent.stderr.trimEnd().split("\n").at(-1);
 			emit(agent, {
@@ -500,7 +521,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		cwd: session.cwd,
 	});
 
-	/** What a release of the agent would give up now; a refusal, with why, unless it is at rest with a session open. */
+	/** What a cut and a release of the agent would give up now; a refusal, with why, unless it has a session open. */
 	function holdOf(name: string): HeldSession | Refused {
 		const session = sessions.get(name);
 		const refused = (refusal: Refused["refusal"], reason: string) => ({ refusal, reason: `${name} ${reason}` });
@@ -514,11 +535,9 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 				? refused("not_acp", "is no agent acp holds")
 				: refused("not_at_rest", "is not running: a job soma stopped starts again with its deferred instruction");
 		}
-		if (agent !== undefined) {
-			const state = agent.seen?.status.state;
-			if (agent.turning || state === "working" || state === "blocked") {
-				return refused("not_at_rest", `is ${state ?? "working"}: only a job at rest is handed over`);
-			}
+		const status = agent?.seen?.status;
+		if (status?.state === "blocked" && status.kind === "auth") {
+			return refused("not_at_rest", "is blocked on a login, which only the human can give: nothing is cancelled");
 		}
 		// A session/new still under way has recorded nothing yet, or only the session of a start before this one.
 		if (session === undefined || (agent !== undefined && agent.session === undefined)) {
@@ -786,6 +805,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			if (again !== undefined) throw new PromptRefused(`acp agent ${agent} ${again}`);
 			target.turning = true;
 			target.ended = false;
+			target.cut = false;
 			target.before = before;
 			emit(target, { state: "working" });
 			target.connection.agent
@@ -825,7 +845,8 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			const target = agents.get(agent);
 			if (target === undefined || !target.ended) {
 				const path = await transcriptOf(session);
-				return path === undefined ? undefined : readLastRecord(path);
+				const last = path === undefined ? undefined : await readLastRecord(path);
+				return target?.cut && last !== undefined ? { id: last.id } : last;
 			}
 			for (const deadline = now() + replyMs; ; await sleep(100)) {
 				const path = await transcriptOf(session);
@@ -904,17 +925,69 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		},
 
 		/**
+		 * Sends session/cancel and answers every permission request waiting `cancelled`, as the protocol has a client do,
+		 * then waits cutMs at most for the prompt's response. One the agent asks once cancelled is answered the same. A turn
+		 * that does not stop stays cancelled, reported `working`: a later cut waits for it again, and when it does stop it is
+		 * idle, and read as saying nothing. A process that exits has stopped its turn.
+		 */
+		async cut(agent: string): Promise<Cut | Refused | undefined> {
+			await loading;
+			const target = agents.get(agent);
+			if (target === undefined || !target.turning || target.exited) return undefined;
+			if (target.cutting === undefined) {
+				const prompt = target.asked[0]?.status.msg;
+				target.cutting = prompt === undefined ? {} : { prompt };
+				target.connection.agent
+					.notify(methods.agent.session.cancel, { sessionId: target.session as string })
+					.catch((error: Error) => onError(new Error(`acp agent ${agent}: session/cancel: ${error.message}`)));
+				for (const asked of target.asked.splice(0)) asked.answer();
+				if (prompt !== undefined) emit(target, { state: "working" });
+			}
+			const cut = target.cutting;
+			const stopped = await new Promise<boolean>((resolve) => {
+				const timer = setTimeout(() => resolve(false), cutMs);
+				target.turnOver = () => {
+					clearTimeout(timer);
+					resolve(true);
+				};
+			});
+			target.turnOver = undefined;
+			if (!stopped) {
+				return {
+					refusal: "not_at_rest",
+					reason:
+						`${agent} was cancelled${cut.prompt === undefined ? "" : `, with the permission prompt it waited on (${cut.prompt})`} ` +
+						`and its turn did not stop within ${cutMs / 1000} s: nothing was closed and no window opened, the job stays ` +
+						"on ACP, working, and the cancel stands: it goes idle if the turn stops",
+				};
+			}
+			if (target.exited || target.cut) return cut;
+			return {
+				refusal: "not_at_rest",
+				reason:
+					`${agent} ended its turn by itself as the cancel went out, so nothing was cut and nothing moved: its result ` +
+					"is recorded as usual, and it can be handed over now",
+			};
+		},
+
+		/**
 		 * Records the handover in progress, so no restart lists the agent until a look at the other side says where it is,
 		 * then closes the session and ends the process, and returns only once the process is gone: the side that takes the
-		 * session must not write its transcript beside it. A dormant agent has none to end. Refuses, with nothing done,
-		 * what `releasable` would refuse now: the check and the taking of the agent off this side are one synchronous step,
-		 * so no turn can begin between them. A mark that does not reach the file puts the agent back and refuses too, since
-		 * after a restart a prompt would wake it here beside the other side's claude, two writers on one transcript.
+		 * session must not write its transcript beside it. A dormant agent has none to end. Refuses, with nothing done, what
+		 * `releasable` would refuse now and an agent in a turn: the check and the taking of the agent off this side are one
+		 * synchronous step, so no turn can begin between them. A mark that does not reach the file puts the agent back and
+		 * refuses too, since after a restart a prompt would wake it here beside the other side's claude, two writers on one
+		 * transcript.
 		 */
 		async release(agent: string, { hangar, at }: HandoverMark): Promise<HeldSession | Refused> {
 			await loading;
 			const held = holdOf(agent);
 			if ("refusal" in held) return held;
+			const running = agents.get(agent);
+			const state = running?.seen?.status.state;
+			if (running?.turning || state === "working" || state === "blocked") {
+				return { refusal: "not_at_rest", reason: `${agent} is ${state ?? "working"}: only a job at rest is released` };
+			}
 			const before = sessions.get(agent) as Session;
 			const { givenBack: _told, ...unmarked } = before;
 			const session = { ...unmarked, handingOver: true as const, hangar, handingOverAt: at };

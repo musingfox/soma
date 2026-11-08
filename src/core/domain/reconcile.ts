@@ -1,4 +1,5 @@
 import type { AgentListing, AgentState } from "../../ports/agent.ts";
+import type { Cut } from "../../ports/handover.ts";
 import type { DispatchList, Job } from "./dispatch.ts";
 
 /**
@@ -42,6 +43,30 @@ export const unfinished = (status: AgentState) => status.state !== "done" && sta
 
 /** The status of a job whose turn a restart cut short: over, with no reply to read an outcome from. */
 export const CUT: AgentState = { state: "done", msg: "the turn was cut short when soma restarted" };
+
+/** The status of a job a handover cut the turn of and that did not land: over, with no reply to read an outcome from. */
+export const HANDOVER_CUT: AgentState = {
+	state: "done",
+	msg: "the turn was cut short by a handover that did not land",
+};
+
+/** What a job recorded in a turn lost when it moved with no `show_job` to say so: its turn, and the prompt it waited on. */
+export function cutOf(status: AgentState): Cut | undefined {
+	if (!turning(status)) return undefined;
+	return status.state === "blocked" && status.msg !== undefined ? { prompt: status.msg } : {};
+}
+
+/** What was cut as the human reads it. A prompt is quoted without its options, which nothing can choose any more. */
+export function cutSentence({ prompt }: Cut): string {
+	return prompt === undefined
+		? "Its running turn was cut."
+		: `The permission prompt it was waiting on was cancelled, and its turn with it: "${prompt.replace(/\n1\. [\s\S]*$/, "")}".`;
+}
+
+/** The same in the notice of a move: nothing waits in the window, and how to go on is the human's to say there. */
+export const cutInWindow = (cut: Cut) =>
+	` ${cutSentence(cut)} ${cut.prompt === undefined ? "Tell" : "The window's claude will not ask again: tell"} it in the ` +
+	"window how to go on.";
 
 /**
  * The one notice of a restart whose agent side left unfinished jobs dormant, naming each and the ones whose turn the

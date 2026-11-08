@@ -1,15 +1,18 @@
-import { mkdir, realpath } from "node:fs/promises";
+import { mkdir, readFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
+import { type AcpAgentPort, TURN_STOP_MS } from "../../../src/adapters/acp/agent-port.ts";
 import { createHandoverAgentPort, noHandover } from "../../../src/adapters/handover/agent-port.ts";
 import { seqOf } from "../../../src/adapters/rex/agent-port.ts";
 import { RexRpcError } from "../../../src/adapters/rex/client.ts";
-import { type AgentStatusEvent, PromptRefused } from "../../../src/ports/agent.ts";
+import { type AgentState, type AgentStatusEvent, PromptRefused } from "../../../src/ports/agent.ts";
 import { cleanUp, SESSION } from "../acp/fake.ts";
 import { AT, type Block, fixture, HANGAR } from "../rex/fake.ts";
 import { AT_IDLE, alive, sides, sleep } from "./fake.ts";
 
 afterEach(cleanUp);
+
+type Sides = Awaited<ReturnType<typeof sides>>;
 
 const WORKING = { state: "working", updated_at: "2026-10-27T01:02:04.000000+08:00" };
 
@@ -126,24 +129,19 @@ test("a restarted soma routes a job handed over to its window, and starts nothin
 	});
 });
 
-test("a job working, blocked, never prompted or with its window name taken is refused, with nothing done", async () => {
+test("a job blocked on a login, never prompted or with its window name taken is refused, with nothing done", async () => {
 	const both = await sides({ blocks: [{ name: "taken", block: "block:taken" }] });
-	await both.acp.start("working");
-	await both.acp.until("idle", 0, "working");
-	await both.agents.prompt("working", "HANG");
-	await both.acp.until("working", 0, "working");
-	await both.acp.start("blocked");
-	await both.acp.until("idle", 0, "blocked");
-	await both.agents.prompt("blocked", "ASK");
-	await both.acp.until("blocked", 0, "blocked");
+	await both.ran("login");
+	const from = both.acp.events.length;
+	await both.agents.prompt("login", "AUTH");
+	await both.acp.until("blocked", from, "login");
 	await both.acp.start("fresh");
 	await both.acp.until("idle", 0, "fresh");
 	await both.ran("taken");
 	const running = await both.pids();
 
 	for (const [name, refusal, reason] of [
-		["working", "not_at_rest", /is working/],
-		["blocked", "not_at_rest", /is blocked/],
+		["login", "not_at_rest", /is blocked on a login/],
 		["fresh", "cannot_resume", /never ran a prompt/],
 		["taken", "cannot_resume", /already has a window named taken/],
 		["nobody", "not_acp", /no agent acp holds/],
@@ -153,11 +151,396 @@ test("a job working, blocked, never prompted or with its window name taken is re
 	}
 
 	expect(await both.closed()).toBe("");
+	expect(await both.cancelled()).toBe("");
 	expect(both.windowsOpened()).toEqual([]);
 	for (const pid of running) expect(alive(pid)).toBe(true);
-	for (const name of ["working", "blocked", "fresh", "taken"])
-		expect((await both.entry(name)).handedOver).toBeUndefined();
+	for (const name of ["login", "fresh", "taken"]) expect((await both.entry(name)).handedOver).toBeUndefined();
 	await both.acp.port.prompt("taken", "still here");
+});
+
+async function until(ok: () => boolean) {
+	for (const deadline = Date.now() + 5_000; !ok(); await sleep(5)) expect(Date.now()).toBeLessThan(deadline);
+}
+
+/** Runs one turn on card-a, then starts `prompt`, a turn that is still in `state` as this returns. */
+async function inTurn(both: Sides, prompt: string, state: "working" | "blocked" = "working") {
+	await both.ran();
+	const from = both.acp.events.length;
+	await both.agents.prompt("card-a", prompt);
+	await both.acp.until(state, from);
+	return from;
+}
+
+test("a working job has its turn cancelled, and it has stopped before the mark goes on, the session closes and a window opens", async () => {
+	const seen: { idle: boolean; cancelled: string; closed: string; mark?: true }[] = [];
+	const release = (port: AcpAgentPort): AcpAgentPort => ({
+		...port,
+		release: async (agent, mark) => {
+			seen.push({
+				idle: (await port.list()).some(({ status }) => status?.state === "idle"),
+				cancelled: await readFile(join(both.acp.cwd, "..", "projects", "cancelled"), "utf8"),
+				closed: await readFile(join(both.acp.cwd, "..", "projects", "closed"), "utf8").catch(() => ""),
+				...(await both.entry().then(({ handingOver }) => (handingOver ? { mark: handingOver } : {}))),
+			});
+			return port.release(agent, mark);
+		},
+	});
+	const both = await sides({ from: release });
+	await inTurn(both, "SPIN");
+	const [pid] = await both.pids();
+	const { acpSessionId } = await both.entry();
+
+	const outcome = await both.agents.handOver("card-a");
+
+	expect(outcome).toEqual({
+		handedOver: true,
+		window: "card-a",
+		session: "hangar",
+		sessionId: acpSessionId,
+		ready: true,
+		cut: {},
+	});
+	expect(seen).toEqual([{ idle: true, cancelled: `${acpSessionId}\n`, closed: "" }]);
+	expect(await both.closed()).toBe(`${acpSessionId}\n`);
+	expect(alive(pid as number)).toBe(false);
+	expect((await both.entry()).handedOver).toBe(true);
+	expect(both.windowsOpened()).toHaveLength(1);
+});
+
+test("a job in its first turn, with no reply yet naming a model, is refused before anything is cancelled", async () => {
+	const both = await sides({ cutMs: 50 });
+	await both.acp.start();
+	await both.acp.until("idle");
+	await both.agents.prompt("card-a", "HANG");
+	await both.acp.until("working");
+	while (!(await both.acp.port.readScreen("card-a")).includes("> HANG")) await sleep(10);
+
+	expect(await both.agents.handOver("card-a")).toMatchObject({
+		handedOver: false,
+		refusal: "cannot_resume",
+		reason: expect.stringContaining("names its model"),
+	});
+
+	expect(await both.cancelled()).toBe("");
+	expect(await both.closed()).toBe("");
+	expect(both.windowsOpened()).toEqual([]);
+});
+
+test("a job at rest is cancelled nothing, and says nothing was cut", async () => {
+	const both = await sides();
+	await both.ran();
+
+	const outcome = await both.agents.handOver("card-a");
+
+	expect(outcome).toMatchObject({ handedOver: true });
+	expect(outcome).not.toHaveProperty("cut");
+	expect(await both.cancelled()).toBe("");
+});
+
+test("a turn that does not stop within the wait: refused with the reason, nothing closed, nothing opened, and the job works on, on ACP", async () => {
+	const both = await sides({ cutMs: 50 });
+	await inTurn(both, "HANG");
+	const [pid] = await both.pids();
+	const before = both.acp.events.length;
+
+	const outcome = await both.agents.handOver("card-a");
+
+	expect(outcome).toEqual({
+		handedOver: false,
+		refusal: "not_at_rest",
+		reason: expect.stringContaining("did not stop within 0.05 s"),
+	});
+	expect(await both.closed()).toBe("");
+	expect(both.windowsOpened()).toEqual([]);
+	expect(alive(pid as number)).toBe(true);
+	const entry = await both.entry();
+	expect(entry.handingOver).toBeUndefined();
+	expect(entry.handedOver).toBeUndefined();
+	expect(await both.agents.list()).toMatchObject([{ name: "card-a", status: { state: "working" } }]);
+	expect(both.acp.events.slice(before)).toEqual([]);
+	await expect(both.agents.prompt("card-a", "now")).rejects.toThrow(PromptRefused);
+});
+
+test("the wait for a turn to stop is a named bound, past what claude-agent-acp allows a wedged interrupt", () => {
+	expect(TURN_STOP_MS).toBe(35_000);
+});
+
+test("a prompt on a job blocked is cancelled, with the quote of it, and the handover goes on as for a working job", async () => {
+	const both = await sides();
+	const heard: AgentStatusEvent[] = [];
+	const off = both.agents.onStatus((event) => heard.push(event));
+	await inTurn(both, "ASK", "blocked");
+	const from = heard.length;
+	const blocked = heard.at(-1)?.status as Extract<AgentState, { state: "blocked" }>;
+	const { acpSessionId } = await both.entry();
+
+	const outcome = await both.agents.handOver("card-a");
+
+	expect(outcome).toMatchObject({ handedOver: true, cut: { prompt: blocked.msg } });
+	expect(blocked.msg).toContain("approve touch probe.txt");
+	expect(await both.cancelled()).toBe(`${acpSessionId}\n`);
+	expect((await both.agents.list())[0]?.status?.state).toBe("idle");
+	expect(heard.slice(from).filter(({ status }) => status.state === "blocked")).toEqual([]);
+	expect(
+		await both.agents.respond("card-a", { option: "1", fingerprint: blocked.fingerprint as string }),
+	).toMatchObject({
+		sent: false,
+		refusal: "not_blocked",
+	});
+	expect(both.typed()).toEqual([]);
+	off();
+});
+
+test("every prompt waiting is answered cancelled", async () => {
+	const both = await sides();
+	await inTurn(both, "TWICE", "blocked");
+
+	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: true, cut: { prompt: expect.any(String) } });
+});
+
+test("a prompt the turn asks once it has been cancelled is answered cancelled too, and blocks nothing", async () => {
+	const both = await sides({ cutMs: 2_000 });
+	await inTurn(both, "LATEASK");
+	const before = both.acp.events.length;
+
+	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: true, cut: {} });
+
+	expect(both.acp.events.slice(before).filter(({ status }) => status.state === "blocked")).toEqual([]);
+});
+
+test("blocked with a turn that will not stop once its prompt is cancelled: refused, closed nothing, and working, not blocked", async () => {
+	const both = await sides({ cutMs: 50 });
+	const heard: AgentStatusEvent[] = [];
+	const off = both.agents.onStatus((event) => heard.push(event));
+	await inTurn(both, "ASKHANG", "blocked");
+	const blocked = heard.at(-1)?.status as Extract<AgentState, { state: "blocked" }>;
+
+	const outcome = await both.agents.handOver("card-a");
+
+	expect(outcome).toMatchObject({
+		handedOver: false,
+		refusal: "not_at_rest",
+		reason: expect.stringContaining("approve touch probe.txt"),
+	});
+	expect(await both.closed()).toBe("");
+	expect(both.windowsOpened()).toEqual([]);
+	expect(await both.agents.list()).toMatchObject([{ status: { state: "working" } }]);
+	expect(heard.at(-1)?.status.state).toBe("working");
+	expect(await both.agents.respond("card-a", { option: "1", fingerprint: blocked.fingerprint as string })).toEqual({
+		sent: false,
+		refusal: "not_blocked",
+	});
+	off();
+});
+
+test("a second handover of a turn still stopping sends no second cancel, and one after it stopped goes through", async () => {
+	const both = await sides({ cutMs: 40, fake: { FAKE_ACP_STOP_MS: "300" } });
+	const from = await inTurn(both, "SPIN");
+	const { acpSessionId } = await both.entry();
+
+	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: false, refusal: "not_at_rest" });
+	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: false, refusal: "not_at_rest" });
+	expect(await both.cancelled()).toBe(`${acpSessionId}\n`);
+	await both.acp.until("idle", from);
+
+	const outcome = await both.agents.handOver("card-a");
+
+	expect(outcome).toMatchObject({ handedOver: true });
+	expect(outcome).not.toHaveProperty("cut");
+	expect(await both.cancelled()).toBe(`${acpSessionId}\n`);
+});
+
+test("a turn that ends by itself as the cancel goes out: refused, nothing cut or closed, and its end reaches whoever listens", async () => {
+	const both = await sides();
+	const heard: AgentStatusEvent[] = [];
+	const off = both.agents.onStatus((event) => heard.push(event));
+	await inTurn(both, "FINISH");
+	const [pid] = await both.pids();
+
+	const outcome = await both.agents.handOver("card-a");
+
+	expect(outcome).toMatchObject({
+		handedOver: false,
+		refusal: "not_at_rest",
+		reason: expect.stringContaining("nothing was cut"),
+	});
+	expect(outcome).not.toHaveProperty("cut");
+	expect(heard.at(-1)?.status.state).toBe("done");
+	expect(alive(pid as number)).toBe(true);
+	expect(both.windowsOpened()).toEqual([]);
+	off();
+});
+
+test("a record that fails leaves the move's answer as it was, logged: the job is on rex, and the next soma tells it", async () => {
+	const both = await sides();
+	await inTurn(both, "SPIN");
+
+	const outcome = await both.agents.handOver("card-a", () => Promise.reject(new Error("the db is away")));
+
+	expect(outcome).toMatchObject({ handedOver: true, cut: {} });
+	expect(both.said).toContain("the db is away");
+	expect((await both.entry()).handedOver).toBe(true);
+});
+
+test("what the window said while its status was being read is not overtaken by the older read", async () => {
+	let answer = () => {};
+	const answered = new Promise<void>((resolve) => {
+		answer = resolve;
+	});
+	let asked = false;
+	const both = await sides({
+		to: (port) => ({
+			...port,
+			list: async () => {
+				const listed = await port.list();
+				asked = true;
+				await answered;
+				return listed;
+			},
+		}),
+	});
+	const heard: AgentStatusEvent[] = [];
+	const off = both.agents.onStatus((event) => heard.push(event));
+	await inTurn(both, "SPIN");
+	const from = heard.length;
+
+	const moving = both.agents.handOver("card-a");
+	await until(() => asked);
+	const window = both.blocks[0] as Block;
+	window.records = [WORKING];
+	both.hangar.emit(both.hangar.status(window.block, WORKING));
+	await until(() => heard.length > from);
+	answer();
+	await moving;
+
+	expect(heard.slice(from)).toEqual([{ agent: "card-a", status: { state: "working" }, seq: seqOf(WORKING) }]);
+	off();
+});
+
+test("each listener hears a status once, what passes after a move as well", async () => {
+	const both = await sides();
+	const one: AgentStatusEvent[] = [];
+	const two: AgentStatusEvent[] = [];
+	const offOne = both.agents.onStatus((event) => one.push(event));
+	const offTwo = both.agents.onStatus((event) => two.push(event));
+	await inTurn(both, "SPIN");
+	const from = one.length;
+	expect(two).toEqual(one);
+
+	await both.agents.handOver("card-a");
+
+	expect(one.slice(from)).toMatchObject([{ agent: "card-a", status: { state: "idle" } }]);
+	expect(two).toEqual(one);
+	expect(new Set(one.map(({ seq }) => seq)).size).toBe(one.length);
+	offOne();
+	offTwo();
+});
+
+test("what a cut turn wrote reads as no reply, and the next turn's as one", async () => {
+	const both = await sides({ cutMs: 20, fake: { FAKE_ACP_STOP_MS: "80" } });
+	await inTurn(both, "SPIN");
+	await both.agents.handOver("card-a");
+	const from = both.acp.events.length;
+	await both.acp.until("idle", from);
+
+	const read = await both.agents.readResult("card-a");
+
+	expect(read?.id).toEqual(expect.any(String));
+	expect(read?.text).toBeUndefined();
+	const next = both.acp.events.length;
+	await both.agents.prompt("card-a", "again");
+	await both.acp.until("done", next);
+	expect((await both.agents.readResult("card-a"))?.text).toBe("echo: again");
+});
+
+test("a job waking is still refused, with nothing cancelled", async () => {
+	const first = await sides();
+	await first.ran();
+	await first.acp.end();
+	const both = await sides({ restartOf: first.acp.cwd, blocks: first.blocks, fake: { FAKE_ACP_LOAD_MS: "200" } });
+	const prompting = both.agents.prompt("card-a", "RECALL");
+	await sleep(50);
+
+	expect(await both.agents.handOver("card-a")).toMatchObject({
+		handedOver: false,
+		refusal: "not_at_rest",
+		reason: expect.stringContaining("waking"),
+	});
+
+	expect(await both.cancelled()).toBe("");
+	expect(both.windowsOpened()).toEqual([]);
+	await prompting;
+});
+
+test("a job being resumed is still refused, with nothing cancelled", async () => {
+	const both = await sides({ fake: { FAKE_ACP_LOAD_MS: "200" } });
+	await both.ran();
+	await both.agents.stop("card-a");
+	const resuming = both.agents.resume({ name: "card-a", card: "card-a", sessionId: SESSION });
+	await sleep(50);
+
+	expect(await both.agents.handOver("card-a")).toMatchObject({
+		handedOver: false,
+		refusal: "not_at_rest",
+		reason: expect.stringContaining("started again"),
+	});
+
+	expect(await both.cancelled()).toBe("");
+	await resuming;
+});
+
+test("a session not yet open is still refused, with nothing cancelled", async () => {
+	const both = await sides({ fake: { FAKE_ACP_NEW_MS: "300" } });
+	await both.acp.start();
+
+	expect(await both.agents.handOver("card-a")).toMatchObject({
+		handedOver: false,
+		refusal: "not_at_rest",
+		reason: expect.stringContaining("no session yet"),
+	});
+
+	expect(await both.cancelled()).toBe("");
+	expect(both.windowsOpened()).toEqual([]);
+});
+
+test("while a turn is being cut it takes no prompt or answer, and is listed with no status", async () => {
+	const both = await sides({ cutMs: 2_000, fake: { FAKE_ACP_STOP_MS: "300" } });
+	await inTurn(both, "SPIN");
+
+	const moving = both.agents.handOver("card-a");
+	while ((await both.cancelled()) === "") await sleep(5);
+
+	expect(await both.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	await expect(both.agents.prompt("card-a", "now")).rejects.toThrow("being handed over");
+	expect(await both.agents.respond("card-a", { option: "1", fingerprint: "f" })).toEqual({
+		sent: false,
+		refusal: "not_blocked",
+		reason: "card-a is being handed over",
+	});
+	expect(await moving).toMatchObject({ handedOver: true });
+});
+
+test("no status of a turn being cut, and none of a window until the caller has recorded the move, reaches the listener", async () => {
+	const both = await sides();
+	const heard: AgentStatusEvent[] = [];
+	const off = both.agents.onStatus((event) => heard.push(event));
+	await inTurn(both, "SPIN");
+	const from = heard.length;
+	let during: AgentStatusEvent[] = [];
+	const window = () => both.blocks[0] as Block;
+
+	const moved = await both.agents.handOver("card-a", async () => {
+		during = heard.slice(from);
+		window().records = [WORKING];
+		both.hangar.emit(both.hangar.status(window().block, WORKING));
+		await sleep(30);
+		during = heard.slice(from);
+	});
+
+	expect(moved).toMatchObject({ handedOver: true });
+	expect(during).toEqual([]);
+	expect(heard.slice(from)).toEqual([{ agent: "card-a", status: { state: "working" }, seq: seqOf(WORKING) }]);
+	off();
 });
 
 test("a rex that does not answer refuses the handover, with the job left running over ACP", async () => {

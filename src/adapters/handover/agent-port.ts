@@ -2,6 +2,7 @@ import { type AgentListing, type AgentPort, type AgentStatusEvent, PromptRefused
 import {
 	type AgentHandover,
 	type AnswerHeld,
+	type Cut,
 	type HandingOver,
 	type HandoverOutcome,
 	type HandoverRefusal,
@@ -45,8 +46,10 @@ type Undecided = HandingOver & { readonly why: Why };
  * is handed over, and on `to` from then on. `from` records which it gave up, so a restart routes each job as the soma
  * before it did, and nothing of a job not handed over goes to `to`: the listing asks it nothing until one has been.
  * Statuses of `to` are passed on only for jobs handed over, since its side may hold other agents of the same name. One
- * handover runs at a time. While one is under way its job is listed with no status and takes no prompt, so the core sees
- * neither a vanished agent nor the trust dialog the handover is about to answer (ARCHITECTURE.md "The ACP implementation").
+ * handover runs at a time. While one is under way its job is listed with no status, takes no prompt and reports nothing,
+ * from the cut of its turn until the caller has recorded how it ended, so the core sees neither a vanished agent, nor the
+ * end of a cut turn as a finished one, nor the trust dialog the handover is about to answer; what the job reports then is
+ * passed on once, as the observation it is (ARCHITECTURE.md "The ACP implementation").
  *
  * A handover cut short leaves `from`'s mark of one in progress, and only a look at `to` ends it: a window there, the job
  * is on `to`; `to` answers and no block of it there at or after the end of the grace period, it goes back to `from`. Until
@@ -64,8 +67,24 @@ export function createHandoverAgentPort({
 	const moved = new Map<string, HeldSession>();
 	const moving = new Map<string, HeldSession>();
 	const undecided = new Map<string, Undecided>();
+	// Jobs a look put on rex whose landing the listeners have not answered yet: what their window says waits for that.
+	const unrecorded = new Set<string>();
 	// Why each job was last told undecided: once per reason, however many looks find it the same.
 	const told = new Map<string, Why>();
+	const statusListeners = new Set<(event: AgentStatusEvent) => void>();
+	// The jobs a status of went out since `passOn` began.
+	const heard = new Set<string>();
+	/**
+	 * What the job reports now goes out, as nothing did while it was held, unless something newer already has. A side that
+	 * has nothing to say, or does not answer, says nothing; the core reads a seq it holds as the observation it recorded.
+	 */
+	async function passOn(agent: string): Promise<void> {
+		heard.delete(agent);
+		const listed = await (moved.has(agent) ? to : from).list().catch(() => []);
+		const { status, seq } = listed.find(({ name }) => name === agent) ?? {};
+		if (status === undefined || seq === undefined || heard.has(agent)) return;
+		for (const listener of statusListeners) listener({ agent, status, seq });
+	}
 
 	const hangarOf = ({ hangar }: HandingOver) => hangar ?? to.hangar;
 	// A mark that records no time is from before they did, and older than any grace period.
@@ -102,6 +121,7 @@ export function createHandoverAgentPort({
 		told.delete(name);
 		if (there === "window") {
 			moved.set(name, session);
+			unrecorded.add(name);
 			undecided.delete(name);
 			await from.confirm(name);
 			onError(new Error(`${name} was left mid-handover and its window is open: it is on rex`));
@@ -136,11 +156,20 @@ export function createHandoverAgentPort({
 		if (released !== undefined && (await to.holds(released, to.hangar)) !== "window") {
 			return { agent, onto: "gone", sessionId };
 		}
-		return { agent, onto: "rex", sessionId, window: agent, session: await to.label().catch(() => to.hangar) };
+		const last = await to.readResult(agent).catch(() => undefined);
+		return {
+			agent,
+			onto: "rex",
+			sessionId,
+			window: agent,
+			session: await to.label().catch(() => to.hangar),
+			...(last === undefined ? {} : { lastRecord: last.id }),
+		};
 	}
 	async function deliver(telling: Telling): Promise<void> {
 		const settled = await settledOf(telling);
 		await Promise.all([...listeners].map((listener) => listener(settled)));
+		if (unrecorded.delete(telling.agent)) await passOn(telling.agent);
 	}
 	function tell(telling: Telling): void {
 		if (listeners.size === 0 || !started) unheard.push(telling);
@@ -189,7 +218,7 @@ export function createHandoverAgentPort({
 		await loading;
 		return moved.has(agent) ? to : from;
 	};
-	const refused = (refusal: HandoverRefusal, reason: string): HandoverOutcome => ({
+	const refused = (refusal: HandoverRefusal, reason: string): Extract<HandoverOutcome, { handedOver: false }> => ({
 		handedOver: false,
 		refusal,
 		reason,
@@ -201,11 +230,13 @@ export function createHandoverAgentPort({
 			? `${agent} is being handed over`
 			: `${agent} is being handed over, and ${whyUndecided(job)}`;
 	};
-	const backOnAcp = (error: Error) =>
-		refused(
+	const backOnAcp = (error: Error, at: number): HandoverOutcome => ({
+		...refused(
 			"cannot_resume",
 			`${error.message}. Its ACP process has ended and the job stays on ACP: its next prompt starts it again in its session`,
-		);
+		),
+		back: at,
+	});
 
 	async function landed(agent: string, session: HeldSession, taken: Taken): Promise<HandoverOutcome> {
 		moved.set(agent, session);
@@ -223,7 +254,7 @@ export function createHandoverAgentPort({
 		const plain = error instanceof TakeRefused;
 		if (there === "none" && plain) {
 			await from.reinstate(agent);
-			return backOnAcp(error);
+			return backOnAcp(error, session.at ?? 0);
 		}
 		let job = session;
 		if (!plain) {
@@ -249,7 +280,31 @@ export function createHandoverAgentPort({
 		);
 	}
 
-	async function handOver(agent: string): Promise<HandoverOutcome> {
+	/** The move itself, with the job held. What was cut is cut whatever comes of the rest. */
+	async function move(agent: string, held: HeldSession): Promise<HandoverOutcome> {
+		const cutting = await from.cut(agent);
+		if (cutting !== undefined && "refusal" in cutting) return refused(cutting.refusal, cutting.reason);
+		const cut: { cut?: Cut } = cutting === undefined ? {} : { cut: cutting };
+		const mark = { hangar: to.hangar, at: now() };
+		try {
+			const released = await from.release(agent, mark);
+			if ("refusal" in released) return { ...refused(released.refusal, released.reason), ...cut };
+		} catch (error) {
+			await from.reinstate(agent);
+			return { ...backOnAcp(error as Error, mark.at), ...cut };
+		}
+		const taken = await to.take(held).catch((error: Error) => error);
+		const outcome =
+			taken instanceof Error
+				? await afterFailedTake(agent, { ...held, ...mark }, taken)
+				: await landed(agent, held, taken);
+		return { ...outcome, ...cut };
+	}
+
+	async function handOver(
+		agent: string,
+		record?: (outcome: HandoverOutcome) => Promise<void>,
+	): Promise<HandoverOutcome> {
 		await loading;
 		if (undecided.has(agent)) await look();
 		if (moved.has(agent)) return refused("not_acp", `${agent} is on rex already, in its window of the same name`);
@@ -259,20 +314,14 @@ export function createHandoverAgentPort({
 		const unfit = await to.takeable(held).catch((error: Error) => error.message);
 		if (unfit !== undefined) return refused("cannot_resume", unfit);
 		moving.set(agent, held);
-		const mark = { hangar: to.hangar, at: now() };
 		try {
-			try {
-				const released = await from.release(agent, mark);
-				if ("refusal" in released) return refused(released.refusal, released.reason);
-			} catch (error) {
-				await from.reinstate(agent);
-				return backOnAcp(error as Error);
-			}
-			const taken = await to.take(held).catch((error: Error) => error);
-			if (taken instanceof Error) return await afterFailedTake(agent, { ...held, ...mark }, taken);
-			return await landed(agent, held, taken);
+			const outcome = await move(agent, held);
+			const toKeep = outcome.handedOver || outcome.cut !== undefined || outcome.back !== undefined;
+			if (toKeep) await record?.(outcome).catch(onError);
+			return outcome;
 		} finally {
 			moving.delete(agent);
+			await passOn(agent);
 		}
 	}
 
@@ -295,8 +344,8 @@ export function createHandoverAgentPort({
 			await flushed;
 		},
 
-		handOver(agent: string): Promise<HandoverOutcome> {
-			const run = queue.then(() => handOver(agent));
+		handOver(agent, record) {
+			const run = queue.then(() => handOver(agent, record));
 			queue = run.catch(() => {});
 			return run;
 		},
@@ -322,7 +371,9 @@ export function createHandoverAgentPort({
 			// Taken before the sides are asked: a move that ends while they answer is in neither answer, and a job missing
 			// from a listing reads as gone.
 			const moves = [...moving.values(), ...undecided.values()];
-			const [here, there] = await Promise.all([from.list(), moved.size === 0 ? [] : to.list()]);
+			const [all, there] = await Promise.all([from.list(), moved.size === 0 ? [] : to.list()]);
+			// One whose turn is being cut is still in `from`'s answer.
+			const here = all.filter((agent) => !moving.has(agent.name));
 			const onRex = there.filter((agent) => moved.has(agent.name));
 			const named = new Set([...here, ...onRex].map((agent) => agent.name));
 			return [
@@ -342,11 +393,19 @@ export function createHandoverAgentPort({
 		},
 
 		onStatus(listener: (event: AgentStatusEvent) => void): () => void {
-			const offFrom = from.onStatus(listener);
+			statusListeners.add(listener);
+			const pass = (event: AgentStatusEvent) => {
+				heard.add(event.agent);
+				listener(event);
+			};
+			const offFrom = from.onStatus((event) => {
+				if (!moving.has(event.agent)) pass(event);
+			});
 			const offTo = to.onStatus((event) => {
-				if (moved.has(event.agent)) listener(event);
+				if (moved.has(event.agent) && !moving.has(event.agent) && !unrecorded.has(event.agent)) pass(event);
 			});
 			return () => {
+				statusListeners.delete(listener);
 				offFrom();
 				offTo();
 			};

@@ -237,6 +237,27 @@ test("a new_window that fails leaving a block in no window: undecided, with no a
 	expect((await both.entry()).handedOver).toBe(true);
 });
 
+test("a new_window rex plainly refuses that leaves a block in no window: undecided, never given back, or two would write", async () => {
+	const both = await sides({ opened: { detached: true } });
+	await both.ran();
+	const pids = await both.pids();
+	aroundWindow(both, async (open) => {
+		await open();
+		throw new RexRpcError("session.new_window", "refused", "no window for you", 400);
+	});
+
+	const outcome = await both.agents.handOver("card-a");
+
+	expect(outcome).toMatchObject({
+		handedOver: false,
+		refusal: "cannot_resume",
+		reason: expect.stringContaining("in no window a listing reads"),
+	});
+	expect((outcome as { reason: string }).reason).not.toContain("stays on ACP");
+	expect(await both.agents.dormant()).toEqual([]);
+	await heldOff(both, pids);
+});
+
 test("a window of the job's name with another label is not its window: the job goes back to ACP", async () => {
 	const first = await died("before");
 	first.blocks.push({ name: "card-a", block: "block:namesake", label: "another", argv0: "claude", records: [] });

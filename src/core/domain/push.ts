@@ -136,8 +136,10 @@ export type HeldPush = Omit<PendingPush, "class"> & {
 };
 
 /**
- * A summary is due once something is held and `idleMs` passed since the later of the human's last input on any
- * interface and the last summary attempt, sent or failed (`tried`): at most one summary every `idleMs`.
+ * A summary is due once something is held and `idleMs` passed since the latest of the oldest held push, the human's
+ * last input on any interface and the last summary attempt, sent or failed (`tried`): at most one summary every
+ * `idleMs`. The oldest push counts so that pushes close together, after a long time away, go into one summary instead
+ * of each being summarized alone (card summary-waits-for-oldest-held).
  */
 export const summaryDue = (
 	held: readonly HeldPush[],
@@ -147,7 +149,9 @@ export const summaryDue = (
 	idleMs: number,
 ): boolean =>
 	held.length > 0 &&
-	[...Object.values(presence), ...(tried === undefined ? [] : [tried])].every((at) => now - at >= idleMs);
+	[Math.min(...held.map((push) => push.at)), ...Object.values(presence), ...(tried === undefined ? [] : [tried])].every(
+		(at) => now - at >= idleMs,
+	);
 
 /** A summary rings unless one already rang since the human last typed: at most once per idle stretch. */
 export const summaryRings = (presence: Presence, rang: number | undefined): boolean =>

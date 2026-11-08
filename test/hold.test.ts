@@ -324,6 +324,28 @@ describe("summary", () => {
 		for (const content of ["card b 完成", "card c 失敗", "記下了"]) expect(prompt).toContain(content);
 	});
 
+	test("after a long time away, pushes held minutes apart wait for the oldest and go into one summary", async () => {
+		const port = await holdingPort();
+		const { advance, held, prompts, settle } = port;
+		const { human, seen } = await port.open();
+		advance(60 * MIN);
+		await settle();
+		await human.notify("card f 失敗", "report", "outcome");
+		await vi.waitFor(async () => expect(await held()).toHaveLength(1));
+		advance(10 * MIN);
+		await settle();
+		expect(summariesOf(seen)).toHaveLength(0);
+		await human.notify("card g 失敗", "report", "outcome");
+		await vi.waitFor(async () => expect(await held()).toHaveLength(2));
+		advance(19 * MIN);
+		await settle();
+		expect(summariesOf(seen)).toHaveLength(0);
+		advance(MIN);
+		await vi.waitFor(() => expect(summariesOf(seen)).toHaveLength(1));
+		const prompt = prompts.find((each) => each.startsWith("[summary]")) ?? "";
+		for (const content of ["card f 失敗", "card g 失敗"]) expect(prompt).toContain(content);
+	});
+
 	test("input on any interface restarts the wait; a button press does not count", async () => {
 		const port = await holdingPort();
 		const { root, advance, notices, settle } = port;
@@ -344,18 +366,20 @@ describe("summary", () => {
 
 	test("a summary rings once per idle stretch: the next one in the same stretch is silent, and rings after input", async () => {
 		const port = await holdingPort();
-		const { root, advance, settle } = port;
+		const { root, advance, held, settle } = port;
 		const { human, seen } = await heldFour(port);
 		advance(30 * MIN);
 		await vi.waitFor(() => expect(summariesOf(seen)).toHaveLength(1));
 
 		await human.notify("card d 完成", "report", "outcome");
+		await vi.waitFor(async () => expect(await held()).toHaveLength(1));
 		advance(30 * MIN);
 		await vi.waitFor(() => expect(summariesOf(seen)).toHaveLength(2));
 		advance(MIN);
 		await human.submit({ content: "回來了", entry: { kind: TERMINAL }, requestId: "terminal:9" });
 		await root.waitForIdle(context);
 		await human.notify("card e 完成", "report", "outcome");
+		await vi.waitFor(async () => expect(await held()).toHaveLength(1));
 		advance(29 * MIN);
 		await settle();
 		expect(summariesOf(seen)).toHaveLength(2);

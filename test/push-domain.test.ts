@@ -181,8 +181,19 @@ test("a summary is due once something is held and nobody typed anywhere for the 
 	expect(summaryDue([], presence, undefined, 90 * MIN, 30 * MIN)).toBe(false);
 	// Input restarts the wait.
 	expect(summaryDue([held], { ...presence, [TELEGRAM]: 35 * MIN }, undefined, 40 * MIN, 30 * MIN)).toBe(false);
-	// Nobody ever typed and nothing was tried: idle already.
-	expect(summaryDue([held], {}, undefined, 0, 30 * MIN)).toBe(true);
+	// Nobody ever typed and nothing was tried: the push alone sets the wait.
+	expect(summaryDue([held], {}, undefined, 29 * MIN, 30 * MIN)).toBe(false);
+	expect(summaryDue([held], {}, undefined, 30 * MIN, 30 * MIN)).toBe(true);
+});
+
+test("a summary waits until the oldest held push is idle-time old, however long the human has been away", () => {
+	const presence = { [TERMINAL]: 0 };
+	const fresh = { ...held, key: "notice:4", at: 100 * MIN };
+	const later = { ...held, key: "notice:5", at: 110 * MIN };
+	expect(summaryDue([fresh], presence, undefined, 101 * MIN, 30 * MIN)).toBe(false);
+	expect(summaryDue([fresh, later], presence, undefined, 129 * MIN, 30 * MIN)).toBe(false);
+	// The oldest sets the wait, so the later push goes into the same summary.
+	expect(summaryDue([later, fresh], presence, undefined, 130 * MIN, 30 * MIN)).toBe(true);
 });
 
 test("a summary attempt, sent or failed, restarts the wait as input does", () => {

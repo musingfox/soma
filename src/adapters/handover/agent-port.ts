@@ -68,8 +68,8 @@ export function createHandoverAgentPort({
 	const moving = new Map<string, HeldSession>();
 	const undecided = new Map<string, Undecided>();
 	// Jobs on rex whose landing the listeners have not answered yet, or whose answer failed: what their window says waits
-	// for that, and in a soma where it failed, for the next soma to say it again.
-	const unrecorded = new Set<string>();
+	// for that, and where it failed, is what tries it again.
+	const unrecorded = new Map<string, Unrecorded>();
 	// Why each job was last told undecided: once per reason, however many looks find it the same.
 	const told = new Map<string, Why>();
 	const statusListeners = new Set<(event: AgentStatusEvent) => void>();
@@ -125,7 +125,7 @@ export function createHandoverAgentPort({
 		told.delete(name);
 		if (there === "window") {
 			moved.set(name, session);
-			unrecorded.add(name);
+			unrecorded.set(name, { said: [] });
 			undecided.delete(name);
 			await from.confirm(name);
 			onError(new Error(`${name} was left mid-handover and its window is open: it is on rex`));
@@ -152,9 +152,14 @@ export function createHandoverAgentPort({
 				readonly released?: HeldSession;
 				readonly answered?: true;
 		  };
+	/**
+	 * What the window of a job not recorded has said, in order, and the telling of it that failed, if one has. `listed` is
+	 * the status a listing withheld of it. `answered`: rex answered that telling and a listener failed.
+	 */
+	type Unrecorded = { readonly said: AgentStatusEvent[]; again?: Telling; listed?: number; answered?: boolean };
 	const listeners = new Set<(settled: Settled) => void | Promise<void>>();
 	const unheard: Telling[] = [];
-	/** Throws when rex cannot say whether a released job's window is there: the job is then told by the next soma. */
+	/** Throws when rex cannot say whether a released job's window is there: the job's next status tries it again. */
 	async function settledOf(telling: Telling): Promise<Settled> {
 		if (telling.onto === "acp") return telling;
 		const { agent, sessionId, released, answered } = telling;
@@ -173,18 +178,39 @@ export function createHandoverAgentPort({
 		};
 	}
 	async function deliver(telling: Telling): Promise<void> {
+		let answered = false;
 		try {
 			const settled = await settledOf(telling);
+			answered = true;
 			await Promise.all([...listeners].map((listener) => listener(settled)));
 		} catch (error) {
-			if (telling.onto === "rex") unrecorded.add(telling.agent);
+			if (telling.onto === "rex") {
+				unrecorded.set(telling.agent, { said: [], ...unrecorded.get(telling.agent), again: telling, answered });
+			}
 			throw error;
 		}
-		if (unrecorded.delete(telling.agent)) await passOn(telling.agent);
+		const held = unrecorded.get(telling.agent);
+		if (held === undefined) return;
+		unrecorded.delete(telling.agent);
+		if (held.said.length === 0) return passOn(telling.agent);
+		for (const event of held.said) for (const listener of statusListeners) listener(event);
 	}
 	function tell(telling: Telling): void {
 		if (listeners.size === 0 || !started) unheard.push(telling);
 		else void deliver(telling).catch(onError);
+	}
+	/**
+	 * The status waits for the telling, and is what tries one that failed again: one try per status, none while one is
+	 * under way. Any status says rex answers now. After a listener's failure only a new one tries: the status watch's first
+	 * look repeats what the startup's listing withheld, and that soma's reconcile holds to the job as it reads.
+	 */
+	function waits(event: AgentStatusEvent, job: Unrecorded): void {
+		// Each listener hears the same event from `to`.
+		if (job.said.at(-1)?.seq !== event.seq) job.said.push(event);
+		const { again } = job;
+		if (again === undefined || (job.answered && event.seq === job.listed)) return;
+		job.again = undefined;
+		tell(again);
 	}
 
 	let looking: Promise<unknown> | undefined;
@@ -332,7 +358,7 @@ export function createHandoverAgentPort({
 				await record?.(outcome).catch((error: Error) => {
 					onError(error);
 					if (!outcome.handedOver) return;
-					unrecorded.add(agent);
+					unrecorded.set(agent, { said: [] });
 					tell({ agent, onto: "rex", sessionId: outcome.sessionId, answered: true });
 				});
 			}
@@ -395,11 +421,11 @@ export function createHandoverAgentPort({
 			// A status of a job whose landing is not recorded would read as the end of a turn on it as it was recorded before.
 			const onRex = there
 				.filter((agent) => moved.has(agent.name))
-				.map(({ status, seq, ...agent }) =>
-					(listeners.size > 0 && unrecorded.has(agent.name)) || status === undefined
-						? agent
-						: { ...agent, status, seq },
-				);
+				.map(({ status, seq, ...agent }) => {
+					const held = listeners.size > 0 ? unrecorded.get(agent.name) : undefined;
+					if (held !== undefined) held.listed = seq;
+					return held !== undefined || status === undefined ? agent : { ...agent, status, seq };
+				});
 			const named = new Set([...here, ...onRex].map((agent) => agent.name));
 			return [
 				...here,
@@ -427,7 +453,10 @@ export function createHandoverAgentPort({
 				if (!moving.has(event.agent)) pass(event);
 			});
 			const offTo = to.onStatus((event) => {
-				if (moved.has(event.agent) && !moving.has(event.agent) && !unrecorded.has(event.agent)) pass(event);
+				if (!moved.has(event.agent) || moving.has(event.agent)) return;
+				const held = unrecorded.get(event.agent);
+				if (held === undefined) pass(event);
+				else waits(event, held);
 			});
 			return () => {
 				statusListeners.delete(listener);

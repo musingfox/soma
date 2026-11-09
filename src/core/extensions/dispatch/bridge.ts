@@ -189,7 +189,7 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
  * in the commit of the notice: unfinished at a startup, by the restart's notice, which never names a done one. A
  * job whose window closed before its move was recorded takes the session too, with no claim of a window: one the
  * reconcile will report gone is told by that, and a done one, which it leaves alone, is told here. A commit that fails
- * fails the listener, so the agent side holds what that job's window says until a later soma's commit.
+ * fails the listener, so the agent side holds what that job's window says until a later commit, which its next status tries.
  */
 export function handoverBridge(conversation: Conversation, settling: HandoverSettling, context: Context) {
 	async function apply(settled: Settled): Promise<void> {

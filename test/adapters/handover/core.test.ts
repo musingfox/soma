@@ -703,8 +703,8 @@ test("a record that fails: the job takes the window's session and is told once, 
 	next.off();
 });
 
-test("a record that fails, and so does the commit after it: what the window says records nothing, and the next soma tells it once", async () => {
-	const soma = await core({ settledOn: commitsFail({ left: 1 }) });
+test("a record that fails, and so do the commits after it: what the window says records nothing, and the next soma tells it once", async () => {
+	const soma = await core({ settledOn: commitsFail({ left: 2 }) });
 	const { turns, before } = await busy(soma, "SPIN");
 	const { acpSessionId } = await soma.entry();
 
@@ -758,6 +758,276 @@ test.each([
 		next.off();
 	},
 );
+
+/** Rex's next `times` answers to whether a released job's window is there are a rejection. `calls` counts them all. */
+const holdsFail =
+	(times: { left: number; calls?: number }, gate?: { shut?: Promise<void>; waiting?: boolean }) =>
+	(port: ReturnType<typeof createRexAgentPort>) => ({
+		...port,
+		holds: async (...args: Parameters<typeof port.holds>) => {
+			times.calls = (times.calls ?? 0) + 1;
+			if (gate?.shut !== undefined) {
+				gate.waiting = true;
+				await gate.shut;
+			}
+			if (times.left === 0) return port.holds(...args);
+			times.left--;
+			throw new Error("rex hiccup");
+		},
+	});
+
+// Ahead of the clock by a little more each time, so no two reports in one millisecond share a seq.
+let reported = 0;
+
+/** The window reports `state` under a seq of its own, and that seq. */
+function reports(soma: Soma, state: "working" | "blocked" | "idle") {
+	const window = soma.blocks.at(-1) as Block;
+	const at = new Date(Date.now() + ++reported).toISOString().replace("Z", "000+00:00");
+	const record = { state, updated_at: at };
+	window.records = [record];
+	soma.hangar.emit(soma.hangar.status(window.block, record));
+	return seqOf(record) as number;
+}
+
+/** The job has taken the status of this seq: a window that settles may report the same record again above it. */
+const reached = (soma: Soma, seq: number) =>
+	soma.until(async () => ((await soma.job())?.seq ?? 0) >= seq, "the job to take the status");
+
+const hiccups = (soma: Soma) => soma.said.filter((said) => said === "rex hiccup").length;
+
+/**
+ * A soma restarted on card-a, moved and recorded by the one before, with its next `times` looks at rex failing: past that
+ * of its startup and that of its status watch's first look, as both have failed.
+ */
+async function restartedHeld(times: { left: number; calls?: number }, gate?: { shut?: Promise<void> }) {
+	const first = await core();
+	await dispatched(first);
+	await first.say("看 card-a");
+	const failing = times.left;
+	const soma = await again(first, { to: holdsFail(times, gate) });
+	await soma.until(() => hiccups(soma) === Math.min(failing, 2), "the failed looks");
+	return soma;
+}
+
+test.each([
+	["its status watch's first look", 1],
+	["the turn's first status", 2],
+])(
+	"a look that fails at startup on a job moved earlier is tried again by %s, and the job is heard again",
+	async (_name, left) => {
+		const soma = await restartedHeld({ left });
+		const { resultId } = (await soma.job()) as { resultId: string };
+		const notices = await soma.notices();
+		const turns = (await soma.turns()).length;
+
+		await soma.say("回覆 card-a go on");
+		await turn(soma, "結果：需要你\nwhich one do you want");
+
+		await soma.until(async () => (await soma.job())?.outcome === "需要你", "the window's turn");
+		expect((await soma.turns()).slice(turns)).toMatchObject([{ outcome: "需要你", notified: true }]);
+		expect((await soma.notices()).slice(notices.length)).toEqual([expect.stringContaining("which one do you want")]);
+		expect((await soma.job())?.resultId).not.toBe(resultId);
+
+		const seq = reports(soma, "blocked");
+		await soma.until(async () => (await soma.wakes()) === 1, "the wake");
+		await soma.until(async () => (await soma.job())?.seq === seq, "the block");
+		expect((await soma.job())?.status.state).toBe("blocked");
+		expect((await soma.agents.list())[0]).toMatchObject({ status: { state: "blocked" }, seq });
+		expect(await soma.wakes()).toBe(1);
+		soma.off();
+	},
+);
+
+test("a job blocked as soma restarts, its look failing: the status watch's first look tries again, and the block wakes once", async () => {
+	const times = { left: 0 };
+	const first = await core();
+	await dispatched(first);
+	await first.say("看 card-a");
+	const window = first.blocks.at(-1) as Block;
+	window.records = [{ state: "blocked", kind: "permission", updated_at: "2026-10-27T01:02:05.000000+08:00" }];
+	window.screen = fixture("claude-bash-prompt-2.1.302.txt");
+	times.left = 1;
+
+	const soma = await again(first, { to: holdsFail(times) });
+
+	await soma.until(async () => (await soma.wakes()) === 1, "the wake");
+	expect(times.left).toBe(0);
+	expect((await soma.job())?.status.state).toBe("blocked");
+	await sleep(50);
+	expect(await soma.wakes()).toBe(1);
+	soma.off();
+});
+
+test("a retry tells a job recorded long since nothing more, and moves nothing it holds", async () => {
+	const times = { left: 2 };
+	const soma = await restartedHeld(times);
+	const before = await soma.job();
+	const notices = await soma.notices();
+	expect(counted(notices, onRex)).toBe(1);
+	const turns = await soma.turns();
+	expect((await soma.agents.list())[0]?.status).toBeUndefined();
+
+	const seq = reports(soma, "idle");
+
+	await reached(soma, seq);
+	expect(times.left).toBe(0);
+	expect(await soma.notices()).toEqual(notices);
+	expect(await soma.turns()).toEqual(turns);
+	expect(await soma.job()).toEqual({ ...before, status: { state: "idle" }, seq: expect.any(Number) });
+	expect((await soma.agents.list())[0]).toMatchObject({ status: { state: "idle" }, seq: expect.any(Number) });
+	soma.off();
+});
+
+test("a status that arrives as the retry fails stays for the next try, with no try of its own until then", async () => {
+	const times: { left: number; calls?: number } = { left: 3 };
+	const soma = await restartedHeld(times);
+
+	const blocked = reports(soma, "blocked");
+	await soma.until(() => hiccups(soma) === 3, "the retry to fail");
+	const tried = times.calls as number;
+	await sleep(100);
+	expect(await soma.wakes()).toBe(0);
+	expect((await soma.job())?.seq).not.toBe(blocked);
+	expect((await soma.job())?.status.state).toBe("idle");
+	expect((await soma.agents.list())[0]?.status).toBeUndefined();
+	expect(times.calls).toBe(tried);
+	expect(hiccups(soma)).toBe(3);
+
+	const idle = reports(soma, "idle");
+
+	await soma.until(async () => (await soma.wakes()) === 1, "the status kept to reach the bridge");
+	await reached(soma, idle);
+	expect(times.calls).toBe(tried + 1);
+	expect((await soma.job())?.status.state).toBe("idle");
+	expect((await soma.agents.list())[0]).toMatchObject({ status: { state: "idle" }, seq: expect.any(Number) });
+	soma.off();
+});
+
+test("statuses that arrive with a retry under way try nothing more, and all reach the bridge once, in order, as it lands", async () => {
+	const times: { left: number; calls?: number } = { left: 2 };
+	const gate: { shut?: Promise<void>; waiting?: boolean } = {};
+	const soma = await restartedHeld(times, gate);
+	const open = shut(gate);
+	const heard: number[] = [];
+	const off = soma.agents.onStatus(({ seq }) => void heard.push(seq));
+	const tried = times.calls as number;
+
+	const working = reports(soma, "working");
+	await soma.until(() => gate.waiting === true, "the retry to look at rex");
+	const blocked = reports(soma, "blocked");
+	const idle = reports(soma, "idle");
+	expect(heard).toEqual([]);
+
+	open();
+
+	await reached(soma, idle);
+	expect(times.calls).toBe(tried + 1);
+	// Past what its first look said, and any report the window settles with.
+	expect(heard.filter((seq) => [working, blocked, idle].includes(seq))).toEqual([working, blocked, idle]);
+	expect(await soma.wakes()).toBe(1);
+	off();
+	soma.off();
+});
+
+test("a record that fails with the window at work and silent: what it reports now goes out once, as the landing is recorded", async () => {
+	const working = { state: "working", updated_at: "2026-10-27T01:02:05.000000+08:00" };
+	const soma = await core({ opened: { records: [working] } });
+	await busy(soma, "SPIN");
+
+	await soma.agents.handOver("card-a", () => Promise.reject(new Error("the db is away")));
+
+	await soma.until(async () => (await soma.job())?.seq === seqOf(working), "the window's state");
+	expect((await soma.job())?.status.state).toBe("working");
+	expect(counted(await soma.notices(), onRex)).toBe(1);
+	soma.off();
+});
+
+test("a job not recorded whose look fails takes no status until the retry lands its commit, and is told once", async () => {
+	const first = await core();
+	const { turns } = await busy(first, "SPIN");
+	const { acpSessionId } = await first.entry();
+	first.off();
+	await first.agents.handOver("card-a");
+	expect((await first.entry()).handedOver).toBe(true);
+
+	const soma = await again(first, { to: holdsFail({ left: 2 }) });
+
+	await soma.until(() => hiccups(soma) === 2, "the failed looks");
+	expect(await soma.notices()).toEqual([]);
+	expect((await soma.job())?.status.state).toBe("working");
+	expect((await soma.job())?.sessionId).not.toBe(acpSessionId);
+	expect((await soma.agents.list())[0]?.status).toBeUndefined();
+
+	const idle = reports(soma, "idle");
+
+	await toldOnRexOnce(soma, acpSessionId);
+	await reached(soma, idle);
+	expect(await soma.notices()).toHaveLength(1);
+	expect(await soma.turns()).toEqual(turns);
+
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), onRex)).toBe(1);
+	next.off();
+});
+
+test("a job not recorded whose commit fails is tried by no status the listing read, by each new one, and told once", async () => {
+	const first = await core();
+	const { turns } = await busy(first, "SPIN");
+	const { acpSessionId } = await first.entry();
+	hangsAfterWindow(first);
+	void first.agents.handOver("card-a");
+	await first.until(() => first.blocks.length === 1, "the window");
+	await sleep(50);
+
+	const commits = { left: 2 };
+	const soma = await again(first, { settledOn: commitsFail(commits) });
+
+	await soma.until(() => commits.left === 1, "the first telling to fail");
+	await sleep(100);
+	expect(commits.left).toBe(1);
+	const blocked = reports(soma, "blocked");
+	await soma.until(() => commits.left === 0, "the retry to fail");
+	await sleep(100);
+	expect(await soma.notices()).toEqual([]);
+	expect(await soma.wakes()).toBe(0);
+	expect((await soma.job())?.status.state).toBe("working");
+	expect((await soma.job())?.sessionId).not.toBe(acpSessionId);
+	expect((await soma.job())?.seq).not.toBe(blocked);
+	expect((await soma.agents.list())[0]?.status).toBeUndefined();
+
+	const idle = reports(soma, "idle");
+
+	await toldOnRexOnce(soma, acpSessionId);
+	await reached(soma, idle);
+	expect(await soma.wakes()).toBe(1);
+	expect(await soma.notices()).toHaveLength(1);
+	expect(await soma.turns()).toEqual(turns);
+
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), onRex)).toBe(1);
+	next.off();
+});
+
+test("a record that fails, and the commit after it: the window's next status lands it, told once, with no turn of the cut", async () => {
+	const soma = await core({ settledOn: commitsFail({ left: 1 }) });
+	const { turns, before } = await busy(soma, "SPIN");
+	const { acpSessionId } = await soma.entry();
+
+	await soma.agents.handOver("card-a", () => Promise.reject(new Error("the db is away")));
+	await soma.until(() => soma.said.length > 1, "the commit to fail");
+	expect(await soma.notices()).toEqual([]);
+
+	const idle = reports(soma, "idle");
+
+	await toldOnRexOnce(soma, acpSessionId);
+	await reached(soma, idle);
+	expect(await soma.notices()).toHaveLength(1);
+	expect(await soma.turns()).toEqual(turns);
+	expect((await soma.job())?.outcome).toBe(before?.outcome);
+	soma.off();
+});
 
 /** Reads of the transcript through the ACP side wait while `gate.shut` holds one: a slow read of a turn just ended. */
 function slowReads(gate: { shut?: Promise<void>; waiting?: boolean }) {

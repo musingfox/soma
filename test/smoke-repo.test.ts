@@ -1,8 +1,10 @@
+import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { fixedSmokeRepo } from "../smoke/smoke-repo.ts";
+import { branchWithSettings, fixedSmokeRepo } from "../smoke/smoke-repo.ts";
+import { openWorktree, runGit } from "../src/agent-cli/worktree.ts";
 
 let home: string;
 let repo: string;
@@ -57,4 +59,38 @@ test("a repo whose entry says false is untrusted", async () => {
 test("no ~/.claude.json at all is untrusted", async () => {
 	await makeRepo();
 	await expect(fixedSmokeRepo(home)).rejects.toThrow(/does not trust/);
+});
+
+test("a card's settings reach its worktree alone, and leave the repo's main and checkout as they were", async () => {
+	const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+	await mkdir(repo, { recursive: true });
+	git("init", "-q", "-b", "main");
+	await writeFile(join(repo, "README.md"), "kept\n");
+	git("add", "README.md");
+	git(
+		"-c",
+		"user.name=t",
+		"-c",
+		"user.email=t@example.com",
+		"-c",
+		"commit.gpgsign=false",
+		"commit",
+		"-q",
+		"--no-verify",
+		"-m",
+		"chore: init",
+	);
+	const main = git("rev-parse", "main");
+
+	branchWithSettings(repo, "card-a", { permissions: { defaultMode: "default" } }, home);
+
+	const worktree = await openWorktree(runGit, repo, "card-a");
+	const show = (name: string) => execFileSync("git", ["-C", worktree, "show", `HEAD:${name}`], { encoding: "utf8" });
+	expect(JSON.parse(show(".claude/settings.json"))).toEqual({ permissions: { defaultMode: "default" } });
+	expect(show("README.md")).toBe("kept\n");
+	expect(git("rev-parse", "fleet/card-a^")).toBe(main);
+	expect(git("rev-parse", "main")).toBe(main);
+	expect(git("symbolic-ref", "HEAD")).toBe("refs/heads/main");
+	expect(git("diff", "--cached", "--name-only")).toBe("");
+	expect(git("ls-files")).toBe("README.md");
 });

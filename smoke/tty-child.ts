@@ -3,8 +3,10 @@
 // this machine), and a stub card whose Bash command stops at a permission prompt. Talks to the Bot API at
 // $TELEGRAM_API_BASE.
 //   node smoke/tty-child.ts <db> <file each card's agent creates>
-// A report line each second carries this process's model calls, the jobs, the notices and the finished turns.
+// A report line each second carries this process's model calls, the jobs, the notices, the finished turns and each
+// running agent's screen. Its claude runs with $CLAUDE_CONFIG_DIR, where its transcripts go too.
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -22,6 +24,8 @@ import { NOTICE } from "../src/core/notice.ts";
 const context = BACKGROUND_CONTEXT;
 const [db, canary] = process.argv.slice(2);
 if (db === undefined || canary === undefined) throw new Error("usage: tty-child.ts <db> <canary file>");
+const config = process.env.CLAUDE_CONFIG_DIR;
+if (config === undefined) throw new Error("CLAUDE_CONFIG_DIR must be set");
 const { telegram } = resolveConfig(undefined, process.env, homedir());
 if (telegram === undefined) throw new Error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set");
 const emit = (record: object) => console.log(JSON.stringify(record));
@@ -55,6 +59,7 @@ const stubCard = async (_repo: string, card: string) =>
 const agents = createTtyAgentPort({
 	spawn: spawnPty,
 	env: process.env,
+	projectsDir: join(config, "projects"),
 	onError: (error) => emit({ event: "tty_error", error: error.message }),
 });
 const harness = await openHarness(db, [dispatchExtension(agents, stubCard)], context, { models });
@@ -69,6 +74,10 @@ emit({ event: "started", pid: process.pid });
 
 for (;;) {
 	const entries = (await root.entries({}, 1000, undefined, context)).items;
+	const listed = await agents.list();
+	const screens = await Promise.all(
+		listed.map(async ({ name }) => [name, await agents.readScreen(name).catch(() => "")] as const),
+	);
 	emit({
 		event: "report",
 		calls: faux.state.callCount,
@@ -80,6 +89,7 @@ for (;;) {
 		})),
 		notices: entries.filter((entry) => entry.kind === NOTICE).map((entry) => entry.data),
 		done: entries.filter((entry) => entry.kind === JOB_DONE).map((entry) => entry.data),
+		screens: Object.fromEntries(screens),
 	});
 	await new Promise((resolve) => setTimeout(resolve, 1_000));
 }

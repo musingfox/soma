@@ -639,6 +639,134 @@ test.each([
 	},
 );
 
+/** A turn of the window, typed by the human or replied by the model, that states 需要你: recorded with its notice. */
+async function needsYou(soma: Soma, turns: number, notices: number) {
+	await soma.say("回覆 card-a go on");
+	await turn(soma, "結果：需要你\nwhich one do you want");
+	await soma.until(async () => (await soma.job())?.outcome === "需要你", "the window's turn");
+	expect((await soma.turns()).slice(turns)).toMatchObject([{ outcome: "需要你", notified: true }]);
+	expect((await soma.notices()).slice(notices)).toEqual([expect.stringContaining("which one do you want")]);
+	expect((await soma.job())?.resultUnread).toBeUndefined();
+}
+
+const rejects = () => Promise.reject(new Error("rex hiccup"));
+
+test("a read that fails at the commit of a job at rest: its next real turn is recorded, with its notice", async () => {
+	const times = { left: 0 };
+	const soma = await core({ to: readsFail(times, rejects) });
+	await dispatched(soma);
+	const turns = (await soma.turns()).length;
+	times.left = 1;
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true });
+	expect(soma.results.at(-1)).not.toHaveProperty("cut");
+	expect(times.left).toBe(0);
+	await soma.until(async () => (await soma.job())?.seq === seqOf(AT_IDLE), "the window's idle");
+	expect((await soma.job())?.resultUnread).toBe(true);
+	expect(await soma.turns()).toHaveLength(turns);
+
+	await needsYou(soma, turns, (await soma.notices()).length);
+	soma.off();
+});
+
+/** The ACP side's `working` of the turn below never reaches the core, as a status not yet read when the human asks. */
+function workingUnseen(gate: { on: boolean; hid?: boolean }) {
+	return (port: AcpAgentPort): AcpAgentPort => ({
+		...port,
+		onStatus: (listener) =>
+			port.onStatus((event) => {
+				if (gate.on && event.status.state === "working") gate.hid = true;
+				else listener(event);
+			}),
+	});
+}
+
+test("a read that fails at the commit of a turn cut unseen: the window's idle takes nothing, and its next real turn is recorded", async () => {
+	const gate: { on: boolean; hid?: boolean } = { on: false };
+	const times = { left: 0 };
+	const soma = await core({ from: workingUnseen(gate), to: readsFail(times, rejects) });
+	await dispatched(soma);
+	const turns = (await soma.turns()).length;
+	gate.on = true;
+	await soma.say("回覆 card-a SPIN");
+	await soma.until(() => gate.hid === true, "the turn to run");
+	expect((await soma.job())?.status.state).toBe("done");
+	times.left = 1;
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true, cut: {} });
+	expect(times.left).toBe(0);
+	await soma.until(async () => (await soma.job())?.seq === seqOf(AT_IDLE), "the window's idle");
+	expect(await soma.job()).toMatchObject({ status: { state: "idle" }, resultUnread: true });
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining(cutTurn)]);
+	expect(await soma.turns()).toHaveLength(turns);
+
+	await needsYou(soma, turns, notices.length);
+	soma.off();
+});
+
+test("a read that finds nothing at the commit of a turn cut, or at the window's first idle: its next real turn is recorded", async () => {
+	const times = { left: 0 };
+	const soma = await core({ to: readsFail(times, () => Promise.resolve(undefined)) });
+	const { turns } = await busy(soma, "SPIN");
+	times.left = 2;
+
+	await soma.say("看 card-a");
+
+	await soma.until(() => times.left === 0, "the window's first idle to read");
+	await sleep(50);
+	expect((await soma.job())?.resultUnread).toBe(true);
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining(cutTurn)]);
+	expect(await soma.turns()).toEqual(turns);
+
+	await needsYou(soma, turns.length, notices.length);
+	soma.off();
+});
+
+test("a read that fails at the commit of a turn cut: the window's idle takes the record, and its next real turn is recorded", async () => {
+	const times = { left: 0 };
+	const soma = await core({ to: readsFail(times, rejects) });
+	const { turns } = await busy(soma, "SPIN");
+	times.left = 1;
+
+	await soma.say("看 card-a");
+
+	await soma.until(async () => (await soma.job())?.resultUnread === undefined, "the window's first idle");
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining(cutTurn)]);
+	expect(await soma.turns()).toEqual(turns);
+
+	await needsYou(soma, turns.length, notices.length);
+	soma.off();
+});
+
+test("a turn the window ran with no working seen, as the commit's read failed: taken as the record, with no turn", async () => {
+	const times = { left: 0 };
+	const soma = await core({ to: readsFail(times, rejects) });
+	await dispatched(soma);
+	const turns = (await soma.turns()).length;
+	times.left = 1;
+	await soma.say("看 card-a");
+	await soma.until(async () => (await soma.job())?.seq === seqOf(AT_IDLE), "the window's idle");
+	const notices = await soma.notices();
+
+	const window = soma.blocks.at(-1) as Block;
+	soma.wrote(await soma.entry(), "結果：需要你\nwhich one do you want");
+	const done = stamped("done");
+	window.records = [done];
+	soma.hangar.emit(soma.hangar.status(window.block, done));
+
+	await soma.until(async () => (await soma.job())?.resultUnread === undefined, "the record to be taken");
+	expect(await soma.turns()).toHaveLength(turns);
+	expect(await soma.notices()).toEqual(notices);
+	soma.off();
+});
+
 test("a window read that keeps failing at its first idle records nothing, and its next idle that reads takes the record", async () => {
 	const times = { left: 0 };
 	const soma = await core({ to: readsFail(times, () => Promise.resolve(undefined)) });

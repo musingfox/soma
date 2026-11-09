@@ -179,7 +179,7 @@ test("a move takes the session id the window runs, lets go of a brief it still h
 	expect(await call("show_job", { card: "card-a" }, "show")).toEqual(MOVED);
 
 	const { launch: _sent, ...kept } = before as NonNullable<typeof before>;
-	// This agent side's transcript reads nothing, so the window's first idle is to take what it reads then.
+	// This agent side's transcript reads nothing, so a `complete` before the window's next working takes what it reads then.
 	expect(await job()).toEqual({ ...kept, sessionId: "the-claude-session", resultUnread: true });
 	const told = await notices();
 	expect(told).toHaveLength(1);

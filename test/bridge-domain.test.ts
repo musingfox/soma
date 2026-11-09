@@ -191,6 +191,51 @@ test("a job whose move could not read its last record takes the first it reads a
 	expect(next.resultUnread).toBeUndefined();
 });
 
+test("a job whose move could not read its last record takes that off at working, and its turn's end is settled as any", () => {
+	const moved: Job = { ...job({ state: "done" }, 1), outcome: "完成", resultId: "old", resultUnread: true };
+
+	const working = observe(moved, { state: "working" }, 2);
+
+	expect(working.action).toBe("none");
+	expect(working.job).toMatchObject({ resultId: "old", outcome: "完成", seq: 2, status: { state: "working" } });
+	expect(working.job.resultUnread).toBeUndefined();
+
+	const ended = observe(working.job, { state: "done" }, 3);
+	expect(ended.action).toBe("complete");
+	const { job: next, action } = complete(ended, { id: "new", text: "結果：需要你\nwhich one" });
+	expect(action).toBe("complete");
+	expect(next).toMatchObject({ resultId: "new", outcome: "需要你", seq: 3 });
+
+	// Ending on the record it holds, that turn records nothing, as any turn.
+	const same = complete(observe(working.job, { state: "done" }, 3), { id: "old", text: "結果：失敗" });
+	expect(same.action).toBe("none");
+	expect(same.job).toMatchObject({ resultId: "old", outcome: "完成" });
+});
+
+test("a status other than working leaves a job's unread record unread, and a repeat of working changes nothing", () => {
+	const moved: Job = { ...job({ state: "idle" }, 1), resultId: "old", resultUnread: true };
+
+	for (const status of [
+		{ state: "blocked", kind: "permission" },
+		{ state: "error", msg: "gone" },
+		{ state: "idle" },
+		{ state: "done" },
+	] as const) {
+		expect(observe(moved, status, 2).job.resultUnread).toBe(true);
+	}
+	expect(observe({ ...moved, seq: 2 }, { state: "working" }, 2).job.resultUnread).toBe(true);
+});
+
+test("a job whose move could not read its last record, with no working since, takes it at a done as well, with no turn", () => {
+	const moved: Job = { ...job({ state: "idle" }, 1), outcome: "完成", resultId: "old", resultUnread: true };
+
+	const { job: next, action } = complete(observe(moved, { state: "done" }, 2), { id: "cut", text: "結果：失敗" });
+
+	expect(action).toBe("none");
+	expect(next).toMatchObject({ resultId: "cut", outcome: "完成" });
+	expect(next.resultUnread).toBeUndefined();
+});
+
 test("a job whose move could not read its last record, and that reads nothing now, goes on waiting to read it", () => {
 	const moved: Job = { ...job({ state: "idle" }, 1), resultId: "old", resultUnread: true };
 

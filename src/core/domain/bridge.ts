@@ -52,7 +52,11 @@ export function observe(job: Job, status: AgentState, seq: number): Observed {
 			};
 		case "done":
 			return { job: next, action: from.state === "done" && !turned ? "none" : "complete" };
-		case "working":
+		case "working": {
+			// A new turn has begun: what it ends on is a real reply, settled against the record the job holds.
+			const { resultUnread: _begun, ...turning } = next;
+			return { job: turning, action: "none" };
+		}
 		case "error":
 			return { job: next, action: "none" };
 	}
@@ -62,8 +66,9 @@ export function observe(job: Job, status: AgentState, seq: number): Observed {
  * Settles a `complete` against what the agent's transcript ends on. The last record already recorded
  * is the same turn observed again, so only the observation is kept. A new one is a finished turn with
  * the outcome its reply's first line states, 未知 when it ends without one; so is a transcript that
- * could not be read at all, which leaves the recorded id alone. A job whose move could not read its last record takes the
- * first it reads as that record, with no turn of it, since nothing can tell what ended on it from what a cut turn left.
+ * could not be read at all, which leaves the recorded id alone. A job whose move could not read its last record, and that
+ * has reported no `working` since, takes the first it reads as that record, with no turn of it, since nothing can tell what
+ * ended on it from what a cut turn left.
  */
 export function complete(observed: Observed, result: AgentResult | undefined): Observed {
 	if (observed.action !== "complete") return observed;

@@ -1,11 +1,13 @@
 // main.ts's startup with the Telegram and terminal clients, the faux model standing in for one that calls
 // `dispatch` on 「派 <card> <repo>」 and writes the digest's report (no API key on this machine), and a stub card
-// asking for a result line. Talks to the herdr session at $SOMA_HERDR_SOCKET and the Bot API at $TELEGRAM_API_BASE.
+// asking for a result line. Talks to the herdr session at $SOMA_HERDR_SOCKET and the Bot API at $TELEGRAM_API_BASE. Its
+// claude runs with $CLAUDE_CONFIG_DIR, where its transcripts go too.
 //   node smoke/telegram-child.ts <db> <digestPeriodMs>
 // stdin lines go to the terminal client; what it prints comes out as {event: "terminal"} lines. A report line
 // each second carries this process's model calls, the Telegram inputs and the finished jobs.
 // SOMA_SMOKE_KILL_IN_DISPATCH=1 kills the process with SIGKILL when the model is asked to dispatch.
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -21,12 +23,15 @@ import { eventBridge, JOB_DONE, reconcileDispatches } from "../src/core/extensio
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { openHumanPort } from "../src/core/human-port.ts";
+import { startingInConfig } from "./herdr-claude.ts";
 
 const context = BACKGROUND_CONTEXT;
 const [db, period] = process.argv.slice(2);
 if (db === undefined || period === undefined) throw new Error("usage: telegram-child.ts <db> <digestPeriodMs>");
 const { telegram } = resolveConfig(undefined, process.env, homedir());
 if (telegram === undefined) throw new Error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set");
+const config = process.env.CLAUDE_CONFIG_DIR;
+if (config === undefined) throw new Error("CLAUDE_CONFIG_DIR must be set");
 const emit = (record: object) => console.log(JSON.stringify(record));
 
 const faux = fauxProvider();
@@ -54,7 +59,10 @@ models.setProvider(faux.provider);
 const stubCard = async (_repo: string, card: string) =>
 	`# ${card}\n\n第一行寫「結果：完成」，第二行只寫 ok 兩個字，不要使用任何工具。`;
 
-const agents = createHerdrAgentPort({ client: createHerdrClient({ socketPath: process.env.SOMA_HERDR_SOCKET }) });
+const agents = createHerdrAgentPort({
+	client: startingInConfig(createHerdrClient({ socketPath: process.env.SOMA_HERDR_SOCKET }), config),
+	projectsDir: join(config, "projects"),
+});
 const digests = digest(agents);
 const harness = await openHarness(db, [dispatchExtension(agents, stubCard), digests.extension], context, { models });
 const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });

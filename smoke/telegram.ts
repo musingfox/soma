@@ -4,18 +4,24 @@
 //      gets one confirmation, with one Telegram input, one job and one herdr agent;
 //   3. a question typed in the terminal is answered there and never reaches the chat;
 //   4. the agent is walked past its folder trust prompt and finishes; the digest's report reaches the chat once,
-//      within one digest period of the finished turn, and nothing else (the herdr wake's answer) does.
-// It runs in a throwaway git repo, so claude shows its trust prompt; the repo, worktree and agent go at the end.
+//      within one digest period of the finished turn, and nothing else (the herdr wake's answer) does;
+//   5. the answer landed for the smoke's repo in the CLAUDE_CONFIG_DIR its claude runs with beside the repo, and
+//      ~/.claude.json gained no trust entry for a path of its own (read, never written).
+// It runs in a throwaway git repo under ~/.cache (not $TMPDIR, which claude trusts on its own), so claude shows its
+// trust prompt; the repo, its config, the worktree and agent go at the end, once the agent's claude has ended.
 //   node smoke/telegram.ts <herdr socket of a test session> [digestPeriodSeconds=8]
 // See smoke/terminal.ts for starting and removing a herdr test session from inside a herdr pane.
 import { spawnSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FakeBotApi } from "../src/adapters/fake-telegram/index.ts";
 import { createHerdrClient } from "../src/adapters/herdr/client.ts";
+import { readSessionModel, resolveTranscriptPath } from "../src/agent-cli/transcript.ts";
 import { type Child, delay, run } from "./driver.ts";
+import { checkTrust, removeAgents, seedClaudeConfig, trusted } from "./herdr-claude.ts";
 
 const [socket, seconds] = process.argv.slice(2);
 if (socket === undefined) throw new Error("usage: telegram.ts <herdr socket> [digestPeriodSeconds]");
@@ -50,23 +56,27 @@ const lastReport = (child: Child) => {
 };
 
 const api = new FakeBotApi(TOKEN);
-const directory = await mkdtemp(join(tmpdir(), "soma-telegram-"));
+const directory = await realpath(await mkdtemp(join(homedir(), ".cache", "soma-telegram-")));
 const children: Child[] = [];
 try {
 	const apiBase = await api.listen();
 	const db = join(directory, "soma.sqlite");
 	const repo = join(directory, "repo");
+	const config = join(directory, "claude-config");
+	const trustedBefore = await trusted(homedir());
 	spawnSync("git", ["init", "-q", repo]);
 	spawnSync("git", ["-C", repo, "commit", "-q", "--allow-empty", "-m", "chore: init"]);
+	await seedClaudeConfig(config);
 	const env = {
 		...process.env,
+		CLAUDE_CONFIG_DIR: config,
 		SOMA_HERDR_SOCKET: socket,
 		TELEGRAM_BOT_TOKEN: TOKEN,
 		TELEGRAM_CHAT_ID: String(CHAT),
 		TELEGRAM_API_BASE: apiBase,
 	};
 	const args = [db, String(periodMs)];
-	log("card", card);
+	log("card", { card, repo });
 
 	const first = run(args, CHILD, { ...env, SOMA_SMOKE_KILL_IN_DISPATCH: "1" });
 	children.push(first);
@@ -112,7 +122,10 @@ try {
 		async () => ((await herdr.agentGet(card)).agent_status === "blocked" ? true : undefined),
 		30_000,
 	);
-	const pane = (await herdr.agentGet(card)).pane_id;
+	const { pane_id: pane, cwd: worktree } = await herdr.agentGet(card);
+	const dialog = (await herdr.paneRead({ pane_id: pane, source: "detection" })).text;
+	check(dialog.includes("Yes, I trust this folder"), `the pane shows no trust dialog: ${dialog}`);
+	log("dialog", dialog.split("\n").filter(Boolean));
 	// Claude Code's folder trust prompt: the cursor starts on "No, exit".
 	await herdr.paneSendKeys(pane, ["Down"]);
 	await delay(300);
@@ -133,11 +146,19 @@ try {
 		`the chat got ${JSON.stringify(api.sent)}`,
 	);
 	log("report", { reportAfterMs, periodMs, sent: api.sent.map((message) => message.text) });
+	const session = await resolveTranscriptPath(
+		(await herdr.agentGet(card)).agent_session?.value as string,
+		worktree,
+		join(config, "projects"),
+	);
+	check(session !== undefined, "no transcript for the session");
+	log("model", await readSessionModel(session as string));
+	log("trust", await checkTrust(config, repo, homedir(), trustedBefore, [directory, worktree as string]));
 	console.log("PASS");
 } finally {
 	for (const child of children) child.process.kill("SIGKILL");
 	await api.close();
-	const agent = (await named())[0];
-	if (agent !== undefined) await herdr.call("worktree.remove", { workspace_id: agent.workspace_id, force: true });
+	const claudes = await removeAgents(herdr, [card]);
 	await rm(directory, { recursive: true, force: true });
+	log("cleanup", { claudes, directoryLeft: existsSync(directory) });
 }

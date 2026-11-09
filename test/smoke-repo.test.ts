@@ -6,6 +6,11 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import { branchWithSettings, fixedSmokeRepo } from "../smoke/smoke-repo.ts";
 import { openWorktree, runGit } from "../src/agent-cli/worktree.ts";
 
+// A git hook exports GIT_INDEX_FILE and the like, which would point the temp repos' git at the repo the hook runs in.
+for (const key of Object.keys(process.env)) {
+	if (key.startsWith("GIT_")) Reflect.deleteProperty(process.env, key);
+}
+
 let home: string;
 let repo: string;
 

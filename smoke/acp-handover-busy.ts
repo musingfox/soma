@@ -1,6 +1,8 @@
 // An ACP job handed over to rex while it is busy, against the real rex server, the real claude-agent-acp and real claude,
 // on haiku:
-//   1. a dedicated rex session, labelled soma-smoke-<random>, is the hangar, and a fresh git repo is the card's;
+//   1. a dedicated rex session, labelled soma-smoke-<random>, is the hangar, and the fixed smoke repo (smoke/smoke-repo.ts)
+//      is the card's, its worktree on a branch that adds the settings of step 3. claude trusts that repo already, so the
+//      window shows no trust dialog: smoke/acp-handover.ts is what answers one, and this smoke is about the cut;
 //   2. the real core, with a faux model standing in for soma's, dispatches the card over ACP and its brief plants a word;
 //   3. a second prompt keeps the job busy:
 //        working  it runs a long Bash `sleep`, which the repo's settings allow, behind an `echo`, since claude's Bash tool
@@ -14,14 +16,14 @@
 //   5. the model's reply goes into the pane and asks for the word, which is in no prompt since the brief: it comes back, as
 //      a turn the bridge records, from the one transcript the session has.
 // Up to three prompts run on haiku. It logs where things stood before its cleanup removes them. It destroys its rex session,
-// removes its repo, what claude keeps for the repo and its worktrees under ~/.claude/projects and its db, and kills what
-// is left of its own by PID, also on failure. ~/.claude.json keeps the trust entry claude wrote for the repo, which is
-// printed; nothing else is read out of that file.
+// removes the card's worktree and branch, what claude keeps for the worktree under ~/.claude/projects and its db, and kills
+// what is left of its own by PID, also on failure. A run that gains a trust entry in ~/.claude.json for any path of its own
+// fails; nothing else is read out of that file.
 //   node smoke/acp-handover-busy.ts working|blocked|first-turn
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, realpath, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,13 +44,13 @@ import {
 	ViewSchema,
 } from "../src/adapters/rex/schema.ts";
 import { projectDirNameFor, readLastRecord, readSessionModel } from "../src/agent-cli/transcript.ts";
-import { runGit } from "../src/agent-cli/worktree.ts";
 import type { Job } from "../src/core/domain/dispatch.ts";
 import { eventBridge, handoverBridge, JOB_DONE, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { NOTICE } from "../src/core/notice.ts";
 import { delay } from "./driver.ts";
+import { branchWithSettings, fixedSmokeRepo } from "./smoke-repo.ts";
 
 const context = BACKGROUND_CONTEXT;
 const scenario = process.argv[2];
@@ -121,13 +123,12 @@ async function trusted(): Promise<Set<string>> {
 
 const onError = (error: Error) => console.error(`[smoke] ${error.message}`);
 const client = createRexClient({ socketPath: process.env.SOMA_REX_SOCKET ?? defaultRexSocket(homedir()), onError });
+// First of all that can fail, so a repo that cannot be used leaves nothing behind.
+const repo = await fixedSmokeRepo(homedir());
 const directory = await realpath(await mkdtemp(join(tmpdir(), "soma-acp-handover-busy-")));
-const repo = join(directory, "repo");
 const projects = join(homedir(), ".claude", "projects");
 const worktree = join(repo, ".claude", "worktrees", card);
 const sessionsFile = join(directory, "acp-sessions.json");
-const git = (...args: string[]) => runGit(repo, args);
-const identity = ["-c", "user.name=soma smoke", "-c", "user.email=smoke@example.com", "-c", "commit.gpgsign=false"];
 const entry = async () =>
 	JSON.parse(await readFile(sessionsFile, "utf8"))[card] as {
 		acpSessionId: string;
@@ -152,16 +153,8 @@ const { session_id: hangar } = await client
 	});
 try {
 	await client.attach(hangar);
-	await runGit(directory, ["init", "-q", "-b", "main", repo]);
-	await writeFile(join(repo, "README.md"), `# acp handover busy smoke ${tag}\n`);
-	await mkdir(join(repo, ".claude"));
 	// The human's own mode may be auto, under which claude does not ask; here `touch` asks, and `sleep` need not.
-	await writeFile(
-		join(repo, ".claude", "settings.json"),
-		`${JSON.stringify({ permissions: { defaultMode: "default", allow: ["Bash(sleep:*)"] } })}\n`,
-	);
-	await git("add", "README.md", ".claude/settings.json");
-	await git(...identity, "commit", "-q", "--no-verify", "-m", "chore: init");
+	branchWithSettings(repo, card, { permissions: { defaultMode: "default", allow: ["Bash(sleep:*)"] } }, directory);
 	const trustedBefore = await trusted();
 	log("hangar", { session: hangar, label, card, repo, scenario, word, sleepCommand, touched });
 
@@ -513,7 +506,10 @@ try {
 	check(JSON.stringify(files) === JSON.stringify([`${acpSessionId}.jsonl`]), `transcripts ${JSON.stringify(files)}`);
 
 	const gained = [...(await trusted())].filter((path) => !trustedBefore.has(path));
-	log("trust", { gained, ours: gained.filter((path) => path.startsWith(directory)) });
+	// Other claudes of the human's may gain theirs meanwhile; none of this smoke's paths may.
+	const ours = gained.filter((path) => path.startsWith(directory) || path.startsWith(repo));
+	log("trust", { gained, ours });
+	check(ours.length === 0, `~/.claude.json gained trust for ${JSON.stringify(ours)}`);
 	console.log(`PASS ${scenario}`);
 } finally {
 	log("at the end", await standing().catch((error: Error) => error.message));
@@ -546,9 +542,12 @@ try {
 	});
 	await harness?.close(context);
 	client.close();
+	// What claude keeps for the fixed repo itself is shared with the other smokes, so only the worktree's goes.
 	const resolved = existsSync(worktree) ? await realpath(worktree) : worktree;
-	for (const path of [resolved, repo]) {
-		await rm(join(projects, projectDirNameFor(path)), { recursive: true, force: true });
+	await rm(join(projects, projectDirNameFor(resolved)), { recursive: true, force: true });
+	if (existsSync(worktree)) {
+		spawnSync("git", ["-C", repo, "worktree", "remove", "--force", worktree], { stdio: "inherit" });
 	}
+	spawnSync("git", ["-C", repo, "branch", "-D", `fleet/${card}`], { stdio: "ignore" });
 	await rm(directory, { recursive: true, force: true });
 }

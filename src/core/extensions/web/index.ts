@@ -1,14 +1,14 @@
+import { Worker } from "node:worker_threads";
 import { defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { int, obj, opt, str } from "@earendil-works/pi-schema";
-import { Defuddle } from "defuddle/node";
-import { parseHTML } from "linkedom";
 import { z } from "zod";
+import type { ParseAnswer, ParseRequest } from "./parse.ts";
 
 export const FETCH_MAX_CHARS = 20_000;
 export const WEB_TIMEOUT_MS = 15_000;
 /**
- * Parsing is synchronous and outside the timeout, and its time grows faster than the page: dense 1 MB took 4.8 s, 512 KB
- * 1.7 s. A 416 KB GitHub page lost its README when cut at 256 KB.
+ * Parsing is outside the timeout and cannot be aborted, and its time grows faster than the page: dense 1 MB took 4.8 s,
+ * 512 KB 1.7 s. A 416 KB GitHub page lost its README when cut at 256 KB.
  */
 export const FETCH_MAX_BYTES = 512 * 1024;
 export const SEARCH_DEFAULT_RESULTS = 5;
@@ -62,6 +62,47 @@ async function readBody(response: Response): Promise<{ body: string; cut: boolea
 	return { body: decoder.decode(bytes.subarray(0, FETCH_MAX_BYTES)), cut: !ended };
 }
 
+type Page = NonNullable<ParseAnswer["page"]>;
+type Waiter = { resolve: (page: Page) => void; reject: (error: Error) => void };
+
+let parser: { worker: Worker; waiting: Map<number, Waiter> } | undefined;
+let lastId = 0;
+
+/**
+ * linkedom and Defuddle on a worker thread, so a dense page does not hold up the event loop while it parses. The worker
+ * starts on the first page and stays, since loading Defuddle again for every page cost as much as parsing a small one;
+ * it keeps the process alive only while a page waits. One that dies fails what it held, and the next page starts anew.
+ */
+function parse(html: string, url: string): Promise<Page> {
+	if (!parser) {
+		const worker = new Worker(new URL("./parse.ts", import.meta.url));
+		const waiting = new Map<number, Waiter>();
+		const own = { worker, waiting };
+		const fail = (error: Error) => {
+			if (parser === own) parser = undefined;
+			for (const waiter of waiting.values()) waiter.reject(error);
+			waiting.clear();
+		};
+		worker.on("message", ({ id, page }: ParseAnswer) => {
+			const waiter = waiting.get(id);
+			waiting.delete(id);
+			if (waiting.size === 0) worker.unref();
+			if (page) waiter?.resolve(page);
+			else waiter?.reject(new Error("the page could not be parsed"));
+		});
+		worker.on("error", fail);
+		worker.on("exit", (code) => fail(new Error(`the parser exited with code ${code}`)));
+		parser = own;
+	}
+	const { worker, waiting } = parser;
+	const id = ++lastId;
+	return new Promise((resolve, reject) => {
+		waiting.set(id, { resolve, reject });
+		worker.ref();
+		worker.postMessage({ id, html, url } satisfies ParseRequest);
+	});
+}
+
 function cap(text: string): string {
 	if (text.length <= FETCH_MAX_CHARS) return text;
 	return `${text.slice(0, FETCH_MAX_CHARS)}\n\n[Cut at ${FETCH_MAX_CHARS} of ${text.length} characters.]`;
@@ -92,9 +133,7 @@ export async function fetchPage(
 	const note = cut ? `\n\n[Read only the first ${FETCH_MAX_BYTES / 1024} KB of the page.]` : "";
 	if (type.includes("html")) {
 		try {
-			const { document } = parseHTML(body);
-			// Async extractors call third-party APIs that the timeout above does not cover.
-			const page = await Defuddle(document, url, { markdown: true, useAsync: false });
+			const page = await parse(body, url);
 			const text = `${page.title ? `# ${page.title}\n\n` : ""}${url}\n\n${page.content}`;
 			return { text: cap(text) + note, isError: false };
 		} catch {

@@ -1,3 +1,9 @@
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { Defuddle } from "defuddle/node";
+import { parseHTML } from "linkedom";
 import { expect, test } from "vitest";
 import {
 	FETCH_MAX_BYTES,
@@ -86,6 +92,82 @@ test("no more than the byte cap is read, so an endless page cannot stall parsing
 	expect(result.text).toMatch(/\[Read only the first 512 KB of the page\.\]$/);
 	expect(pulled).toBeLessThan(FETCH_MAX_BYTES + 3 * chunk.byteLength);
 });
+
+/** Just under the byte cap, so it is read whole; dense as the 512 KB page in `FETCH_MAX_BYTES`, it took 1.6 s to parse. */
+const densePage = (() => {
+	const paragraph = (i: number) => `<p>Item ${i} ${"word ".repeat(100)}<em>e</em></p>`;
+	const paragraphs: string[] = [];
+	let size = Buffer.byteLength(html(""));
+	for (let i = 0; size + paragraph(i).length <= FETCH_MAX_BYTES; i++) {
+		paragraphs.push(paragraph(i));
+		size += paragraph(i).length;
+	}
+	return html(paragraphs.join(""));
+})();
+
+test("a dense page parses while a timer set beside it still fires on time", async () => {
+	const started = performance.now();
+	let fired = Number.POSITIVE_INFINITY;
+	setTimeout(() => {
+		fired = performance.now() - started;
+	}, 10);
+	const result = await fetchPage("https://example.com/dense", serve(densePage), signal);
+	const parsed = performance.now() - started;
+	expect(result.isError).toBe(false);
+	// The parse outlasted the 100 ms, so a parse on the event loop would have kept the timer from firing in them.
+	expect(parsed).toBeGreaterThan(100);
+	expect(fired).toBeLessThan(100);
+}, 60_000);
+
+test("a dense page comes back as the parse on the main thread gave it", async () => {
+	const url = "https://example.com/dense";
+	const result = await fetchPage(url, serve(densePage), signal);
+	const page = await Defuddle(parseHTML(densePage).document, url, { markdown: true, useAsync: false });
+	const text = `# ${page.title}\n\n${url}\n\n${page.content}`;
+	expect(result).toEqual({
+		isError: false,
+		text: `${text.slice(0, FETCH_MAX_CHARS)}\n\n[Cut at ${FETCH_MAX_CHARS} of ${text.length} characters.]`,
+	});
+}, 60_000);
+
+test("pages fetched at once each come back with their own content", async () => {
+	const pages = await Promise.all(
+		[0, 1, 2].map((i) =>
+			fetchPage(`https://example.com/${i}`, serve(html(`<p>Only page ${i} says this.</p>`)), signal),
+		),
+	);
+	pages.forEach((page, i) => {
+		expect(page.text).toContain(`https://example.com/${i}\n\n`);
+		expect(page.text).toContain(`Only page ${i} says this.`);
+	});
+});
+
+test("a page the parser throws on is an error result, and the next page still parses", async () => {
+	expect(await fetchPage("https://example.com/broken", serve("<"), signal)).toEqual({
+		isError: true,
+		text: "https://example.com/broken could not be parsed as HTML.",
+	});
+	expect((await fetchPage("https://example.com/a", serve(html("<p>Fine.</p>")), signal)).text).toContain("Fine.");
+});
+
+test("plain node parses a page without a build and exits once it is answered", () => {
+	const module = resolve(import.meta.dirname, "../src/core/extensions/web/index.ts");
+	const script =
+		`const { fetchPage } = await import(${JSON.stringify(module)});` +
+		`const page = new Response("<html><body><article><p>Parsed in a worker.</p></article></body></html>", ` +
+		`{ headers: { "content-type": "text/html" } });` +
+		`console.log((await fetchPage("https://example.com/", async () => page, undefined)).text);`;
+	// A file, not --eval: the worker takes node's flags, and it cannot load with --eval's --input-type.
+	const dir = mkdtempSync(join(tmpdir(), "soma-web-"));
+	try {
+		writeFileSync(join(dir, "fetch.mjs"), script);
+		const run = spawnSync(process.execPath, [join(dir, "fetch.mjs")], { encoding: "utf8", timeout: 30_000 });
+		expect(run.stdout).toContain("Parsed in a worker.");
+		expect(run.status).toBe(0);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}, 60_000);
 
 test("a page of exactly the byte cap is not reported as cut, one byte more is", async () => {
 	const chunked = (total: number) => {

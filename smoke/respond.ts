@@ -5,19 +5,22 @@
 //   2. the card's Bash command stops at a permission prompt. The model first answers with the trust dialog's
 //      fingerprint: the screen has changed since, so nothing may be sent. Then it answers 1 with the right one,
 //      and the agent runs the command and finishes;
-//   3. a second claude, started with a fake ANTHROPIC_API_KEY exported in its shell, stops at the custom API
+//   3. a second claude, started with a fake ANTHROPIC_API_KEY in its shell's environment, stops at the custom API
 //      key dialog. The model must not be called, the HumanPort must get a question notice, and the dialog
-//      must still be up afterwards.
-// The repo is a throwaway one whose .claude/settings.json sets defaultMode "default", so the user's own default
-// mode cannot skip the permission prompt. Repo, worktrees and agents go at the end.
+//      must still be up afterwards;
+//   4. the answer landed for the smoke's repo in the CLAUDE_CONFIG_DIR both claudes run with beside the repo, and
+//      ~/.claude.json gained no trust entry for a path of its own (read, never written).
+// The repo is a throwaway one under ~/.cache (not $TMPDIR, which claude trusts on its own), whose
+// .claude/settings.json sets defaultMode "default", so the user's own default mode cannot skip the permission prompt.
+// Repo, its config, worktrees and agents go at the end, once the agents' claudes have ended.
 //   tmux -L herdr-test new-session -d "env -u HERDR_SOCKET_PATH -u HERDR_ENV -u HERDR_SESSION -u HERDR_TAB_ID \
 //     -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u TERM_PROGRAM -u SSH_AUTH_SOCK herdr --session soma-test"
 //   node smoke/respond.ts ~/.config/herdr/sessions/soma-test/herdr.sock
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -26,18 +29,22 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { createHerdrAgentPort } from "../src/adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "../src/adapters/herdr/client.ts";
 import { AgentStartedResultSchema, WorktreeOpenedResultSchema } from "../src/adapters/herdr/schema.ts";
+import { readSessionModel, resolveTranscriptPath } from "../src/agent-cli/transcript.ts";
 import { AGENT_BLOCKED, eventBridge } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { openHumanPort } from "../src/core/human-port.ts";
 import type { SomaEvent } from "../src/ports/human.ts";
 import { delay } from "./driver.ts";
+import { checkTrust, paneInConfig, removeAgents, seedClaudeConfig, startingInConfig, trusted } from "./herdr-claude.ts";
 
 const context = BACKGROUND_CONTEXT;
 const [socketPath] = process.argv.slice(2);
 if (socketPath === undefined) throw new Error("usage: respond.ts <herdr socket of a test session>");
 const herdr = createHerdrClient({ socketPath });
-const agents = createHerdrAgentPort({ client: herdr });
+const directory = await realpath(await mkdtemp(join(homedir(), ".cache", "soma-respond-")));
+const config = join(directory, "claude-config");
+const agents = createHerdrAgentPort({ client: startingInConfig(herdr, config), projectsDir: join(config, "projects") });
 const stamp = Date.now().toString(36);
 const card = `answer-${stamp}`;
 const authCard = `auth-${stamp}`;
@@ -84,6 +91,7 @@ faux.setResponses(
 		if (fingerprint === undefined) return fauxAssistantMessage("轉給人。");
 		fingerprints.push(fingerprint);
 		const trust = /\\n(\d+)\. Yes, I trust this folder/.exec(said)?.[1];
+		if (trust !== undefined) log("dialog", JSON.parse(said));
 		const answer =
 			trust !== undefined
 				? { card, option: trust, fingerprint, reason: "soma 自己開的 fleet worktree" }
@@ -96,12 +104,13 @@ models.setProvider(faux.provider);
 const cardText = async (_repo: string, name: string) =>
 	`# ${name}\n\n用 Bash 工具執行這一行指令：touch canary.txt\n做完只回覆 ok。`;
 
-const directory = await mkdtemp(join(tmpdir(), "soma-respond-"));
 const harness = await openHarness(join(directory, "soma.sqlite"), [dispatchExtension(agents, cardText)], context, {
 	models,
 });
 try {
 	const repo = join(directory, "repo");
+	const trustedBefore = await trusted(homedir());
+	await seedClaudeConfig(config);
 	spawnSync("git", ["init", "-q", repo]);
 	await mkdir(join(repo, ".claude"));
 	await writeFile(join(repo, ".claude/settings.json"), JSON.stringify({ permissions: { defaultMode: "default" } }));
@@ -150,6 +159,10 @@ try {
 	);
 	const answers = toolResults.filter((result) => typeof result === "object" && result !== null && "sent" in result);
 	log("answered", { status: done.status.state, decisions: done.decisions, answers, canary: true });
+	const worktree = path as string;
+	const session = await resolveTranscriptPath(done.sessionId, worktree, join(config, "projects"));
+	check(session !== undefined, "no transcript for the session");
+	log("model", await readSessionModel(session as string));
 
 	// 3: an auth dialog never reaches the model.
 	const calls = faux.state.callCount;
@@ -159,13 +172,9 @@ try {
 		{ cwd: repo, branch: `fleet/${authCard}`, label: authCard, focus: false },
 		WorktreeOpenedResultSchema,
 	);
-	const pane = opened.root_pane.pane_id;
-	await delay(3_000);
-	await herdr.paneSendText(
-		pane,
-		"export ANTHROPIC_API_KEY=sk-ant-api03-soma-smoke-not-a-real-key-0000000000000000000000000000000000000000AA\n",
-	);
-	await delay(1_000);
+	const pane = await paneInConfig(herdr, opened.root_pane.pane_id, config, {
+		ANTHROPIC_API_KEY: "sk-ant-api03-soma-smoke-not-a-real-key-0000000000000000000000000000000000000000AA",
+	});
 	await root.commit(async (tx) => {
 		(await tx.doc(Dispatches, root.id)).jobs.push({
 			card: authCard,
@@ -192,16 +201,15 @@ try {
 	const screen = (await herdr.paneRead({ pane_id: still.pane_id, source: "detection" })).text;
 	check(still.agent_status === "blocked" && screen.includes("Do you want to use this API key?"), "the dialog is gone");
 	log("auth", { notices, decisions: escalated, modelCalls: 0, herdr: still.agent_status });
+	const own = [directory, worktree, opened.worktree.path];
+	log("trust", await checkTrust(config, repo, homedir(), trustedBefore, own));
 
 	unlisten();
 	await human.close();
 	console.log("PASS");
 } finally {
 	await harness.close(context);
-	for (const agent of await herdr.agentList()) {
-		if (agent.name === card || agent.name === authCard) {
-			await herdr.call("worktree.remove", { workspace_id: agent.workspace_id, force: true });
-		}
-	}
+	const claudes = await removeAgents(herdr, [card, authCard]);
 	await rm(directory, { recursive: true, force: true });
+	log("cleanup", { claudes, directoryLeft: existsSync(directory) });
 }

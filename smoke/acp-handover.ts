@@ -5,13 +5,14 @@
 //      word: the hangar stays empty, and the agent is claude-agent-acp under this process;
 //   3. the model's show_job hands the job over: nothing runs under this process any more, one window is open, labelled
 //      with the ACP session id, whose claude runs `--resume` on that session with an explicit model in the worktree's
-//      realpath, past the trust dialog nobody pressed by hand, and the human is told once;
+//      realpath, past a real trust dialog that take answered and nobody pressed by hand, and the human is told once;
 //   4. the model's reply goes into the pane and asks for the word, which is in no prompt since the brief: the turn is
 //      recorded by the event bridge, readResult reads the word back from the one transcript, and screen shows the pane;
 //   5. the session is destroyed, and neither the pane's claude nor anything under this process is left.
-// Two prompts run on haiku. It removes its rex session, its repo, what claude keeps for the repo and its worktrees under
-// ~/.claude/projects and its db at the end, also on failure. ~/.claude.json keeps the trust entry claude wrote for the
-// repo, which is printed; nothing else is read out of that file.
+// Two prompts run on haiku. Both claudes run with one CLAUDE_CONFIG_DIR beside the repo, as the pane's --resume has to
+// find the transcript written over ACP, so the dialog is asked and its answer lands there: a run with no dialog, or one
+// that gains a trust entry in ~/.claude.json for a path of its own, fails. It removes its rex session, and its repo,
+// config and db, at the end, also on failure. Only the trusted paths are read out of either .claude.json.
 //   node smoke/acp-handover.ts
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -31,11 +32,13 @@ import {
 	AttachAllResultSchema,
 	BlockListSchema,
 	EmptyResultSchema,
+	FormatResultSchema,
 	ProcessResultSchema,
 	ProgramStatusResultSchema,
 	TERMINAL,
 	ViewSchema,
 } from "../src/adapters/rex/schema.ts";
+import { isTrustDialog, readBlockedScreen } from "../src/agent-cli/permission/blocked-screen.ts";
 import { projectDirNameFor, readLastRecord, readSessionModel } from "../src/agent-cli/transcript.ts";
 import { runGit } from "../src/agent-cli/worktree.ts";
 import type { Job } from "../src/core/domain/dispatch.ts";
@@ -98,9 +101,9 @@ const alive = (pid: number) => {
 	}
 };
 
-/** The project paths ~/.claude.json marks as trusted; nothing else is read out of it. */
-async function trusted(): Promise<Set<string>> {
-	const text = await readFile(join(homedir(), ".claude.json"), "utf8");
+/** The project paths the `.claude.json` in `directory` marks as trusted; nothing else is read out of it. */
+async function trusted(directory: string): Promise<Set<string>> {
+	const text = await readFile(join(directory, ".claude.json"), "utf8");
 	const { projects } = JSON.parse(text) as { projects?: Record<string, { hasTrustDialogAccepted?: boolean }> };
 	return new Set(
 		Object.entries(projects ?? {}).flatMap(([path, entry]) => (entry.hasTrustDialogAccepted ? [path] : [])),
@@ -112,10 +115,21 @@ const onError = (error: Error) => console.error(`[smoke] ${error.message}`);
 const client = createRexClient({ socketPath, onError });
 // Every key pressed in a pane, read off the client the adapter calls rex through: what a trust dialog was answered with.
 const pressed: string[] = [];
+// The screen the first key was pressed on, read just before it: once it lands, the dialog is gone.
+let answered: string | undefined;
 const { call: callRex } = client;
-client.call = (method, payload, schema) => {
-	const { event } = payload as { event?: { type: string; payload: { key: string; action: string } } };
+client.call = async (method, payload, schema) => {
+	const { event, session_id, block_id } = payload as {
+		event?: { type: string; payload: { key: string; action: string } };
+		session_id?: string;
+		block_id?: string;
+	};
 	if (method === "block.event" && event?.type === "key" && event.payload.action === "press") {
+		if (pressed.length === 0) {
+			const args = { format: "text", trim: true, max_bytes: 65_536 };
+			const screen = await callRex(`${TERMINAL}.format`, { session_id, block_id, args }, FormatResultSchema);
+			answered = screen.content;
+		}
 		pressed.push(event.payload.key);
 	}
 	return callRex(method, payload, schema);
@@ -125,7 +139,9 @@ const hangar = created.session_id;
 
 const directory = await realpath(await mkdtemp(join(tmpdir(), "soma-acp-handover-")));
 const repo = join(directory, "repo");
-const projects = join(homedir(), ".claude", "projects");
+const config = join(directory, "claude-config");
+const projects = join(config, "projects");
+const sessionsDir = join(config, "sessions");
 const worktree = join(repo, ".claude", "worktrees", card);
 const sessionsFile = join(directory, "acp-sessions.json");
 const git = (...args: string[]) => runGit(repo, args);
@@ -148,23 +164,43 @@ try {
 	);
 	await git("add", "README.md", ".claude/settings.json");
 	await git(...identity, "commit", "-q", "--no-verify", "-m", "chore: init");
-	const trustedBefore = await trusted();
+	// Past the first-run screens, which come before the dialog; there is nothing else in this config to start with.
+	await mkdir(config);
+	await writeFile(join(config, ".claude.json"), `${JSON.stringify({ hasCompletedOnboarding: true })}\n`);
+	const trustedBefore = await trusted(homedir());
 	log("hangar", { session: hangar, label, card, repo });
 
 	const bin = join(fileURLToPath(new URL("..", import.meta.url)), "bin");
-	const env = { SOMA_SOCKET: join(directory, "defer.sock"), SOMA_NODE: process.execPath };
+	const env = {
+		SOMA_SOCKET: join(directory, "defer.sock"),
+		SOMA_NODE: process.execPath,
+		CLAUDE_CONFIG_DIR: config,
+		// claude names its login's Keychain item after a CLAUDE_CONFIG_DIR, which would leave this config with no login.
+		// Empty, this keeps the usual name; the smoke handles no credential.
+		CLAUDE_SECURESTORAGE_CONFIG_DIR: "",
+	};
 	// ANTHROPIC_MODEL picks the ACP session's model; the window is told by the --model the handover reads off its reply.
 	const acp = createAcpAgentPort({
 		env: process.env,
 		vars: { ...env, ANTHROPIC_MODEL: "haiku" },
 		path: bin,
 		sessionsFile,
+		projectsDir: projects,
 		onError,
 	});
 	acpAgents = async () => {
 		for (const { name } of await acp.list()) await acp.stop(name);
 	};
-	const rex = createRexAgentPort({ client, sessionId: hangar, onError, env, path: bin, takeMs: 60_000 });
+	const rex = createRexAgentPort({
+		client,
+		sessionId: hangar,
+		onError,
+		env,
+		path: bin,
+		projectsDir: projects,
+		sessionsDir,
+		takeMs: 60_000,
+	});
 	const agents = createHandoverAgentPort({ from: acp, to: rex });
 	const statuses: AgentStatusEvent[] = [];
 	agents.onStatus((event) => {
@@ -175,6 +211,7 @@ try {
 
 	// soma's model: dispatches, shows, replies and reads the screen on ask, and says yes to a prompt it is woken for.
 	const results: unknown[] = [];
+	let responses = 0;
 	const faux = fauxProvider();
 	faux.setResponses(
 		Array.from({ length: 20 }, () => (request: { messages: { role: string; content: unknown }[] }) => {
@@ -188,6 +225,7 @@ try {
 				fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
 			const fingerprint = /fingerprint=([0-9a-f]{16})/.exec(text)?.[1];
 			if (fingerprint !== undefined) {
+				responses++;
 				return call("respond", { card, option: "1", fingerprint, reason: "the smoke approves its own agent" });
 			}
 			if (text.includes("派工")) return call("dispatch", { card, repo });
@@ -246,8 +284,9 @@ try {
 		reply: await agents.readResult(card),
 		acpSessionId,
 		cwd,
-		processes: children.map(({ pid, command }) => ({ pid, command: command.slice(0, 80) })),
+		processes: children.map(({ pid, command }) => ({ pid, command: command.slice(0, 160) })),
 		blocksInHangar: (await blocks()).length,
+		model: await readSessionModel(join(projects, projectDirNameFor(cwd), `${acpSessionId}.jsonl`)),
 	});
 	check(cwd === (await realpath(worktree)), `the session's cwd is ${cwd}`);
 	check(
@@ -259,17 +298,21 @@ try {
 	check(acpSessionId !== onAcp?.sessionId, "the job already goes by the ACP session id");
 
 	const started = Date.now();
+	const responsesBefore = responses;
 	await say("給我看");
 	const moved = results.at(-1) as { handedOver: boolean; window?: string; session?: string; ready?: boolean };
 	log("show_job", { result: moved, ms: Date.now() - started, keysPressed: pressed });
+	log("dialog", answered?.split("\n"));
 	check(moved.handedOver === true, `show_job refused: ${JSON.stringify(moved)}`);
 	// What explains it, read now: the cleanup below removes the pane and everything else that would.
 	if (moved.ready === false) {
 		const [pane] = await blocks();
 		const where = { session_id: hangar, block_id: pane?.block_id, args: {} };
+		const { foreground } = await client.call(`${TERMINAL}.process`, where, ProcessResultSchema);
+		paneClaude = foreground?.pid;
 		log("not ready", {
 			keysPressed: pressed,
-			foreground: (await client.call(`${TERMINAL}.process`, where, ProcessResultSchema)).foreground?.argv0,
+			foreground: foreground?.argv0,
 			records: (await client.call(`${TERMINAL}.program_status`, where, ProgramStatusResultSchema)).records,
 			screen: (await agents.readScreen(card)).split("\n").slice(-40),
 		});
@@ -298,7 +341,7 @@ try {
 	}).stdout;
 	// claude's own record of the session it runs, keyed by its pid; read only for its sessionId.
 	const own = await until("claude's record of its session", 15_000, () =>
-		readFile(join(homedir(), ".claude/sessions", `${foreground?.pid}.json`), "utf8").then(
+		readFile(join(sessionsDir, `${foreground?.pid}.json`), "utf8").then(
 			(text) => JSON.parse(text) as { sessionId?: string },
 			() => undefined,
 		),
@@ -333,16 +376,15 @@ try {
 	check(notices.length === 1, `${notices.length} notices were written`);
 	check(JSON.stringify(notices[0]?.data).includes(`its window is ${card} in session ${label}`), "no notice names it");
 
-	const trustedAfter = await trusted();
-	const gained = [...trustedAfter].filter((path) => !trustedBefore.has(path));
-	// Other claudes of the human's may gain theirs meanwhile; of this smoke's paths, only the repo's root is trusted.
-	const ours = gained.filter((path) => path.startsWith(directory));
-	check(
-		ours.every((path) => path === repo),
-		`~/.claude.json gained trust for ${JSON.stringify(ours)}, not only the smoke's ${repo}`,
-	);
-	log("trust", { gained, keysPressed: pressed });
-	check(ours.length === 0 || pressed.at(-1) === "enter", "the repo gained trust with no key pressed in its window");
+	// The real dialog, answered by take: a repo trusted already would pass everything above with no key pressed at all.
+	log("answer", {
+		keysPressed: pressed,
+		responsesDuringHandover: responses - responsesBefore,
+		inOwnConfigNow: [...(await trusted(config))],
+	});
+	check(answered !== undefined, "no key was pressed in the window");
+	check(isTrustDialog(readBlockedScreen(answered as string)), "the first key was not pressed on the trust dialog");
+	check(responses === responsesBefore, "the model answered a prompt during the handover, which take should have");
 
 	await say("回覆");
 	check(JSON.stringify(results.at(-1)) === '{"sent":true}', `reply said ${JSON.stringify(results.at(-1))}`);
@@ -379,6 +421,16 @@ try {
 	check(model?.includes("haiku") ?? false, `the reply ran on ${model}`);
 	const { records } = await client.call(`${TERMINAL}.program_status`, where, ProgramStatusResultSchema);
 	log("status", { root: records.find((record) => !record.id)?.state });
+	// Read after a turn, as claude may not have written the answer yet when it first reports itself up.
+	const inOwnConfig = await until("the answer to the dialog in the smoke's own config", 30_000, async () => {
+		const own = await trusted(config);
+		return own.has(repo) ? [...own] : undefined;
+	});
+	const gained = [...(await trusted(homedir()))].filter((path) => !trustedBefore.has(path));
+	// Other claudes of the human's may gain theirs meanwhile.
+	const ours = gained.filter((path) => path.startsWith(directory));
+	log("trust", { gained, ours, inOwnConfig });
+	check(ours.length === 0, `~/.claude.json gained trust for ${JSON.stringify(ours)}`);
 	console.log("PASS");
 } finally {
 	log("at the end", await standing().catch((error: Error) => error.message));
@@ -409,9 +461,6 @@ try {
 	});
 	await harness?.close(context);
 	client.close();
-	const resolved = existsSync(worktree) ? await realpath(worktree) : worktree;
-	for (const path of [resolved, repo]) {
-		await rm(join(projects, projectDirNameFor(path)), { recursive: true, force: true });
-	}
 	await rm(directory, { recursive: true, force: true });
+	log("removed", { directoryLeft: existsSync(directory) });
 }

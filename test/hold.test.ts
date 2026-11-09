@@ -433,6 +433,47 @@ describe("summary", () => {
 		await settle();
 		expect(notices(seen)).toHaveLength(1);
 		expect(prompts.filter((each) => each.startsWith("[summary]"))).toEqual([]);
+		expect(await root.commit(async (tx) => (await tx.doc(Holds, root.id)).tried, context)).toBeUndefined();
+	});
+
+	test("a question whose prompt is gone is not the oldest held push: a report held after it waits its own idle time and is summarized alone", async () => {
+		const { root, open, advance, job, held, notices, prompts, settle } = await holdingPort();
+		await job(blocked);
+		const { human, seen } = await open();
+		await root.submit({ type: "write", entry: noticeEntry("question", "action", "要讓 a 執行嗎？", choices) }, context);
+		await vi.waitFor(async () => expect(await held()).toHaveLength(1));
+		await job({ state: "idle" });
+		// A later attempt keeps any check from dropping the question before the report is held, the human idle all along.
+		await root.commit(async (tx) => {
+			(await tx.doc(Holds, root.id)).tried = 105 * MIN;
+		}, context);
+		advance(34 * MIN);
+		await human.notify("card b 完成", "report", "outcome");
+		await vi.waitFor(async () => expect(await held()).toHaveLength(2));
+		const before = notices(seen).length;
+
+		advance(MIN);
+		await vi.waitFor(async () =>
+			expect((await held()).map((push: { content: string }) => push.content)).toEqual(["card b 完成"]),
+		);
+		advance(28 * MIN);
+		await settle();
+		expect(summariesOf(seen)).toEqual([]);
+		expect(prompts.filter((each) => each.startsWith("[summary]"))).toEqual([]);
+		expect(await root.commit(async (tx) => (await tx.doc(Holds, root.id)).tried, context)).toBe(105 * MIN);
+
+		advance(MIN);
+		await vi.waitFor(() => expect(summariesOf(seen)).toHaveLength(1));
+		await settle();
+		expect(
+			notices(seen)
+				.slice(before)
+				.map((notice) => notice.kind),
+		).toEqual(["report"]);
+		const prompt = prompts.find((each) => each.startsWith("[summary]")) ?? "";
+		expect(prompt).toContain("card b 完成");
+		expect(prompt).not.toContain("要讓 a 執行嗎？");
+		expect(await held()).toEqual([]);
 	});
 
 	test("a failed round keeps what it covers held, pushes nothing, and is tried again after the idle time", async () => {

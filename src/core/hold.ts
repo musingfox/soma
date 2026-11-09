@@ -224,8 +224,9 @@ const delivered = (entry: ReturnType<typeof noticeEntry>, delivery: Record<strin
 });
 
 /**
- * The summary of what interfaces hold (ARCHITECTURE.md "Whom to push to"). Once one is due, one commit drops the held
- * questions whose prompt is gone, pins the rest and admits the input that asks the model for the summary, so a restart
+ * The summary of what interfaces hold (ARCHITECTURE.md "Whom to push to"). Once everything held is past the wait, the
+ * held questions whose prompt is gone leave the doc, and they do not count towards what is due: the summary waits for
+ * the rest. Once that is due, one commit pins it and admits the input that asks the model for the summary, so a restart
  * waits on the same round. When the round answers, one commit writes the summary, with each `卡片：` line of what it
  * covers that the model left out (`withCardLines`), ringing on the interfaces holding
  * what it covers unless one rang since the human last typed, sends each question still waiting there again with its
@@ -247,7 +248,7 @@ export function summaries({ harness, root, context, policies, now, presence, idl
 			const { jobs, told } = await prompts(tx);
 			const live = held.filter((push) => !promptGone(push, jobs, told));
 			if (live.length !== held.length) doc.held = live;
-			if (live.length === 0) return undefined;
+			if (!summaryDue(live, presence(), doc.tried, now(), idleMs)) return undefined;
 			const begun = (doc.begun ?? 0) + 1;
 			const requestId = `summary:${begun}`;
 			const keys = live.map((push) => push.key);

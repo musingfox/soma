@@ -61,7 +61,9 @@ test("a long page is cut at the cap and says how long it was", async () => {
 });
 
 test("no more than the byte cap is read, so an endless page cannot stall parsing", async () => {
-	const chunk = new TextEncoder().encode("<p>filler text.</p>".repeat(1024));
+	// One element per chunk: Defuddle's time follows the element count, not the bytes this test counts. A chunk of 1024
+	// <p> spent 2.4 s of the 5 s budget in Defuddle, and CPU load took it past 5 s.
+	const chunk = new TextEncoder().encode(`<p>${"filler text. ".repeat(1496)}</p>`);
 	let pulled = 0;
 	const endless = new ReadableStream<Uint8Array>({
 		start(controller) {

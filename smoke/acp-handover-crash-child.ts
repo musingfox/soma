@@ -11,7 +11,9 @@
 //                                                         readResult, wait for a line, and exit
 // The scenario `before` dies as `take` is called, past the mark and the end of the ACP process, with no window; `after`
 // dies as the reply to session.new_window comes, with the window open, before anything else of `take` runs and before
-// the final mark, so its claude is met by a trust dialog nobody has answered. Only the first soma is wrapped to die.
+// the final mark, so its claude is met by a trust dialog nobody has answered. Only the first soma is wrapped to die. The
+// second soma of `after` prints what the dialog's answer took: "woken" for the model's wake, and "dialog" with the screen
+// the first key was pressed on and "key" for each key. Every claude runs with <dir>/claude-config as its CLAUDE_CONFIG_DIR.
 import { once } from "node:events";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +25,7 @@ import { createAcpAgentPort } from "../src/adapters/acp/agent-port.ts";
 import { createHandoverAgentPort } from "../src/adapters/handover/agent-port.ts";
 import { createRexAgentPort } from "../src/adapters/rex/agent-port.ts";
 import { createRexClient, defaultRexSocket } from "../src/adapters/rex/client.ts";
+import { FormatResultSchema, TERMINAL } from "../src/adapters/rex/schema.ts";
 import { eventBridge, handoverBridge, JOB_DONE, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
@@ -53,17 +56,58 @@ if (mode === "first" && scenario === "after") {
 		return reply;
 	};
 }
+if (mode === "second" && scenario === "after") {
+	const { call } = client;
+	let pressed = false;
+	client.call = async (method, payload, schema) => {
+		const { event, session_id, block_id } = payload as {
+			event?: { type: string; payload: { key: string; action: string } };
+			session_id?: string;
+			block_id?: string;
+		};
+		if (method === "block.event" && event?.type === "key" && event.payload.action === "press") {
+			// Read just before the first key: once the answer lands, the dialog is gone.
+			if (!pressed) {
+				pressed = true;
+				const args = { format: "text", trim: true, max_bytes: 65_536 };
+				const screen = await call(`${TERMINAL}.format`, { session_id, block_id, args }, FormatResultSchema);
+				emit("dialog", { screen: screen.content.split("\n") });
+			}
+			emit("key", { key: event.payload.key });
+		}
+		return call(method, payload, schema);
+	};
+}
 const bin = join(fileURLToPath(new URL("..", import.meta.url)), "bin");
-const env = { SOMA_SOCKET: join(dir, "defer.sock"), SOMA_NODE: process.execPath };
+const config = join(dir, "claude-config");
+const projectsDir = join(config, "projects");
+const env = {
+	SOMA_SOCKET: join(dir, "defer.sock"),
+	SOMA_NODE: process.execPath,
+	CLAUDE_CONFIG_DIR: config,
+	// claude names its login's Keychain item after a CLAUDE_CONFIG_DIR, which would leave this config with no login.
+	// Empty, this keeps the usual name; the smoke handles no credential.
+	CLAUDE_SECURESTORAGE_CONFIG_DIR: "",
+};
 const acp = createAcpAgentPort({
 	env: process.env,
 	// ANTHROPIC_MODEL picks the ACP session's model; the window is told by the --model the handover reads off its reply.
 	vars: { ...env, ANTHROPIC_MODEL: "haiku" },
 	path: bin,
 	sessionsFile: join(dir, "acp-sessions.json"),
+	projectsDir,
 	onError,
 });
-const rex = createRexAgentPort({ client, sessionId: hangar, onError, env, path: bin, takeMs: 60_000 });
+const rex = createRexAgentPort({
+	client,
+	sessionId: hangar,
+	onError,
+	env,
+	path: bin,
+	projectsDir,
+	sessionsDir: join(config, "sessions"),
+	takeMs: 60_000,
+});
 const agents = createHandoverAgentPort({
 	from: acp,
 	to: mode === "first" && scenario === "before" ? { ...rex, take: async () => die() } : rex,
@@ -101,6 +145,7 @@ faux.setResponses(
 			// The fixture's order, should the wake have come from the listing and not from a status this process heard.
 			const option =
 				blocked?.state === "blocked" ? (blocked.options?.find((each) => /^yes\b/i.test(each.label))?.id ?? "1") : "2";
+			emit("woken", { wake: text, option, fingerprint });
 			return call("respond", { card, option, fingerprint, reason: "the smoke trusts its own repo" });
 		}
 		if (text.includes("派工")) return call("dispatch", { card, repo });

@@ -10,10 +10,13 @@
 //           one notice names the window, the job takes the session, the listing names the window, nothing runs under the
 //           second soma, ever, the bridge hands the model the trust dialog no one answered, and a reply goes into the pane
 //           and brings the word back.
-// Either way one transcript holds the job. Two prompts run on haiku, and each passing `after` run leaves a trust entry in
-// ~/.claude.json for the deleted repo, which is printed. It kills what is left of its children by PID, and destroys its
-// rex session and removes its repo, what claude keeps for them under ~/.claude/projects and its db at the end, also on
-// failure.
+// Either way one transcript holds the job. Two prompts run on haiku. Every claude runs with one CLAUDE_CONFIG_DIR beside the
+// repo, as the pane's --resume has to find the transcript written over ACP, so in `after` the dialog is asked and its
+// answer lands there. Since the dead soma's `take` is not repeated, the bridge wakes the model for it, and `respond`
+// answers it: an `after` run with no dialog, or with one answered any other way, fails, and either scenario fails on a
+// trust entry in ~/.claude.json for a path of its own. It kills what is left of its children by PID, waits for the pane's
+// claude, and destroys its rex session and removes its repo, config and db at the end, also on failure. Only the trusted
+// paths are read out of either .claude.json.
 //   node smoke/acp-handover-crash.ts before|after
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -33,7 +36,8 @@ import {
 	TERMINAL,
 	ViewSchema,
 } from "../src/adapters/rex/schema.ts";
-import { projectDirNameFor } from "../src/agent-cli/transcript.ts";
+import { isTrustDialog, readBlockedScreen } from "../src/agent-cli/permission/blocked-screen.ts";
+import { projectDirNameFor, readSessionModel } from "../src/agent-cli/transcript.ts";
 import { runGit } from "../src/agent-cli/worktree.ts";
 import { delay } from "./driver.ts";
 
@@ -60,7 +64,7 @@ function soma(args: string[]) {
 		try {
 			const parsed = JSON.parse(line) as Line;
 			lines.push(parsed);
-			if (parsed.step === "status" || parsed.step === "tool" || parsed.step === "dying") log(parsed.step, parsed);
+			if (["status", "tool", "dying", "woken", "dialog", "key"].includes(parsed.step)) log(parsed.step, parsed);
 		} catch {
 			console.log(line);
 		}
@@ -107,9 +111,9 @@ const alive = (pid: number) => {
 	}
 };
 
-/** The project paths ~/.claude.json marks as trusted; nothing else is read out of it. */
-async function trusted(): Promise<Set<string>> {
-	const text = await readFile(join(homedir(), ".claude.json"), "utf8");
+/** The project paths the `.claude.json` in `directory` marks as trusted; nothing else is read out of it. */
+async function trusted(directory: string): Promise<Set<string>> {
+	const text = await readFile(join(directory, ".claude.json"), "utf8");
 	const { projects } = JSON.parse(text) as { projects?: Record<string, { hasTrustDialogAccepted?: boolean }> };
 	return new Set(
 		Object.entries(projects ?? {}).flatMap(([path, entry]) => (entry.hasTrustDialogAccepted ? [path] : [])),
@@ -122,8 +126,8 @@ const client = createRexClient({
 });
 const directory = await realpath(await mkdtemp(join(tmpdir(), "soma-acp-handover-crash-")));
 const repo = join(directory, "repo");
-const projects = join(homedir(), ".claude", "projects");
-const worktree = join(repo, ".claude", "worktrees", card);
+const config = join(directory, "claude-config");
+const projects = join(config, "projects");
 const sessionsFile = join(directory, "acp-sessions.json");
 const git = (...args: string[]) => runGit(repo, args);
 const identity = ["-c", "user.name=soma smoke", "-c", "user.email=smoke@example.com", "-c", "commit.gpgsign=false"];
@@ -145,7 +149,22 @@ const { session_id: hangar } = await client
 const blocks = async () =>
 	(await client.call("session.list_blocks", { session_id: hangar }, BlockListSchema)).blocks ?? [];
 const children: ChildProcess[] = [];
-let paneClaude: number | undefined;
+// The first soma's processes until they are seen gone: its death leaves them under no one, and `descendants` finds none.
+let firstTree: number[] = [];
+
+/** The claude in each pane of the hangar, read before the destroy ends it. */
+async function paneClaudes(): Promise<number[]> {
+	const running = await Promise.all(
+		(await blocks()).map((block) =>
+			client.call(
+				`${TERMINAL}.process`,
+				{ session_id: hangar, block_id: block.block_id, args: {} },
+				ProcessResultSchema,
+			),
+		),
+	);
+	return running.flatMap(({ foreground }) => (foreground?.argv0 === "claude" ? [foreground.pid] : []));
+}
 
 /** What explains a run, read before the cleanup removes it. */
 async function standing() {
@@ -191,7 +210,10 @@ try {
 	);
 	await git("add", "README.md", ".claude/settings.json");
 	await git(...identity, "commit", "-q", "--no-verify", "-m", "chore: init");
-	const trustedBefore = await trusted();
+	// Past the first-run screens, which come before the dialog; there is nothing else in this config to start with.
+	await mkdir(config);
+	await writeFile(join(config, ".claude.json"), `${JSON.stringify({ hasCompletedOnboarding: true })}\n`);
+	const trustedBefore = await trusted(homedir());
 	log("hangar", { session: hangar, label, card, repo, scenario, word });
 	const args = [scenario, directory, hangar, card, repo, word];
 
@@ -201,10 +223,12 @@ try {
 	log("recorded", { done: recorded.done, result: recorded.result });
 	const before = await entry();
 	const tree = descendants(first.process.pid as number);
+	firstTree = tree.map(({ pid }) => pid);
 	log("over acp", {
 		entry: before,
-		processes: tree.map(({ pid, command }) => ({ pid, command: command.slice(0, 80) })),
+		processes: tree.map(({ pid, command }) => ({ pid, command: command.slice(0, 160) })),
 		blocksInHangar: (await blocks()).length,
+		model: await readSessionModel(join(projects, projectDirNameFor(before.cwd), `${before.acpSessionId}.jsonl`)),
 	});
 	check(
 		tree.some(({ command }) => command.includes("claude-agent-acp")),
@@ -232,6 +256,7 @@ try {
 	const orphaned = tree.filter(({ pid }) => alive(pid));
 	log("left", orphaned);
 	check(orphaned.length === 0, `${orphaned.length} of the first soma's processes are still alive`);
+	firstTree = [];
 
 	const second = soma(["second", ...args]);
 	children.push(second.process);
@@ -326,7 +351,6 @@ try {
 		check(inHangar[0]?.label === before.acpSessionId, `the block is labelled ${inHangar[0]?.label}`);
 		const where = { session_id: hangar, block_id: inHangar[0]?.block_id, args: {} };
 		const { foreground } = await client.call(`${TERMINAL}.process`, where, ProcessResultSchema);
-		paneClaude = foreground?.pid;
 		const command = spawnSync("ps", ["-ww", "-o", "command=", "-p", String(foreground?.pid)], {
 			encoding: "utf8",
 		}).stdout;
@@ -338,14 +362,44 @@ try {
 	const files = (await readdir(join(projects, projectDirNameFor(before.cwd)))).filter((name) =>
 		name.endsWith(".jsonl"),
 	);
-	log("transcript", { files });
+	const model = await readSessionModel(join(projects, projectDirNameFor(before.cwd), `${before.acpSessionId}.jsonl`));
+	log("transcript", { files, model });
 	check(
 		JSON.stringify(files) === JSON.stringify([`${before.acpSessionId}.jsonl`]),
 		`the job has transcripts ${JSON.stringify(files)}`,
 	);
 
-	const gained = [...(await trusted())].filter((path) => !trustedBefore.has(path));
-	log("trust", { gained, ours: gained.filter((path) => path.startsWith(directory)) });
+	if (scenario === "after") {
+		// The real dialog, answered by the model: a repo trusted already would pass everything above with no key pressed.
+		const woken = second.lines.find((line) => line.step === "woken");
+		const dialog = second.lines.find((line) => line.step === "dialog");
+		const { decisions } = replied.job as { decisions: { action: string; fingerprint?: string }[] };
+		log("answer", {
+			keysPressed: second.lines.filter((line) => line.step === "key").map((line) => line.key),
+			option: woken?.option,
+			decisions,
+		});
+		check(woken !== undefined, "the bridge did not wake the model for the dialog");
+		check(String(woken?.wake).includes(`repository root ${repo}`), "the wake does not name the smoke's repo");
+		check(dialog !== undefined, "no key was pressed in the window");
+		check(
+			isTrustDialog(readBlockedScreen(((dialog?.screen ?? []) as string[]).join("\n"))),
+			"the first key was not pressed on the trust dialog",
+		);
+		check(
+			decisions.some(({ action, fingerprint }) => action === "answered" && fingerprint === woken?.fingerprint),
+			"the job records no answer to the prompt the model was woken for",
+		);
+		// Read after a turn, as claude may not have written the answer yet when it first reports itself up.
+		for (const deadline = Date.now() + 30_000; !(await trusted(config)).has(repo); await delay(250)) {
+			check(Date.now() < deadline, "the answer to the dialog did not land in the smoke's own config");
+		}
+	}
+	const gained = [...(await trusted(homedir()))].filter((path) => !trustedBefore.has(path));
+	// Other claudes of the human's may gain theirs meanwhile.
+	const ours = gained.filter((path) => path.startsWith(directory));
+	log("trust", { gained, ours, inOwnConfig: [...(await trusted(config))] });
+	check(ours.length === 0, `~/.claude.json gained trust for ${JSON.stringify(ours)}`);
 
 	second.go();
 	await second.next("end", 30_000);
@@ -353,27 +407,29 @@ try {
 } finally {
 	log("at the end", await standing().catch((error: Error) => error.message));
 	// Everything under a soma is the smoke's too: left running, it would write its transcript back after the removal below.
-	const orphans = children.flatMap((child) => descendants(child.pid as number).map(({ pid }) => pid));
+	const orphans = [
+		...firstTree,
+		...children.flatMap((child) => descendants(child.pid as number).map(({ pid }) => pid)),
+	];
 	for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
 	for (const pid of orphans) if (alive(pid)) process.kill(pid, "SIGKILL");
 	for (const deadline = Date.now() + 5_000; orphans.some(alive) && Date.now() < deadline; ) await delay(100);
+	const panes = await paneClaudes().catch((error: Error) => {
+		console.error(`the panes' claudes: ${error.message}`);
+		return [];
+	});
 	await client
 		.call("session.destroy", { session_id: hangar }, EmptyResultSchema)
 		.catch((error: Error) => console.error(`destroy ${hangar}: ${error.message}`));
-	// The pane's claude was started for this smoke, so what the destroy left of it is the smoke's to end.
-	const pid = paneClaude;
-	if (pid !== undefined) {
-		for (const deadline = Date.now() + 10_000; alive(pid) && Date.now() < deadline; ) await delay(200);
-		if (alive(pid)) {
-			console.error(`the pane's claude ${pid} outlived its session, and is killed`);
-			process.kill(pid, "SIGTERM");
-		}
+	// A claude that outlives its session writes its config back, after a removal that came too soon, so what the destroy
+	// left of it is the smoke's to end, and to wait for.
+	for (const deadline = Date.now() + 10_000; panes.some(alive) && Date.now() < deadline; ) await delay(200);
+	for (const pid of panes.filter(alive)) {
+		console.error(`the pane's claude ${pid} outlived its session, and is killed`);
+		process.kill(pid, "SIGTERM");
 	}
+	for (const deadline = Date.now() + 5_000; panes.some(alive) && Date.now() < deadline; ) await delay(200);
 	client.close();
-	const resolved = existsSync(worktree) ? await realpath(worktree) : worktree;
-	for (const path of [resolved, repo]) {
-		await rm(join(projects, projectDirNameFor(path)), { recursive: true, force: true });
-	}
 	await rm(directory, { recursive: true, force: true });
-	log("cleanup", { paneClaudeAlive: pid !== undefined && alive(pid), repoGone: !existsSync(repo) });
+	log("cleanup", { panes, paneClaudesAlive: panes.filter(alive), directoryLeft: existsSync(directory) });
 }

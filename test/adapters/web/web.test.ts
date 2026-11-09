@@ -280,6 +280,25 @@ test("the answer of the page's own turn comes back over the socket, to every ope
 	expect(await page.next()).toEqual({ type: "failure", id: ID, text: "no model", loud: true });
 });
 
+test("a failure carrying a provider's JSON error reaches the page as a readable sentence, its own turn's or not", async () => {
+	const { human, server } = await serve();
+	const page = await open(server.port);
+	// An Anthropic 401 as soma's failure reason carries it: the SDK's message is the status and the body whole.
+	const body = {
+		type: "error",
+		error: { type: "authentication_error", message: "invalid x-api-key" },
+		request_id: "req_011CVa1b2c3d4e5f6g7h8i9j",
+	};
+	const reason = `模型出錯：401 ${JSON.stringify(body)}`;
+	human.emit({ type: "failure", requestId: `web:${ID}`, reason });
+	human.emit({ type: "failure", requestId: "agent:fix-bug:3", reason, class: "outcome" });
+	const readable = "模型出錯：401 authentication_error：invalid x-api-key";
+	expect([await page.next(), await page.next()]).toEqual([
+		{ type: "failure", id: ID, text: readable, loud: true },
+		{ type: "failure", text: `agent:fix-bug:3 那一輪：${readable}`, loud: true },
+	]);
+});
+
 test("the answer of a turn another interface started is not sent; a scheduled turn's is a report", async () => {
 	const { human, server } = await serve();
 	const page = await open(server.port);

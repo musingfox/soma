@@ -9,6 +9,7 @@ import { gzipSync } from "node:zlib";
 import { type RawData, WebSocket, WebSocketServer } from "ws";
 import { z } from "zod";
 import { deliveryTo, type HumanPort, type SomaEvent } from "../../ports/human.ts";
+import { readableFailure } from "./failure.ts";
 
 /** Serve mode: soma is behind `tailscale serve`, which terminates HTTPS and says who the caller is. */
 export interface ServeConfig {
@@ -163,10 +164,14 @@ export async function startWeb(options: WebOptions): Promise<WebServer> {
 			if (event.class !== undefined && delivery !== "log")
 				return { type: "notice", kind: "report", text: event.content, loud: delivery === "ring" };
 		} else if (event.type === "failure") {
-			if (mine) return { type: "failure", id, text: event.reason, loud: true };
+			if (mine) return { type: "failure", id, text: readableFailure(event.reason), loud: true };
 			const delivery = deliveryTo(event, ENTRY_KIND);
 			if (event.class !== undefined && delivery !== "log")
-				return { type: "failure", text: `${event.requestId} 那一輪：${event.reason}`, loud: delivery === "ring" };
+				return {
+					type: "failure",
+					text: `${event.requestId} 那一輪：${readableFailure(event.reason)}`,
+					loud: delivery === "ring",
+				};
 		}
 		return undefined;
 	};

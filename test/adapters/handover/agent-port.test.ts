@@ -424,6 +424,10 @@ test("a second handover of a turn still stopping sends no second cancel, and one
 
 	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: false, refusal: "not_at_rest" });
 	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: false, refusal: "not_at_rest" });
+	// session/cancel is a notification: the refusals do not wait for the agent to have taken it.
+	for (const deadline = Date.now() + 5_000; (await both.cancelled()) === ""; await sleep(5)) {
+		expect(Date.now()).toBeLessThan(deadline);
+	}
 	expect(await both.cancelled()).toBe(`${acpSessionId}\n`);
 	await both.release("stop");
 	await both.acp.until("idle", from);

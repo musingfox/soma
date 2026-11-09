@@ -66,6 +66,8 @@ test("a message is answered in its chat, and Telegram delivering it again after 
 
 	const update = api.deliver("派 a", CHAT);
 	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "已派工 a。", parse_mode: "HTML" }]));
+	// The answered reaction goes out on a queue of its own, which the stop would cut short.
+	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍"]));
 	await first.stop();
 
 	api.redeliver(update);
@@ -74,6 +76,8 @@ test("a message is answered in its chat, and Telegram delivering it again after 
 		const { items } = await root.entries({ order: "ascending" }, 100, undefined, context);
 		expect(items.filter((entry) => entry.kind === "chat.telegram")).toHaveLength(1);
 	});
+	// Marked received only once the core has admitted it again, which the entry above does not show.
+	await vi.waitFor(() => expect(api.reactions).toHaveLength(3));
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	await root.waitForIdle(context);
 	expect(faux.state.callCount).toBe(1);

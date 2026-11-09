@@ -1,8 +1,14 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { createTtyAgentPort, type Pty, type SpawnPty } from "../../../src/adapters/tty/agent-port.ts";
-import { type AgentPort, type AgentStatusEvent, NotImplemented, PromptRefused } from "../../../src/ports/agent.ts";
+import {
+	type AgentPort,
+	type AgentState,
+	type AgentStatusEvent,
+	NotImplemented,
+	PromptRefused,
+} from "../../../src/ports/agent.ts";
 import { git } from "../rex/fake.ts";
 
 const SESSION = "0e9d6c1f-4a3b-4a52-9c85-2f6d3f6f2f10";
@@ -75,6 +81,13 @@ function harness(options: { cap?: number; env?: NodeJS.ProcessEnv } = {}) {
 /** Lets the emulator parse what was written and the adapter's queue run. */
 const settle = () => sleep(20);
 
+/**
+ * Waits for `state` to be the last status reported. On a loaded machine the emulator's parse and the adapter's queue
+ * take longer than `settle` gives them, and what was written last is reported last.
+ */
+const reported = (events: AgentStatusEvent[], state: AgentState["state"]) =>
+	vi.waitFor(() => expect(events.at(-1)?.status.state).toBe(state));
+
 async function started(port: AgentPort, ptys: FakePty[], name = "card-a") {
 	await port.start({ ...request, name, card: name });
 	const pty = ptys.at(-1);
@@ -126,8 +139,7 @@ test("the 7501 probe is answered, so claude reports its status", async () => {
 	const { port, ptys } = harness();
 	const pty = await started(port, ptys);
 	pty.out(report("?"));
-	await settle();
-	expect(pty.written).toContain("\x1b]7501;?\x1b\\");
+	await vi.waitFor(() => expect(pty.written).toContain("\x1b]7501;?\x1b\\"));
 });
 
 test("root reports become statuses under rising seqs; child records and unknown states are ignored", async () => {
@@ -138,7 +150,7 @@ test("root reports become statuses under rising seqs; child records and unknown 
 	pty.out(report("state=working:app=claude-code"));
 	pty.out(report("state=sleeping"));
 	pty.out(report(`state=done:msg=${b64("all done")}`));
-	await settle();
+	await reported(events, "done");
 
 	expect(events.map(({ agent, status }) => ({ agent, status }))).toEqual([
 		{ agent: "card-a", status: { state: "idle" } },
@@ -159,7 +171,7 @@ test("a blocked report carries the prompt read off the screen, and an answer typ
 	pty.out(report("state=working"));
 	pty.out(herdrFixture("blocked-bash-prompt.txt"));
 	pty.out(report("state=blocked:kind=permission"));
-	await settle();
+	await reported(events, "blocked");
 
 	const blocked = events.at(-1)?.status;
 	if (blocked?.state !== "blocked" || blocked.fingerprint === undefined) throw new Error("no readable block");
@@ -285,6 +297,6 @@ test("a block whose screen moved on before it was read is not reported", async (
 	pty.out(herdrFixture("blocked-bash-prompt.txt"));
 	pty.out(report("state=blocked:kind=permission"));
 	pty.out(`\x1b[2J${report("state=working")}`);
-	await settle();
+	await reported(events, "working");
 	expect(events.map((event) => event.status.state)).toEqual(["working"]);
 });

@@ -6,17 +6,23 @@
 //      model call in that process;
 //   4. the trust prompt is answered; the reopened core sends the held launch prompt, the agent finishes,
 //      and the dispatch list and transcript must record it, with the outcome read off claude's own
-//      transcript, and no model call.
-// It runs in a throwaway git repo: claude keeps folder trust per repo root, so a repo it has seen before
-// shows no trust prompt and nothing blocks. The repo, the card's worktree and its agent go at the end.
+//      transcript, and no model call;
+//   5. the answer landed for the smoke's repo in the CLAUDE_CONFIG_DIR its claude runs with beside the repo, and
+//      ~/.claude.json gained no trust entry for a path of its own (read, never written).
+// It runs in a throwaway git repo under ~/.cache (not $TMPDIR, which claude trusts on its own): claude keeps folder
+// trust per repo root, so a repo it has seen before shows no trust prompt and nothing blocks. The repo, its config,
+// the card's worktree and its agent go at the end, once the agent's claude has ended.
 //   node smoke/bridge.ts
 import { spawnSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHerdrClient } from "../src/adapters/herdr/client.ts";
+import { readSessionModel, resolveTranscriptPath } from "../src/agent-cli/transcript.ts";
 import { type Child, delay, run } from "./driver.ts";
+import { checkTrust, removeAgents, seedClaudeConfig, trusted } from "./herdr-claude.ts";
 
 const CHILD = fileURLToPath(new URL("./bridge-child.ts", import.meta.url));
 const card = `smoke-${Date.now().toString(36)}`;
@@ -26,6 +32,7 @@ const log = (step: string, value: unknown) => console.log(`${step.padEnd(10)} ${
 type Job = {
 	agent: string;
 	seq?: number;
+	sessionId: string;
 	status: { state: string };
 	outcome?: string;
 	launchHeld: boolean;
@@ -50,16 +57,21 @@ async function until(child: Child, what: string, ok: (report: Report) => boolean
 	}
 }
 
-const directory = await mkdtemp(join(tmpdir(), "soma-bridge-"));
+// realpath, as claude keys its trust by the real path.
+const directory = await realpath(await mkdtemp(join(homedir(), ".cache", "soma-bridge-")));
 const children: Child[] = [];
 try {
 	const db = join(directory, "soma.sqlite");
 	const repo = join(directory, "repo");
+	const config = join(directory, "claude-config");
+	const trustedBefore = await trusted(homedir());
 	spawnSync("git", ["init", "-q", repo]);
 	spawnSync("git", ["-C", repo, "commit", "-q", "--allow-empty", "-m", "chore: init"]);
-	log("card", card);
+	await seedClaudeConfig(config);
+	const env = { ...process.env, CLAUDE_CONFIG_DIR: config };
+	log("card", { card, repo });
 
-	const first = run(["run", db, card, repo], CHILD, { ...process.env, SOMA_SMOKE_HANG_AFTER_WAKE: "1" });
+	const first = run(["run", db, card, repo], CHILD, { ...env, SOMA_SMOKE_HANG_AFTER_WAKE: "1" });
 	children.push(first);
 	const woke = await first.next("woke");
 	check(
@@ -84,7 +96,7 @@ try {
 	check(jobOf(later.at(-1) as Report)?.seq === undefined, "the job's seq was committed before the kill");
 	log("killed", { signal: "SIGKILL", jobSeq: jobOf(later.at(-1) as Report)?.seq ?? null });
 
-	const second = run(["run", db], CHILD);
+	const second = run(["run", db], CHILD, env);
 	children.push(second);
 	const resent = await until(second, "the resent block", (report) => jobOf(report)?.seq !== undefined, 15_000);
 	await delay(3_000);
@@ -94,7 +106,10 @@ try {
 	check(jobOf(quiet)?.wake === "done", `the wake submission is ${jobOf(quiet)?.wake}`);
 	log("resent", { calls: quiet.calls, wakes: quiet.blocked.length, job: jobOf(resent) });
 
-	const pane = (await herdr.agentGet(card)).pane_id;
+	const { pane_id: pane, cwd: worktree } = await herdr.agentGet(card);
+	const dialog = (await herdr.paneRead({ pane_id: pane, source: "detection" })).text;
+	check(dialog.includes("Yes, I trust this folder"), `the pane shows no trust dialog: ${dialog}`);
+	log("dialog", dialog.split("\n").filter(Boolean));
 	// Claude Code's folder trust prompt: the cursor starts on "No, exit".
 	await herdr.paneSendKeys(pane, ["Down"]);
 	await delay(300);
@@ -118,10 +133,14 @@ try {
 		herdr: (await herdr.agentGet(card)).agent_status,
 	});
 	log("agent", JSON.stringify(transcript).includes("ok") ? "replied ok to the launch prompt" : transcript);
+	const session = await resolveTranscriptPath(jobOf(after)?.sessionId as string, worktree, join(config, "projects"));
+	check(session !== undefined, "no transcript for the session");
+	log("model", await readSessionModel(session as string));
+	log("trust", await checkTrust(config, repo, homedir(), trustedBefore, [directory, worktree as string]));
 	console.log("PASS");
 } finally {
 	for (const child of children) child.process.kill("SIGKILL");
-	const agent = (await herdr.agentList()).find((each) => each.name === card);
-	if (agent !== undefined) await herdr.call("worktree.remove", { workspace_id: agent.workspace_id, force: true });
+	const claudes = await removeAgents(herdr, [card]);
 	await rm(directory, { recursive: true, force: true });
+	log("cleanup", { claudes, directoryLeft: existsSync(directory) });
 }

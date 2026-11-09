@@ -1,10 +1,12 @@
 // The core as the event-bridge smoke runs it: main.ts's startup with the event bridge listening, the faux
 // model standing in for one that calls `dispatch` (no API key on this machine), and a stub card that
-// asks for a result line and a one-word answer. Talks to the herdr session at $HERDR_SOCKET_PATH.
+// asks for a result line and a one-word answer. Talks to the herdr session at $HERDR_SOCKET_PATH. Its claude runs with
+// $CLAUDE_CONFIG_DIR, where its transcripts go too.
 //   run <db> [<card> <repo>]   start up, submit 「派 <card> <repo>」 when given, then report once a second
 // Each report line carries the faux request count of this process, the bridge's entries and the jobs.
 // SOMA_SMOKE_HANG_AFTER_WAKE=1 freezes the process once a wake's run has finished, before the bridge
 // commits the job's seq, so the driver can kill -9 it in that window.
+import { join } from "node:path";
 import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -21,13 +23,19 @@ import {
 } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
+import { startingInConfig } from "./herdr-claude.ts";
 
 const context = BACKGROUND_CONTEXT;
 const [mode, db, card, repo] = process.argv.slice(2);
 if (mode !== "run" || db === undefined) throw new Error("usage: bridge-child.ts run <db> [<card> <repo>]");
+const config = process.env.CLAUDE_CONFIG_DIR;
+if (config === undefined) throw new Error("CLAUDE_CONFIG_DIR must be set");
 const emit = (record: object) => console.log(JSON.stringify(record));
 
-const agents = createHerdrAgentPort({ client: createHerdrClient({ socketPath: process.env.HERDR_SOCKET_PATH }) });
+const agents = createHerdrAgentPort({
+	client: startingInConfig(createHerdrClient({ socketPath: process.env.HERDR_SOCKET_PATH }), config),
+	projectsDir: join(config, "projects"),
+});
 const faux = fauxProvider();
 faux.setResponses(
 	Array.from({ length: 20 }, () => (transcript: { messages: { role: string; content: unknown }[] }) => {

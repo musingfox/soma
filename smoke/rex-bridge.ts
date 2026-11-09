@@ -11,12 +11,15 @@
 //   5. the human says to trust it; the faux model answers with `respond`, the wake's fingerprint and the option
 //      "Yes, I trust this folder"; the held launch prompt goes out, the agent finishes, and the dispatch list and
 //      transcript record one finished turn, with no further model call;
-//   6. ~/.claude.json gained one trust entry, for the smoke's repo, which the wake named as what a yes trusts (read,
-//      never written).
-// It destroys its rex session and removes the repo at the end, also on failure.
+//   6. the answer landed for the smoke's repo, which the wake named as what a yes trusts, in the CLAUDE_CONFIG_DIR its
+//      claude runs with beside the repo, and ~/.claude.json gained no trust entry for a path of its own (read, never
+//      written).
+// It destroys its rex session, waits for the pane's claude to end, and removes the repo and config at the end, also on
+// failure.
 //   node smoke/rex-bridge.ts
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,7 +27,7 @@ import { z } from "zod";
 import { createRexClient, defaultRexSocket } from "../src/adapters/rex/client.ts";
 import { readProcessStart } from "../src/adapters/rex/process-start.ts";
 import { EmptyResultSchema, ProcessResultSchema, TERMINAL, ViewSchema } from "../src/adapters/rex/schema.ts";
-import { readLastRecord, resolveTranscriptPath } from "../src/agent-cli/transcript.ts";
+import { readLastRecord, readSessionModel, resolveTranscriptPath } from "../src/agent-cli/transcript.ts";
 import { type Child, delay, run } from "./driver.ts";
 
 const CHILD = fileURLToPath(new URL("./rex-bridge-child.ts", import.meta.url));
@@ -65,13 +68,41 @@ async function until(child: Child, what: string, ok: (report: Report) => boolean
 	}
 }
 
-/** The project paths ~/.claude.json marks as trusted; nothing else is read out of it. */
-async function trusted(): Promise<Set<string>> {
-	const text = await readFile(join(homedir(), ".claude.json"), "utf8");
-	const projects = (JSON.parse(text) as { projects?: Record<string, { hasTrustDialogAccepted?: boolean }> }).projects;
+/** The project paths the `.claude.json` in `directory` marks as trusted; nothing else is read out of it. */
+async function trusted(directory: string): Promise<Set<string>> {
+	const text = await readFile(join(directory, ".claude.json"), "utf8");
+	const { projects } = JSON.parse(text) as { projects?: Record<string, { hasTrustDialogAccepted?: boolean }> };
 	return new Set(
 		Object.entries(projects ?? {}).flatMap(([path, entry]) => (entry.hasTrustDialogAccepted ? [path] : [])),
 	);
+}
+
+/** The pids of the claudes in the foreground of the session's blocks, which outlive the destroy by a moment. */
+async function claudesIn(session: string): Promise<number[]> {
+	const { windows } = await client.call("session.view", { session_id: session }, ViewSchema);
+	const blocks = (windows ?? []).flatMap((window) =>
+		(window.layers ?? []).flatMap((layer) => (layer.blocks ?? []).flatMap((block) => block.block_id ?? [])),
+	);
+	const processes = await Promise.all(
+		blocks.map((blockId) =>
+			client.call(`${TERMINAL}.process`, { session_id: session, block_id: blockId, args: {} }, ProcessResultSchema),
+		),
+	);
+	return processes.flatMap(({ foreground }) => (foreground?.argv0 === "claude" ? [foreground.pid as number] : []));
+}
+
+const alive = (pid: number) => {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+
+async function ended(pids: number[], ms: number): Promise<boolean> {
+	for (const deadline = Date.now() + ms; pids.some(alive) && Date.now() < deadline; ) await delay(200);
+	return !pids.some(alive);
 }
 
 const created = await client.call(
@@ -83,17 +114,22 @@ const hangar = created.session_id;
 // Under ~/.cache, which claude does not trust on its own; realpath, as claude keys its trust by the real path.
 const directory = await realpath(await mkdtemp(join(homedir(), ".cache", "soma-rex-bridge-")));
 const repo = join(directory, "repo");
+const config = join(directory, "claude-config");
 const worktree = join(repo, ".claude/worktrees", card);
 const children: Child[] = [];
 try {
 	await client.attach(hangar);
-	const trustedBefore = await trusted();
+	const trustedBefore = await trusted(homedir());
 	check(![...trustedBefore].some((path) => path.startsWith(directory)), "the fresh repo is trusted already");
 	const db = join(directory, "soma.sqlite");
 	spawnSync("git", ["init", "-q", repo]);
 	spawnSync("git", ["-C", repo, "commit", "-q", "--allow-empty", "-m", "chore: init"]);
+	// Past the first-run screens, which come before the dialog; there is nothing else in this config to start with.
+	await mkdir(config);
+	await writeFile(join(config, ".claude.json"), `${JSON.stringify({ hasCompletedOnboarding: true })}\n`);
 	const env = {
 		...process.env,
+		CLAUDE_CONFIG_DIR: config,
 		SOMA_REX_SESSION_ID: hangar,
 		SOMA_REX_SOCKET: socketPath,
 		SOMA_SMOKE_TRUST_PATH: worktree,
@@ -155,6 +191,7 @@ try {
 	const firstWake = jobOf(resent)?.wake;
 	check(firstWake === "done", `the wake submission is ${firstWake}`);
 	check(jobOf(quiet)?.status.state === "blocked", `the job is ${jobOf(quiet)?.status.state}`);
+	log("dialog", { screen: jobOf(resent)?.status.msg?.split("\n"), fingerprint: jobOf(resent)?.status.fingerprint });
 	log("resent", {
 		calls: quiet.calls,
 		wakes: quiet.blocked.length,
@@ -180,11 +217,15 @@ try {
 	const after = reports(second).at(-1) as Report;
 	check(after.calls === 2, `the finished turn cost ${after.calls - 2} more model calls`);
 	check(after.done.length === 1, `${after.done.length} done records`);
-	const transcript = await resolveTranscriptPath(jobOf(after)?.sessionId as string, worktree);
+	const transcript = await resolveTranscriptPath(jobOf(after)?.sessionId as string, worktree, join(config, "projects"));
 	check(transcript !== undefined, "no transcript for the session");
 	const reply = await readLastRecord(transcript as string);
 	log("done", { calls: after.calls, decision, done: after.done, job: jobOf(after) });
-	log("agent", { reply: reply?.text, rexErrors: second.lines.filter((line) => line.event === "rex_error") });
+	log("agent", {
+		reply: reply?.text,
+		model: await readSessionModel(transcript as string),
+		rexErrors: second.lines.filter((line) => line.event === "rex_error"),
+	});
 	check(reply?.text?.includes("ok") === true, `the agent replied ${JSON.stringify(reply?.text)}`);
 	check(jobOf(after)?.outcome === "完成", `the job's outcome is ${jobOf(after)?.outcome}`);
 	check(
@@ -192,19 +233,35 @@ try {
 		`the job recorded reply ${jobOf(after)?.resultId}, transcript ${reply?.id}`,
 	);
 
-	// claude keys the trust by the worktree's main checkout, the smoke's fresh repo, as the worktree inherits it.
-	const gained = [...(await trusted())].filter((path) => !trustedBefore.has(path));
-	check(
-		gained.length === 1 && gained[0] === repo,
-		`~/.claude.json gained trust for ${JSON.stringify(gained)}, not only the smoke's ${repo}`,
-	);
-	log("trust", { gained, for: "the smoke's repo, as the wake said" });
+	// claude keys the trust by the worktree's main checkout, the smoke's fresh repo, as the worktree inherits it. It may
+	// not have written the answer when it first reports itself up, so this is read after the turn.
+	let inOwnConfig = await trusted(config);
+	for (const deadline = Date.now() + 30_000; !inOwnConfig.has(repo) && Date.now() < deadline; await delay(250)) {
+		inOwnConfig = await trusted(config);
+	}
+	check(inOwnConfig.has(repo), `the answer to the dialog did not land in the smoke's own config: ${[...inOwnConfig]}`);
+	const gained = [...(await trusted(homedir()))].filter((path) => !trustedBefore.has(path));
+	// Other claudes of the human's may gain theirs meanwhile.
+	const ours = gained.filter((path) => path.startsWith(directory));
+	log("trust", { gained, ours, inOwnConfig: [...inOwnConfig] });
+	check(ours.length === 0, `~/.claude.json gained trust for ${JSON.stringify(ours)}`);
 	console.log("PASS");
 } finally {
 	for (const child of children) child.process.kill("SIGKILL");
+	const claudes = await claudesIn(hangar).catch((error: Error) => {
+		console.error(`claudes of ${hangar}: ${error.message}`);
+		return [];
+	});
 	await client
 		.call("session.destroy", { session_id: hangar }, EmptyResultSchema)
 		.catch((error: Error) => console.error(`destroy ${hangar}: ${error.message}`));
 	client.close();
+	// A claude that outlives its core by a moment writes its config back, after a removal that came too soon.
+	if (!(await ended(claudes, 10_000))) {
+		console.error(`the pane's claude outlived its session, and is killed: ${claudes.filter(alive)}`);
+		for (const pid of claudes.filter(alive)) process.kill(pid, "SIGTERM");
+		await ended(claudes, 5_000);
+	}
 	await rm(directory, { recursive: true, force: true });
+	log("cleanup", { claudes, claudesLeft: claudes.filter(alive), directoryLeft: existsSync(directory) });
 }

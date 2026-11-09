@@ -1,7 +1,7 @@
 // The core as the rex event-bridge smoke runs it: main.ts's startup with the rex adapter and the event bridge
 // listening, the faux model standing in for one that calls `dispatch` and `respond`, and a stub card that asks for a
 // result line and a one-word answer. Dispatches into the rex session $SOMA_REX_SESSION_ID on the server at
-// $SOMA_REX_SOCKET.
+// $SOMA_REX_SOCKET. Its claude runs with $CLAUDE_CONFIG_DIR, where its transcripts and process records go too.
 //   run <db> [<card> <repo>]   start up, submit 「派 <card> <repo>」 when given, then report once a second
 // A line `trust <card>` on stdin submits 「信任 <card>」, the human's go-ahead for the folder-trust dialog the model
 // asked about. The faux model answers it with `respond`, choosing "Yes, I trust this folder" with the fingerprint the
@@ -9,6 +9,7 @@
 // SOMA_SMOKE_HANG_AFTER_WAKE=1 freezes the process once a wake's run has finished, before the bridge commits the job's
 // seq, so the driver can kill -9 it in that window.
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -32,6 +33,8 @@ const [mode, db, card, repo] = process.argv.slice(2);
 if (mode !== "run" || db === undefined) throw new Error("usage: rex-bridge-child.ts run <db> [<card> <repo>]");
 const hangar = process.env.SOMA_REX_SESSION_ID;
 if (hangar === undefined) throw new Error("SOMA_REX_SESSION_ID names the smoke's rex session");
+const config = process.env.CLAUDE_CONFIG_DIR;
+if (config === undefined) throw new Error("CLAUDE_CONFIG_DIR must be set");
 const trustPath = process.env.SOMA_SMOKE_TRUST_PATH;
 const emit = (record: object) => console.log(JSON.stringify(record));
 
@@ -40,6 +43,15 @@ const agents = createRexAgentPort({
 	client,
 	sessionId: hangar,
 	onError: (error) => emit({ event: "rex_error", error: error.message }),
+	// A pane sees only what the launch command types, not this process's environment.
+	env: {
+		CLAUDE_CONFIG_DIR: config,
+		// claude names its login's Keychain item after a CLAUDE_CONFIG_DIR, which would leave this config with no login.
+		// Empty, this keeps the usual name; the smoke handles no credential.
+		CLAUDE_SECURESTORAGE_CONFIG_DIR: "",
+	},
+	projectsDir: join(config, "projects"),
+	sessionsDir: join(config, "sessions"),
 });
 
 type Message = { role: string; content: unknown };

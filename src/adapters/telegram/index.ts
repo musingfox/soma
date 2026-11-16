@@ -41,8 +41,9 @@ const REACTIONS = { received: "👀", forwarded: "👌", answered: "👍", faile
 
 // callback_data takes 1-64 bytes: https://core.telegram.org/bots/api#inlinekeyboardbutton
 const CALLBACK_DATA_LIMIT = 64;
-// The data of the button that replaces a pressed keyboard: it names no answer, so a press on it only gets answered.
-const SETTLED = "-";
+// The one button that replaces a settled keyboard is disabled, so it does nothing when pressed:
+// https://core.telegram.org/bots/api#inlinekeyboardbutton. Older messages carry one with the data "-" instead,
+// which names no answer, so a press on it only gets answered.
 // What replaces the buttons of a prompt answered on another interface, or by the model.
 const ELSEWHERE = "已在別處處理";
 
@@ -248,7 +249,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 						await quietly("editMessageReplyMarkup", {
 							chat_id: chatId,
 							message_id: messageId,
-							reply_markup: { inline_keyboard: [[{ text: ELSEWHERE, callback_data: SETTLED }]] },
+							reply_markup: { inline_keyboard: [[{ text: ELSEWHERE, disabled: {} }]] },
 						});
 					}
 				}
@@ -281,7 +282,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		await quietly("editMessageReplyMarkup", {
 			chat_id: chatId,
 			message_id: message.message_id,
-			reply_markup: { inline_keyboard: [[{ text: result, callback_data: SETTLED }]] },
+			reply_markup: { inline_keyboard: [[{ text: result, disabled: {} }]] },
 		});
 	};
 

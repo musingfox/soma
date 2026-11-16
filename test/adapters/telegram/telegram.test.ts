@@ -279,7 +279,8 @@ const choices = {
 		{ id: "2", label: "No" },
 	],
 };
-const chosen = (text: string) => ({ inline_keyboard: [[{ text, callback_data: "-" }]] });
+// toEqual tells a missing key from a set one, so the settled button must carry no callback_data.
+const chosen = (text: string) => ({ inline_keyboard: [[{ text, disabled: {} }]] });
 
 test("a question with choices arrives with a button per option; a press answers the agent and shows the choice", async () => {
 	const human = new FakeHumanPort();
@@ -393,6 +394,31 @@ test("a second tap on the same question answers nothing and leaves the first res
 		method: "answerCallbackQuery",
 		params: { callback_query_id: second.callback_query.id },
 	});
+});
+
+test('a press on an older message\'s settled button, whose data is "-", is answered and changes nothing', async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	// Update 0, so the fake's own next update still comes after it.
+	api.redeliver({
+		update_id: 0,
+		callback_query: {
+			id: "old",
+			data: "-",
+			message: {
+				message_id: 99,
+				chat: { id: CHAT },
+				reply_markup: { inline_keyboard: [[{ text: "已選：No", callback_data: "-" }]] },
+			},
+		},
+	});
+	api.deliver("after", CHAT);
+
+	await vi.waitFor(() => expect(human.inputs).toHaveLength(1));
+	expect(human.answers).toEqual([]);
+	expect(api.calls).toEqual([{ method: "answerCallbackQuery", params: { callback_query_id: "old" } }]);
 });
 
 test("a push arrives as the core delivers it here: ringing, silently, or not at all when logged", async () => {

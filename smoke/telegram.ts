@@ -96,7 +96,7 @@ try {
 	await delay(3_000);
 	const confirmed = lastReport(second) as Report;
 	check(
-		JSON.stringify(api.sent) === JSON.stringify([{ chat_id: CHAT, text: "已派工。", parse_mode: "HTML" }]),
+		JSON.stringify(api.sent) === JSON.stringify([{ chat_id: CHAT, text: "已派工。", rich: true }]),
 		"wrong confirmation",
 	);
 	check(confirmed.telegramInputs === 1, `${confirmed.telegramInputs} Telegram inputs after the redelivery`);

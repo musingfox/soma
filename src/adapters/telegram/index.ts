@@ -31,6 +31,9 @@ const REQUEST_PREFIX = "telegram:";
 export const ENTRY_KIND = "chat.telegram";
 // sendMessage takes 1-4096 characters; JavaScript string length counts the same UTF-16 units.
 export const MESSAGE_LIMIT = 4096;
+// sendRichMessage takes up to 32768 UTF-8 characters; counting bytes keeps a text with wide characters under it too.
+// https://core.telegram.org/bots/api#rich-message-formatting-options
+const RICH_LIMIT = 32768;
 const EMPTY_ANSWER = "（這一輪沒有文字回答）";
 // What Telegram answers a message whose entities it cannot place: https://core.telegram.org/bots/api#formatting-options
 const ENTITY_REFUSAL = /can't parse entities|can't find end tag|unsupported start tag|entity/i;
@@ -111,6 +114,9 @@ export function messageParts(text: string): string[] {
 	return splitMessage(source).map(escapeHtml);
 }
 
+/** A call the Bot API answered with `ok: false`, as opposed to one that never got an answer. */
+class Refused extends Error {}
+
 const REFUSALS: Record<Extract<HumanAnswerOutcome, { sent: false }>["refusal"], string> = {
 	not_blocked: "agent 已經不在等回答",
 	stale: "提示已經變了",
@@ -157,7 +163,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			signal,
 		});
 		const parsed = ResponseSchema.parse(await response.json());
-		if (!parsed.ok) throw new Error(`${method}: ${parsed.description ?? response.status}`);
+		if (!parsed.ok) throw new Refused(`${method}: ${parsed.description ?? response.status}`);
 		return parsed.result;
 	};
 
@@ -183,6 +189,33 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		{ silent = false, prompt }: { silent?: boolean; prompt?: Choices } = {},
 	) => {
 		sending = sending.then(async () => {
+			// The message that carries the keyboard, whichever way it went.
+			const show = (sent: unknown) => {
+				const messageId = (sent as { message_id?: unknown }).message_id;
+				if (prompt === undefined || typeof messageId !== "number") return;
+				const key = `${prompt.card}\n${prompt.fingerprint}`;
+				const entry = shown.get(key) ?? { card: prompt.card, fingerprint: prompt.fingerprint, messageIds: [] };
+				entry.messageIds.push(messageId);
+				shown.set(key, entry);
+			};
+			// One rich message shows the markdown as written, tables and headings included. A text too long for one, or
+			// one Telegram refuses, goes as HTML parts, so formatting never loses a message; a refusal is still reported.
+			const markdown = text.trim() === "" ? EMPTY_ANSWER : text;
+			if (Buffer.byteLength(markdown) <= RICH_LIMIT) {
+				try {
+					return show(
+						await call("sendRichMessage", {
+							chat_id: chatId,
+							rich_message: { markdown },
+							...(markup !== undefined ? { reply_markup: markup } : {}),
+							...(silent ? { disable_notification: true } : {}),
+						}),
+					);
+				} catch (error) {
+					if (!signal.aborted) onError(error);
+					if (!(error instanceof Refused)) return;
+				}
+			}
 			const parts = messageParts(text);
 			for (const [index, part] of parts.entries()) {
 				const last = index === parts.length - 1 && markup !== undefined;
@@ -191,13 +224,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 						...(last ? { reply_markup: markup } : {}),
 						...(silent ? { disable_notification: true } : {}),
 					});
-					const messageId = (sent as { message_id?: unknown }).message_id;
-					if (last && prompt !== undefined && typeof messageId === "number") {
-						const key = `${prompt.card}\n${prompt.fingerprint}`;
-						const entry = shown.get(key) ?? { card: prompt.card, fingerprint: prompt.fingerprint, messageIds: [] };
-						entry.messageIds.push(messageId);
-						shown.set(key, entry);
-					}
+					if (last) show(sent);
 				} catch (error) {
 					if (!signal.aborted) onError(error);
 					return;

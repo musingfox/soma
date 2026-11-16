@@ -65,7 +65,7 @@ test("a message is answered in its chat, and Telegram delivering it again after 
 	const first = start(human, apiBase);
 
 	const update = api.deliver("派 a", CHAT);
-	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "已派工 a。", parse_mode: "HTML" }]));
+	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "已派工 a。", rich: true }]));
 	// The answered reaction goes out on a queue of its own, which the stop would cut short.
 	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍"]));
 	await first.stop();
@@ -105,7 +105,7 @@ test("this client's failed round goes back to its chat; another client's failure
 
 	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
 	await new Promise((resolve) => setTimeout(resolve, 100));
-	expect(api.sent).toEqual([{ chat_id: CHAT, text: "[失敗] 模型出錯：401 invalid x-api-key", parse_mode: "HTML" }]);
+	expect(api.sent).toEqual([{ chat_id: CHAT, text: "[失敗] 模型出錯：401 invalid x-api-key", rich: true }]);
 	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👎"]));
 });
 
@@ -240,16 +240,31 @@ test("only this client's answers, schedule rounds and notices reach the chat", a
 	expect(api.sent.every((message) => message.chat_id === CHAT)).toBe(true);
 });
 
-test("a long answer arrives as ordered parts within the limit", async () => {
+test("a text over 32768 bytes of UTF-8 arrives whole as ordered HTML parts; one at the limit goes as one rich message", async () => {
 	const human = new FakeHumanPort();
 	const { api, apiBase } = await bot();
 	start(human, apiBase);
+	// 32769 bytes in 10923 characters, which a rich message would take: the bytes are what counts.
+	const wide = "好".repeat(10923);
 
-	human.emit({ type: "answer", requestId: "telegram:1", content: "x".repeat(5000) });
+	human.emit({ type: "answer", requestId: "telegram:1", content: wide });
+	human.emit({ type: "answer", requestId: "telegram:2", content: "x".repeat(32768) });
 	human.emit({ type: "notice", kind: "report", class: "outcome", content: "after" });
 
-	await vi.waitFor(() => expect(api.sent).toHaveLength(3));
-	expect(api.sent.map((message) => message.text.length)).toEqual([4096, 904, "[通知] after".length]);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(5));
+	expect(api.sent.map((message) => [message.rich ?? false, message.parse_mode, message.text.length])).toEqual([
+		[false, "HTML", 4096],
+		[false, "HTML", 4096],
+		[false, "HTML", 2731],
+		[true, undefined, 32768],
+		[true, undefined, "[通知] after".length],
+	]);
+	expect(
+		api.sent
+			.slice(0, 3)
+			.map((message) => message.text)
+			.join(""),
+	).toBe(wide);
 });
 
 test("a failing Bot API is reported and polled again", async () => {
@@ -292,7 +307,7 @@ test("a question with choices arrives with a button per option; a press answers 
 	expect(api.sent[0]).toEqual({
 		chat_id: CHAT,
 		text: "[問題] 要讓它執行嗎？",
-		parse_mode: "HTML",
+		rich: true,
 		reply_markup: {
 			inline_keyboard: [
 				[{ text: "Yes", callback_data: "1:f00d:card-a" }],
@@ -357,7 +372,7 @@ test("choices whose button data would pass 64 bytes arrive as plain text", async
 		content: "q",
 		choices: { ...choices, card: "c".repeat(60) },
 	});
-	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "[問題] q", parse_mode: "HTML" }]));
+	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "[問題] q", rich: true }]));
 });
 
 test("a callback Telegram no longer accepts an answer for does not hold the polling back", async () => {
@@ -480,9 +495,10 @@ test("a prompt's buttons go once its job leaves that prompt, unless a press here
 
 	human.emit({ type: "job", card: "card-a", agent: "card-a", status: { state: "working" } });
 	await vi.waitFor(() => expect(api.calls).toHaveLength(2));
-	expect(api.calls.map(({ method, params }) => [method, params.reply_markup])).toEqual([
-		["editMessageReplyMarkup", elsewhere],
-		["editMessageReplyMarkup", elsewhere],
+	// The fake numbers its messages from 1: these are the two prompts.
+	expect(api.calls.map(({ method, params }) => [method, params.message_id, params.reply_markup])).toEqual([
+		["editMessageReplyMarkup", 1, elsewhere],
+		["editMessageReplyMarkup", 2, elsewhere],
 	]);
 
 	human.emit({
@@ -500,14 +516,37 @@ test("a prompt's buttons go once its job leaves that prompt, unless a press here
 	expect(api.calls).toHaveLength(4);
 });
 
-test("a markdown answer arrives as Telegram HTML: formatting converted, markup characters escaped", async () => {
+const markdownAnswer =
+	"# Plan\n\n- **one** & `a<b`\n- two\n\n| k | v |\n|---|--:|\n| x | 1 |\n\n```ts\nconst a = 1 < 2;\n```";
+
+test("a markdown answer with a table arrives as one rich message holding the model's text unchanged", async () => {
 	const human = new FakeHumanPort();
 	const { api, apiBase } = await bot();
 	const { onError } = start(human, apiBase);
-	const answer =
-		"# Plan\n\n- **one** & `a<b`\n- two\n\n| k | v |\n|---|--:|\n| x | 1 |\n\n```ts\nconst a = 1 < 2;\n```";
 
-	human.emit({ type: "answer", requestId: "telegram:1", content: answer });
+	human.emit({ type: "answer", requestId: "telegram:1", content: markdownAnswer });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	expect(api.sent[0]).toEqual({ chat_id: CHAT, text: markdownAnswer, rich: true });
+	expect(api.methods.filter((method) => method.startsWith("send"))).toEqual(["sendRichMessage"]);
+	expect(onError).not.toHaveBeenCalled();
+});
+
+test("an answer with no text arrives as a rich message saying so", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	human.emit({ type: "answer", requestId: "telegram:1", content: "  " });
+	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "（這一輪沒有文字回答）", rich: true }]));
+});
+
+test("a text whose rich message Telegram refuses arrives as Telegram HTML, and the refusal is reported", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const { onError } = start(human, apiBase);
+	api.failing.add("sendRichMessage");
+
+	human.emit({ type: "answer", requestId: "telegram:1", content: markdownAnswer });
 	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
 	expect(api.sent[0]).toEqual({
 		chat_id: CHAT,
@@ -525,10 +564,26 @@ test("a markdown answer arrives as Telegram HTML: formatting converted, markup c
 			'<pre><code class="language-ts">const a = 1 &lt; 2;</code></pre>',
 		].join("\n"),
 	});
-	expect(onError).not.toHaveBeenCalled();
+	expect(onError).toHaveBeenCalledOnce();
+	expect(onError).toHaveBeenCalledWith(
+		expect.objectContaining({ message: expect.stringContaining("sendRichMessage") }),
+	);
 });
 
-test("notices, prompts with buttons and pushed failures are converted too, and the buttons still go once answered", async () => {
+test("a rich message that gets no answer is reported and not resent as HTML", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const { onError } = start(human, apiBase);
+	api.dropping.add("sendRichMessage");
+
+	human.emit({ type: "answer", requestId: "telegram:1", content: "**x**" });
+	await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	expect(api.methods.filter((method) => method.startsWith("send"))).toEqual(["sendRichMessage"]);
+	expect(api.sent).toEqual([]);
+});
+
+test("notices, prompts with buttons and pushed failures go as rich messages too, and the buttons still go once answered", async () => {
 	const human = new FakeHumanPort();
 	const { api, apiBase } = await bot();
 	start(human, apiBase);
@@ -537,10 +592,10 @@ test("notices, prompts with buttons and pushed failures are converted too, and t
 	human.emit({ type: "notice", kind: "question", class: "action", content: "run `rm x`?", choices });
 	human.emit({ type: "failure", requestId: "schedule:1", reason: "bad *thing* & <more>", class: "outcome" });
 	await vi.waitFor(() => expect(api.sent).toHaveLength(3));
-	expect(api.sent.map((message) => [message.parse_mode, message.text])).toEqual([
-		["HTML", "[通知] <b>done</b> &lt;3"],
-		["HTML", "[問題] run <code>rm x</code>?"],
-		["HTML", "[失敗] schedule:1 那一輪：bad <i>thing</i> &amp; &lt;more&gt;"],
+	expect(api.sent.map((message) => [message.rich, message.text])).toEqual([
+		[true, "[通知] **done** <3"],
+		[true, "[問題] run `rm x`?"],
+		[true, "[失敗] schedule:1 那一輪：bad *thing* & <more>"],
 	]);
 	expect(api.sent[1]?.reply_markup).toBeDefined();
 
@@ -551,11 +606,11 @@ test("notices, prompts with buttons and pushed failures are converted too, and t
 	expect(human.answers).toEqual([{ card: "card-a", answer: { option: "1", fingerprint: "f00d" } }]);
 });
 
-test("a long markdown answer is split into parts that each parse, with the buttons on the last", async () => {
+test("a prompt too long for a rich message is split into HTML parts that each parse, with the buttons on the last", async () => {
 	const human = new FakeHumanPort();
 	const { api, apiBase } = await bot();
 	const { onError } = start(human, apiBase);
-	const answer = `**${"bold words here ".repeat(600)}**\n\n\`\`\`py\n${"print('a < b')\n".repeat(300)}\`\`\``;
+	const answer = `**${"bold words here ".repeat(2100)}**\n\n\`\`\`py\n${"print('a < b')\n".repeat(300)}\`\`\``;
 
 	human.emit({ type: "notice", kind: "question", class: "action", content: answer, choices });
 	await vi.waitFor(() => expect(api.sent.length).toBeGreaterThan(3));
@@ -567,12 +622,18 @@ test("a long markdown answer is split into parts that each parse, with the butto
 	expect(api.sent.slice(0, -1).every((message) => message.reply_markup === undefined)).toBe(true);
 	expect(api.sent.at(-1)?.reply_markup).toBeDefined();
 	expect(api.sent.at(-1)?.text).toContain('<pre><code class="language-py">');
+
+	human.emit({ type: "job", card: "card-a", agent: "card-a", status: { state: "working" } });
+	await vi.waitFor(() => expect(api.calls).toHaveLength(1));
+	// The fake numbers its messages from 1, so the last part's id is the count of parts.
+	expect(api.calls[0]?.params.message_id).toBe(api.sent.length);
 });
 
 test("a part Telegram refuses for its entities is resent as plain text, and nothing after it is lost", async () => {
 	const human = new FakeHumanPort();
 	const { api, apiBase } = await bot();
 	const { onError } = start(human, apiBase);
+	api.failing.add("sendRichMessage");
 	api.refuseEntities = true;
 
 	human.emit({ type: "notice", kind: "question", class: "action", content: "**sure** about `a<b`?", choices });
@@ -584,16 +645,20 @@ test("a part Telegram refuses for its entities is resent as plain text, and noth
 		reply_markup: expect.objectContaining({ inline_keyboard: expect.any(Array) }),
 	});
 	expect(api.sent[1]).toEqual({ chat_id: CHAT, text: "next" });
-	expect(onError).not.toHaveBeenCalled();
+	expect(api.methods.filter((method) => method === "sendRichMessage")).toHaveLength(2);
+	expect(onError).toHaveBeenCalledTimes(2);
 });
 
 test("a refusal that is not about entities is reported and not resent", async () => {
 	const human = new FakeHumanPort();
 	const { api, apiBase } = await bot();
 	const { onError } = start(human, apiBase);
+	api.failing.add("sendRichMessage");
 	api.failing.add("sendMessage");
 
 	human.emit({ type: "answer", requestId: "telegram:1", content: "**x**" });
-	await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+	await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(2));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	expect(api.methods.filter((method) => method.startsWith("send"))).toEqual(["sendRichMessage", "sendMessage"]);
 	expect(api.sent).toEqual([]);
 });

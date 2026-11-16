@@ -662,3 +662,111 @@ test("a refusal that is not about entities is reported and not resent", async ()
 	expect(api.methods.filter((method) => method.startsWith("send"))).toEqual(["sendRichMessage", "sendMessage"]);
 	expect(api.sent).toEqual([]);
 });
+
+// The draft refreshed every few milliseconds, so a test sees several refreshes of an open round.
+function drafting(human: HumanPort, apiBase: string, onError = vi.fn()) {
+	const controller = new AbortController();
+	const options = { human, token: TOKEN, chatId: CHAT, apiBase, signal: controller.signal, onError };
+	const running = runTelegram({ ...options, draftRefreshMs: 20 });
+	cleanup.push(() => {
+		controller.abort();
+		return running;
+	});
+	return { onError };
+}
+const settle = () => new Promise((resolve) => setTimeout(resolve, 100));
+
+test("a message from the chat gets a Thinking draft under its id once the core has admitted it", async () => {
+	const human = new FakeHumanPort();
+	let admit = () => {};
+	const admitted = new Promise<void>((resolve) => {
+		admit = resolve;
+	});
+	const submit = human.submit.bind(human);
+	vi.spyOn(human, "submit").mockImplementation(async (input) => {
+		await admitted;
+		await submit(input);
+	});
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	api.deliver("not you", 7);
+	const { message } = api.deliver("你好", CHAT);
+	await vi.waitFor(() => expect(human.submit).toHaveBeenCalledTimes(1));
+	await settle();
+	expect(api.drafts).toEqual([]);
+
+	admit();
+	await vi.waitFor(() => expect(api.drafts).toEqual([{ chat_id: CHAT, draft_id: message.message_id, text: "" }]));
+});
+
+test("an open round's draft is sent again until its answer or its failure, and then no more", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	drafting(human, apiBase);
+	const sentFor = (update: { message: { message_id: number } }) =>
+		api.drafts.filter(({ draft_id }) => draft_id === update.message.message_id).length;
+
+	const answered = api.deliver("一", CHAT);
+	const failed = api.deliver("二", CHAT);
+	await vi.waitFor(() => expect(Math.min(sentFor(answered), sentFor(failed))).toBeGreaterThanOrEqual(3));
+
+	human.emit({ type: "answer", requestId: `telegram:${answered.message.message_id}`, content: "好" });
+	human.emit({ type: "failure", requestId: `telegram:${failed.message.message_id}`, reason: "x" });
+	await settle();
+	const after = api.drafts.length;
+	await settle();
+	expect(api.drafts).toHaveLength(after);
+	expect(api.sent.map((sent) => sent.text)).toEqual(["好", "[失敗] x"]);
+});
+
+test("a message Telegram delivers again while its round is open keeps one refresh, which its answer ends", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	drafting(human, apiBase);
+
+	const update = api.deliver("一", CHAT);
+	await vi.waitFor(() => expect(api.drafts.length).toBeGreaterThanOrEqual(2));
+	api.redeliver(update);
+	await vi.waitFor(() => expect(api.reactions).toHaveLength(2));
+	human.emit({ type: "answer", requestId: `telegram:${update.message.message_id}`, content: "好" });
+
+	await settle();
+	const after = api.drafts.length;
+	await settle();
+	expect(api.drafts).toHaveLength(after);
+});
+
+test("a round answered before its submit resolves shows no draft", async () => {
+	const human = new FakeHumanPort();
+	const submit = human.submit.bind(human);
+	vi.spyOn(human, "submit").mockImplementation(async (input) => {
+		await submit(input);
+		human.emit({ type: "answer", requestId: input.requestId, content: "快" });
+	});
+	const { api, apiBase } = await bot();
+	drafting(human, apiBase);
+
+	api.deliver("一", CHAT);
+	await vi.waitFor(() => expect(api.reactions).toHaveLength(2));
+	await settle();
+	expect(api.drafts).toEqual([]);
+});
+
+test("a refused draft is reported, and the answers and the reactions still go through", async () => {
+	const { faux, human } = await core();
+	faux.setResponses([fauxAssistantMessage("一。"), fauxAssistantMessage("二。")]);
+	const { api, apiBase } = await bot();
+	api.failing.add("sendMessageDraft");
+	const { onError } = start(human, apiBase);
+
+	api.deliver("一", CHAT);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	api.deliver("二", CHAT);
+
+	await vi.waitFor(() => expect(api.sent.map((message) => message.text)).toEqual(["一。", "二。"]));
+	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍", "👀", "👍"]));
+	expect(onError).toHaveBeenCalledWith(
+		expect.objectContaining({ message: expect.stringContaining("sendMessageDraft") }),
+	);
+});

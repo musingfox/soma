@@ -101,7 +101,7 @@ const badButtonData = (markup: InlineKeyboard | undefined) =>
 
 /**
  * A local stand-in for the Telegram Bot API (getUpdates long polling, sendMessage and sendRichMessage with inline buttons, and the
- * answerCallbackQuery and editMessageReplyMarkup calls a button press leads to, and setMessageReaction) for one bot token, so the
+ * answerCallbackQuery and editMessageReplyMarkup calls a button press leads to, setMessageReaction and sendMessageDraft) for one bot token, so the
  * client runs over real HTTP without a bot. An update stays queued until a getUpdates offset above its id
  * confirms it, as Telegram does; `redeliver` puts one back, as Telegram does when a confirmation was lost.
  */
@@ -113,6 +113,8 @@ export class FakeBotApi {
 	readonly calls: { readonly method: string; readonly params: Record<string, unknown> }[] = [];
 	/** Each setMessageReaction as the message and its one emoji, in the order they came. */
 	readonly reactions: { readonly message_id: number; readonly emoji: string }[] = [];
+	/** Each sendMessageDraft it accepted, in the order they came; `text` as sent, absent when it was left out. */
+	readonly drafts: { readonly chat_id: number; readonly draft_id: number; readonly text?: string }[] = [];
 	/** Refuse every message that asks for a parse mode, as Telegram does for entities it cannot place. */
 	refuseEntities = false;
 	/** Methods answered with a 400, as Telegram answers a callback query that is too old. */
@@ -209,6 +211,20 @@ export class FakeBotApi {
 			if (method === "setMessageReaction") {
 				const [reaction] = params.reaction as { emoji: string }[];
 				this.reactions.push({ message_id: params.message_id as number, emoji: reaction?.emoji ?? "" });
+				return reply(200, { ok: true, result: true });
+			}
+			// draft_id must be non-zero and text 0-4096 characters: https://core.telegram.org/bots/api#sendmessagedraft
+			if (method === "sendMessageDraft") {
+				const { chat_id, draft_id, text } = params;
+				if (!Number.isInteger(draft_id) || draft_id === 0)
+					return reply(400, { ok: false, error_code: 400, description: "Bad Request: invalid draft_id" });
+				if (text !== undefined && (typeof text !== "string" || text.length > 4096))
+					return reply(400, { ok: false, error_code: 400, description: "Bad Request: message text is invalid" });
+				this.drafts.push({
+					chat_id: chat_id as number,
+					draft_id: draft_id as number,
+					text: text as string | undefined,
+				});
 				return reply(200, { ok: true, result: true });
 			}
 			reply(404, { ok: false, error_code: 404, description: "Not Found" });

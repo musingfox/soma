@@ -23,6 +23,7 @@ export interface TelegramOptions extends TelegramConfig {
 	readonly signal: AbortSignal;
 	readonly pollTimeoutSeconds?: number;
 	readonly retryMs?: number;
+	readonly draftRefreshMs?: number;
 	readonly onError?: (error: unknown) => void;
 }
 
@@ -41,6 +42,8 @@ const ENTITY_REFUSAL = /can't parse entities|can't find end tag|unsupported star
 // The one reaction a message from the human carries, replaced as the round moves on; a bot without premium gets one.
 // Each is in ReactionTypeEmoji's list: https://core.telegram.org/bots/api#reactiontypeemoji
 const REACTIONS = { received: "👀", forwarded: "👌", answered: "👍", failed: "👎" } as const;
+// An empty draft shows "Thinking…" for 30 seconds, so it is sent again before it goes: https://core.telegram.org/bots/api#sendmessagedraft
+const DRAFT_REFRESH_MS = 20_000;
 
 // callback_data takes 1-64 bytes: https://core.telegram.org/bots/api#inlinekeyboardbutton
 const CALLBACK_DATA_LIMIT = 64;
@@ -247,6 +250,24 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		};
 		reacting = reacting.then(() => quietly("setMessageReaction", body).then(() => {}));
 	};
+	// By requestId, the refresh of the "Thinking…" draft of each round from this chat still open; lost on a restart.
+	// The entry is made before the input is submitted, so an answer that comes before the submit resolves still ends it.
+	const drafts = new Map<string, ReturnType<typeof setInterval> | undefined>();
+	// A call after `signal` aborts is never sent: fetch takes the signal.
+	const draft = (messageId: number) =>
+		void quietly("sendMessageDraft", { chat_id: chatId, draft_id: messageId, text: "" });
+	const think = (requestId: string, messageId: number) => {
+		if (!drafts.has(requestId) || drafts.get(requestId) !== undefined) return;
+		draft(messageId);
+		drafts.set(
+			requestId,
+			setInterval(() => draft(messageId), options.draftRefreshMs ?? DRAFT_REFRESH_MS),
+		);
+	};
+	const settle = (requestId: string) => {
+		clearInterval(drafts.get(requestId));
+		drafts.delete(requestId);
+	};
 
 	// A push the core starts: it says whether this chat rings, shows it without a sound, or leaves it to the history.
 	const push = (text: string, delivery: Delivery, choices?: Choices) => {
@@ -283,11 +304,13 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			});
 		} else if (event.type === "answer") {
 			if (mine) {
+				settle(event.requestId);
 				react(event.requestId, "answered");
 				send(event.content);
 			} else if (event.class !== undefined) push(label("report", event.content), deliveryTo(event, ENTRY_KIND));
 		} else if (event.type === "failure") {
 			if (mine) {
+				settle(event.requestId);
 				react(event.requestId, "failed");
 				send(`[失敗] ${event.reason}`);
 			} else if (event.class !== undefined)
@@ -324,12 +347,14 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 				for (const { update_id, message, callback_query } of updates) {
 					if (message?.text !== undefined && message.chat.id === chatId) {
 						const requestId = `${REQUEST_PREFIX}${message.message_id}`;
+						if (!drafts.has(requestId)) drafts.set(requestId, undefined);
 						await human.submit({
 							content: message.text,
 							entry: { kind: ENTRY_KIND, data: { messageId: message.message_id } },
 							requestId,
 						});
 						react(requestId, "received");
+						think(requestId, message.message_id);
 					}
 					// A press delivered again after a restart is safe: once its answer went through, the fingerprint no longer matches.
 					if (callback_query?.message?.chat.id === chatId) await answerPress(callback_query, callback_query.message);
@@ -344,6 +369,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		}
 	} finally {
 		unsubscribe();
+		for (const refresh of drafts.values()) clearInterval(refresh);
 		await Promise.all([sending, reacting]);
 	}
 }

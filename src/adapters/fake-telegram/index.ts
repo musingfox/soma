@@ -33,7 +33,12 @@ export interface SentMessage {
 	readonly parse_mode?: string;
 	/** Present only when the message was sent without a sound. */
 	readonly disable_notification?: true;
+	/** Present only when the message was sent by sendRichMessage; `text` is then its `rich_message.markdown`. */
+	readonly rich?: true;
 }
+
+// A rich message takes up to 32768 UTF-8 characters: https://core.telegram.org/bots/api#rich-message-formatting-options
+const RICH_LIMIT = 32768;
 
 // The tags parse_mode HTML takes: https://core.telegram.org/bots/api#html-style
 const HTML_TAGS = new Set([
@@ -88,14 +93,22 @@ function htmlToText(html: string): string {
 		.replace(/&amp;/g, "&");
 }
 
+const badButtonData = (markup: InlineKeyboard | undefined) =>
+	markup?.inline_keyboard.flat().some((button) => {
+		const bytes = Buffer.byteLength(button.callback_data ?? "");
+		return bytes < 1 || bytes > 64;
+	});
+
 /**
- * A local stand-in for the Telegram Bot API (getUpdates long polling, sendMessage with inline buttons, and the
+ * A local stand-in for the Telegram Bot API (getUpdates long polling, sendMessage and sendRichMessage with inline buttons, and the
  * answerCallbackQuery and editMessageReplyMarkup calls a button press leads to, and setMessageReaction) for one bot token, so the
  * client runs over real HTTP without a bot. An update stays queued until a getUpdates offset above its id
  * confirms it, as Telegram does; `redeliver` puts one back, as Telegram does when a confirmation was lost.
  */
 export class FakeBotApi {
 	readonly sent: SentMessage[] = [];
+	/** The method of every call but getUpdates, refused ones included, in the order they came. */
+	readonly methods: string[] = [];
 	/** answerCallbackQuery and editMessageReplyMarkup, in the order they came. */
 	readonly calls: { readonly method: string; readonly params: Record<string, unknown> }[] = [];
 	/** Each setMessageReaction as the message and its one emoji, in the order they came. */
@@ -104,6 +117,8 @@ export class FakeBotApi {
 	refuseEntities = false;
 	/** Methods answered with a 400, as Telegram answers a callback query that is too old. */
 	readonly failing = new Set<string>();
+	/** Methods whose connection is cut without an answer, as a network failure looks to the client. */
+	readonly dropping = new Set<string>();
 	readonly #markups = new Map<number, InlineKeyboard>();
 	readonly #token: string;
 	#queue: FakeUpdate[] = [];
@@ -127,6 +142,8 @@ export class FakeBotApi {
 			const [, token, method] = /^\/bot([^/]+)\/(\w+)$/.exec(request.url ?? "") ?? [];
 			if (token !== this.#token) return reply(401, { ok: false, error_code: 401, description: "Unauthorized" });
 			const params = JSON.parse(body || "{}") as Record<string, unknown>;
+			if (method !== undefined && method !== "getUpdates") this.methods.push(method);
+			if (method !== undefined && this.dropping.has(method)) return void response.destroy();
 			if (method !== undefined && this.failing.has(method))
 				return reply(400, { ok: false, error_code: 400, description: "Bad Request: query is too old" });
 			if (method === "getUpdates") return reply(200, { ok: true, result: await this.#updates(params) });
@@ -149,17 +166,35 @@ export class FakeBotApi {
 				const shown = parseMode === undefined ? message.text : htmlToText(message.text);
 				if (shown.length < 1 || shown.length > 4096)
 					return reply(400, { ok: false, error_code: 400, description: "Bad Request: message text is invalid" });
-				const tooLong = markup?.inline_keyboard.flat().some((button) => {
-					const bytes = Buffer.byteLength(button.callback_data ?? "");
-					return bytes < 1 || bytes > 64;
-				});
-				if (tooLong) return reply(400, { ok: false, error_code: 400, description: "Bad Request: BUTTON_DATA_INVALID" });
+				if (badButtonData(markup))
+					return reply(400, { ok: false, error_code: 400, description: "Bad Request: BUTTON_DATA_INVALID" });
 				const silent = params.disable_notification === true ? { disable_notification: true as const } : {};
 				const mode = parseMode === undefined ? {} : { parse_mode: parseMode };
 				this.sent.push(
 					markup === undefined
 						? { ...message, ...mode, ...silent }
 						: { ...message, reply_markup: markup, ...mode, ...silent },
+				);
+				const messageId = this.#nextMessage++;
+				if (markup !== undefined) this.#markups.set(messageId, markup);
+				return reply(200, { ok: true, result: { message_id: messageId, chat: { id: message.chat_id } } });
+			}
+			// Only the markdown form of InputRichMessage, which takes exactly one of html, markdown or blocks:
+			// https://core.telegram.org/bots/api#inputrichmessage. Empty markdown is refused as sendMessage refuses empty
+			// text; the docs give no minimum.
+			if (method === "sendRichMessage") {
+				const markup = params.reply_markup as InlineKeyboard | undefined;
+				const rich = (params.rich_message ?? {}) as Record<string, unknown>;
+				const forms = ["html", "markdown", "blocks"].filter((field) => field in rich);
+				const markdown = rich.markdown;
+				if (forms.length !== 1 || typeof markdown !== "string" || markdown === "" || [...markdown].length > RICH_LIMIT)
+					return reply(400, { ok: false, error_code: 400, description: "Bad Request: rich message is invalid" });
+				if (badButtonData(markup))
+					return reply(400, { ok: false, error_code: 400, description: "Bad Request: BUTTON_DATA_INVALID" });
+				const silent = params.disable_notification === true ? { disable_notification: true as const } : {};
+				const message = { chat_id: params.chat_id as number, text: markdown, rich: true as const };
+				this.sent.push(
+					markup === undefined ? { ...message, ...silent } : { ...message, reply_markup: markup, ...silent },
 				);
 				const messageId = this.#nextMessage++;
 				if (markup !== undefined) this.#markups.set(messageId, markup);

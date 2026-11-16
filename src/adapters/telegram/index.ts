@@ -24,6 +24,7 @@ export interface TelegramOptions extends TelegramConfig {
 	readonly pollTimeoutSeconds?: number;
 	readonly retryMs?: number;
 	readonly draftRefreshMs?: number;
+	readonly draftLimitMs?: number;
 	readonly onError?: (error: unknown) => void;
 }
 
@@ -44,6 +45,8 @@ const ENTITY_REFUSAL = /can't parse entities|can't find end tag|unsupported star
 const REACTIONS = { received: "👀", forwarded: "👌", answered: "👍", failed: "👎" } as const;
 // An empty draft shows "Thinking…" for 30 seconds, so it is sent again before it goes: https://core.telegram.org/bots/api#sendmessagedraft
 const DRAFT_REFRESH_MS = 20_000;
+// A round whose answer or failure never comes, such as a message delivered again after a restart, stops showing it.
+const DRAFT_LIMIT_MS = 10 * 60_000;
 
 // callback_data takes 1-64 bytes: https://core.telegram.org/bots/api#inlinekeyboardbutton
 const CALLBACK_DATA_LIMIT = 64;
@@ -259,10 +262,9 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	const think = (requestId: string, messageId: number) => {
 		if (!drafts.has(requestId) || drafts.get(requestId) !== undefined) return;
 		draft(messageId);
-		drafts.set(
-			requestId,
-			setInterval(() => draft(messageId), options.draftRefreshMs ?? DRAFT_REFRESH_MS),
-		);
+		const until = Date.now() + (options.draftLimitMs ?? DRAFT_LIMIT_MS);
+		const refresh = () => (Date.now() > until ? settle(requestId) : draft(messageId));
+		drafts.set(requestId, setInterval(refresh, options.draftRefreshMs ?? DRAFT_REFRESH_MS));
 	};
 	const settle = (requestId: string) => {
 		clearInterval(drafts.get(requestId));

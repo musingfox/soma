@@ -664,10 +664,11 @@ test("a refusal that is not about entities is reported and not resent", async ()
 });
 
 // The draft refreshed every few milliseconds, so a test sees several refreshes of an open round.
-function drafting(human: HumanPort, apiBase: string, onError = vi.fn()) {
+function drafting(human: HumanPort, apiBase: string, limit: { draftLimitMs?: number } = {}) {
+	const onError = vi.fn();
 	const controller = new AbortController();
 	const options = { human, token: TOKEN, chatId: CHAT, apiBase, signal: controller.signal, onError };
-	const running = runTelegram({ ...options, draftRefreshMs: 20 });
+	const running = runTelegram({ ...options, draftRefreshMs: 20, ...limit });
 	cleanup.push(() => {
 		controller.abort();
 		return running;
@@ -769,4 +770,24 @@ test("a refused draft is reported, and the answers and the reactions still go th
 	expect(onError).toHaveBeenCalledWith(
 		expect.objectContaining({ message: expect.stringContaining("sendMessageDraft") }),
 	);
+});
+
+test("a round whose answer does not come stops getting the draft after the limit, and its answer still arrives", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	drafting(human, apiBase, { draftLimitMs: 100 });
+
+	const { message } = api.deliver("一", CHAT);
+	await vi.waitFor(() => expect(api.drafts.length).toBeGreaterThanOrEqual(3));
+	await settle();
+	await settle();
+	const after = api.drafts.length;
+	// Sent at once and on each refresh up to the limit: 100 ms of 20 ms refreshes.
+	expect(after).toBeLessThanOrEqual(6);
+	await settle();
+	expect(api.drafts).toHaveLength(after);
+
+	human.emit({ type: "answer", requestId: `telegram:${message.message_id}`, content: "好" });
+	await vi.waitFor(() => expect(api.sent.map((sent) => sent.text)).toEqual(["好"]));
+	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍"]));
 });

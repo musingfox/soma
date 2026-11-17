@@ -52,6 +52,9 @@ const SummaryFileConfig = z.object({ idleMinutes: z.number().positive() }).parti
 /** How long the human types nowhere before what interfaces hold is summarized, unless the config says otherwise. */
 export const SUMMARY_IDLE_MINUTES = 30;
 
+/** The root conversation's size in tokens past which it is compacted, unless the config says otherwise (2026-11-18). */
+export const COMPACT_AT = 100_000;
+
 /**
  * The hangar is a rex session found by its id, never by its label, which rex does not keep unique. When rex says the
  * session soma would use does not exist, soma makes a new one labelled `label`, `soma-hangar` when unset, uses it from
@@ -80,6 +83,7 @@ const FileConfig = z
 		model: z.string().min(1),
 		language: z.string().refine((tag) => canonicalLanguage(tag) !== undefined, "Expected a BCP 47 language tag"),
 		hangarCap: z.number().int().positive(),
+		compactAt: z.number().int().positive(),
 		programStatus: z.boolean(),
 		repo: z.string().min(1),
 		reflection: z.boolean(),
@@ -134,6 +138,8 @@ export interface Config {
 	readonly language: string;
 	/** Unset: performance cores minus two, see hangar-cap.ts. */
 	readonly hangarCap?: number;
+	/** The root conversation's size in tokens past which it is compacted; see "Compacting the root conversation". */
+	readonly compactAt: number;
 	/** Unset: ask the terminal whether it supports OSC 7501. */
 	readonly programStatus?: boolean;
 	/** soma's own repository: the reflection's code-change cards go to the vault project its `.obsidian.yaml` names. */
@@ -239,6 +245,10 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 	const hangarCap =
 		parseEnv("SOMA_HANGAR_CAP", (v) => (/^[1-9][0-9]*$/.test(v) ? Number(v) : undefined), "a positive integer") ??
 		file?.hangarCap;
+	const compactAt =
+		parseEnv("SOMA_COMPACT_AT", (v) => (/^[1-9][0-9]*$/.test(v) ? Number(v) : undefined), "a positive integer") ??
+		file?.compactAt ??
+		COMPACT_AT;
 	const programStatus =
 		parseEnv("SOMA_PROGRAM_STATUS", (v) => ({ 1: true, 0: false })[v], "1 or 0") ?? file?.programStatus;
 	const reflection = parseEnv("SOMA_REFLECTION", (v) => ({ 1: true, 0: false })[v], "1 or 0") ?? file?.reflection;
@@ -294,6 +304,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		// Unset, the checkout this code runs from; a release directory is not a git repo, so prod sets it.
 		repo: fromEnv("SOMA_REPO") ?? file?.repo ?? dirname(dirname(fileURLToPath(import.meta.url))),
 		reflection: reflection ?? true,
+		compactAt,
 		...((agentAdapter === "rex" || (agentAdapter === "acp" && namesHangar(file, fromEnv, path))) && {
 			rex: resolveRex(file, fromEnv, home, path),
 		}),

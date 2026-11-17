@@ -82,6 +82,13 @@ const fields = [
 		values: [3, 5, undefined],
 	},
 	{
+		name: "compactAt",
+		env: ["SOMA_COMPACT_AT", "20000"],
+		file: { compactAt: 50000 },
+		read: (c) => c.compactAt,
+		values: [20000, 50000, 100000],
+	},
+	{
 		name: "programStatus",
 		env: ["SOMA_PROGRAM_STATUS", "0"],
 		file: { programStatus: true },
@@ -366,6 +373,10 @@ describe("invalid environment variables", () => {
 	test.each([
 		["SOMA_HANGAR_CAP", "0"],
 		["SOMA_HANGAR_CAP", "four"],
+		["SOMA_COMPACT_AT", "0"],
+		["SOMA_COMPACT_AT", "-5"],
+		["SOMA_COMPACT_AT", "1.5"],
+		["SOMA_COMPACT_AT", "100k"],
 		["SOMA_PROGRAM_STATUS", "yes"],
 		["SOMA_REFLECTION", "off"],
 		["TELEGRAM_CHAT_ID", "me"],
@@ -391,6 +402,11 @@ describe("the config file", () => {
 		const path = write(JSON.stringify({ hangarCap: "4", telegram: { chatId: "me" } }));
 		expect(() => loadConfig(path, {}, HOME)).toThrow(path);
 		expect(() => loadConfig(path, {}, HOME)).toThrow(/hangarCap: Expected number.*telegram\.chatId: Expected number/);
+	});
+	test.each([0, -1, 1.5, "100000"])("a compactAt of %j throws with the path and the field", (compactAt) => {
+		const path = write(JSON.stringify({ compactAt }));
+		expect(() => loadConfig(path, {}, HOME)).toThrow(ConfigError);
+		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: compactAt:`);
 	});
 	test("a language that is not a BCP 47 tag throws with the field", () => {
 		const path = write(JSON.stringify({ language: "繁體中文" }));

@@ -1,8 +1,13 @@
 import { readFileSync } from "node:fs";
 import { request } from "node:http";
 import { connect } from "node:net";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createModels } from "@earendil-works/pi-ai/models";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
 import { afterEach, expect, test, vi } from "vitest";
 import { WebSocket as WsClient } from "ws";
+import { FakeAgentPort } from "../../../src/adapters/fake-agent/index.ts";
 import { FakeHumanPort } from "../../../src/adapters/fake-human/index.ts";
 import {
 	checkHost,
@@ -14,6 +19,9 @@ import {
 	type WebMessage,
 	type WebServer,
 } from "../../../src/adapters/web/index.ts";
+import { askExtension } from "../../../src/core/extensions/ask/index.ts";
+import { openHumanPort } from "../../../src/core/human-port.ts";
+import type { HumanPort } from "../../../src/ports/human.ts";
 
 const HOST = "127.0.0.1";
 const ID = "0123456789abcdef0123456789abcdef";
@@ -23,7 +31,10 @@ afterEach(async () => {
 	servers = [];
 });
 
-async function serve(human = new FakeHumanPort(), heartbeatMs?: number) {
+async function serve<Human extends HumanPort = FakeHumanPort>(
+	human: Human = new FakeHumanPort() as unknown as Human,
+	heartbeatMs?: number,
+) {
 	const server = await startWeb({ host: HOST, port: 0, human, heartbeatMs });
 	servers.push(server);
 	return { human, server, base: `http://${HOST}:${server.port}` };
@@ -333,6 +344,105 @@ test("a push shown quietly here is shown without ringing, and a logged one is no
 		{ type: "failure", text: "agent:fix-bug:3 那一輪：429", loud: false },
 		{ type: "run", state: "working" },
 	]);
+});
+
+const ID2 = "fedcba9876543210fedcba9876543210";
+
+test("a question soma asks reaches the page with its options; a press is the human's answer and runs a round", async () => {
+	const context = BACKGROUND_CONTEXT;
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const registry = createRegistry();
+	registry.install(askExtension());
+	const harness = await Harness.open(new MemoryStorage(), { models, registry }, context);
+	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+	harness.resume();
+	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
+	try {
+		let heard = "";
+		faux.setResponses([
+			fauxAssistantMessage([fauxToolCall("ask", { question: "要我稍後再試嗎？", options: ["好", "不用"] })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("先停。"),
+			(request) => {
+				heard = JSON.stringify(request.messages.at(-1));
+				return fauxAssistantMessage("好，稍後再試。");
+			},
+		]);
+		const { server } = await serve(human);
+		const page = await open(server.port);
+		const other = await open(server.port);
+		const until = async (who: typeof page, type: WebMessage["type"]) => {
+			for (;;) {
+				const message = await who.next();
+				if (message.type === type) return message;
+			}
+		};
+		page.send({ type: "input", id: ID, text: "部署失敗了" });
+		const notice = await until(page, "notice");
+		const question = notice.type === "notice" ? notice.choices?.question : undefined;
+		expect(notice).toEqual({
+			type: "notice",
+			kind: "question",
+			text: "要我稍後再試嗎？",
+			loud: true,
+			choices: {
+				question,
+				options: [
+					{ id: "1", label: "好" },
+					{ id: "2", label: "不用" },
+				],
+			},
+		});
+		await root.waitForIdle(context);
+
+		page.send({ type: "say", id: ID2, question, option: "1" });
+		const said = { type: "said", question, label: "好" };
+		await vi.waitFor(() => expect(page.received).toContainEqual({ type: "answer", id: ID2, text: "好，稍後再試。" }));
+		expect(page.received).toContainEqual({ type: "accepted", id: ID2 });
+		expect(page.received).toContainEqual(said);
+		await vi.waitFor(() => expect(other.received).toContainEqual(said));
+		expect(JSON.parse(heard)).toMatchObject({ role: "user", content: "好" });
+
+		// Settled: a second press, from a page that had not heard, admits nothing and names what was said.
+		other.send({ type: "say", id: ID, question, option: "2" });
+		await vi.waitFor(() => expect(other.received).toContainEqual({ ...said, id: ID }));
+		await root.waitForIdle(context);
+		expect(faux.state.callCount).toBe(3);
+	} finally {
+		await human.close();
+		await harness.close(context);
+	}
+});
+
+test("a press goes to say under the page's id; an unknown question is a failure; a prompt's options stay off the page", async () => {
+	const { human, server } = await serve();
+	const page = await open(server.port);
+	page.send({ type: "say", id: ID, question: "abc", option: "2" });
+	expect(await page.next()).toEqual({ type: "accepted", id: ID });
+	expect(human.said).toEqual([
+		{ question: "abc", option: "2", input: { entry: { kind: "chat.web" }, requestId: `web:${ID}` } },
+	]);
+	expect(human.inputs).toEqual([]);
+	expect(human.answers).toEqual([]);
+
+	human.saidOutcome = { said: false, refusal: "no_question" };
+	page.send({ type: "say", id: ID2, question: "abc", option: "1" });
+	expect(await page.next()).toEqual({ type: "failure", id: ID2, text: "沒有送出：找不到這個問題", loud: true });
+	page.send({ type: "say", id: ID2, question: "", option: "1" });
+	expect(await page.next()).toEqual({ type: "error", text: "not an input" });
+
+	const options = [{ id: "1", label: "Yes" }];
+	human.emit({
+		type: "notice",
+		kind: "question",
+		class: "action",
+		content: "要讓它執行嗎？",
+		choices: { card: "c", fingerprint: "f", options },
+	});
+	expect(await page.next()).toEqual({ type: "notice", kind: "question", text: "要讓它執行嗎？", loud: true });
 });
 
 test("a closed page unsubscribes", async () => {

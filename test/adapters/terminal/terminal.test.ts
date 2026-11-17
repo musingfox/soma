@@ -184,3 +184,32 @@ test("a push shown quietly here is printed without raising the root record, and 
 	expect(take()).toBe(`[問題] 問這裡\n${root({ state: "blocked", kind: "question", message: "問這裡" })}`);
 	await end();
 });
+
+test("a question soma asked prints its options numbered, and the answer is typed; a prompt's options are not listed", async () => {
+	const { human, type, take, end } = await session(false);
+	const options = [
+		{ id: "1", label: "好" },
+		{ id: "2", label: "不用" },
+	];
+	human.emit({
+		type: "notice",
+		kind: "question",
+		class: "action",
+		content: "要我稍後再試嗎？",
+		choices: { question: "q", options },
+	});
+	human.emit({
+		type: "notice",
+		kind: "question",
+		class: "action",
+		content: "要讓它執行嗎？",
+		choices: { card: "c", fingerprint: "f", options },
+	});
+	human.emit({ type: "said", question: "q", label: "好" });
+	expect(take()).toBe("[問題] 要我稍後再試嗎？\n  1. 好\n  2. 不用\n[問題] 要讓它執行嗎？\n");
+
+	const typed = await type("2");
+	expect(human.inputs.at(-1)).toEqual({ content: "2", entry: { kind: "chat.terminal" }, requestId: typed });
+	expect(human.said).toEqual([]);
+	await end();
+});

@@ -174,6 +174,16 @@ test("a question's prompt is gone once its job or foreign agent is past it; a re
 
 const held: HeldPush = { key: "notice:3", at: 0, kind: "report", class: "outcome", content: "done", to: [TELEGRAM] };
 
+test("a question soma asked is gone once one of its options was pressed, and is never a job's prompt", () => {
+	const asked = { choices: { question: "q1", options: [{ id: "1", label: "好" }] } };
+	expect(promptGone(asked, [], {})).toBe(false);
+	expect(promptGone(asked, [], {}, new Set(["q2"]))).toBe(false);
+	expect(promptGone(asked, [], {}, new Set(["q1"]))).toBe(true);
+	const pending = { key: "notice:1", at: 0, kind: "question" as const, content: "?", ...asked };
+	expect(escalation(pending, {}, [], {}, 10, 5)).toBe("due");
+	expect(escalation(pending, {}, [], {}, 10, 5, new Set(["q1"]))).toBe("drop");
+});
+
 test("a summary is due once something is held and nobody typed anywhere for the idle time", () => {
 	const presence = { [TERMINAL]: 10 * MIN, [TELEGRAM]: 5 * MIN };
 	expect(summaryDue([held], presence, undefined, 39 * MIN, 30 * MIN)).toBe(false);

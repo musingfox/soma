@@ -1,5 +1,6 @@
 // The page around the house: the socket to soma, the words typed to the fox, its speech bubbles, which state it is in,
 // and the debug panel.
+import { renderChoices, settleChoices, waiting } from "./choices.js";
 import { STATES } from "./fox.js";
 import { renderMarkdown } from "./markdown.js";
 import { createHouse } from "./scene.js";
@@ -8,6 +9,7 @@ const $ = (id) => document.getElementById(id);
 const stage = $("stage");
 const bubble = $("bubble");
 const bubbleText = $("bubble-text");
+const bubbleChoices = $("bubble-choices");
 const form = $("say");
 const text = $("text");
 const statusLine = $("status");
@@ -51,9 +53,12 @@ const REVEAL_MS_PER_CHAR = 60;
 /** How long a fully shown bubble stays before it fades: longer for more to read. */
 const holdMs = (words) => Math.min(45_000, Math.max(6000, 3000 + words.length * 60));
 
-/** Queues a bubble; `kind` is answer, notice or failure, `label` a short heading, and a quiet one does not ring. */
-function say(kind, words, { label = "", quiet = false } = {}) {
-	queue.push({ kind, words, label, quiet });
+/**
+ * Queues a bubble; `kind` is answer, notice or failure, `label` a short heading, and a quiet one does not ring.
+ * `choices` is the box of a question's options, shown under the words.
+ */
+function say(kind, words, { label = "", quiet = false, choices } = {}) {
+	queue.push({ kind, words, label, quiet, choices });
 	if (!shown) showNext();
 	else updateHead();
 }
@@ -78,6 +83,7 @@ function showNext() {
 	bubble.className = `bubble ${shown.kind}${shown.quiet ? " quiet" : ""}`;
 	bubbleText.className = "";
 	bubbleText.textContent = "";
+	bubbleChoices.replaceChildren(...(shown.choices ? [shown.choices] : []));
 	settle();
 	placeBubble();
 	if (shown.kind !== "failure") house.speak(true);
@@ -116,10 +122,11 @@ function finishReveal() {
 	startHold();
 }
 
-// The hold runs only while the page is in view, so words that arrive while the human is away wait for them.
+// The hold runs only while the page is in view, so words that arrive while the human is away wait for them. A
+// question whose options wait for a press does not fade on its own; a tap still lets it go.
 function startHold() {
 	clearTimeout(holdTimer);
-	if (!shown || revealTimer || document.hidden) return;
+	if (!shown || revealTimer || document.hidden || waiting(shown.choices)) return;
 	holdTimer = setTimeout(fade, holdMs(shown.words));
 }
 
@@ -193,6 +200,8 @@ function fly(words) {
 
 // Sent and not yet admitted, by id: resent with the same id after a reconnect, so the core admits each once.
 const pending = new Map();
+/** The option boxes of the questions soma asked while the page was open, by question id. */
+const questions = new Map();
 let socket;
 let connected = false;
 let retryMs = 500;
@@ -205,8 +214,25 @@ function showStatus() {
 	statusLine.hidden = connected;
 }
 
-function send(id, words) {
-	if (connected) socket.send(JSON.stringify({ type: "input", id, text: words }));
+function send(message) {
+	if (connected) socket.send(JSON.stringify(message));
+}
+
+/** A press says the option: it goes to soma as the human's words, and the fox listens as for typed ones. */
+function choose(question, option) {
+	const id = newId();
+	const message = { type: "say", id, question, option };
+	pending.set(id, message);
+	awaiting.add(id);
+	send(message);
+	startHold();
+	settle();
+}
+
+function asked({ question, options }) {
+	const box = renderChoices(options, (option) => choose(question, option));
+	questions.set(question, box);
+	return box;
 }
 
 function receive(message) {
@@ -221,8 +247,22 @@ function receive(message) {
 		say("answer", message.text);
 		ring();
 	} else if (message.type === "notice") {
-		say("notice", message.text, { label: message.kind === "question" ? "問題" : "通知", quiet: !message.loud });
+		say("notice", message.text, {
+			label: message.kind === "question" ? "問題" : "通知",
+			quiet: !message.loud,
+			...(message.choices && { choices: asked(message.choices) }),
+		});
 		if (message.loud) ring();
+	} else if (message.type === "said") {
+		// Said here or elsewhere; with an id, this page's press came after the question was settled.
+		const box = questions.get(message.question);
+		if (box) settleChoices(box, message.label);
+		if (message.id !== undefined) {
+			pending.delete(message.id);
+			awaiting.delete(message.id);
+		}
+		if (box && shown?.choices === box) startHold();
+		settle();
 	} else if (message.type === "failure") {
 		if (message.id !== undefined) {
 			pending.delete(message.id);
@@ -241,7 +281,7 @@ function connect() {
 		connected = true;
 		retryMs = 500;
 		showStatus();
-		for (const [id, words] of pending) send(id, words);
+		for (const message of pending.values()) send(message);
 	};
 	socket.onmessage = (event) => receive(JSON.parse(event.data));
 	socket.onclose = () => {
@@ -257,10 +297,11 @@ form.addEventListener("submit", (event) => {
 	const words = text.value.trim();
 	if (words === "") return;
 	const id = newId();
-	pending.set(id, words);
+	const message = { type: "input", id, text: words };
+	pending.set(id, message);
 	awaiting.add(id);
 	fly(words);
-	send(id, words);
+	send(message);
 	text.value = "";
 	text.style.height = "";
 	settle();

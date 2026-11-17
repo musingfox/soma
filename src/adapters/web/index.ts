@@ -8,7 +8,7 @@ import type { Duplex } from "node:stream";
 import { gzipSync } from "node:zlib";
 import { type RawData, WebSocket, WebSocketServer } from "ws";
 import { z } from "zod";
-import { deliveryTo, type HumanPort, type SomaEvent } from "../../ports/human.ts";
+import { deliveryTo, type HumanPort, isPrompt, type SaidChoices, type SomaEvent } from "../../ports/human.ts";
 import { readableFailure } from "./failure.ts";
 
 /** Serve mode: soma is behind `tailscale serve`, which terminates HTTPS and says who the caller is. */
@@ -47,7 +47,8 @@ export const ENTRY_KIND = "chat.web";
 export const ABILITIES = [
 	"網頁（狐狸的對話泡泡）：markdown 會顯示成格式：標題、粗體、斜體、刪除線、行內程式碼與程式碼區塊、清單、引用、分隔線、表格（太寬時在泡泡裡橫向捲動），以及 http 或 https 的連結。",
 	"原始 HTML 一律當文字顯示，所以 `<details>` 不會折疊；圖片只顯示描述文字，不載入。",
-	"文字先逐字出現（最多 4 秒）再換成格式；泡泡依長度停留 6 到 45 秒（頁面在眼前時才計時），點一下或時間到就淡出，頁面上不留紀錄。沒有長度上限，但泡泡不大，長文要捲動。",
+	"文字先逐字出現（最多 4 秒）再換成格式；泡泡依長度停留 6 到 45 秒（頁面在眼前時才計時），點一下或時間到就淡出，頁面上不留紀錄。附選項、還在等人按的泡泡不會自己淡出，選定後才開始計時，點泡泡（按鈕以外）仍會讓它淡出。沒有長度上限，但泡泡不大，長文要捲動。",
+	"你用 `ask` 問的問題，選項會在泡泡裡顯示成按鈕，人按一個就是回答。",
 ].join("\n");
 export const SOCKET_PATH = "/socket";
 /** A larger message closes the connection: typed text is far smaller, and nothing else is buffered without bound. */
@@ -85,7 +86,7 @@ const staticFile = (type: string, body: Buffer): StaticFile => ({
 });
 const JS = "text/javascript; charset=utf-8";
 /** The page's own ES modules, each served at its name. */
-export const PAGE_MODULES = ["page.js", "markdown.js", "scene.js", "fox.js", "room.js", "shapes.js"];
+export const PAGE_MODULES = ["page.js", "markdown.js", "choices.js", "scene.js", "fox.js", "room.js", "shapes.js"];
 const page = (name: string) => readFileSync(new URL(`./page/${name}`, import.meta.url));
 // The package's own published ES modules, served as they are; three.module.js imports ./three.core.js beside it.
 const threeBuild = dirname(createRequire(import.meta.url).resolve("three"));
@@ -109,22 +110,43 @@ const FILES = new Map<string, StaticFile>([
 ]);
 
 // The page names each message with 128 random bits in hex; a resend keeps the id, so the core admits it once.
+const MessageId = z.string().regex(/^[0-9a-f]{32}$/);
 const InputSchema = z
-	.object({ type: z.literal("input"), id: z.string().regex(/^[0-9a-f]{32}$/), text: z.string().min(1).max(100_000) })
+	.object({ type: z.literal("input"), id: MessageId, text: z.string().min(1).max(100_000) })
 	.strict();
+// A press on an option of a question soma asked; the core knows the question and its labels.
+const SaySchema = z
+	.object({
+		type: z.literal("say"),
+		id: MessageId,
+		question: z.string().min(1).max(64),
+		option: z.string().min(1).max(8),
+	})
+	.strict();
+const PageSchema = z.discriminatedUnion("type", [InputSchema, SaySchema]);
 
 /** What the page receives; `loud` is false on a push the core meant for another interface. */
 export type WebMessage =
 	| { readonly type: "accepted"; readonly id: string }
 	| { readonly type: "answer"; readonly id: string; readonly text: string }
 	| { readonly type: "failure"; readonly id?: string; readonly text: string; readonly loud: boolean }
-	| { readonly type: "notice"; readonly kind: "question" | "report"; readonly text: string; readonly loud: boolean }
+	| {
+			readonly type: "notice";
+			readonly kind: "question" | "report";
+			readonly text: string;
+			readonly loud: boolean;
+			// The options of a question soma asked, offered as buttons; a prompt's are not offered here yet.
+			readonly choices?: SaidChoices;
+	  }
+	// A question's option was said, here or elsewhere; `id` names this page's press the core found already settled.
+	| { readonly type: "said"; readonly question: string; readonly label: string; readonly id?: string }
 	| { readonly type: "run"; readonly state: "working" | "idle" }
 	| { readonly type: "error"; readonly text: string };
 
 /**
- * The web client: one page and a WebSocket on one address. Each message the page sends is an input; answers and
- * failures of the page's inputs, failures of rounds the core started, and notices go to every page open then. A push the
+ * The web client: one page and a WebSocket on one address. Each message the page sends is an input, typed or the press
+ * of an option of a question soma asked; answers and failures of the page's inputs, failures of rounds the core
+ * started, notices and the options said go to every page open then. A push the
  * core meant for another interface is shown without ringing, as the terminal does. The `web:` prefix, not a set of ids
  * sent from here, marks this client's rounds, so a round the core finishes after a restart still reaches the page.
  * A page that stops answering pings is dropped and unsubscribed; closing the server drops every page at once, so a page
@@ -160,10 +182,18 @@ export async function startWeb(options: WebOptions): Promise<WebServer> {
 		if (event.type === "notice") {
 			if (event.kind === "forwarded") return undefined;
 			const delivery = deliveryTo(event, ENTRY_KIND);
+			const { choices } = event;
 			return delivery === "log"
 				? undefined
-				: { type: "notice", kind: event.kind, text: event.content, loud: delivery === "ring" };
+				: {
+						type: "notice",
+						kind: event.kind,
+						text: event.content,
+						loud: delivery === "ring",
+						...(choices !== undefined && !isPrompt(choices) && { choices }),
+					};
 		}
+		if (event.type === "said") return { type: "said", question: event.question, label: event.label };
 		if (event.type === "answer") {
 			if (mine) return { type: "answer", id, text: event.content };
 			const delivery = deliveryTo(event, ENTRY_KIND);
@@ -189,12 +219,21 @@ export async function startWeb(options: WebOptions): Promise<WebServer> {
 		} catch {
 			return sendTo(socket, { type: "error", text: "not JSON" });
 		}
-		const input = InputSchema.safeParse(parsed);
-		if (!input.success) return sendTo(socket, { type: "error", text: "not an input" });
-		const { id } = input.data;
+		const message = PageSchema.safeParse(parsed);
+		if (!message.success) return sendTo(socket, { type: "error", text: "not an input" });
+		const { id } = message.data;
+		const requestId = REQUEST_PREFIX + id;
 		try {
-			await human.submit({ content: input.data.text, entry: { kind: ENTRY_KIND }, requestId: REQUEST_PREFIX + id });
-			sendTo(socket, { type: "accepted", id });
+			if (message.data.type === "input") {
+				await human.submit({ content: message.data.text, entry: { kind: ENTRY_KIND }, requestId });
+				return sendTo(socket, { type: "accepted", id });
+			}
+			const { question, option } = message.data;
+			const outcome = await human.say(question, option, { entry: { kind: ENTRY_KIND }, requestId });
+			if (outcome.said) return sendTo(socket, { type: "accepted", id });
+			if (outcome.refusal === "settled") return sendTo(socket, { type: "said", question, label: outcome.label, id });
+			const reason = outcome.refusal === "no_question" ? "找不到這個問題" : "沒有這個選項";
+			sendTo(socket, { type: "failure", id, text: `沒有送出：${reason}`, loud: true });
 		} catch (error) {
 			onError(error);
 			sendTo(socket, { type: "failure", id, text: `沒有送出：${(error as Error).message}`, loud: true });

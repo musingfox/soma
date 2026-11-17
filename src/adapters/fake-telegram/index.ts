@@ -244,11 +244,17 @@ export class FakeBotApi {
 		return update;
 	}
 
-	/** Queue a press on the button carrying `data`, on the last message that shows it, as seen from `chatId`. */
-	press(data: string, chatId: number): CallbackUpdate {
-		const shown = [...this.#markups].findLast(([, markup]) =>
-			markup.inline_keyboard.flat().some((button) => button.callback_data === data),
-		);
+	/**
+	 * Queue a press on the button carrying `data`, on the last message that shows it, as seen from `chatId`; or on message
+	 * `messageId` whatever it shows now, as a client that has not yet seen the message's buttons change would press it.
+	 */
+	press(data: string, chatId: number, messageId?: number): CallbackUpdate {
+		const shown =
+			messageId === undefined
+				? [...this.#markups].findLast(([, markup]) =>
+						markup.inline_keyboard.flat().some((button) => button.callback_data === data),
+					)
+				: ([messageId, this.#markups.get(messageId)] as const);
 		const update = {
 			update_id: this.#nextUpdate++,
 			callback_query: {

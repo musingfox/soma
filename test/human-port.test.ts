@@ -5,16 +5,17 @@ import { PassThrough } from "node:stream";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
+import { type Conversation, createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { runTerminal } from "../src/adapters/terminal/index.ts";
 import { type Policies, PRESETS } from "../src/core/domain/push.ts";
+import { Questions } from "../src/core/extensions/ask/index.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { schedule } from "../src/core/extensions/schedule/index.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { openHumanPort, Pushes, type PushOptions } from "../src/core/human-port.ts";
-import { NOTICE } from "../src/core/notice.ts";
+import { NOTICE, noticeEntry } from "../src/core/notice.ts";
 import type { SomaEvent } from "../src/ports/human.ts";
 import { ringing } from "./ringing.ts";
 
@@ -365,6 +366,7 @@ describe("push target and escalation", () => {
 	const MIN = 60_000;
 	const TELEGRAM = "chat.telegram";
 	const TERMINAL = "chat.terminal";
+	const WEB = "chat.web";
 
 	/** A HumanPort with a push target, on a clock the test moves; `open` reopens it on the same store, as a restart. */
 	async function pushing() {
@@ -457,6 +459,65 @@ describe("push target and escalation", () => {
 		advance(20 * MIN);
 		await settle();
 		expect(notices(seen).map((notice) => notice.content)).toEqual(["which one?"]);
+	});
+
+	const options = [
+		{ id: "1", label: "好" },
+		{ id: "2", label: "不用" },
+	];
+	const ask = (root: Conversation, question: string) =>
+		root.submit(
+			{ type: "write", entry: noticeEntry("question", "action", `問 ${question}`, { question, options }) },
+			context,
+		);
+
+	test("a press on a question's option counts as the human's presence on that interface, as typing does", async () => {
+		const { root, open, notices, advance } = await pushing();
+		const { human, seen } = await open();
+		await root.commit(async (tx) => {
+			(await tx.doc(Questions, root.id)).questions = { q1: { options } };
+		}, context);
+		await human.submit({ content: "嗨", entry: { kind: TERMINAL }, requestId: "terminal:1" });
+		await root.waitForIdle(context);
+		advance(16 * MIN);
+		expect(await human.say("q1", "1", { entry: { kind: WEB }, requestId: "web:1" })).toEqual({
+			said: true,
+			label: "好",
+		});
+		await root.waitForIdle(context);
+		await human.notify("after the press", "report", "outcome");
+
+		await vi.waitFor(() => expect(notices(seen)).toHaveLength(1));
+		expect(notices(seen).map((notice) => [notice.content, ringing(notice)])).toEqual([["after the press", WEB]]);
+		const presence = await root.commit(async (tx) => ({ ...(await tx.doc(Pushes, root.id)).presence }), context);
+		expect(presence[WEB]).toBe(116 * MIN);
+	});
+
+	test("a question whose option was said is not pushed again; one still open is", async () => {
+		const { root, open, notices, settle, advance } = await pushing();
+		const { human, seen } = await open();
+		await root.commit(async (tx) => {
+			(await tx.doc(Questions, root.id)).questions = { q1: { options }, q2: { options } };
+		}, context);
+		await human.submit({ content: "嗨", entry: { kind: TERMINAL }, requestId: "terminal:1" });
+		await root.waitForIdle(context);
+		await ask(root, "q1");
+		await ask(root, "q2");
+		await vi.waitFor(() => expect(notices(seen)).toHaveLength(2));
+		// Said as a press writes it, with no input after the push, so only the said question tells it from q2.
+		await root.commit(async (tx) => {
+			const doc = await tx.doc(Questions, root.id);
+			doc.questions.q1 = { options, said: "2" };
+		}, context);
+
+		advance(16 * MIN);
+		await vi.waitFor(() => expect(notices(seen)).toHaveLength(3));
+		await settle();
+		expect(notices(seen).map((notice) => [notice.content, ringing(notice)])).toEqual([
+			["問 q1", TERMINAL],
+			["問 q2", TERMINAL],
+			["問 q2", TELEGRAM],
+		]);
 	});
 
 	test("a pending escalation survives a restart and is pushed once across two", async () => {

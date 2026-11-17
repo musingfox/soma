@@ -7,6 +7,7 @@ import { FakeAgentPort } from "../../../src/adapters/fake-agent/index.ts";
 import { FakeHumanPort } from "../../../src/adapters/fake-human/index.ts";
 import { FakeBotApi } from "../../../src/adapters/fake-telegram/index.ts";
 import { runTelegram, splitMessage } from "../../../src/adapters/telegram/index.ts";
+import { askExtension } from "../../../src/core/extensions/ask/index.ts";
 import { Dispatches, dispatchExtension } from "../../../src/core/extensions/dispatch/index.ts";
 import { openHumanPort } from "../../../src/core/human-port.ts";
 import type { HumanPort } from "../../../src/ports/human.ts";
@@ -514,6 +515,243 @@ test("a prompt's buttons go once its job leaves that prompt, unless a press here
 	human.emit({ type: "job", card: "card-a", agent: "card-a", status: { state: "idle" } });
 	await new Promise((resolve) => setTimeout(resolve, 100));
 	expect(api.calls).toHaveLength(4);
+});
+
+test("a question soma asks arrives with a button per option; a press is the human's answer and runs a round", async () => {
+	const registry = createRegistry();
+	registry.install(askExtension());
+	const { faux, root, human } = await core(registry);
+	let heard = "";
+	faux.setResponses([
+		fauxAssistantMessage([fauxToolCall("ask", { question: "要我稍後再試一次嗎？", options: ["好", "不用"] })], {
+			stopReason: "toolUse",
+		}),
+		fauxAssistantMessage("先停在這。"),
+		(request) => {
+			heard = JSON.stringify(request.messages.at(-1));
+			return fauxAssistantMessage("好，十分鐘後再試。");
+		},
+		fauxAssistantMessage("不該有第三輪"),
+	]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	api.deliver("部署失敗了", CHAT);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	const prompt = api.sent.find((message) => message.reply_markup !== undefined);
+	const data = prompt?.reply_markup?.inline_keyboard.flat().map((button) => button.callback_data) ?? [];
+	expect(data).toHaveLength(2);
+	const question = /^ask\/([0-9a-f]{16})\/1$/.exec(data[0] ?? "")?.[1];
+	expect(prompt).toEqual({
+		chat_id: CHAT,
+		text: "[問題] 要我稍後再試一次嗎？",
+		rich: true,
+		reply_markup: {
+			inline_keyboard: [
+				[{ text: "好", callback_data: `ask/${question}/1` }],
+				[{ text: "不用", callback_data: `ask/${question}/2` }],
+			],
+		},
+	});
+	await root.waitForIdle(context);
+
+	const press = api.press(`ask/${question}/1`, CHAT);
+	await vi.waitFor(() => expect(api.sent.map(({ text }) => text)).toContain("好，十分鐘後再試。"));
+	expect(JSON.parse(heard)).toMatchObject({ role: "user", content: "好" });
+	const { items } = await root.entries({ order: "ascending" }, 100, undefined, context);
+	expect(items.filter((entry) => entry.kind === "chat.telegram").map((entry) => entry.data)).toEqual([
+		{ messageId: 1 },
+		{ pressed: press.callback_query.message.message_id },
+	]);
+	expect(api.calls).toEqual([
+		{ method: "answerCallbackQuery", params: { callback_query_id: press.callback_query.id, text: "已選：好" } },
+		{
+			method: "editMessageReplyMarkup",
+			params: { chat_id: CHAT, message_id: press.callback_query.message.message_id, reply_markup: chosen("已選：好") },
+		},
+	]);
+	// The round from the press shows the Thinking draft under the prompt's id; it has no message of the human's to mark.
+	expect(api.drafts.map(({ draft_id }) => draft_id)).toContain(press.callback_query.message.message_id);
+	await vi.waitFor(() => expect(api.reactions.map(({ message_id }) => message_id)).toEqual([1, 1]));
+
+	// The button is disabled now; a stale client's second press is only answered.
+	const second = api.press(`ask/${question}/2`, CHAT, press.callback_query.message.message_id);
+	api.deliver("after", CHAT);
+	await vi.waitFor(() => expect(faux.state.callCount).toBe(4));
+	await root.waitForIdle(context);
+	expect(api.calls).toHaveLength(3);
+	expect(api.calls.at(-1)).toEqual({
+		method: "answerCallbackQuery",
+		params: { callback_query_id: second.callback_query.id },
+	});
+	const pressed = items.filter((entry) => entry.kind === "chat.telegram").length;
+	const after = (await root.entries({ order: "ascending" }, 100, undefined, context)).items;
+	expect(after.filter((entry) => entry.kind === "chat.telegram")).toHaveLength(pressed + 1);
+});
+
+test("a question pressed elsewhere shows the choice on every message here offering it, and no prompt's buttons go", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+	const said = {
+		question: "abc",
+		options: [
+			{ id: "1", label: "好" },
+			{ id: "2", label: "不用" },
+		],
+	};
+
+	human.emit({ type: "notice", kind: "question", class: "action", content: "要嗎？", choices: said });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "還是要嗎？", choices: said });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "要讓它執行嗎？", choices });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(3));
+	human.emit({ type: "said", question: "other", label: "x" });
+	human.emit({ type: "said", question: "abc", label: "不用" });
+	await vi.waitFor(() => expect(api.calls).toHaveLength(2));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	expect(api.calls.map(({ method, params }) => [method, params.message_id, params.reply_markup])).toEqual([
+		["editMessageReplyMarkup", 1, chosen("已選：不用")],
+		["editMessageReplyMarkup", 2, chosen("已選：不用")],
+	]);
+
+	// Settled here, so a press that was on its way is only answered.
+	api.press("ask/abc/1", CHAT, 1);
+	api.deliver("after", CHAT);
+	await vi.waitFor(() => expect(human.inputs).toHaveLength(1));
+	expect(human.said).toEqual([]);
+	expect(api.calls.at(-1)?.method).toBe("answerCallbackQuery");
+});
+
+test("a press goes to say, never to an agent; one the core finds settled or unknown shows why", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+	const said = {
+		question: "abc",
+		options: [
+			{ id: "1", label: "好" },
+			{ id: "2", label: "不用" },
+		],
+	};
+
+	// As after a restart: this adapter does not know the question was answered, the core does.
+	human.saidOutcome = { said: false, refusal: "settled", label: "不用" };
+	human.emit({ type: "notice", kind: "question", class: "action", content: "要嗎？", choices: said });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	const press = api.press("ask/abc/1", CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(2));
+	expect(human.answers).toEqual([]);
+	expect(human.said).toEqual([
+		{
+			question: "abc",
+			option: "1",
+			input: { entry: { kind: "chat.telegram", data: { pressed: 1 } }, requestId: "telegram:ask/abc" },
+		},
+	]);
+	expect(api.calls.map(({ params }) => params.text ?? params.reply_markup)).toEqual([
+		"已選：不用",
+		chosen("已選：不用"),
+	]);
+	expect(api.drafts).toEqual([]);
+
+	human.saidOutcome = { said: false, refusal: "no_question" };
+	human.emit({ type: "notice", kind: "question", class: "action", content: "又一題", choices: said });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	api.press("ask/abc/2", CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(4));
+	expect(api.calls.slice(2).map(({ params }) => params.text ?? params.reply_markup)).toEqual([
+		"未送出：找不到這個問題",
+		chosen("未送出：找不到這個問題"),
+	]);
+	expect(press.callback_query.message.message_id).toBe(1);
+});
+
+test("a say that throws is reported and leaves its buttons; a respond that throws settles as unknown", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const { onError } = start(human, apiBase);
+	const said = { question: "abc", options: [{ id: "1", label: "好" }] };
+	const say = human.say.bind(human);
+	const respond = human.respond.bind(human);
+	vi.spyOn(human, "say").mockRejectedValueOnce(new Error("the db is gone"));
+	vi.spyOn(human, "respond").mockRejectedValueOnce(new Error("the decision commit failed"));
+	human.saidOutcome = { said: true, label: "好" };
+
+	human.emit({ type: "notice", kind: "question", class: "action", content: "要嗎？", choices: said });
+	human.emit({ type: "notice", kind: "question", class: "action", content: "要讓它執行嗎？", choices });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	const first = api.press("ask/abc/1", CHAT);
+	const prompt = api.press("1:f00d:card-a", CHAT);
+	api.deliver("after", CHAT);
+	await vi.waitFor(() => expect(human.inputs).toHaveLength(1));
+	expect(onError).toHaveBeenCalledTimes(2);
+	const unknown = "不確定有沒有送出：出錯了，請到 agent 的畫面確認";
+	expect(api.calls).toEqual([
+		{
+			method: "answerCallbackQuery",
+			params: { callback_query_id: first.callback_query.id, text: "未送出：出錯了，可以再按一次" },
+		},
+		{ method: "answerCallbackQuery", params: { callback_query_id: prompt.callback_query.id, text: unknown } },
+		{
+			method: "editMessageReplyMarkup",
+			params: { chat_id: CHAT, message_id: prompt.callback_query.message.message_id, reply_markup: chosen(unknown) },
+		},
+	]);
+
+	// A second press on the prompt, from a client that still shows its buttons, reaches no agent: the keys may have gone.
+	vi.mocked(human.respond).mockImplementation(respond);
+	const again = api.press("1:f00d:card-a", CHAT, prompt.callback_query.message.message_id);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(4));
+	expect(api.calls.at(-1)).toEqual({
+		method: "answerCallbackQuery",
+		params: { callback_query_id: again.callback_query.id },
+	});
+	expect(human.answers).toEqual([]);
+
+	// say's message is not settled by the failure: the next press on it goes through.
+	vi.mocked(human.say).mockImplementation(say);
+	api.press("ask/abc/1", CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(6));
+	expect(human.said).toHaveLength(1);
+	expect(api.calls.at(-1)?.params.reply_markup).toEqual(chosen("已選：好"));
+});
+
+test("a press that throws leaves settled a message an event settled while the press was in flight", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+	const said = { question: "abc", options: [{ id: "1", label: "好" }] };
+	let fail = (_error: Error) => {};
+	vi.spyOn(human, "say").mockImplementationOnce(
+		() =>
+			new Promise((_resolve, reject) => {
+				fail = reject;
+			}),
+	);
+
+	human.emit({ type: "notice", kind: "question", class: "action", content: "要嗎？", choices: said });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	const press = api.press("ask/abc/1", CHAT);
+	await vi.waitFor(() => expect(human.say).toHaveBeenCalledOnce());
+	// Said on another interface while this press waits: the event leaves the message to the press.
+	human.emit({ type: "said", question: "abc", label: "好" });
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	expect(api.calls).toEqual([]);
+	fail(new Error("the db is gone"));
+	await vi.waitFor(() => expect(api.calls).toHaveLength(2));
+	expect(api.calls).toEqual([
+		{ method: "answerCallbackQuery", params: { callback_query_id: press.callback_query.id, text: "已選：好" } },
+		{
+			method: "editMessageReplyMarkup",
+			params: { chat_id: CHAT, message_id: press.callback_query.message.message_id, reply_markup: chosen("已選：好") },
+		},
+	]);
+
+	// Still settled: a stale client's press is only answered.
+	api.press("ask/abc/1", CHAT, press.callback_query.message.message_id);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(3));
+	expect(api.calls.at(-1)?.params.text).toBeUndefined();
+	expect(human.say).toHaveBeenCalledOnce();
 });
 
 const markdownAnswer =

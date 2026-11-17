@@ -1,5 +1,12 @@
 import type { AgentState } from "../../ports/agent.ts";
-import { type Choices, type Delivery, MESSAGE_CLASSES, type MessageClass, type NoticeKind } from "../../ports/human.ts";
+import {
+	type Choices,
+	type Delivery,
+	isPrompt,
+	MESSAGE_CLASSES,
+	type MessageClass,
+	type NoticeKind,
+} from "../../ports/human.ts";
 import { samePrompt, type Told } from "./foreign.ts";
 
 /**
@@ -95,11 +102,19 @@ type Jobs = readonly { readonly card: string; readonly status: AgentState }[];
 
 /**
  * Whether the prompt a question tells of is gone: no longer on the job's screen, or, for a foreign agent, no longer the
- * prompt told for it (`told`, by agent id, forgotten once the agent is past the prompt).
+ * prompt told for it (`told`, by agent id, forgotten once the agent is past the prompt), or, for a question soma
+ * asked, one whose option was pressed (`said`, by question id).
  */
-export function promptGone(push: Pick<PendingPush, "choices" | "foreign">, jobs: Jobs, told: Told): boolean {
+export function promptGone(
+	push: Pick<PendingPush, "choices" | "foreign">,
+	jobs: Jobs,
+	told: Told,
+	said: ReadonlySet<string> = new Set(),
+): boolean {
 	const { choices } = push;
-	if (choices !== undefined) {
+	if (choices !== undefined && !isPrompt(choices)) {
+		if (said.has(choices.question)) return true;
+	} else if (choices !== undefined) {
 		const status = jobs.find((job) => job.card === choices.card)?.status;
 		if (status?.state !== "blocked" || status.fingerprint !== choices.fingerprint) return true;
 	}
@@ -122,9 +137,10 @@ export function escalation(
 	told: Told,
 	now: number,
 	escalateMs: number,
+	said?: ReadonlySet<string>,
 ): "drop" | "due" | "wait" {
 	if (Object.values(presence).some((at) => at > push.at)) return "drop";
-	if (promptGone(push, jobs, told)) return "drop";
+	if (promptGone(push, jobs, told, said)) return "drop";
 	return now - push.at >= escalateMs ? "due" : "wait";
 }
 

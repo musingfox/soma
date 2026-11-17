@@ -7,7 +7,9 @@ import {
 	deliveryTo,
 	type HumanAnswerOutcome,
 	type HumanPort,
+	isPrompt,
 	type NoticeKind,
+	type SaidOutcome,
 } from "../../ports/human.ts";
 import { escapeHtml, htmlToPlain, markdownToHtml, splitHtml } from "./html.ts";
 
@@ -40,6 +42,7 @@ const RICH_LIMIT = 32768;
 export const ABILITIES = [
 	"Telegram（人的手機）：markdown 照你寫的原樣送出，Telegram 顯示成格式（GitHub Flavored Markdown）：標題、表格、清單、程式碼區塊、引用、連結，以及可折疊的 `<details><summary>摘要</summary>…</details>` 區段。",
 	"長的細節放進收合的 `<details>` 區段，上面只留一行摘要，讓人在手機上先看到短的回答。",
+	"你用 `ask` 問的問題，選項會顯示成訊息下的按鈕，人按一個就是回答。",
 	`超過 ${RICH_LIMIT} 位元組（UTF-8，中文一字約 3 位元組）的訊息改送分段的簡單格式：標題變粗體、表格變等寬文字，\`<details>\` 只顯示成原始文字，不會收合。Telegram 拒收的訊息也改用這種簡單格式重送。Telegram 說明的上限另有 500 個區塊、表格 20 欄。`,
 ].join("\n");
 const EMPTY_ANSWER = "（這一輪沒有文字回答）";
@@ -138,6 +141,16 @@ const REFUSALS: Record<Extract<HumanAnswerOutcome, { sent: false }>["refusal"], 
 	no_job: "派工清單裡沒有這張卡片",
 };
 
+const PRESS_FAILED = "未送出：出錯了，可以再按一次";
+// A respond that throws may have sent the keys already, and where a fingerprint is the prompt's content a later
+// identical prompt carries the same one, so a second press could answer that prompt: this text does not offer one.
+const PRESS_UNKNOWN = "不確定有沒有送出：出錯了，請到 agent 的畫面確認";
+
+const SAID_REFUSALS: Record<Exclude<Extract<SaidOutcome, { said: false }>["refusal"], "settled">, string> = {
+	no_question: "找不到這個問題",
+	unknown_option: "沒有這個選項",
+};
+
 // A card name is kebab-case and a fingerprint hex, so neither holds the separator.
 const callbackData = (card: string, { option, fingerprint }: Answer) => `${option}:${fingerprint}:${card}`;
 
@@ -147,11 +160,23 @@ function parseCallbackData(data: string | undefined): { card: string; answer: An
 	return { card, answer: { option, fingerprint } };
 }
 
+// A question soma asked: `ask/<question>/<option>`. It holds no ':', so it never reads as a prompt's data.
+const SAID_PREFIX = "ask/";
+const saidData = (question: string, option: string) => `${SAID_PREFIX}${question}/${option}`;
+
+function parseSaidData(data: string | undefined): { question: string; option: string } | undefined {
+	if (!data?.startsWith(SAID_PREFIX) || data.includes(":")) return undefined;
+	const [question, option, ...rest] = data.slice(SAID_PREFIX.length).split("/");
+	if (!question || !option || rest.length > 0) return undefined;
+	return { question, option };
+}
+
 /** One button per option, or none when a button's data would not fit: a cut card name would answer another job. */
-function keyboard({ card, fingerprint, options }: Choices) {
-	const rows = options.map(({ id, label }) => [
-		{ text: label, callback_data: callbackData(card, { option: id, fingerprint }) },
-	]);
+function keyboard(choices: Choices) {
+	const data = isPrompt(choices)
+		? (id: string) => callbackData(choices.card, { option: id, fingerprint: choices.fingerprint })
+		: (id: string) => saidData(choices.question, id);
+	const rows = choices.options.map(({ id, label }) => [{ text: label, callback_data: data(id) }]);
 	const fits = rows.every(([button]) => Buffer.byteLength(button?.callback_data ?? "") <= CALLBACK_DATA_LIMIT);
 	return fits ? { inline_keyboard: rows } : undefined;
 }
@@ -182,8 +207,13 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	// A second tap arrives before the first press's edit hides the buttons; its refusal must not replace the result.
 	// A message whose buttons were taken away as answered elsewhere is settled too.
 	const settled = new Set<number>();
+	// By message, the presses still in flight and what an event settled each message with meanwhile: the event leaves
+	// the message to the press, and a press that then fails shows that instead of offering its buttons again.
+	const pressing = new Map<number, string | undefined>();
 	// By card and fingerprint, the messages here showing that prompt's buttons; lost on a restart.
 	const shown = new Map<string, { card: string; fingerprint: string; messageIds: number[] }>();
+	// By question, the messages here showing the options of a question soma asked; lost on a restart.
+	const asked = new Map<string, number[]>();
 	// A part Telegram refuses for its entities goes again as the text it shows, so formatting never loses a message.
 	const sendPart = async (html: string, extra: object): Promise<unknown> => {
 		try {
@@ -205,6 +235,10 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			const show = (sent: unknown) => {
 				const messageId = (sent as { message_id?: unknown }).message_id;
 				if (prompt === undefined || typeof messageId !== "number") return;
+				if (!isPrompt(prompt)) {
+					asked.set(prompt.question, [...(asked.get(prompt.question) ?? []), messageId]);
+					return;
+				}
 				const key = `${prompt.card}\n${prompt.fingerprint}`;
 				const entry = shown.get(key) ?? { card: prompt.card, fingerprint: prompt.fingerprint, messageIds: [] };
 				entry.messageIds.push(messageId);
@@ -249,12 +283,28 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		call(method, body).catch((error: unknown) => {
 			if (!signal.aborted) onError(error);
 		});
+	// What an event puts in place of the buttons of each message here it settles.
+	const settleShown = async (messageIds: number[], text: string) => {
+		for (const messageId of messageIds) {
+			if (pressing.has(messageId)) pressing.set(messageId, text);
+			if (settled.has(messageId)) continue;
+			settled.add(messageId);
+			await quietly("editMessageReplyMarkup", {
+				chat_id: chatId,
+				message_id: messageId,
+				reply_markup: { inline_keyboard: [[{ text, disabled: {} }]] },
+			});
+		}
+	};
 	// One at a time, so a later stage's reaction is the one that stays.
 	let reacting = Promise.resolve();
+	// A press's round has no message from the human to react on.
 	const react = (requestId: string, stage: keyof typeof REACTIONS) => {
+		const messageId = Number(requestId.slice(REQUEST_PREFIX.length));
+		if (!Number.isInteger(messageId)) return;
 		const body = {
 			chat_id: chatId,
-			message_id: Number(requestId.slice(REQUEST_PREFIX.length)),
+			message_id: messageId,
 			reaction: [{ type: "emoji", emoji: REACTIONS[stage] }],
 		};
 		reacting = reacting.then(() => quietly("setMessageReaction", body).then(() => {}));
@@ -292,6 +342,15 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			if (event.kind === "forwarded") {
 				if (mine) react(event.requestId, "forwarded");
 			} else push(label(event.kind, event.content), deliveryTo(event, ENTRY_KIND), event.choices);
+		} else if (event.type === "said") {
+			// Pressed here or elsewhere: every message here offering that question shows the choice. Queued behind the
+			// sends, so it sees them.
+			const { question } = event;
+			sending = sending.then(async () => {
+				const messageIds = asked.get(question) ?? [];
+				asked.delete(question);
+				await settleShown(messageIds, `已選：${event.label}`);
+			});
 		} else if (event.type === "job") {
 			// Answered elsewhere: the prompt is no longer on the job's screen. Queued behind the sends, so it sees them.
 			const { card, status } = event;
@@ -300,14 +359,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 					if (prompt.card !== card) continue;
 					if (status.state === "blocked" && status.fingerprint === prompt.fingerprint) continue;
 					shown.delete(key);
-					for (const messageId of prompt.messageIds.filter((id) => !settled.has(id))) {
-						settled.add(messageId);
-						await quietly("editMessageReplyMarkup", {
-							chat_id: chatId,
-							message_id: messageId,
-							reply_markup: { inline_keyboard: [[{ text: ELSEWHERE, disabled: {} }]] },
-						});
-					}
+					await settleShown(prompt.messageIds, ELSEWHERE);
 				}
 			});
 		} else if (event.type === "answer") {
@@ -326,22 +378,63 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		}
 	});
 	type CallbackQuery = NonNullable<z.infer<typeof UpdateSchema>["callback_query"]>;
-	const answerPress = async (query: CallbackQuery, message: NonNullable<CallbackQuery["message"]>) => {
-		const pressed = parseCallbackData(query.data);
-		if (pressed === undefined || settled.has(message.message_id))
-			return quietly("answerCallbackQuery", { callback_query_id: query.id });
-		settled.add(message.message_id);
-		const outcome = await human.respond(pressed.card, pressed.answer);
-		const button = message.reply_markup?.inline_keyboard.flat().find((each) => each.callback_data === query.data);
-		const result = outcome.sent
-			? `已選：${button?.text ?? pressed.answer.option}`
-			: `未送出：${REFUSALS[outcome.refusal]}`;
+	const settleOn = async (query: CallbackQuery, messageId: number, result: string) => {
 		await quietly("answerCallbackQuery", { callback_query_id: query.id, text: result });
 		await quietly("editMessageReplyMarkup", {
 			chat_id: chatId,
-			message_id: message.message_id,
+			message_id: messageId,
 			reply_markup: { inline_keyboard: [[{ text: result, disabled: {} }]] },
 		});
+	};
+	// The human said an option of a question soma asked: their input, which starts a round as a typed message does.
+	// One request id per question, so a press Telegram delivers again after a restart is admitted once.
+	const sayPress = async (query: CallbackQuery, messageId: number, pressed: { question: string; option: string }) => {
+		const requestId = `${REQUEST_PREFIX}${SAID_PREFIX}${pressed.question}`;
+		if (!drafts.has(requestId)) drafts.set(requestId, undefined);
+		const outcome = await human.say(pressed.question, pressed.option, {
+			entry: { kind: ENTRY_KIND, data: { pressed: messageId } },
+			requestId,
+		});
+		if (outcome.said) think(requestId, messageId);
+		else settle(requestId);
+		const result =
+			outcome.said || outcome.refusal === "settled"
+				? `已選：${outcome.label}`
+				: `未送出：${SAID_REFUSALS[outcome.refusal]}`;
+		await settleOn(query, messageId, result);
+	};
+	const answerPress = async (query: CallbackQuery, message: NonNullable<CallbackQuery["message"]>) => {
+		const said = parseSaidData(query.data);
+		const pressed = parseCallbackData(query.data);
+		if ((said === undefined && pressed === undefined) || settled.has(message.message_id))
+			return quietly("answerCallbackQuery", { callback_query_id: query.id });
+		settled.add(message.message_id);
+		pressing.set(message.message_id, undefined);
+		try {
+			if (said !== undefined) return await sayPress(query, message.message_id, said);
+			if (pressed === undefined) return;
+			const outcome = await human.respond(pressed.card, pressed.answer);
+			const button = message.reply_markup?.inline_keyboard.flat().find((each) => each.callback_data === query.data);
+			const result = outcome.sent
+				? `已選：${button?.text ?? pressed.answer.option}`
+				: `未送出：${REFUSALS[outcome.refusal]}`;
+			await settleOn(query, message.message_id, result);
+		} catch (error) {
+			// Thrown back to the poll loop, the press would never be confirmed and every update after it would wait. It is
+			// reported and answered instead.
+			if (!signal.aborted) onError(error);
+			const meanwhile = pressing.get(message.message_id);
+			// A respond can throw after the keys went, so the message stays settled and says the outcome is unknown.
+			if (said === undefined) await settleOn(query, message.message_id, PRESS_UNKNOWN);
+			else if (meanwhile !== undefined) await settleOn(query, message.message_id, meanwhile);
+			else {
+				// say is idempotent through the questions doc, so its buttons stay and the human can press again.
+				settled.delete(message.message_id);
+				await quietly("answerCallbackQuery", { callback_query_id: query.id, text: PRESS_FAILED });
+			}
+		} finally {
+			pressing.delete(message.message_id);
+		}
 	};
 
 	const timeout = options.pollTimeoutSeconds ?? 30;

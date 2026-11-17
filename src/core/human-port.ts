@@ -18,12 +18,14 @@ import type { AgentPort, AgentState } from "../ports/agent.ts";
 import {
 	type Choices,
 	type Delivery,
+	type HumanInput,
 	type HumanPort,
 	MESSAGE_CLASSES,
 	type MessageClass,
 	type NoticeKind,
 	PUSHED_ANSWERS,
 	PUSHED_FAILURES,
+	type SaidOutcome,
 	type SomaEvent,
 } from "../ports/human.ts";
 import { HUMAN_CHOSEN } from "./domain/dispatch.ts";
@@ -39,6 +41,7 @@ import {
 	pushTarget,
 } from "./domain/push.ts";
 import { turnSignal } from "./domain/signal.ts";
+import { Questions, saidQuestions } from "./extensions/ask/index.ts";
 import { ForeignPrompts } from "./extensions/dispatch/foreign.ts";
 import { answerJob, Dispatches } from "./extensions/dispatch/index.ts";
 import { recordFact } from "./extensions/memory/index.ts";
@@ -364,12 +367,13 @@ export async function openHumanPort(
 				const doc = await tx.doc(Pushes, root.id);
 				const jobsNow = (await tx.doc(Dispatches, root.id)).jobs;
 				const told = JSON.parse(JSON.stringify((await tx.doc(ForeignPrompts, root.id)).told)) as Told;
+				const said = await saidQuestions(tx, root.id);
 				const stored = JSON.parse(JSON.stringify(doc)) as { presence: Presence; pending: PendingPush[] };
 				const kept: PendingPush[] = [];
 				for (const pending of stored.pending) {
 					const messageClass = pendingClass(pending);
 					if (!escalates(policies, defaultTarget, messageClass)) continue;
-					const verdict = escalation(pending, stored.presence, jobsNow, told, now(), escalateMs);
+					const verdict = escalation(pending, stored.presence, jobsNow, told, now(), escalateMs, said);
 					if (verdict === "wait") kept.push(pending);
 					if (verdict !== "due") continue;
 					const { kind, content, choices } = pending;
@@ -401,21 +405,55 @@ export async function openHumanPort(
 	const summarizer = summary && setInterval(() => void summary.check(), push?.checkMs ?? 30_000);
 	summarizer?.unref();
 
+	const entryOf = ({ kind, data }: HumanInput["entry"]) =>
+		data === undefined ? { kind } : { kind, data: data as JsonValue };
+	const present = async (kind: string) => {
+		if (!tracksPresence) return;
+		const at = now();
+		presence[kind] = at;
+		await root.commit(async (tx) => {
+			(await tx.doc(Pushes, root.id)).presence[kind] = at;
+		}, context);
+	};
+
 	return {
 		async submit(input) {
-			const { kind, data } = input.entry;
-			const entry = data === undefined ? { kind } : { kind, data: data as JsonValue };
-			if (tracksPresence) {
-				const at = now();
-				presence[kind] = at;
-				await root.commit(async (tx) => {
-					(await tx.doc(Pushes, root.id)).presence[kind] = at;
-				}, context);
-			}
+			await present(input.entry.kind);
 			await root.submit(
-				{ type: "input", content: input.content, entry, requestId: input.requestId, whenBusy: "followUp" },
+				{
+					type: "input",
+					content: input.content,
+					entry: entryOf(input.entry),
+					requestId: input.requestId,
+					whenBusy: "followUp",
+				},
 				context,
 			);
+		},
+		async say(question, option, input) {
+			await present(input.entry.kind);
+			// Settled in the commit that admits the input, so two presses, on one interface or two, admit one.
+			const outcome = await root.commit(async (tx): Promise<SaidOutcome> => {
+				const doc = await tx.doc(Questions, root.id);
+				// Own keys only: an id such as __proto__ or toString would otherwise find the prototype's.
+				const asked = Object.hasOwn(doc.questions, question) ? doc.questions[question] : undefined;
+				if (asked === undefined) return { said: false, refusal: "no_question" };
+				const labelOf = (id: string) => asked.options.find((each) => each.id === id)?.label;
+				if (asked.said !== undefined) return { said: false, refusal: "settled", label: labelOf(asked.said) ?? "" };
+				const label = labelOf(option);
+				if (label === undefined) return { said: false, refusal: "unknown_option" };
+				doc.questions[question] = { ...JSON.parse(JSON.stringify(asked)), said: option };
+				await root.submit(tx, {
+					type: "input",
+					content: label,
+					entry: entryOf(input.entry),
+					requestId: input.requestId,
+					whenBusy: "followUp",
+				});
+				return { said: true, label };
+			}, context);
+			if (outcome.said) emit({ type: "said", question, label: outcome.label });
+			return outcome;
 		},
 		subscribe(listener) {
 			listener({ type: "run", state: run !== undefined ? "working" : "idle" });

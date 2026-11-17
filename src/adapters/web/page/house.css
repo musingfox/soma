@@ -98,6 +98,26 @@ body {
 	white-space: pre-wrap;
 	overflow-wrap: anywhere;
 }
+/* A question's options, under its words: one button each, a single disabled one once said. */
+.choices {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 10px;
+}
+.choices button {
+	padding: 6px 14px;
+	border: 1.5px solid currentColor;
+	border-radius: 999px;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	cursor: pointer;
+}
+.choices button:disabled {
+	opacity: 0.55;
+	cursor: default;
+}
 /* The reveal shows the words as typed; once done they are rendered markdown, which sets its own line breaks. */
 #bubble-text.md {
 	white-space: normal;

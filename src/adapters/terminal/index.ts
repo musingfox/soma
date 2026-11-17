@@ -1,6 +1,13 @@
 import { createInterface } from "node:readline";
 import type { AgentState } from "../../ports/agent.ts";
-import { type Delivery, deliveryTo, type HumanPort, type SomaEvent } from "../../ports/human.ts";
+import {
+	type Choices,
+	type Delivery,
+	deliveryTo,
+	type HumanPort,
+	isPrompt,
+	type SomaEvent,
+} from "../../ports/human.ts";
 import {
 	formatProgramStatus,
 	isProgramStatusReply,
@@ -35,6 +42,7 @@ export const ENTRY_KIND = "chat.terminal";
 export const ABILITIES = [
 	"終端機（開發用）：回答照原樣印成純文字，markdown 不轉換，`**`、`#`、`|` 和 `<details>` 都原樣出現，不能折疊；通知前面加 `[通知]` 或 `[問題]`，失敗加 `[失敗]`。",
 	"沒有長度上限，但沒有格式，表格只在你自己對齊欄位時才好讀。",
+	"你用 `ask` 問的問題，選項印成問題下的編號清單（`  1. 好`），沒有按鈕：人打字回答，可能只打編號。",
 ].join("\n");
 
 /**
@@ -116,10 +124,13 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 		lastRoot = sequence;
 		report({ ...status, app: "soma" });
 	};
-	// A push this terminal shows quietly is printed only: the root record is how this client rings.
-	const notice = (kind: "question" | "report", content: string, delivery: Delivery) => {
+	// A push this terminal shows quietly is printed only: the root record is how this client rings. The options of a
+	// question soma asked are printed numbered, and the human types the answer.
+	const notice = (kind: "question" | "report", content: string, delivery: Delivery, choices?: Choices) => {
 		if (delivery === "log") return;
 		print(`[${kind === "question" ? "問題" : "通知"}] ${content}`);
+		if (choices !== undefined && !isPrompt(choices))
+			for (const [index, { label }] of choices.options.entries()) print(`  ${index + 1}. ${label}`);
 		if (delivery === "quiet") return;
 		if (attention?.state !== "blocked" || kind === "question") {
 			attention =
@@ -140,7 +151,7 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 	const onEvent = (event: SomaEvent) => {
 		if (event.type === "run") running = event.state === "working";
 		else if (event.type === "notice" && event.kind !== "forwarded")
-			notice(event.kind, event.content, deliveryTo(event, ENTRY_KIND));
+			notice(event.kind, event.content, deliveryTo(event, ENTRY_KIND), event.choices);
 		else if (event.type === "answer") {
 			if (mine.delete(event.requestId)) print(event.content);
 			else if (event.class !== undefined) notice("report", event.content, deliveryTo(event, ENTRY_KIND));

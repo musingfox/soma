@@ -18,6 +18,7 @@ import {
 import { SERVE_HOST, startWeb, ABILITIES as WEB_ABILITIES, ENTRY_KIND as WEB_KIND } from "./adapters/web/index.ts";
 import { dispatchOver, openAgentPort } from "./agent-side.ts";
 import { anthropicAuthContext, type Config, ConfigError, configPath, loadConfig } from "./config.ts";
+import { askExtension } from "./core/extensions/ask/index.ts";
 import { clock } from "./core/extensions/clock/index.ts";
 import { deferExtension } from "./core/extensions/defer/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
@@ -94,7 +95,8 @@ const mcpClients = (
 const storage = await openStorage(config.db);
 // The entry kinds of the interfaces serving the human now: a round no interface started is told what each can show.
 // Telegram is on from the start when configured, so a round the resumed tasks or the reconcile start before it polls
-// is told of it; the section never goes away, which would make the prompt planner re-add every section.
+// is told of it. With nothing on, the section still shows its fixed line, so it never goes away and comes back,
+// which would make the prompt planner re-add every section.
 const on = new Set<string>(config.telegram ? [TELEGRAM_KIND] : []);
 const extensions = [
 	clock(),
@@ -111,6 +113,8 @@ const extensions = [
 	...vaultExtensions(config.vault),
 	...(await skillsExtensions(config.skillsDir)),
 	...(await Promise.all(mcpClients.map(({ name, client }) => mcpExtension(name, client)))),
+	// After the other tools: a tool new to the transcript is appended, where in the middle the planner re-adds every tool.
+	askExtension(),
 	// Last: a section new to the transcript costs one patch at the end, where in the middle the prompt planner would
 	// remove and re-add every section shown before it, on the first request after the release that added it.
 	interfaces(storage, {

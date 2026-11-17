@@ -20,9 +20,25 @@ export type MessageClass = (typeof MESSAGE_CLASSES)[number];
 export type Delivery = "ring" | "quiet" | "log";
 
 /** A blocked prompt handed to the human with everything a client needs to offer its options. */
-export type Choices = { readonly card: string; readonly fingerprint: string; readonly options: Choice[] };
+export type PromptChoices = { readonly card: string; readonly fingerprint: string; readonly options: Choice[] };
+
+/**
+ * A question soma's model asked the human, with a few options: it names no card, and a press means "the human said
+ * this option", submitted as their input through `HumanPort.say`.
+ */
+export type SaidChoices = { readonly question: string; readonly options: Choice[] };
+
+export type Choices = PromptChoices | SaidChoices;
+
+export const isPrompt = (choices: Choices): choices is PromptChoices => "card" in choices;
 
 export type HumanAnswerOutcome = AnswerOutcome | { readonly sent: false; readonly refusal: "no_job" };
+
+/** What became of a press on a question's option; a question already answered refuses with the label chosen then. */
+export type SaidOutcome =
+	| { readonly said: true; readonly label: string }
+	| { readonly said: false; readonly refusal: "settled"; readonly label: string }
+	| { readonly said: false; readonly refusal: "no_question" | "unknown_option" };
 
 /**
  * requestId prefixes of rounds the core starts itself (schedule, the event bridge for a job, the foreign bridge for a
@@ -58,6 +74,8 @@ export type SomaEvent =
 	  } & Pushed)
 	// A round's words went on to a worker agent: progress on the input with this requestId, nothing to show as text.
 	| { readonly type: "notice"; readonly kind: "forwarded"; readonly requestId: string }
+	// A question's option was pressed on some interface: every client settles that question's options on `label`.
+	| { readonly type: "said"; readonly question: string; readonly label: string }
 	| { readonly type: "job"; readonly card: string; readonly agent: string; readonly status: AgentState }
 	// soma's own run: working while a round of the root conversation runs, whoever started it.
 	| { readonly type: "run"; readonly state: "working" | "idle" };
@@ -68,4 +86,9 @@ export interface HumanPort {
 	notify(content: string, kind: NoticeKind, messageClass: MessageClass): Promise<void>;
 	// The human's own choice on a blocked prompt: sent to the card's agent without a model round.
 	respond(card: string, answer: Answer): Promise<HumanAnswerOutcome>;
+	/**
+	 * The human's press on an option of a question soma asked: the option's label is submitted to the root conversation
+	 * as their input, as `submit` would, and the question is settled, so a second press says nothing.
+	 */
+	say(question: string, option: string, input: Omit<HumanInput, "content">): Promise<SaidOutcome>;
 }

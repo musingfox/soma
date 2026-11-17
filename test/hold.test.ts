@@ -6,6 +6,7 @@ import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durab
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { type Policies, PRESETS } from "../src/core/domain/push.ts";
+import { Questions } from "../src/core/extensions/ask/index.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { Holds } from "../src/core/hold.ts";
 import { openHumanPort, Pushes } from "../src/core/human-port.ts";
@@ -322,6 +323,54 @@ describe("summary", () => {
 		const prompt = prompts.find((each) => each.startsWith("[summary]")) ?? "";
 		expect(prompt.indexOf("要讓 a 執行嗎？")).toBeLessThan(prompt.indexOf("card b 完成"));
 		for (const content of ["card b 完成", "card c 失敗", "記下了"]) expect(prompt).toContain(content);
+	});
+
+	test("a question soma asked is left out of the summary once pressed, and not offered again if pressed meanwhile", async () => {
+		const options = [
+			{ id: "1", label: "好" },
+			{ id: "2", label: "不用" },
+		];
+		let press = async () => {};
+		const port = await holdingPort(async (prompt) => {
+			// q2 is pressed while the summary's round runs.
+			if (prompt.startsWith("[summary]")) await press();
+			return writes(prompt);
+		});
+		const { root, advance, notices, held, prompts } = port;
+		const said = (question: string) =>
+			root.commit(async (tx) => {
+				const doc = await tx.doc(Questions, root.id);
+				doc.questions[question] = { options, said: "2" };
+			}, context);
+		press = () => said("q2");
+		const { human, seen } = await port.open();
+		await root.commit(async (tx) => {
+			(await tx.doc(Questions, root.id)).questions = { q1: { options }, q2: { options }, q3: { options } };
+		}, context);
+		const asked = (question: string) => noticeEntry("question", "action", `問 ${question}`, { question, options });
+		for (const question of ["q1", "q2", "q3"]) await root.submit({ type: "write", entry: asked(question) }, context);
+		await human.notify("card b 完成", "report", "outcome");
+		await vi.waitFor(async () => expect(await held()).toHaveLength(4));
+		await said("q1");
+		const before = notices(seen).length;
+
+		advance(30 * MIN);
+		await vi.waitFor(() => expect(notices(seen)).toHaveLength(before + 2));
+		const summary = prompts.find((each) => each.startsWith("[summary]")) ?? "";
+		expect([summary.includes("問 q1"), summary.includes("問 q2"), summary.includes("問 q3")]).toEqual([
+			false,
+			true,
+			true,
+		]);
+		expect(notices(seen)[before + 1]).toEqual({
+			type: "notice",
+			kind: "question",
+			class: "action",
+			content: "問 q3",
+			choices: { question: "q3", options },
+			delivery: { [TELEGRAM]: "quiet", [TERMINAL]: "log" },
+		});
+		expect(await held()).toEqual([]);
 	});
 
 	test("after a long time away, pushes held minutes apart wait for the oldest and go into one summary", async () => {

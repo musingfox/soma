@@ -5,6 +5,7 @@ import type {
 	HumanPort,
 	MessageClass,
 	NoticeKind,
+	SaidOutcome,
 	SomaEvent,
 } from "../../ports/human.ts";
 
@@ -13,6 +14,10 @@ export class FakeHumanPort implements HumanPort {
 	readonly answers: { readonly card: string; readonly answer: Answer }[] = [];
 	/** What the next `respond` returns. */
 	outcome: HumanAnswerOutcome = { sent: true };
+	readonly said: { readonly question: string; readonly option: string; readonly input: Omit<HumanInput, "content"> }[] =
+		[];
+	/** What the next `say` returns. */
+	saidOutcome: SaidOutcome = { said: true, label: "" };
 	readonly #listeners = new Set<(event: SomaEvent) => void>();
 
 	async submit(input: HumanInput): Promise<void> {
@@ -32,6 +37,11 @@ export class FakeHumanPort implements HumanPort {
 	async respond(card: string, answer: Answer): Promise<HumanAnswerOutcome> {
 		this.answers.push({ card, answer });
 		return this.outcome;
+	}
+
+	async say(question: string, option: string, input: Omit<HumanInput, "content">): Promise<SaidOutcome> {
+		this.said.push({ question, option, input });
+		return this.saidOutcome;
 	}
 
 	emit(event: SomaEvent): void {

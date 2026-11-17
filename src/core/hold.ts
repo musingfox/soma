@@ -22,6 +22,7 @@ import {
 	summaryRings,
 } from "./domain/push.ts";
 import { summaryPrompt, withCardLines } from "./domain/report.ts";
+import { saidQuestions } from "./extensions/ask/index.ts";
 import { ForeignPrompts } from "./extensions/dispatch/foreign.ts";
 import { Dispatches } from "./extensions/dispatch/index.ts";
 import { noticeEntry } from "./notice.ts";
@@ -237,6 +238,7 @@ export function summaries({ harness, root, context, policies, now, presence, idl
 	const prompts = async (tx: Tx) => ({
 		jobs: copy((await tx.doc(Dispatches, root.id)).jobs),
 		told: copy((await tx.doc(ForeignPrompts, root.id)).told) as Told,
+		said: await saidQuestions(tx, root.id),
 	});
 
 	const pin = () =>
@@ -245,8 +247,8 @@ export function summaries({ harness, root, context, policies, now, presence, idl
 			if (doc.round !== undefined) return copy(doc.round);
 			const held = copy(doc.held);
 			if (!summaryDue(held, presence(), doc.tried, now(), idleMs)) return undefined;
-			const { jobs, told } = await prompts(tx);
-			const live = held.filter((push) => !promptGone(push, jobs, told));
+			const { jobs, told, said } = await prompts(tx);
+			const live = held.filter((push) => !promptGone(push, jobs, told, said));
 			if (live.length !== held.length) doc.held = live;
 			if (!summaryDue(live, presence(), doc.tried, now(), idleMs)) return undefined;
 			const begun = (doc.begun ?? 0) + 1;
@@ -284,9 +286,9 @@ export function summaries({ harness, root, context, policies, now, presence, idl
 				root.id,
 				delivered(noticeEntry("report", messageClass, content), only(to, rings ? "ring" : "quiet")),
 			);
-			const { jobs, told } = await prompts(tx);
+			const { jobs, told, said } = await prompts(tx);
 			for (const push of covered) {
-				if (push.kind !== "question" || promptGone(push, jobs, told)) continue;
+				if (push.kind !== "question" || promptGone(push, jobs, told, said)) continue;
 				const question = noticeEntry("question", push.class, push.content, push.choices, push.foreign);
 				await tx.appendEntry(root.id, delivered(question, only(push.to, "quiet")));
 			}

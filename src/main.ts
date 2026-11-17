@@ -34,6 +34,7 @@ import { REFLECTION_PERIOD_MS, reflection } from "./core/extensions/reflection/i
 import { schedule } from "./core/extensions/schedule/index.ts";
 import { sleeper } from "./core/extensions/sleeper/index.ts";
 import { stopGuard } from "./core/extensions/stop/index.ts";
+import { tools } from "./core/extensions/tools/index.ts";
 import { web } from "./core/extensions/web/index.ts";
 import { acquireDbLock, DbLockedError, openHarness, openStorage } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
@@ -126,6 +127,8 @@ const extensions = [
 	// Last: a section new to the transcript costs one patch at the end, where in the middle the prompt planner would
 	// remove and re-add every section shown before it, on the first request after the release that added it.
 	interfaces(storage, { texts, on: () => on }),
+	// After it for the same reason: added on 2026-11-18, when `interface` was already in the root's transcript.
+	tools,
 ];
 const harness: Harness = await openHarness(storage, extensions, context, { models });
 const root = await harness.root(context, {

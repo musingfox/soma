@@ -1611,7 +1611,9 @@ test("a prompt too long for a rich message is split into HTML parts that each pa
 	const answer = `**${"bold words here ".repeat(2100)}**\n\n\`\`\`py\n${"print('a < b')\n".repeat(300)}\`\`\``;
 
 	human.emit({ type: "notice", kind: "question", class: "action", content: answer, choices });
-	await vi.waitFor(() => expect(api.sent.length).toBeGreaterThan(3));
+	// The buttons go on the last part only, so once a part carrying them is sent, every part is.
+	await vi.waitFor(() => expect(api.sent.at(-1)?.reply_markup).toBeDefined());
+	expect(api.sent.length).toBeGreaterThan(3);
 	expect(onError).not.toHaveBeenCalled();
 	for (const message of api.sent) {
 		expect(message.text.length).toBeLessThanOrEqual(4096);

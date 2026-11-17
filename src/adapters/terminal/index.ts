@@ -153,8 +153,10 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 		else if (event.type === "notice" && event.kind !== "forwarded")
 			notice(event.kind, event.content, deliveryTo(event, ENTRY_KIND), event.choices);
 		else if (event.type === "answer") {
-			if (mine.delete(event.requestId)) print(event.content);
-			else if (event.class !== undefined) notice("report", event.content, deliveryTo(event, ENTRY_KIND));
+			// A round that asked a question ends there when it wrote nothing after it: no empty line.
+			if (mine.delete(event.requestId)) {
+				if (event.asked === undefined || event.content.trim() !== "") print(event.content);
+			} else if (event.class !== undefined) notice("report", event.content, deliveryTo(event, ENTRY_KIND));
 		} else if (event.type === "failure") {
 			if (mine.delete(event.requestId)) fail(event.reason);
 			else if (event.class !== undefined)

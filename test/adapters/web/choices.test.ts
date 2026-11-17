@@ -1,6 +1,6 @@
 import { parseHTML } from "linkedom";
 import { expect, test } from "vitest";
-import { renderChoices, settleChoices, waiting } from "../../../src/adapters/web/page/choices.js";
+import { answerShown, renderChoices, settleChoices, waiting } from "../../../src/adapters/web/page/choices.js";
 
 const { document, Event } = parseHTML("<!doctype html><html><body></body></html>");
 const options = [
@@ -46,4 +46,13 @@ test("a settled question shows one disabled button with the label said, and a pr
 	expect(chosen).toEqual([]);
 	expect(waiting(box)).toBe(false);
 	expect(waiting(undefined)).toBe(false);
+});
+
+test("the answer of a turn that asked a question rings no more, and with no text shows no bubble", () => {
+	expect(answerShown({ text: "", asked: true })).toEqual({ bubble: false, ring: false });
+	expect(answerShown({ text: " \n", asked: true })).toEqual({ bubble: false, ring: false });
+	expect(answerShown({ text: "想好再按。", asked: true })).toEqual({ bubble: true, ring: false });
+	// A turn that asked nothing shows its answer and rings, an empty one too, as before.
+	expect(answerShown({ text: "" })).toEqual({ bubble: true, ring: true });
+	expect(answerShown({ text: "好" })).toEqual({ bubble: true, ring: true });
 });

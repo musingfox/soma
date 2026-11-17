@@ -32,5 +32,14 @@ export function settleChoices(box, label, doc = document) {
 	box.dataset.state = "said";
 }
 
+/**
+ * What the page does with the answer to the human's words: a bubble, and a ring. A round that asked a question (`asked`)
+ * rang with the question, which is the reply: its answer does not ring, and one with no text shows no bubble.
+ */
+export const answerShown = ({ text, asked = false }) => {
+	const bubble = !asked || text.trim() !== "";
+	return { bubble, ring: !asked };
+};
+
 /** Whether the box still waits for a press, so its bubble should not fade on its own. */
 export const waiting = (box) => box !== undefined && !box.dataset.state;

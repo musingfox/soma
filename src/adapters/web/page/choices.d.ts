@@ -4,4 +4,8 @@ export function renderChoices(
 	doc?: Document,
 ): HTMLElement;
 export function settleChoices(box: HTMLElement, label: string, doc?: Document): void;
+export function answerShown(answer: { readonly text: string; readonly asked?: boolean }): {
+	bubble: boolean;
+	ring: boolean;
+};
 export function waiting(box: HTMLElement | undefined): boolean;

@@ -823,13 +823,12 @@ test("at summary, a question asked in reply to a message from the chat comes at 
 	api.deliver("用選項題問我：晚餐吃拉麵還是咖哩？", CHAT);
 	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
 	const question = questionOf(api.sent[0]);
-	// Quiet: the answer after it rings, as every answer to the human's own message does.
+	// The question rings, and the answer after it to the same round does not: the reply rings once.
 	expect(api.sent).toEqual([
 		{
 			chat_id: CHAT,
 			text: "[問題] 晚餐吃什麼？",
 			rich: true,
-			disable_notification: true,
 			reply_markup: {
 				inline_keyboard: [
 					[{ text: "拉麵", callback_data: `ask/${question}/1` }],
@@ -837,10 +836,10 @@ test("at summary, a question asked in reply to a message from the chat comes at 
 				],
 			},
 		},
-		{ chat_id: CHAT, text: "選一個吧。", rich: true },
+		{ chat_id: CHAT, text: "選一個吧。", rich: true, disable_notification: true },
 	]);
 	expect(seen.find((event) => event.type === "notice" && event.kind === "question")).toMatchObject({
-		delivery: { [TELEGRAM]: "quiet", [TERMINAL]: "quiet" },
+		delivery: { [TELEGRAM]: "ring", [TERMINAL]: "quiet" },
 	});
 	await root.waitForIdle(context);
 	expect(await held()).toEqual([]);
@@ -924,7 +923,7 @@ test("with two interfaces at summary, the one whose message the round answers ge
 	await human.submit({ content: "晚餐吃什麼？", entry: { kind: TERMINAL }, requestId: "terminal:1" });
 	await root.waitForIdle(context);
 	const asked = seen.filter((event) => event.type === "notice" && event.kind === "question");
-	expect(asked).toEqual([expect.objectContaining({ delivery: { [TELEGRAM]: "log", [TERMINAL]: "quiet" } })]);
+	expect(asked).toEqual([expect.objectContaining({ delivery: { [TELEGRAM]: "log", [TERMINAL]: "ring" } })]);
 	await vi.waitFor(async () => expect(await held()).toMatchObject([{ kind: "question", to: [TELEGRAM] }]));
 	await pause();
 	expect(api.sent).toEqual([]);
@@ -969,12 +968,96 @@ test("a steered round answering both interfaces sends its question at once to ea
 	await root.waitForIdle(context);
 	await vi.waitFor(() => expect(api.sent.some(({ reply_markup }) => reply_markup !== undefined)).toBe(true));
 	const asked = seen.filter((event) => event.type === "notice" && event.kind === "question");
-	expect(asked).toEqual([expect.objectContaining({ delivery: { [TELEGRAM]: "quiet", [TERMINAL]: "quiet" } })]);
+	expect(asked).toEqual([expect.objectContaining({ delivery: { [TELEGRAM]: "ring", [TERMINAL]: "ring" } })]);
 	expect(await held()).toEqual([]);
 
 	advance(31 * MIN);
 	await pause();
 	expect(faux.state.callCount).toBe(3);
+});
+
+/** The messages sent to the chat with a sound. */
+const ringing = (api: FakeBotApi) => api.sent.filter(({ disable_notification }) => disable_notification !== true);
+const dinnerKeyboard = (question: string | undefined) => ({
+	inline_keyboard: [
+		[{ text: "拉麵", callback_data: `ask/${question}/1` }],
+		[{ text: "咖哩", callback_data: `ask/${question}/2` }],
+	],
+});
+
+test("at summary, a round from the chat that asks and then writes nothing sends the question alone, ringing once", async () => {
+	const { faux, root, human } = await summaryCore();
+	faux.setResponses([dinner, fauxAssistantMessage(""), fauxAssistantMessage("不該有第三輪")]);
+	const { api, apiBase } = await bot();
+	const { onError } = drafting(human, apiBase);
+
+	const { message } = api.deliver("用選項題問我晚餐", CHAT);
+	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍"]));
+	await root.waitForIdle(context);
+	await settle();
+	// One message, the question with its keyboard and a sound; no placeholder after it.
+	expect(api.sent).toEqual([
+		{ chat_id: CHAT, text: "[問題] 晚餐吃什麼？", rich: true, reply_markup: dinnerKeyboard(questionOf(api.sent[0])) },
+	]);
+	expect(ringing(api)).toHaveLength(1);
+	expect(api.reactions.every(({ message_id }) => message_id === message.message_id)).toBe(true);
+	// The Thinking draft was shown and is sent no more.
+	const drafts = api.drafts.length;
+	expect(drafts).toBeGreaterThan(0);
+	await settle();
+	expect(api.drafts).toHaveLength(drafts);
+	expect(onError).not.toHaveBeenCalled();
+});
+
+test("at summary, a round from the chat that asks and then writes text sends the question and the text, ringing once", async () => {
+	const { faux, root, human } = await summaryCore();
+	faux.setResponses([dinner, fauxAssistantMessage("想好再按。"), fauxAssistantMessage("不該有第三輪")]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	api.deliver("用選項題問我晚餐", CHAT);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	await root.waitForIdle(context);
+	await settle();
+	expect(api.sent).toEqual([
+		{ chat_id: CHAT, text: "[問題] 晚餐吃什麼？", rich: true, reply_markup: dinnerKeyboard(questionOf(api.sent[0])) },
+		{ chat_id: CHAT, text: "想好再按。", rich: true, disable_notification: true },
+	]);
+	expect(ringing(api)).toHaveLength(1);
+	expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍"]);
+});
+
+test("a round from the chat that asks twice rings with its first question only", async () => {
+	const { faux, root, human } = await summaryCore();
+	const lunch = fauxAssistantMessage([fauxToolCall("ask", { question: "午餐呢？", options: ["飯", "麵"] })], {
+		stopReason: "toolUse",
+	});
+	faux.setResponses([dinner, lunch, fauxAssistantMessage(""), fauxAssistantMessage("不該有第四輪")]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	api.deliver("用選項題問我兩餐", CHAT);
+	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍"]));
+	await root.waitForIdle(context);
+	await settle();
+	expect(api.sent.map(({ text, disable_notification }) => [text, disable_notification])).toEqual([
+		["[問題] 晚餐吃什麼？", undefined],
+		["[問題] 午餐呢？", true],
+	]);
+});
+
+test("at summary, a round from the chat that asks nothing and writes nothing still gets the placeholder", async () => {
+	const { faux, root, human } = await summaryCore();
+	faux.setResponses([fauxAssistantMessage(""), fauxAssistantMessage("不該有第二輪")]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	api.deliver("嗯", CHAT);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	await root.waitForIdle(context);
+	await settle();
+	expect(api.sent).toEqual([{ chat_id: CHAT, text: "（這一輪沒有文字回答）", rich: true }]);
+	expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍"]);
 });
 
 const markdownAnswer =

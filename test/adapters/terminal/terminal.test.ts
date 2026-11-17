@@ -213,3 +213,27 @@ test("a question soma asked prints its options numbered, and the answer is typed
 	expect(human.said).toEqual([]);
 	await end();
 });
+
+test("a round that asked a question here and wrote nothing after it prints no empty line, and its question rang", async () => {
+	const { human, type, take, end } = await session(true);
+	const asked = await type("問我晚餐");
+	expect(take()).toBe(root({ state: "idle" }));
+
+	human.emit({ type: "run", state: "working" });
+	const here = { "chat.terminal": "ring" } as const;
+	human.emit({ type: "notice", kind: "question", class: "action", content: "晚餐吃什麼？", delivery: here });
+	human.emit({ type: "answer", requestId: asked, content: "", asked: true });
+	human.emit({ type: "run", state: "idle" });
+	// The question raised the root record over working; the round's end leaves it there, with nothing printed.
+	expect(take()).toBe(
+		`${root({ state: "working" })}[問題] 晚餐吃什麼？\n${root({ state: "blocked", kind: "question", message: "晚餐吃什麼？" })}`,
+	);
+
+	const typed = await type("問我午餐");
+	expect(take()).toBe(root({ state: "idle" }));
+	human.emit({ type: "answer", requestId: typed, content: "想好再說。", asked: true });
+	const plain = await type("嗯");
+	human.emit({ type: "answer", requestId: plain, content: "" });
+	expect(take()).toBe("想好再說。\n\n");
+	await end();
+});

@@ -128,7 +128,8 @@ const PageSchema = z.discriminatedUnion("type", [InputSchema, SaySchema]);
 /** What the page receives; `loud` is false on a push the core meant for another interface. */
 export type WebMessage =
 	| { readonly type: "accepted"; readonly id: string }
-	| { readonly type: "answer"; readonly id: string; readonly text: string }
+	// `asked`: the round asked a question in reply here, which rang: the answer does not, and with no text shows nothing.
+	| { readonly type: "answer"; readonly id: string; readonly text: string; readonly asked?: true }
 	| { readonly type: "failure"; readonly id?: string; readonly text: string; readonly loud: boolean }
 	| {
 			readonly type: "notice";
@@ -195,7 +196,7 @@ export async function startWeb(options: WebOptions): Promise<WebServer> {
 		}
 		if (event.type === "said") return { type: "said", question: event.question, label: event.label };
 		if (event.type === "answer") {
-			if (mine) return { type: "answer", id, text: event.content };
+			if (mine) return { type: "answer", id, text: event.content, ...(event.asked && { asked: true }) };
 			const delivery = deliveryTo(event, ENTRY_KIND);
 			if (event.class !== undefined && delivery !== "log")
 				return { type: "notice", kind: "report", text: event.content, loud: delivery === "ring" };

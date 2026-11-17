@@ -140,14 +140,15 @@ function pushOf(entry: EntryRecord): Push | undefined {
 }
 
 /**
- * A notice that is part of the reply to an interface's input goes to that interface at once, whatever its policy, and
- * quietly: the round's own answer or failure rings there as answers do, so the notice adds no ring of its own. Every
- * other interface keeps the delivery its policy gave. Without push options every client rings, as for any notice.
+ * A notice that is part of the reply to an interface's input goes to that interface at once, whatever its policy. The
+ * round's first such notice rings there: the round may end with no text, and its answer, marked `asked`, then shows
+ * nothing, and with text does not ring, so the reply rings once. A later one in the same round is quiet. Every other
+ * interface keeps the delivery its policy gave. Without push options every client rings, as for any notice.
  */
-const replying = (pushed: Delivered, replyTo: readonly string[]): Delivered =>
+const replying = (pushed: Delivered, replyTo: readonly string[], delivery: Delivery): Delivered =>
 	pushed.delivery === undefined || replyTo.length === 0
 		? pushed
-		: { delivery: { ...pushed.delivery, ...Object.fromEntries(replyTo.map((kind) => [kind, "quiet" as const])) } };
+		: { delivery: { ...pushed.delivery, ...Object.fromEntries(replyTo.map((kind) => [kind, delivery])) } };
 
 const failureContent = (requestId: string, reason: string) => `${requestId} 那一輪失敗：${reason}`;
 const pushedFailure = (requestId: string, reason: string): Push => ({
@@ -256,6 +257,9 @@ export async function openHumanPort(
 	};
 	// requestIds of inputs placed in the running round; a follow-up input joins a round already running.
 	const placed = new Map<SubmissionId, string>();
+	// requestIds of inputs whose round asked a question in reply to an interface; its answer is marked `asked`. Lost on
+	// a restart, so a round a restart split ends as one that asked nothing.
+	const asking = new Set<string>();
 	const onCommit = async (changes: readonly CommitChange[]) => {
 		// Change order within a commit is unspecified. An answer's entry and its submission settle in the same commit,
 		// so entries go before submissions; a run that ended goes before both, and one that began after them.
@@ -284,6 +288,8 @@ export async function openHumanPort(
 			if (entry.kind !== NOTICE) continue;
 			const { kind, content, choices, foreign, target, delivery, replyTo = [] } = entry.data as NoticeData;
 			const messageClass = classOf(entry.data as { class?: unknown });
+			const rings = ![...placed.values()].some((requestId) => asking.has(requestId));
+			if (replyTo.length > 0) for (const requestId of placed.values()) asking.add(requestId);
 			// An escalation names its target and a summary its delivery; reports never escalate.
 			const pushed =
 				delivery !== undefined
@@ -299,6 +305,7 @@ export async function openHumanPort(
 										: undefined,
 								),
 								replyTo,
+								rings ? "ring" : "quiet",
 							);
 			await hold?.notice(entry.id, pushOf(entry)).catch((error: unknown) => console.error("[soma] held push:", error));
 			emit({ type: "notice", kind, class: messageClass, content, ...(choices && { choices }), ...pushed });
@@ -308,6 +315,7 @@ export async function openHumanPort(
 			const { requestId } = record;
 			if (record.status === "placed" && requestId !== undefined) placed.set(record.id, requestId);
 			else placed.delete(record.id);
+			const asked = record.status !== "placed" && requestId !== undefined && asking.delete(requestId);
 			if (record.status === "unanswered") {
 				const reason = failureReason(record.reason, record.detail);
 				if (requestId !== undefined && PUSHED_FAILURES.some((source) => requestId.startsWith(source))) {
@@ -337,7 +345,7 @@ export async function openHumanPort(
 				const pushed = answered
 					? { class: "outcome" as const, ...(await deliveryOf(`answer:${record.id}`, "outcome")) }
 					: {};
-				emit({ type: "answer", requestId, content, ...pushed });
+				emit({ type: "answer", requestId, content, ...(asked && { asked: true as const }), ...pushed });
 			}
 		}
 		if (began) emit({ type: "run", state: "working" });

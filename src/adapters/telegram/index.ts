@@ -366,7 +366,10 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			if (mine) {
 				settle(event.requestId);
 				react(event.requestId, "answered");
-				send(event.content);
+				// A round that asked a question rang with it, and the question is the reply: an answer with no text sends
+				// nothing, not the placeholder, and one with text goes without a sound.
+				if (event.asked === undefined) send(event.content);
+				else if (event.content.trim() !== "") send(event.content, undefined, { silent: true });
 			} else if (event.class !== undefined) push(label("report", event.content), deliveryTo(event, ENTRY_KIND));
 		} else if (event.type === "failure") {
 			if (mine) {

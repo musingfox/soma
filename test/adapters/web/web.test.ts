@@ -291,6 +291,15 @@ test("the answer of the page's own turn comes back over the socket, to every ope
 	expect(await page.next()).toEqual({ type: "failure", id: ID, text: "no model", loud: true });
 });
 
+test("the answer of a page's turn that asked a question says so, with no text or with some", async () => {
+	const { human, server } = await serve();
+	const page = await open(server.port);
+	human.emit({ type: "answer", requestId: `web:${ID}`, content: "", asked: true });
+	expect(await page.next()).toEqual({ type: "answer", id: ID, text: "", asked: true });
+	human.emit({ type: "answer", requestId: `web:${ID2}`, content: "想好再按。", asked: true });
+	expect(await page.next()).toEqual({ type: "answer", id: ID2, text: "想好再按。", asked: true });
+});
+
 test("a failure carrying a provider's JSON error reaches the page as a readable sentence, its own turn's or not", async () => {
 	const { human, server } = await serve();
 	const page = await open(server.port);

@@ -62,8 +62,14 @@ export const deliveryTo = (event: { readonly delivery?: Pushed["delivery"] }, en
 	event.delivery === undefined ? "ring" : (event.delivery[entryKind] ?? "quiet");
 
 export type SomaEvent =
-	// Pushed when a round the core started answered (`PUSHED_ANSWERS`).
-	| ({ readonly type: "answer"; readonly requestId: string; readonly content: string } & Partial<Pushed>)
+	// Pushed when a round the core started answered (`PUSHED_ANSWERS`). `asked`: the round asked the human a question in
+	// reply to this input, which rang where it replied, so this answer does not ring, and one with no text shows nothing.
+	| ({
+			readonly type: "answer";
+			readonly requestId: string;
+			readonly content: string;
+			readonly asked?: true;
+	  } & Partial<Pushed>)
 	// The round ended without an answer: a provider error, no model, an abort or a fault. Pushed for `PUSHED_FAILURES`.
 	| ({ readonly type: "failure"; readonly requestId: string; readonly reason: string } & Partial<Pushed>)
 	| ({

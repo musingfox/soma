@@ -1060,6 +1060,198 @@ test("at summary, a round from the chat that asks nothing and writes nothing sti
 	expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍"]);
 });
 
+const gated = () => {
+	let release = () => {};
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	return { gate, release };
+};
+/** A tool round that waits for `gate`, so an input can join the round while it runs. */
+const waiting = (gate: Promise<void>) => async () => {
+	await gate;
+	return fauxAssistantMessage([fauxToolCall("nothing", {})], { stopReason: "toolUse" });
+};
+const answersSeen = (seen: SomaEvent[]) =>
+	seen.flatMap((event) => (event.type === "answer" ? [[event.requestId, event.asked]] : []));
+
+test("an input from the chat that joins a round after its question is answered as following it: nothing more is sent", async () => {
+	const { faux, root, human, seen } = await summaryCore();
+	const { gate, release } = gated();
+	faux.setResponses([dinner, waiting(gate), fauxAssistantMessage(""), fauxAssistantMessage("不該有第二輪")]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	const { message } = api.deliver("問我晚餐", CHAT);
+	await vi.waitFor(() => expect(faux.state.callCount).toBe(2));
+	await root.submit(
+		{ type: "input", content: "快點", entry: { kind: TELEGRAM }, requestId: "telegram:steer", whenBusy: "steer" },
+		context,
+	);
+	release();
+	await root.waitForIdle(context);
+	await settle();
+	expect(answersSeen(seen)).toEqual([
+		[`telegram:${message.message_id}`, true],
+		["telegram:steer", true],
+	]);
+	expect(api.sent.map(({ text, disable_notification }) => [text, disable_notification])).toEqual([
+		["[問題] 晚餐吃什麼？", undefined],
+	]);
+	expect(faux.state.callCount).toBe(3);
+});
+
+test("a message from the chat sent while a round that asked runs is a round of its own, which asked nothing", async () => {
+	const { faux, root, human, seen } = await summaryCore();
+	const { gate, release } = gated();
+	faux.setResponses([
+		dinner,
+		waiting(gate),
+		fauxAssistantMessage(""),
+		fauxAssistantMessage(""),
+		fauxAssistantMessage("不該"),
+	]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	const first = api.deliver("問我晚餐", CHAT);
+	await vi.waitFor(() => expect(faux.state.callCount).toBe(2));
+	// Telegram submits as a follow-up: the message waits for the round to end and starts the next one.
+	const second = api.deliver("快點", CHAT);
+	await pause();
+	release();
+	await vi.waitFor(() => expect(faux.state.callCount).toBe(4));
+	await root.waitForIdle(context);
+	await settle();
+	expect(answersSeen(seen)).toEqual([
+		[`telegram:${first.message.message_id}`, true],
+		[`telegram:${second.message.message_id}`, undefined],
+	]);
+	expect(api.sent.map(({ text, disable_notification }) => [text, disable_notification])).toEqual([
+		["[問題] 晚餐吃什麼？", undefined],
+		["（這一輪沒有文字回答）", undefined],
+	]);
+});
+
+test("in a steered round, each interface's first question rings there and a later one is quiet there", async () => {
+	const { faux, root, human, seen } = await summaryCore();
+	const { gate, release } = gated();
+	const lunch = fauxAssistantMessage([fauxToolCall("ask", { question: "午餐呢？", options: ["飯", "麵"] })], {
+		stopReason: "toolUse",
+	});
+	faux.setResponses([dinner, waiting(gate), lunch, fauxAssistantMessage(""), fauxAssistantMessage("不該有第二輪")]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	await human.submit({ content: "晚餐", entry: { kind: TERMINAL }, requestId: "terminal:1" });
+	await vi.waitFor(() => expect(faux.state.callCount).toBe(2));
+	await root.submit(
+		{ type: "input", content: "午餐也問", entry: { kind: TELEGRAM }, requestId: "telegram:steer", whenBusy: "steer" },
+		context,
+	);
+	release();
+	await root.waitForIdle(context);
+	await settle();
+	const asked = seen.flatMap((event) =>
+		event.type === "notice" && event.kind === "question" ? [[event.content, event.delivery]] : [],
+	);
+	// The first went to the terminal only; Telegram, at summary, holds it.
+	expect(asked).toEqual([
+		["晚餐吃什麼？", { [TELEGRAM]: "log", [TERMINAL]: "ring" }],
+		["午餐呢？", { [TELEGRAM]: "ring", [TERMINAL]: "quiet" }],
+	]);
+	expect(answersSeen(seen)).toEqual([
+		["terminal:1", true],
+		["telegram:steer", true],
+	]);
+	expect(api.sent.map(({ text, disable_notification }) => [text, disable_notification])).toEqual([
+		["[問題] 午餐呢？", undefined],
+	]);
+});
+
+test("a round from the chat that asks and then fails rings twice: the question, then the failure", async () => {
+	const { faux, root, human } = await summaryCore();
+	faux.setResponses([
+		dinner,
+		fauxAssistantMessage("", { stopReason: "error", errorMessage: "boom" }),
+		fauxAssistantMessage(""),
+		fauxAssistantMessage("不該有第三輪"),
+	]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	api.deliver("問我晚餐", CHAT);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	await root.waitForIdle(context);
+	expect(api.sent.map(({ text, disable_notification }) => [text.split("：")[0], disable_notification])).toEqual([
+		["[問題] 晚餐吃什麼？", undefined],
+		["[失敗] 模型出錯", undefined],
+	]);
+	// The next round asks nothing and writes nothing: the placeholder, as for any such round.
+	api.deliver("嗯", CHAT);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(3));
+	expect(api.sent[2]).toEqual({ chat_id: CHAT, text: "（這一輪沒有文字回答）", rich: true });
+});
+
+/** A core whose HumanPort can be closed and opened again over the same harness, as a restart of soma's process does. */
+async function reopenable() {
+	const storage = new MemoryStorage();
+	const registry = createRegistry();
+	registry.install(askExtension({ storage, interfaces: [TELEGRAM, TERMINAL] }));
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const harness = await Harness.open(storage, { models, registry }, context);
+	cleanup.push(() => harness.close(context));
+	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+	harness.resume();
+	const open = async () => {
+		const human = await openHumanPort(harness, root, new FakeAgentPort(), context, {
+			defaultTarget: TELEGRAM,
+			policies: { [TELEGRAM]: PRESETS.summary, [TERMINAL]: PRESETS.instant },
+			now: () => 100 * MIN,
+			checkMs: 10,
+			summaryIdleMs: 30 * MIN,
+			storage,
+		});
+		cleanup.push(() => human.close());
+		return human;
+	};
+	return { faux, root, open };
+}
+
+for (const asked of ["before", "after"] as const)
+	test(`a HumanPort opened again in a round from the chat, ${asked} its question, sends nothing after the question`, async () => {
+		const { faux, root, open } = await reopenable();
+		const { gate, release } = gated();
+		const late = async () => {
+			await gate;
+			return asked === "before" ? fauxAssistantMessage("") : dinner;
+		};
+		faux.setResponses(
+			asked === "before"
+				? [dinner, late, fauxAssistantMessage("不該有第二輪")]
+				: [late, fauxAssistantMessage(""), fauxAssistantMessage("不該有第二輪")],
+		);
+		const { api, apiBase } = await bot();
+		const first = await open();
+		const telegram = start(first, apiBase);
+		api.deliver("問我晚餐", CHAT);
+		await vi.waitFor(() => expect(faux.state.callCount).toBe(asked === "before" ? 2 : 1));
+		await pause();
+		await telegram.stop();
+		await first.close();
+
+		start(await open(), apiBase);
+		release();
+		await root.waitForIdle(context);
+		await settle();
+		await settle();
+		expect(api.sent.map(({ text, disable_notification }) => [text, disable_notification])).toEqual([
+			["[問題] 晚餐吃什麼？", undefined],
+		]);
+	});
+
 const markdownAnswer =
 	"# Plan\n\n- **one** & `a<b`\n- two\n\n| k | v |\n|---|--:|\n| x | 1 |\n\n```ts\nconst a = 1 < 2;\n```";
 

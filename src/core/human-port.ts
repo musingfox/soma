@@ -3,6 +3,7 @@ import type { Context } from "@earendil-works/chord/context";
 import {
 	type CommitChange,
 	type Conversation,
+	type Cursor,
 	defineDoc,
 	type EntryId,
 	type EntryRecord,
@@ -109,6 +110,8 @@ export interface PushOptions {
 }
 
 const FIFTEEN_MINUTES = 15 * 60_000;
+/** Entries read at a time from a round's history. */
+const ROUND_PAGE = 100;
 const THIRTY_MINUTES = 30 * 60_000;
 
 type Delivered = { delivery?: Record<string, Delivery> };
@@ -141,14 +144,24 @@ function pushOf(entry: EntryRecord): Push | undefined {
 
 /**
  * A notice that is part of the reply to an interface's input goes to that interface at once, whatever its policy. The
- * round's first such notice rings there: the round may end with no text, and its answer, marked `asked`, then shows
- * nothing, and with text does not ring, so the reply rings once. A later one in the same round is quiet. Every other
- * interface keeps the delivery its policy gave. Without push options every client rings, as for any notice.
+ * round's first such notice to an interface rings there, and a later one in the same round is quiet there (`rang`
+ * names the interfaces an earlier one went to): the round may end with no text, and the answer, marked `asked`, then
+ * shows nothing, and with text does not ring, so the reply rings once. Every other interface keeps the delivery its
+ * policy gave. Without push options every client rings, as for any notice.
  */
-const replying = (pushed: Delivered, replyTo: readonly string[], delivery: Delivery): Delivered =>
+const replying = (pushed: Delivered, replyTo: readonly string[], rang: ReadonlySet<string>): Delivered =>
 	pushed.delivery === undefined || replyTo.length === 0
 		? pushed
-		: { delivery: { ...pushed.delivery, ...Object.fromEntries(replyTo.map((kind) => [kind, delivery])) } };
+		: {
+				delivery: {
+					...pushed.delivery,
+					...Object.fromEntries(replyTo.map((kind) => [kind, rang.has(kind) ? "quiet" : "ring"])),
+				},
+			};
+
+/** The interfaces, by entry kind, that the notices among `entries` are part of the reply to. */
+const repliedTo = (entries: readonly EntryRecord[]): Set<string> =>
+	new Set(entries.flatMap((entry) => (entry.kind === NOTICE ? ((entry.data as NoticeData).replyTo ?? []) : [])));
 
 const failureContent = (requestId: string, reason: string) => `${requestId} 那一輪失敗：${reason}`;
 const pushedFailure = (requestId: string, reason: string): Push => ({
@@ -257,9 +270,25 @@ export async function openHumanPort(
 	};
 	// requestIds of inputs placed in the running round; a follow-up input joins a round already running.
 	const placed = new Map<SubmissionId, string>();
-	// requestIds of inputs whose round asked a question in reply to an interface; its answer is marked `asked`. Lost on
-	// a restart, so a round a restart split ends as one that asked nothing.
-	const asking = new Set<string>();
+	/**
+	 * A round's entries from `first` to `last`, read from storage rather than kept, so a round a restart split is read
+	 * whole. A queued input gets its entry only once placed, so the range holds no other round's.
+	 */
+	const roundEntries = async (first: EntryId, last: EntryId) => {
+		const found: EntryRecord[] = [];
+		let cursor: Cursor | undefined;
+		do {
+			const page = await root.entries(
+				{ minEntryId: first, maxEntryId: last, order: "ascending" },
+				ROUND_PAGE,
+				cursor,
+				context,
+			);
+			found.push(...page.items);
+			cursor = page.next;
+		} while (cursor !== undefined);
+		return found;
+	};
 	const onCommit = async (changes: readonly CommitChange[]) => {
 		// Change order within a commit is unspecified. An answer's entry and its submission settle in the same commit,
 		// so entries go before submissions; a run that ended goes before both, and one that began after them.
@@ -288,8 +317,17 @@ export async function openHumanPort(
 			if (entry.kind !== NOTICE) continue;
 			const { kind, content, choices, foreign, target, delivery, replyTo = [] } = entry.data as NoticeData;
 			const messageClass = classOf(entry.data as { class?: unknown });
-			const rings = ![...placed.values()].some((requestId) => asking.has(requestId));
-			if (replyTo.length > 0) for (const requestId of placed.values()) asking.add(requestId);
+			// The interfaces an earlier notice of this round replied to; the round starts at its run's first entry.
+			const first = run?.first;
+			const rang =
+				replyTo.length === 0 || first === undefined
+					? new Set<string>()
+					: await roundEntries(first, entry.id)
+							.then((round) => repliedTo(round.filter((each) => each.id !== entry.id)))
+							.catch((error: unknown) => {
+								console.error("[soma] round entries:", error);
+								return new Set<string>();
+							});
 			// An escalation names its target and a summary its delivery; reports never escalate.
 			const pushed =
 				delivery !== undefined
@@ -305,17 +343,43 @@ export async function openHumanPort(
 										: undefined,
 								),
 								replyTo,
-								rings ? "ring" : "quiet",
+								rang,
 							);
 			await hold?.notice(entry.id, pushOf(entry)).catch((error: unknown) => console.error("[soma] held push:", error));
 			emit({ type: "notice", kind, class: messageClass, content, ...(choices && { choices }), ...pushed });
 		}
+		// By answer, the earliest entry of the inputs it settles here, where its round starts: a round's inputs all settle
+		// in the commit that answers them, the one that started it and those that joined it later.
+		const starts = new Map<EntryId, EntryId>();
+		for (const record of submissions)
+			if (record.type === "input" && record.status === "done")
+				starts.set(record.answer, Math.min(record.entry, starts.get(record.answer) ?? record.entry) as EntryId);
+		// By answer, the interfaces a notice of its round replied to, and the entry kind of each of its inputs.
+		const rounds = new Map<EntryId, Promise<{ replied: Set<string>; kinds: Map<EntryId, string> }>>();
+		const roundOf = (answer: EntryId) => {
+			let found = rounds.get(answer);
+			if (found === undefined) {
+				found = roundEntries(starts.get(answer) ?? answer, answer).then((round) => ({
+					replied: repliedTo(round),
+					kinds: new Map(round.map((each) => [each.id, each.kind])),
+				}));
+				rounds.set(answer, found);
+			}
+			return found;
+		};
+		/** Whether a notice of the round that answered `record` replied to the interface its input came from. */
+		const asked = (record: { entry: EntryId; answer: EntryId }) =>
+			roundOf(record.answer)
+				.then(({ replied, kinds }) => replied.has(kinds.get(record.entry) ?? ""))
+				.catch((error: unknown) => {
+					console.error("[soma] round entries:", error);
+					return false;
+				});
 		for (const record of submissions) {
 			if (record.type !== "input") continue;
 			const { requestId } = record;
 			if (record.status === "placed" && requestId !== undefined) placed.set(record.id, requestId);
 			else placed.delete(record.id);
-			const asked = record.status !== "placed" && requestId !== undefined && asking.delete(requestId);
 			if (record.status === "unanswered") {
 				const reason = failureReason(record.reason, record.detail);
 				if (requestId !== undefined && PUSHED_FAILURES.some((source) => requestId.startsWith(source))) {
@@ -345,7 +409,8 @@ export async function openHumanPort(
 				const pushed = answered
 					? { class: "outcome" as const, ...(await deliveryOf(`answer:${record.id}`, "outcome")) }
 					: {};
-				emit({ type: "answer", requestId, content, ...(asked && { asked: true as const }), ...pushed });
+				const reply = (await asked(record)) && { asked: true as const };
+				emit({ type: "answer", requestId, content, ...reply, ...pushed });
 			}
 		}
 		if (began) emit({ type: "run", state: "working" });

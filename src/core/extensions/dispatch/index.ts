@@ -5,6 +5,7 @@ import {
 	defineDoc,
 	defineExtension,
 	defineTool,
+	section,
 	type ToolExecutionApi,
 	type Tx,
 } from "@earendil-works/pi-durable";
@@ -13,10 +14,11 @@ import { type AgentPort, type Answer, PromptRefused } from "../../../ports/agent
 import type { AgentHandover, HandoverOutcome, HandoverRefusal } from "../../../ports/handover.ts";
 import type { Choices, HumanAnswerOutcome } from "../../../ports/human.ts";
 import { deferCancelled } from "../../domain/defer.ts";
-import type { Decision, Job } from "../../domain/dispatch.ts";
+import { type Decision, type Job, jobQuestions } from "../../domain/dispatch.ts";
 import { composeLaunchPrompt, composeTicketPrompt } from "../../domain/launch-prompt.ts";
 import { cutInWindow, cutSentence, HANDOVER_CUT, turning } from "../../domain/reconcile.ts";
 import { FORWARDED, noticeEntry } from "../../notice.ts";
+import { Questions } from "../ask/index.ts";
 import { Deferrals } from "../defer/deferrals.ts";
 
 /** Entry kind of a turn the bridge recorded as finished; it carries no model message. */
@@ -595,5 +597,12 @@ export function dispatchExtension(
 	return defineExtension({
 		name: "soma.dispatch",
 		tools: [dispatch, jobs, respond, escalate, reply, foreignAgents, foreignResult, screen, foreignPrompt, showJob],
+		sections: [
+			section("job_questions", async (input, context) => {
+				const asked = (await input.read.snapshot(Questions, input.conversationId, context))?.questions ?? {};
+				const listed = (await input.read.snapshot(Dispatches, input.conversationId, context))?.jobs ?? [];
+				return jobQuestions(Object.values(asked), listed);
+			}),
+		],
 	});
 }

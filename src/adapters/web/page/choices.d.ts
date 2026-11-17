@@ -3,6 +3,7 @@ export function renderChoices(
 	onChoose: (option: string) => unknown,
 	doc?: Document,
 ): HTMLElement;
+export function reopenChoices(box: HTMLElement): void;
 export function settleChoices(box: HTMLElement, label: string, doc?: Document): void;
 export function answerShown(answer: { readonly text: string; readonly asked?: boolean }): {
 	bubble: boolean;

@@ -1,7 +1,9 @@
-// Ported from musingfox/cc-mobile server/launch-prompt.ts @ d9f0690.
+import { MAX_OPTIONS, MIN_OPTIONS, OPTION_MAX_CHARS, OPTIONS_LINE } from "./options.ts";
+
+// Ported from musingfox/cc-mobile server/launch-prompt.ts @ d9f0690. Rule 1's options are read by `listedOptions`.
 const LAUNCH_RULES = `你正在被無人值守地派工，操作者可能不在終端機前。請遵守三條規則：
 
-1. 不要使用 AskUserQuestion 工具。需要問問題時，把問題寫在最終回覆裡，然後結束這一輪。
+1. 不要使用 AskUserQuestion 工具。需要問問題時，把問題寫在最終回覆裡，然後結束這一輪。要人從 ${MIN_OPTIONS} 到 ${MAX_OPTIONS} 個短選項中選一個時，在回覆最後寫一行「${OPTIONS_LINE}」，下面每行一個選項，從 1 依序編號，例如「1. A」「2. B」，每個選項不超過 ${OPTION_MAX_CHARS} 字，選項之後不要再寫任何東西。人會看到按鈕，按下的選項文字會原樣成為你的下一個提示。
 2. Never run /clear: it replaces the session id, which breaks soma's binding of this job to your session.
 3. 每一輪最終回覆的第一行必須恰好是下列三者之一：
 結果：完成

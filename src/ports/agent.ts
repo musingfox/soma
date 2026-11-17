@@ -102,9 +102,17 @@ export type AgentResult = { readonly id: string; readonly text?: string };
 
 /**
  * What `prompt` throws when it refused before typing anything, as for an agent busy with a turn: trying again later
- * cannot send the text twice. Any other error may come after some of the text reached the agent.
+ * cannot send the text twice. Any other error may come after some of the text reached the agent. `busy` says the agent
+ * was refused for being in a turn or on a prompt; any other refusal, such as an agent that could not be woken, says
+ * nothing of where the agent is.
  */
-export class PromptRefused extends Error {}
+export class PromptRefused extends Error {
+	readonly busy: boolean;
+	constructor(message: string, { busy = false }: { readonly busy?: boolean } = {}) {
+		super(message);
+		this.busy = busy;
+	}
+}
 
 /**
  * What an adapter throws, having done nothing, for a call it does not implement, or for a resume of an agent it can

@@ -1,6 +1,6 @@
 // The page around the house: the socket to soma, the words typed to the fox, its speech bubbles, which state it is in,
 // and the debug panel.
-import { answerShown, renderChoices, settleChoices, waiting } from "./choices.js";
+import { answerShown, renderChoices, reopenChoices, settleChoices, waiting } from "./choices.js";
 import { STATES } from "./fox.js";
 import { renderMarkdown } from "./markdown.js";
 import { createHouse } from "./scene.js";
@@ -267,6 +267,8 @@ function receive(message) {
 		settle();
 	} else if (message.type === "failure") {
 		if (message.id !== undefined) {
+			const box = message.again ? questions.get(pending.get(message.id)?.question) : undefined;
+			if (box) reopenChoices(box);
 			pending.delete(message.id);
 			awaiting.delete(message.id);
 		}

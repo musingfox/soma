@@ -10,6 +10,7 @@ import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { createRexAgentPort } from "../src/adapters/rex/agent-port.ts";
 import { RexRpcError } from "../src/adapters/rex/client.ts";
 import { HUMAN_CHOSEN, type Job } from "../src/core/domain/dispatch.ts";
+import { Questions } from "../src/core/extensions/ask/index.ts";
 import {
 	AGENT_BLOCKED,
 	blockedRequestId,
@@ -446,6 +447,51 @@ test("需要你 is told to the human at once, without a model call, and once how
 		},
 	]);
 	expect(await entriesOf(soma.root, JOB_DONE)).toMatchObject([{ data: { outcome: "需要你", notified: true } }]);
+});
+
+test("a 需要你 reply listing options in the launch rules' form becomes a question offering them; one without offers none", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await dispatched(await database(), agents, "card-a");
+	agents.emit("card-a", { state: "idle" });
+	await soma.settle();
+
+	agents.finish("card-a", "結果：需要你\n選 A 還是 B？\n選項：\n1. A\n2. B");
+	await soma.settle();
+	agents.emit("card-a", { state: "working" });
+	agents.finish("card-a", "結果：需要你\n要用哪個 server？");
+	await soma.settle();
+
+	const [plain, listed] = await entriesOf(soma.root, NOTICE);
+	const question = (listed?.data as { choices?: { question?: string } } | undefined)?.choices?.question;
+	expect(question).toMatch(/^[0-9a-f]{16}$/);
+	expect(listed?.data).toEqual({
+		kind: "question",
+		class: "action",
+		content: "agent card-a（卡片 card-a）這一輪結束了：\n結果：需要你\n選 A 還是 B？",
+		choices: {
+			question,
+			options: [
+				{ id: "1", label: "A" },
+				{ id: "2", label: "B" },
+			],
+			job: "card-a",
+		},
+	});
+	expect(plain?.data).toEqual({
+		kind: "question",
+		class: "action",
+		content: "agent card-a（卡片 card-a）這一輪結束了：\n結果：需要你\n要用哪個 server？",
+	});
+	const asked = (await soma.harness.snapshot(Questions, soma.root.id, context))?.questions;
+	expect(asked).toEqual({
+		[question ?? ""]: {
+			options: [
+				{ id: "1", label: "A" },
+				{ id: "2", label: "B" },
+			],
+			job: { card: "card-a", turn: "msg_1", at: expect.any(String), text: "結果：需要你\n選 A 還是 B？" },
+		},
+	});
 });
 
 test("完成 waits for the report, unless the human touched the job just before", async () => {

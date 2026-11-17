@@ -142,13 +142,27 @@ const REFUSALS: Record<Extract<HumanAnswerOutcome, { sent: false }>["refusal"], 
 };
 
 const PRESS_FAILED = "未送出：出錯了，可以再按一次";
+// answerCallbackQuery takes a text of 0-200 characters: https://core.telegram.org/bots/api#answercallbackquery
+const CALLBACK_TEXT_LIMIT = 200;
+/** A press the agent side refused for `reason`, which may be pressed again; the reason is cut to fit. */
+function unsentText(reason: string): string {
+	const [head, tail] = ["未送出：", "，可以再按一次"];
+	const words = [...reason.trim()];
+	if (words.length === 0) return PRESS_FAILED;
+	const room = CALLBACK_TEXT_LIMIT - head.length - tail.length;
+	return head + (words.length <= room ? words.join("") : `${words.slice(0, room - 1).join("")}…`) + tail;
+}
 // A respond that throws may have sent the keys already, and where a fingerprint is the prompt's content a later
 // identical prompt carries the same one, so a second press could answer that prompt: this text does not offer one.
 const PRESS_UNKNOWN = "不確定有沒有送出：出錯了，請到 agent 的畫面確認";
 
-const SAID_REFUSALS: Record<Exclude<Extract<SaidOutcome, { said: false }>["refusal"], "settled">, string> = {
+const SAID_REFUSALS: Record<
+	Exclude<Extract<SaidOutcome, { said: false }>["refusal"], "settled" | "unsure" | "unsent">,
+	string
+> = {
 	no_question: "找不到這個問題",
 	unknown_option: "沒有這個選項",
+	not_waiting: "agent 已經不在等這個回答",
 };
 
 // A card name is kebab-case and a fingerprint hex, so neither holds the separator.
@@ -389,8 +403,16 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			reply_markup: { inline_keyboard: [[{ text: result, disabled: {} }]] },
 		});
 	};
+	// A press that can be made again: its buttons stay, unless an event settled the message while it was in flight.
+	const reopen = async (query: CallbackQuery, messageId: number, text: string) => {
+		const meanwhile = pressing.get(messageId);
+		if (meanwhile !== undefined) return settleOn(query, messageId, meanwhile);
+		settled.delete(messageId);
+		await quietly("answerCallbackQuery", { callback_query_id: query.id, text });
+	};
 	// The human said an option of a question soma asked: their input, which starts a round as a typed message does.
-	// One request id per question, so a press Telegram delivers again after a restart is admitted once.
+	// One request id per question, so a press Telegram delivers again after a restart is admitted once. An option a
+	// job's agent listed goes to that agent instead, and starts no round here.
 	const sayPress = async (query: CallbackQuery, messageId: number, pressed: { question: string; option: string }) => {
 		const requestId = `${REQUEST_PREFIX}${SAID_PREFIX}${pressed.question}`;
 		if (!drafts.has(requestId)) drafts.set(requestId, undefined);
@@ -398,12 +420,15 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			entry: { kind: ENTRY_KIND, data: { pressed: messageId } },
 			requestId,
 		});
-		if (outcome.said) think(requestId, messageId);
+		if (outcome.said && outcome.job === undefined) think(requestId, messageId);
 		else settle(requestId);
+		if (!outcome.said && outcome.refusal === "unsent") return reopen(query, messageId, unsentText(outcome.reason));
 		const result =
 			outcome.said || outcome.refusal === "settled"
 				? `已選：${outcome.label}`
-				: `未送出：${SAID_REFUSALS[outcome.refusal]}`;
+				: outcome.refusal === "unsure"
+					? PRESS_UNKNOWN
+					: `未送出：${SAID_REFUSALS[outcome.refusal]}`;
 		await settleOn(query, messageId, result);
 	};
 	const answerPress = async (query: CallbackQuery, message: NonNullable<CallbackQuery["message"]>) => {
@@ -426,15 +451,10 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			// Thrown back to the poll loop, the press would never be confirmed and every update after it would wait. It is
 			// reported and answered instead.
 			if (!signal.aborted) onError(error);
-			const meanwhile = pressing.get(message.message_id);
 			// A respond can throw after the keys went, so the message stays settled and says the outcome is unknown.
 			if (said === undefined) await settleOn(query, message.message_id, PRESS_UNKNOWN);
-			else if (meanwhile !== undefined) await settleOn(query, message.message_id, meanwhile);
-			else {
-				// say is idempotent through the questions doc, so its buttons stay and the human can press again.
-				settled.delete(message.message_id);
-				await quietly("answerCallbackQuery", { callback_query_id: query.id, text: PRESS_FAILED });
-			}
+			// say is idempotent through the questions doc, so its buttons stay and the human can press again.
+			else await reopen(query, message.message_id, PRESS_FAILED);
 		} finally {
 			pressing.delete(message.message_id);
 		}

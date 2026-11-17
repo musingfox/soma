@@ -4,6 +4,7 @@ import type { AgentPort, AgentState, AgentStatusEvent } from "../../../ports/age
 import type { HandoverSettling, Settled } from "../../../ports/handover.ts";
 import { complete, observe } from "../../domain/bridge.ts";
 import type { Decision, Job } from "../../domain/dispatch.ts";
+import { listedOptions } from "../../domain/options.ts";
 import {
 	CUT,
 	cutInWindow,
@@ -14,9 +15,10 @@ import {
 	turning,
 	unfinished,
 } from "../../domain/reconcile.ts";
-import { resultNotice, urgent } from "../../domain/report.ts";
+import { clip, resultNotice, urgent } from "../../domain/report.ts";
 import { dispatchSignal, reblockSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
+import { askForJob } from "../ask/index.ts";
 import { recordFact } from "../memory/index.ts";
 import { commitCut, commitMove, Dispatches, JOB_DONE } from "./index.ts";
 import { reclaimer } from "./reclaim.ts";
@@ -140,7 +142,17 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			if (action === "complete") {
 				// Told now, in the commit of its seq, so a resent event or a restart tells it once; the report skips it.
 				const notified = reply !== undefined && urgent(outcome, current, Date.now());
-				if (notified) {
+				// Options a 需要你 reply lists in the launch rules' form go as the question's buttons, and out of its text.
+				const listed = notified && outcome === "需要你" ? listedOptions(reply) : undefined;
+				if (listed !== undefined && next.resultId !== undefined) {
+					const text = clip(listed.text.trim());
+					const asked = { card: next.card, turn: next.resultId, at: new Date().toISOString(), text };
+					const choices = await askForJob(tx, conversation.id, asked, listed.options);
+					await tx.appendEntry(
+						conversation.id,
+						noticeEntry("question", "action", resultNotice(next, listed.text), choices),
+					);
+				} else if (notified) {
 					await tx.appendEntry(
 						conversation.id,
 						outcome === "需要你"

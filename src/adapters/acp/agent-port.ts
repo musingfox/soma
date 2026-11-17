@@ -813,13 +813,13 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			await loading;
 			const target = await awake(agent);
 			const refused = busy(target);
-			if (refused !== undefined) throw new PromptRefused(`acp agent ${agent} ${refused}`);
+			if (refused !== undefined) throw new PromptRefused(`acp agent ${agent} ${refused}`, { busy: target.turning });
 			const session = sessions.get(agent);
 			const path = session && (await transcriptOf(session));
 			const before = path === undefined ? undefined : (await readLastRecord(path))?.id;
 			// Checked again: another prompt may have gone while the transcript was read.
 			const again = busy(target);
-			if (again !== undefined) throw new PromptRefused(`acp agent ${agent} ${again}`);
+			if (again !== undefined) throw new PromptRefused(`acp agent ${agent} ${again}`, { busy: target.turning });
 			target.turning = true;
 			target.ended = false;
 			target.cut = false;

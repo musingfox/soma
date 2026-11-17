@@ -455,6 +455,42 @@ test("a press goes to say under the page's id; an unknown question is a failure;
 	expect(await page.next()).toEqual({ type: "notice", kind: "question", text: "要讓它執行嗎？", loud: true });
 });
 
+test("a press that went to a job's agent settles the page's press, as no answer comes; one the job no longer waits on fails", async () => {
+	const { human, server } = await serve();
+	const page = await open(server.port);
+	human.saidOutcome = { said: true, label: "B", job: "pick" };
+	page.send({ type: "say", id: ID, question: "abc", option: "2" });
+	expect(await page.next()).toEqual({ type: "said", question: "abc", label: "B", id: ID });
+
+	human.saidOutcome = { said: false, refusal: "not_waiting" };
+	page.send({ type: "say", id: ID2, question: "abc", option: "1" });
+	expect(await page.next()).toEqual({
+		type: "failure",
+		id: ID2,
+		text: "沒有送出：agent 已經不在等這個回答",
+		loud: true,
+	});
+
+	human.saidOutcome = { said: false, refusal: "unsent", reason: "acp agent pick is dormant: hangar is full" };
+	page.send({ type: "say", id: ID2, question: "abc", option: "1" });
+	expect(await page.next()).toEqual({
+		type: "failure",
+		id: ID2,
+		text: "沒有送出：acp agent pick is dormant: hangar is full，可以再按一次",
+		loud: true,
+		again: true,
+	});
+
+	human.saidOutcome = { said: false, refusal: "unsure", label: "A" };
+	page.send({ type: "say", id: ID2, question: "abc", option: "1" });
+	expect(await page.next()).toEqual({
+		type: "failure",
+		id: ID2,
+		text: "不確定有沒有送出：出錯了，請到 agent 的畫面確認",
+		loud: true,
+	});
+});
+
 test("a closed page unsubscribes", async () => {
 	const human = new FakeHumanPort();
 	let live = 0;

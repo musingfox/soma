@@ -868,14 +868,17 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		text: string,
 		{ session, blockId }: { readonly session: string; readonly blockId: string },
 	): Promise<void> {
+		let state: string | undefined;
 		try {
 			const { records } = await blockCall("program_status", blockId, ProgramStatusResultSchema, {}, session);
-			const state = records.find(isRoot)?.state;
-			if (state !== "idle" && state !== "done") {
-				throw new Error(`${what} is ${state ?? "without a status record"}: a prompt goes only to idle or done`);
-			}
+			state = records.find(isRoot)?.state;
 		} catch (error) {
 			throw refused(error);
+		}
+		if (state !== "idle" && state !== "done") {
+			throw new PromptRefused(`${what} is ${state ?? "without a status record"}: a prompt goes only to idle or done`, {
+				busy: state === "working" || state === "blocked",
+			});
 		}
 		const working = turnsWorking(blockId, confirmMs, session);
 		try {

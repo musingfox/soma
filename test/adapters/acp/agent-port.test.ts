@@ -242,12 +242,17 @@ test("a request still open when its turn ends leaves nothing to answer, and the 
 test("a prompt goes only to an agent between turns, and a reply to a done one starts its next turn", async () => {
 	const acp = await harness({ fake: { FAKE_ACP_NEW_MS: "300" } });
 	await acp.start();
-	await expect(acp.port.prompt("card-a", "too early")).rejects.toThrow(PromptRefused);
+	const early = acp.port.prompt("card-a", "too early");
+	await expect(early).rejects.toThrow(PromptRefused);
+	// With no session yet, the agent is in no turn: the refusal is not for being busy.
+	await expect(early).rejects.toMatchObject({ busy: false });
 	await acp.until("idle");
 	let from = acp.events.length;
 	await acp.port.prompt("card-a", "ASK");
 	const blocked = await acp.until("blocked", from);
-	await expect(acp.port.prompt("card-a", "1")).rejects.toThrow(/is blocked: a prompt goes only between turns/);
+	const onPrompt = acp.port.prompt("card-a", "1");
+	await expect(onPrompt).rejects.toThrow(/is blocked: a prompt goes only between turns/);
+	await expect(onPrompt).rejects.toMatchObject({ busy: true });
 	await expect(acp.port.prompt("card-b", "hi")).rejects.toThrow(PromptRefused);
 	const fingerprint = blocked.status.state === "blocked" ? (blocked.status.fingerprint ?? "") : "";
 	await acp.port.respond("card-a", { option: "1", fingerprint });
@@ -504,6 +509,8 @@ test("a dormant agent counts against the hangar cap only once it has a process",
 	const refused = second.port.prompt("card-a", "RECALL");
 	await expect(refused).rejects.toThrow(PromptRefused);
 	await expect(refused).rejects.toThrow("acp agent card-a is dormant: hangar is full: 1 of 1 agents running");
+	// The agent still waits: a full hangar says nothing of where it is.
+	await expect(refused).rejects.toMatchObject({ busy: false });
 	expect((await spawned(second)).map(([name]) => name)).toEqual(["card-b"]);
 	// Refused by the cap, it is still dormant, and woken once there is room.
 	await second.port.stop("card-b");
@@ -533,6 +540,7 @@ test("the first prompt to a dormant agent starts it with session/load of its rec
 	]);
 	expect(both.map((each) => each.status).sort()).toEqual(["fulfilled", "rejected"]);
 	expect(both.find((each) => each.status === "rejected")).toMatchObject({ reason: expect.any(PromptRefused) });
+	expect(both.find((each) => each.status === "rejected")).toMatchObject({ reason: { busy: true } });
 	await second.until("done", from);
 	expect((await second.port.readResult("card-a"))?.text).toBe("recall: the word is KIWI");
 	const { acpSessionId, cwd } = (await recorded(first))["card-a"] ?? { acpSessionId: "", cwd: "" };

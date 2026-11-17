@@ -7,8 +7,10 @@ import { FakeAgentPort } from "../../../src/adapters/fake-agent/index.ts";
 import { FakeHumanPort } from "../../../src/adapters/fake-human/index.ts";
 import { FakeBotApi, type SentMessage } from "../../../src/adapters/fake-telegram/index.ts";
 import { runTelegram, splitMessage } from "../../../src/adapters/telegram/index.ts";
+import { HUMAN_CHOSEN } from "../../../src/core/domain/dispatch.ts";
 import { PRESETS, type Preset } from "../../../src/core/domain/push.ts";
 import { askExtension } from "../../../src/core/extensions/ask/index.ts";
+import { eventBridge } from "../../../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../../../src/core/extensions/dispatch/index.ts";
 import { Holds } from "../../../src/core/hold.ts";
 import { openHumanPort } from "../../../src/core/human-port.ts";
@@ -96,6 +98,76 @@ async function summaryCore(terminal: Preset = "instant") {
 		},
 	};
 }
+
+/**
+ * A core with the event bridge over a fake agent side and one idle job, `pick`, whose turns the test ends; with
+ * `summary`, Telegram is the default target at `summary` on a clock the test moves, as in `summaryCore`.
+ */
+async function jobCore({ summary = false } = {}) {
+	const storage = new MemoryStorage();
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const harness = await Harness.open(storage, { models, registry: createRegistry() }, context);
+	cleanup.push(() => harness.close(context));
+	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+	harness.resume();
+	let clock = 100 * MIN;
+	const agents = new FakeAgentPort();
+	const human = await openHumanPort(
+		harness,
+		root,
+		agents,
+		context,
+		summary
+			? {
+					defaultTarget: TELEGRAM,
+					policies: { [TELEGRAM]: PRESETS.summary },
+					now: () => clock,
+					checkMs: 10,
+					summaryIdleMs: 30 * MIN,
+					storage,
+				}
+			: undefined,
+	);
+	cleanup.push(() => human.close());
+	await root.commit(async (tx) => {
+		const job = { card: "pick", agent: "pick", sessionId: "s", status: { state: "idle" as const }, decisions: [] };
+		(await tx.doc(Dispatches, root.id)).jobs.push(job);
+	}, context);
+	const bridge = eventBridge(root, agents, context);
+	const handled: Promise<void>[] = [];
+	agents.onStatus((event) => handled.push(bridge.handle(event)));
+	/** Runs a turn of `pick` that ends on `reply`, and waits until the bridge recorded it. */
+	const turn = async (reply: string) => {
+		agents.emit("pick", { state: "working" });
+		agents.finish("pick", reply);
+		await Promise.all(handled);
+	};
+	/** Waits until the bridge handled every status reported so far. */
+	const settle = async () => {
+		await Promise.all(handled);
+	};
+	const job = async () =>
+		(await harness.snapshot(Dispatches, root.id, context))?.jobs.find((each) => each.card === "pick");
+	const held = () =>
+		root.commit(async (tx) => JSON.parse(JSON.stringify((await tx.doc(Holds, root.id)).held)) as unknown[], context);
+	return {
+		faux,
+		root,
+		human,
+		agents,
+		turn,
+		settle,
+		job,
+		held,
+		advance: (ms: number) => {
+			clock += ms;
+		},
+	};
+}
+const AB = "結果：需要你\n選 A 還是 B？\n選項：\n1. A\n2. B";
+const AB_NOTICE = "[問題] agent pick（卡片 pick）這一輪結束了：\n結果：需要你\n選 A 還是 B？";
 
 const dinner = fauxAssistantMessage([fauxToolCall("ask", { question: "晚餐吃什麼？", options: ["拉麵", "咖哩"] })], {
 	stopReason: "toolUse",
@@ -721,6 +793,80 @@ test("a press goes to say, never to an agent; one the core finds settled or unkn
 	expect(press.callback_query.message.message_id).toBe(1);
 });
 
+test("a press whose label may have reached a job's agent in part settles as unknown, and shows no draft", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+	const options = [
+		{ id: "1", label: "A" },
+		{ id: "2", label: "B" },
+	];
+
+	human.saidOutcome = { said: false, refusal: "unsure", label: "A" };
+	human.emit({
+		type: "notice",
+		kind: "question",
+		class: "action",
+		content: "選 A 還是 B？",
+		choices: { question: "abc", options, job: "pick" },
+	});
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	api.press("ask/abc/1", CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(2));
+	const unknown = "不確定有沒有送出：出錯了，請到 agent 的畫面確認";
+	expect(api.calls.map(({ params }) => params.text ?? params.reply_markup)).toEqual([unknown, chosen(unknown)]);
+	expect(api.drafts).toEqual([]);
+});
+
+test("a press the agent side refused keeps its buttons and says why; a later press on them goes through", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+	const options = [
+		{ id: "1", label: "A" },
+		{ id: "2", label: "B" },
+	];
+	const choices = { question: "abc", options, job: "pick" };
+
+	human.saidOutcome = { said: false, refusal: "unsent", reason: "acp agent pick is dormant: hangar is full" };
+	human.emit({ type: "notice", kind: "question", class: "action", content: "選 A 還是 B？", choices });
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	const first = api.press("ask/abc/1", CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(1));
+	expect(api.calls).toEqual([
+		{
+			method: "answerCallbackQuery",
+			params: {
+				callback_query_id: first.callback_query.id,
+				text: "未送出：acp agent pick is dormant: hangar is full，可以再按一次",
+			},
+		},
+	]);
+
+	// A reason too long for the callback's text is cut, and the text still says the press may be made again.
+	human.saidOutcome = { said: false, refusal: "unsent", reason: "x".repeat(300) };
+	api.press("ask/abc/1", CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(2));
+	const cut = String(api.calls[1]?.params.text);
+	expect([...cut]).toHaveLength(200);
+	expect(cut).toMatch(/^未送出：x+…，可以再按一次$/);
+
+	// One the agent side gives no reason for says so in general words.
+	human.saidOutcome = { said: false, refusal: "unsent", reason: " " };
+	api.press("ask/abc/1", CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(3));
+	expect(api.calls[2]?.params.text).toBe("未送出：出錯了，可以再按一次");
+
+	human.saidOutcome = { said: true, label: "B", job: "pick" };
+	api.press("ask/abc/2", CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(5));
+	expect(api.calls.slice(3).map(({ params }) => params.text ?? params.reply_markup)).toEqual([
+		"已選：B",
+		chosen("已選：B"),
+	]);
+	expect(human.said.map(({ option }) => option)).toEqual(["1", "1", "1", "2"]);
+});
+
 test("a say that throws is reported and leaves its buttons; a respond that throws settles as unknown", async () => {
 	const human = new FakeHumanPort();
 	const { api, apiBase } = await bot();
@@ -907,6 +1053,122 @@ test("at summary, a question asked in a schedule round is held, then offered aga
 	api.press(`ask/${question}/2`, CHAT);
 	await vi.waitFor(() => expect(api.sent.map(({ text }) => text)).toContain("好，咖哩。"));
 	expect(api.calls.at(-1)?.params.reply_markup).toEqual(chosen("已選：咖哩"));
+});
+
+test("a job's 需要你 reply listing options arrives with their buttons; a press prompts its agent, and no round runs", async () => {
+	const { faux, human, agents, turn, job } = await jobCore();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	await turn(AB);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	const question = questionOf(api.sent[0]);
+	expect(api.sent).toEqual([
+		{
+			chat_id: CHAT,
+			text: AB_NOTICE,
+			rich: true,
+			reply_markup: {
+				inline_keyboard: [
+					[{ text: "A", callback_data: `ask/${question}/1` }],
+					[{ text: "B", callback_data: `ask/${question}/2` }],
+				],
+			},
+		},
+	]);
+
+	const press = api.press(`ask/${question}/2`, CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(2));
+	expect(agents.prompts).toEqual([{ agent: "pick", text: "B" }]);
+	const messageId = press.callback_query.message.message_id;
+	expect(api.calls).toEqual([
+		{ method: "answerCallbackQuery", params: { callback_query_id: press.callback_query.id, text: "已選：B" } },
+		{
+			method: "editMessageReplyMarkup",
+			params: { chat_id: CHAT, message_id: messageId, reply_markup: chosen("已選：B") },
+		},
+	]);
+	expect((await job())?.decisions).toEqual([
+		{ at: expect.any(String), kind: "question", action: "replied", text: "B", reason: HUMAN_CHOSEN },
+	]);
+
+	// A press from a client that still shows the buttons, here on a message the chat never settled, sends nothing more.
+	const again = api.press(`ask/${question}/1`, CHAT, messageId + 100);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(4));
+	expect(api.calls[2]).toEqual({
+		method: "answerCallbackQuery",
+		params: { callback_query_id: again.callback_query.id, text: "已選：B" },
+	});
+	await pause();
+	expect(agents.prompts).toHaveLength(1);
+	expect(faux.state.callCount).toBe(0);
+	expect(api.drafts).toEqual([]);
+});
+
+test("a press on a job's question it no longer waits on sends nothing and says so in the chat", async () => {
+	const { human, agents, turn, settle } = await jobCore();
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+	const refused = chosen("未送出：agent 已經不在等這個回答");
+
+	await turn(AB);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
+	// Prompted some other way: the human typed into its window, and it works on that.
+	agents.emit("pick", { state: "working" });
+	await settle();
+	api.press(`ask/${questionOf(api.sent[0])}/1`, CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(2));
+	expect(api.calls.map(({ params }) => params.text ?? params.reply_markup)).toEqual([
+		"未送出：agent 已經不在等這個回答",
+		refused,
+	]);
+
+	// Asked again, and the job ends before the press.
+	await turn(AB);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	agents.emit("pick", { state: "error" });
+	await settle();
+	api.press(`ask/${questionOf(api.sent[1])}/2`, CHAT);
+	await vi.waitFor(() => expect(api.calls).toHaveLength(4));
+	expect(api.calls.at(-1)?.params.reply_markup).toEqual(refused);
+	expect(agents.prompts).toEqual([]);
+});
+
+test("at summary, a job's question with options is held, then offered again with its buttons after the summary", async () => {
+	const { faux, human, agents, turn, held, advance } = await jobCore({ summary: true });
+	faux.setResponses([fauxAssistantMessage("摘要：pick 在問你選 A 還是 B。"), fauxAssistantMessage("不該有第二輪")]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	await turn(AB);
+	await vi.waitFor(async () => expect(await held()).toHaveLength(1));
+	await pause();
+	expect(api.sent).toEqual([]);
+
+	advance(31 * MIN);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	const question = questionOf(api.sent[1]);
+	expect(api.sent).toEqual([
+		{ chat_id: CHAT, text: "[通知] 摘要：pick 在問你選 A 還是 B。", rich: true },
+		{
+			chat_id: CHAT,
+			text: AB_NOTICE,
+			rich: true,
+			disable_notification: true,
+			reply_markup: {
+				inline_keyboard: [
+					[{ text: "A", callback_data: `ask/${question}/1` }],
+					[{ text: "B", callback_data: `ask/${question}/2` }],
+				],
+			},
+		},
+	]);
+	expect(await held()).toEqual([]);
+
+	api.press(`ask/${question}/1`, CHAT);
+	await vi.waitFor(() => expect(api.calls.at(-1)?.params.reply_markup).toEqual(chosen("已選：A")));
+	expect(agents.prompts).toEqual([{ agent: "pick", text: "A" }]);
+	expect(faux.state.callCount).toBe(1);
 });
 
 test("with two interfaces at summary, the one whose message the round answers gets the question at once, the other holds it", async () => {

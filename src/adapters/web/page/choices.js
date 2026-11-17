@@ -22,6 +22,13 @@ export function renderChoices(options, onChoose, doc = document) {
 	return box;
 }
 
+/** A press that was not sent: the options take a press again, unless the question was settled meanwhile. */
+export function reopenChoices(box) {
+	if (box.dataset.state !== "pressed") return;
+	delete box.dataset.state;
+	for (const each of box.querySelectorAll("button")) each.disabled = false;
+}
+
 /** The question is answered: one disabled button with the label chosen. */
 export function settleChoices(box, label, doc = document) {
 	const button = doc.createElement("button");

@@ -8,7 +8,14 @@ import type { Duplex } from "node:stream";
 import { gzipSync } from "node:zlib";
 import { type RawData, WebSocket, WebSocketServer } from "ws";
 import { z } from "zod";
-import { deliveryTo, type HumanPort, isPrompt, type SaidChoices, type SomaEvent } from "../../ports/human.ts";
+import {
+	deliveryTo,
+	type HumanPort,
+	isPrompt,
+	type SaidChoices,
+	type SaidOutcome,
+	type SomaEvent,
+} from "../../ports/human.ts";
 import { readableFailure } from "./failure.ts";
 
 /** Serve mode: soma is behind `tailscale serve`, which terminates HTTPS and says who the caller is. */
@@ -125,18 +132,34 @@ const SaySchema = z
 	.strict();
 const PageSchema = z.discriminatedUnion("type", [InputSchema, SaySchema]);
 
+const SAY_REFUSALS: Record<
+	Exclude<Extract<SaidOutcome, { said: false }>["refusal"], "settled" | "unsure" | "unsent">,
+	string
+> = {
+	no_question: "找不到這個問題",
+	unknown_option: "沒有這個選項",
+	not_waiting: "agent 已經不在等這個回答",
+};
+
 /** What the page receives; `loud` is false on a push the core meant for another interface. */
 export type WebMessage =
 	| { readonly type: "accepted"; readonly id: string }
 	// `asked`: the round asked a question in reply here, which rang: the answer does not, and with no text shows nothing.
 	| { readonly type: "answer"; readonly id: string; readonly text: string; readonly asked?: true }
-	| { readonly type: "failure"; readonly id?: string; readonly text: string; readonly loud: boolean }
+	// `again`: the page's press was not sent and may be made again, so its options take presses once more.
+	| {
+			readonly type: "failure";
+			readonly id?: string;
+			readonly text: string;
+			readonly loud: boolean;
+			readonly again?: true;
+	  }
 	| {
 			readonly type: "notice";
 			readonly kind: "question" | "report";
 			readonly text: string;
 			readonly loud: boolean;
-			// The options of a question soma asked, offered as buttons; a prompt's are not offered here yet.
+			// The options of a question soma or a job's agent asked, offered as buttons; a prompt's are not offered here yet.
 			readonly choices?: SaidChoices;
 	  }
 	// A question's option was said, here or elsewhere; `id` names this page's press the core found already settled.
@@ -231,10 +254,19 @@ export async function startWeb(options: WebOptions): Promise<WebServer> {
 			}
 			const { question, option } = message.data;
 			const outcome = await human.say(question, option, { entry: { kind: ENTRY_KIND }, requestId });
-			if (outcome.said) return sendTo(socket, { type: "accepted", id });
-			if (outcome.refusal === "settled") return sendTo(socket, { type: "said", question, label: outcome.label, id });
-			const reason = outcome.refusal === "no_question" ? "找不到這個問題" : "沒有這個選項";
-			sendTo(socket, { type: "failure", id, text: `沒有送出：${reason}`, loud: true });
+			// One that went to a job's agent starts no round, so the page waits for no answer.
+			if (outcome.said && outcome.job === undefined) return sendTo(socket, { type: "accepted", id });
+			if (outcome.said || outcome.refusal === "settled")
+				return sendTo(socket, { type: "said", question, label: outcome.label, id });
+			if (outcome.refusal === "unsent") {
+				const text = `沒有送出：${outcome.reason.trim() || "出錯了"}，可以再按一次`;
+				return sendTo(socket, { type: "failure", id, text, loud: true, again: true });
+			}
+			const text =
+				outcome.refusal === "unsure"
+					? "不確定有沒有送出：出錯了，請到 agent 的畫面確認"
+					: `沒有送出：${SAY_REFUSALS[outcome.refusal]}`;
+			sendTo(socket, { type: "failure", id, text, loud: true });
 		} catch (error) {
 			onError(error);
 			sendTo(socket, { type: "failure", id, text: `沒有送出：${(error as Error).message}`, loud: true });

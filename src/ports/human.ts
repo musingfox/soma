@@ -23,10 +23,11 @@ export type Delivery = "ring" | "quiet" | "log";
 export type PromptChoices = { readonly card: string; readonly fingerprint: string; readonly options: Choice[] };
 
 /**
- * A question soma's model asked the human, with a few options: it names no card, and a press means "the human said
- * this option", submitted as their input through `HumanPort.say`.
+ * A question with a few options that names no card: a press means "the human said this option", through
+ * `HumanPort.say`. Asked by soma's model, the option is submitted as the human's input. Listed by a job's agent at the
+ * end of its 需要你 reply, it names the job's card in `job`, and the option goes to that agent as its next prompt.
  */
-export type SaidChoices = { readonly question: string; readonly options: Choice[] };
+export type SaidChoices = { readonly question: string; readonly options: Choice[]; readonly job?: string };
 
 export type Choices = PromptChoices | SaidChoices;
 
@@ -34,11 +35,19 @@ export const isPrompt = (choices: Choices): choices is PromptChoices => "card" i
 
 export type HumanAnswerOutcome = AnswerOutcome | { readonly sent: false; readonly refusal: "no_job" };
 
-/** What became of a press on a question's option; a question already answered refuses with the label chosen then. */
+/**
+ * What became of a press on a question's option; a question already answered refuses with the label chosen then. One
+ * that went to a job's agent names the job's card in `job`: it started no round. `not_waiting`: the job no longer waits
+ * on the question, so nothing was sent. `unsent`: the agent side refused the prompt before typing anything, for a reason
+ * other than the agent being busy, given in `reason`; the question stays open, so a later press may go through.
+ * `unsure`: sending to the agent failed after it may have typed some of the label; the question stays settled, so it is
+ * never sent twice.
+ */
 export type SaidOutcome =
-	| { readonly said: true; readonly label: string }
-	| { readonly said: false; readonly refusal: "settled"; readonly label: string }
-	| { readonly said: false; readonly refusal: "no_question" | "unknown_option" };
+	| { readonly said: true; readonly label: string; readonly job?: string }
+	| { readonly said: false; readonly refusal: "settled" | "unsure"; readonly label: string }
+	| { readonly said: false; readonly refusal: "unsent"; readonly reason: string }
+	| { readonly said: false; readonly refusal: "no_question" | "unknown_option" | "not_waiting" };
 
 /**
  * requestId prefixes of rounds the core starts itself (schedule, the event bridge for a job, the foreign bridge for a
@@ -94,7 +103,8 @@ export interface HumanPort {
 	respond(card: string, answer: Answer): Promise<HumanAnswerOutcome>;
 	/**
 	 * The human's press on an option of a question soma asked: the option's label is submitted to the root conversation
-	 * as their input, as `submit` would, and the question is settled, so a second press says nothing.
+	 * as their input, as `submit` would, and the question is settled, so a second press says nothing. On a question a
+	 * job's agent listed, the label goes to that agent as its next prompt instead, while the job still waits on it.
 	 */
 	say(question: string, option: string, input: Omit<HumanInput, "content">): Promise<SaidOutcome>;
 }

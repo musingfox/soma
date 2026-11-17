@@ -15,7 +15,7 @@ import {
 	type SubmissionId,
 	type SubmissionRecord,
 } from "@earendil-works/pi-durable";
-import type { AgentPort, AgentState } from "../ports/agent.ts";
+import { type AgentPort, type AgentState, PromptRefused } from "../ports/agent.ts";
 import {
 	type Choices,
 	type Delivery,
@@ -29,7 +29,7 @@ import {
 	type SaidOutcome,
 	type SomaEvent,
 } from "../ports/human.ts";
-import { HUMAN_CHOSEN } from "./domain/dispatch.ts";
+import { awaitsAnswer, type Decision, HUMAN_CHOSEN } from "./domain/dispatch.ts";
 import type { Told } from "./domain/foreign.ts";
 import {
 	deliveries,
@@ -179,7 +179,7 @@ const pushedAnswer = (content: string): Push => ({ kind: "report", class: "outco
 export async function openHumanPort(
 	harness: Harness,
 	root: Conversation,
-	agents: Pick<AgentPort, "respond">,
+	agents: Pick<AgentPort, "respond" | "prompt">,
 	context: Context,
 	push?: PushOptions,
 ): Promise<HumanPort & { close(): Promise<void> }> {
@@ -268,7 +268,8 @@ export async function openHumanPort(
 		if (changed && before !== undefined) emit({ type: "run", state: "idle" });
 		return changed && next !== undefined;
 	};
-	// requestIds of inputs placed in the running round; a follow-up input joins a round already running.
+	// requestIds of inputs placed in the running round. A follow-up input, as every input here is, never joins a round
+	// already running: it is placed once that round answers, and starts the next.
 	const placed = new Map<SubmissionId, string>();
 	/**
 	 * A round's entries from `first` to `last`, read from storage rather than kept, so a round a restart split is read
@@ -510,6 +511,54 @@ export async function openHumanPort(
 		}, context);
 	};
 
+	/**
+	 * Sends the label of a job's question, already settled, to its agent as the `reply` tool does, and records it as a
+	 * reply the human chose. A refusal before anything was typed leaves the question unsettled: for an agent busy with a
+	 * turn or a prompt, the job no longer waits on it; for any other reason, the agent may still, and a later press may go.
+	 */
+	const promptJob = async (
+		question: string,
+		card: string,
+		agent: string,
+		label: string,
+	): Promise<SaidOutcome | undefined> => {
+		try {
+			await agents.prompt(agent, label);
+		} catch (error) {
+			if (!(error instanceof PromptRefused)) {
+				console.error(`[soma] prompt of ${agent} with a pressed option:`, error);
+				return { said: false, refusal: "unsure", label };
+			}
+			await root.commit(async (tx) => {
+				const doc = await tx.doc(Questions, root.id);
+				const asked = doc.questions[question];
+				if (asked === undefined) return;
+				const { said: _unsaid, ...rest } = JSON.parse(JSON.stringify(asked)) as typeof asked;
+				doc.questions[question] = rest;
+			}, context);
+			return error.busy
+				? { said: false, refusal: "not_waiting" }
+				: { said: false, refusal: "unsent", reason: error.message };
+		}
+		const decision: Decision = {
+			at: new Date().toISOString(),
+			kind: "question",
+			action: "replied",
+			text: label,
+			reason: HUMAN_CHOSEN,
+		};
+		await root
+			.commit(async (tx) => {
+				const doc = await tx.doc(Dispatches, root.id);
+				const index = doc.jobs.findIndex((each) => each.card === card);
+				const current = doc.jobs[index];
+				if (current !== undefined) doc.jobs[index] = { ...current, decisions: [...current.decisions, decision] };
+			}, context)
+			// The label went: a lost record must not read as a press that failed.
+			.catch((error: unknown) => console.error("[soma] reply decision:", error));
+		return undefined;
+	};
+
 	return {
 		async submit(input) {
 			await present(input.entry.kind);
@@ -526,8 +575,9 @@ export async function openHumanPort(
 		},
 		async say(question, option, input) {
 			await present(input.entry.kind);
-			// Settled in the commit that admits the input, so two presses, on one interface or two, admit one.
-			const outcome = await root.commit(async (tx): Promise<SaidOutcome> => {
+			// Settled in the commit that admits the input, so two presses, on one interface or two, admit one. A job's
+			// question is settled in the commit that finds the job waiting on it, before its agent is prompted.
+			const claimed = await root.commit(async (tx): Promise<SaidOutcome & { agent?: string }> => {
 				const doc = await tx.doc(Questions, root.id);
 				// Own keys only: an id such as __proto__ or toString would otherwise find the prototype's.
 				const asked = Object.hasOwn(doc.questions, question) ? doc.questions[question] : undefined;
@@ -536,6 +586,13 @@ export async function openHumanPort(
 				if (asked.said !== undefined) return { said: false, refusal: "settled", label: labelOf(asked.said) ?? "" };
 				const label = labelOf(option);
 				if (label === undefined) return { said: false, refusal: "unknown_option" };
+				const { job } = asked;
+				if (job !== undefined) {
+					const found = (await tx.doc(Dispatches, root.id)).jobs.find((each) => each.card === job.card);
+					if (found === undefined || !awaitsAnswer(found, job)) return { said: false, refusal: "not_waiting" };
+					doc.questions[question] = { ...JSON.parse(JSON.stringify(asked)), said: option };
+					return { said: true, label, job: job.card, agent: found.agent };
+				}
 				doc.questions[question] = { ...JSON.parse(JSON.stringify(asked)), said: option };
 				await root.submit(tx, {
 					type: "input",
@@ -546,6 +603,11 @@ export async function openHumanPort(
 				});
 				return { said: true, label };
 			}, context);
+			const { agent, ...outcome } = claimed;
+			if (outcome.said && outcome.job !== undefined && agent !== undefined) {
+				const sent = await promptJob(question, outcome.job, agent, outcome.label);
+				if (sent !== undefined) return sent;
+			}
 			if (outcome.said) emit({ type: "said", question, label: outcome.label });
 			return outcome;
 		},

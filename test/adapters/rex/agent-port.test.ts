@@ -382,24 +382,28 @@ test("prompt does not press \\r again when the status cannot be read", async () 
 });
 
 test.each([
-	["blocked", [{ state: "blocked", kind: "permission", updated_at: AT }]],
-	["working", [{ state: "working", updated_at: AT }]],
-	["without a status record", []],
-])("prompt refuses without typing anything when claude is %s", async (state, records) => {
-	const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude", records }]);
+	["blocked", [{ state: "blocked", kind: "permission", updated_at: AT }], true],
+	["working", [{ state: "working", updated_at: AT }], true],
+	["without a status record", [], false],
+])(
+	"prompt refuses without typing anything when claude is %s, as busy only in a turn or on a prompt",
+	async (state, records, busy) => {
+		const fake = rex([{ name: "card-a", block: "block:a", argv0: "claude", records }]);
 
-	const prompted = createRexAgentPort({
-		processStart: unstarted,
-		client: fake.client,
-		sessionId: HANGAR,
-		confirmMs: 10,
-	}).prompt("card-a", "go");
+		const prompted = createRexAgentPort({
+			processStart: unstarted,
+			client: fake.client,
+			sessionId: HANGAR,
+			confirmMs: 10,
+		}).prompt("card-a", "go");
 
-	await expect(prompted).rejects.toThrow(`rex agent card-a is ${state}`);
-	await expect(prompted).rejects.toBeInstanceOf(PromptRefused);
+		await expect(prompted).rejects.toThrow(`rex agent card-a is ${state}`);
+		await expect(prompted).rejects.toBeInstanceOf(PromptRefused);
+		await expect(prompted).rejects.toMatchObject({ busy });
 
-	expect(fake.methods().filter((method) => method === "block.event" || method.endsWith(".write"))).toEqual([]);
-});
+		expect(fake.methods().filter((method) => method === "block.event" || method.endsWith(".write"))).toEqual([]);
+	},
+);
 
 test("prompt that fails after the paste does not call it a refusal", async () => {
 	const fake = rex([

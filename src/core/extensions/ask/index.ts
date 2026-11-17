@@ -10,16 +10,16 @@ import {
 import { arr, obj, str } from "@earendil-works/pi-schema";
 import type { Choice } from "../../../ports/agent.ts";
 import type { SaidChoices } from "../../../ports/human.ts";
+import type { JobQuestion } from "../../domain/dispatch.ts";
+import { MAX_OPTIONS, MIN_OPTIONS, OPTION_MAX_CHARS, optionsRefusal } from "../../domain/options.ts";
 import { noticeEntry } from "../../notice.ts";
 import { inputKinds } from "../interfaces/index.ts";
 
-export const MIN_OPTIONS = 2;
-export const MAX_OPTIONS = 4;
-/** An option is a button's text: a few words, not a sentence. */
-export const OPTION_MAX_CHARS = 40;
-
-/** A question soma's model asked the human, and the option they said once they pressed one. */
-export type Asked = { readonly options: Choice[]; readonly said?: string };
+/**
+ * A question asked the human, and the option they said once they pressed one. `job` names the turn of the job whose
+ * agent listed the options; a question soma's model asked has none.
+ */
+export type Asked = { readonly options: Choice[]; readonly said?: string; readonly job?: JobQuestion };
 
 /** The questions asked with options, by question id; one is settled in the commit that submits its press. */
 export const Questions = defineDoc<{ questions: Record<string, Asked> }>({
@@ -38,21 +38,28 @@ export async function saidQuestions(tx: Tx, conversationId: ConversationId): Pro
 	return new Set(Object.keys(questions).filter((id) => questions[id]?.said !== undefined));
 }
 
+/**
+ * Records the options a job's agent listed at the end of its 需要你 reply as a question naming the job, in the commit
+ * that tells the human of the turn, and returns its choices. The id comes from the job and its turn, so the same turn
+ * asks once.
+ */
+export async function askForJob(
+	tx: Tx,
+	conversationId: ConversationId,
+	asked: JobQuestion,
+	labels: readonly string[],
+): Promise<SaidChoices> {
+	const question = createHash("sha256").update(`job\n${asked.card}\n${asked.turn}`).digest("hex").slice(0, 16);
+	const options = labels.map((label, index) => ({ id: String(index + 1), label }));
+	const doc = await tx.doc(Questions, conversationId);
+	if (!Object.hasOwn(doc.questions, question)) doc.questions[question] = { options, job: asked };
+	return { question, options, job: asked.card };
+}
+
 const text = (value: object, isError = false) => ({
 	output: [{ type: "text" as const, text: JSON.stringify(value) }],
 	isError,
 });
-
-/** Why these option labels cannot be offered, if they cannot. */
-function refusal(options: readonly string[]): string | undefined {
-	if (options.length < MIN_OPTIONS || options.length > MAX_OPTIONS)
-		return `give ${MIN_OPTIONS} to ${MAX_OPTIONS} options, not ${options.length}`;
-	if (options.some((label) => label.trim() === "")) return "an option is empty";
-	if (options.some((label) => [...label].length > OPTION_MAX_CHARS))
-		return `an option is longer than ${OPTION_MAX_CHARS} characters: keep each to a few words`;
-	if (new Set(options.map((label) => label.trim())).size !== options.length) return "two options are the same";
-	return undefined;
-}
 
 /**
  * What the model is told to do once it asked, in the description and in the result: the question is the reply, and a
@@ -95,7 +102,7 @@ export function askExtension({ storage, interfaces }: AskOptions) {
 		// A rerun finds the question its first run asked by call id instead of asking again.
 		replay: "safe",
 		execute: async (args, api, context) => {
-			const refused = refusal(args.options);
+			const refused = optionsRefusal(args.options);
 			if (refused !== undefined) return text({ asked: false, error: refused }, true);
 			const question = createHash("sha256").update(api.callId).digest("hex").slice(0, 16);
 			const kinds = await inputKinds(storage, api, api.conversationId, context);

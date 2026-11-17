@@ -1,6 +1,12 @@
 import { parseHTML } from "linkedom";
 import { expect, test } from "vitest";
-import { answerShown, renderChoices, settleChoices, waiting } from "../../../src/adapters/web/page/choices.js";
+import {
+	answerShown,
+	renderChoices,
+	reopenChoices,
+	settleChoices,
+	waiting,
+} from "../../../src/adapters/web/page/choices.js";
 
 const { document, Event } = parseHTML("<!doctype html><html><body></body></html>");
 const options = [
@@ -55,4 +61,22 @@ test("the answer of a turn that asked a question rings no more, and with no text
 	// A turn that asked nothing shows its answer and rings, an empty one too, as before.
 	expect(answerShown({ text: "" })).toEqual({ bubble: true, ring: true });
 	expect(answerShown({ text: "好" })).toEqual({ bubble: true, ring: true });
+});
+
+test("a press that was not sent opens the options to a press again; a settled question stays settled", () => {
+	const chosen: string[] = [];
+	const box = renderChoices(options, (option: string) => chosen.push(option), document);
+	press(box, 0);
+	reopenChoices(box);
+	expect(buttons(box)).toEqual([
+		["好", false],
+		["不用", false],
+	]);
+	expect(waiting(box)).toBe(true);
+	press(box, 1);
+	expect(chosen).toEqual(["1", "2"]);
+
+	settleChoices(box, "不用", document);
+	reopenChoices(box);
+	expect(buttons(box)).toEqual([["已選：不用", true]]);
 });

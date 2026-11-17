@@ -92,7 +92,17 @@ const UpdateSchema = z
 			.optional(),
 		// A press on a draft's stop button names only the chat and the draft: https://core.telegram.org/bots/api#messagegenerationstopped
 		stopped_message_generation: z
-			.object({ chat: z.object({ id: z.number() }).passthrough(), draft_id: z.number() })
+			.object({
+				chat: z.object({ id: z.number() }).passthrough(),
+				// The reference says Integer, but the real API sent the id as a string of digits (seen on 2026-11-18).
+				draft_id: z.union([
+					z.number(),
+					z
+						.string()
+						.regex(/^-?\d+$/)
+						.transform(Number),
+				]),
+			})
 			.passthrough()
 			.optional(),
 		callback_query: z

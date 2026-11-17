@@ -28,7 +28,8 @@ export interface StopUpdate {
 	readonly update_id: number;
 	readonly stopped_message_generation: {
 		readonly chat: { readonly id: number; readonly type: string };
-		readonly draft_id: number;
+		/** A string of digits, as the real API sends it, though the reference says Integer. */
+		readonly draft_id: string;
 	};
 }
 
@@ -377,7 +378,7 @@ export class FakeBotApi {
 	stopGeneration(draftId: number, chatId: number): StopUpdate {
 		const update = {
 			update_id: this.#nextUpdate++,
-			stopped_message_generation: { chat: { id: chatId, type: "private" }, draft_id: draftId },
+			stopped_message_generation: { chat: { id: chatId, type: "private" }, draft_id: String(draftId) },
 		};
 		this.redeliver(update);
 		return update;

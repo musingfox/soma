@@ -474,7 +474,7 @@ test("an update that does not parse, last in its batch, is confirmed by the next
 	const { api, apiBase } = await bot();
 	const { onError } = start(human, apiBase);
 
-	const bad = api.deliverRaw({ stopped_message_generation: { chat: { id: CHAT }, draft_id: "1" } });
+	const bad = api.deliverRaw({ stopped_message_generation: { chat: { id: CHAT }, draft_id: "not a number" } });
 	await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
 	api.deliver("之後", CHAT);
 

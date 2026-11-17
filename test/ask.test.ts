@@ -61,7 +61,7 @@ const choicesOf = (event: SomaEvent | undefined) =>
 test("ask appends a question notice of class action carrying its options, naming no card", async () => {
 	const { ask, notices, seen } = await setup();
 
-	expect(await ask(["好", "不用"])).toEqual({ isError: false, body: { asked: true } });
+	expect(await ask(["好", "不用"])).toEqual({ isError: false, body: { asked: true, note: expect.any(String) } });
 
 	const [notice] = await notices();
 	const question = (notice?.data as { choices?: { question?: unknown } } | undefined)?.choices?.question;
@@ -94,6 +94,16 @@ test("the tool's description names no interface: each says what it shows in its 
 	const description = askExtension({ storage: new MemoryStorage(), interfaces: [] }).tools?.[0]?.description ?? "";
 	expect(description).toContain("one press");
 	expect(description).not.toMatch(/telegram|web|terminal|chat\./i);
+});
+
+test("the description and the result tell the model the question went on its own and to end with no text", async () => {
+	const { ask } = await setup();
+	const description = askExtension({ storage: new MemoryStorage(), interfaces: [] }).tools?.[0]?.description ?? "";
+	const note = ((await ask(["好", "不用"]))?.body as { note?: string } | undefined)?.note ?? "";
+	for (const told of [description, note]) {
+		expect(told).toMatch(/sent to the human as its own message/);
+		expect(told).toMatch(/end your turn with no text, unless the human needs something else besides the question/);
+	}
 });
 
 test("ask refuses fewer than 2 or more than 4 options, and asks nothing", async () => {
@@ -213,7 +223,7 @@ test("a call replayed under the same call id finds its question and appends no s
 		await root.waitForIdle(context);
 	}
 
-	expect(results.map((text) => JSON.parse(text))).toEqual([{ asked: true }, { asked: true }, { asked: true }]);
+	expect(results.map((text) => JSON.parse(text).asked)).toEqual([true, true, true]);
 	const questions = (await notices()).map(
 		(entry) => (entry.data as { choices: { question: string } }).choices.question,
 	);

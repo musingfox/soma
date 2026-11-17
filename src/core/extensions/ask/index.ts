@@ -54,6 +54,14 @@ function refusal(options: readonly string[]): string | undefined {
 	return undefined;
 }
 
+/**
+ * What the model is told to do once it asked, in the description and in the result: the question is the reply, and a
+ * text after it reaches the human as a second message they did not want.
+ */
+const END_TURN =
+	"end your turn with no text, unless the human needs something else besides the question; never restate the " +
+	"question or its options.";
+
 export interface AskOptions {
 	/** The Harness's own storage, where the entry kinds of the running round's inputs are looked up. */
 	readonly storage: Pick<Storage, "submission" | "entry">;
@@ -74,8 +82,8 @@ export function askExtension({ storage, interfaces }: AskOptions) {
 			`Ask the human one question with ${MIN_OPTIONS} to ${MAX_OPTIONS} short options. Where their interface shows ` +
 			"buttons they answer with one press; elsewhere they type the answer. Use it when the answer is one of " +
 			"a small closed set, such as yes or no, now or later, or which of a few named things. Not for an open question, " +
-			"one whose answer you cannot list: ask that in your reply. The question goes to the human as its own message, so " +
-			"do not repeat it in your reply. Their choice comes back as their next message, the option's label word for " +
+			"one whose answer you cannot list: ask that in your reply. The question is sent to the human as its own message, " +
+			`options included, so ${END_TURN} Their choice comes back as their next message, the option's label word for ` +
 			"word; they may also type an answer instead. Write the question and options in the human's language, each " +
 			`option a few words (at most ${OPTION_MAX_CHARS} characters).`,
 		parameters: obj({
@@ -105,7 +113,7 @@ export function askExtension({ storage, interfaces }: AskOptions) {
 					noticeEntry("question", "action", args.question, choices, undefined, replyTo),
 				);
 			}, context);
-			return text({ asked: true });
+			return text({ asked: true, note: `The question has been sent to the human as its own message: ${END_TURN}` });
 		},
 	});
 	return defineExtension({ name: "soma.ask", tools: [ask] });

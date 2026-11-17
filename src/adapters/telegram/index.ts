@@ -36,6 +36,12 @@ export const MESSAGE_LIMIT = 4096;
 // sendRichMessage takes up to 32768 UTF-8 characters; counting bytes keeps a text with wide characters under it too.
 // https://core.telegram.org/bots/api#rich-message-formatting-options
 const RICH_LIMIT = 32768;
+/** What this chat shows of what the model writes, told to the model in the system prompt. */
+export const ABILITIES = [
+	"Telegram（人的手機）：markdown 照你寫的原樣送出，Telegram 顯示成格式（GitHub Flavored Markdown）：標題、表格、清單、程式碼區塊、引用、連結，以及可折疊的 `<details><summary>摘要</summary>…</details>` 區段。",
+	"長的細節放進收合的 `<details>` 區段，上面只留一行摘要，讓人在手機上先看到短的回答。",
+	`超過 ${RICH_LIMIT} 位元組（UTF-8，中文一字約 3 位元組）的訊息改送分段的簡單格式：標題變粗體、表格變等寬文字，\`<details>\` 只顯示成原始文字，不會收合。Telegram 拒收的訊息也改用這種簡單格式重送。Telegram 說明的上限另有 500 個區塊、表格 20 欄。`,
+].join("\n");
 const EMPTY_ANSWER = "（這一輪沒有文字回答）";
 // What Telegram answers a message whose entities it cannot place: https://core.telegram.org/bots/api#formatting-options
 const ENTITY_REFUSAL = /can't parse entities|can't find end tag|unsupported start tag|entity/i;

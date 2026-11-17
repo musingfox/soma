@@ -5,9 +5,17 @@ import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import type { Harness } from "@earendil-works/pi-durable";
 import { serveDefer } from "./adapters/defer-socket/index.ts";
 import { createCard, readCard } from "./adapters/obsidian/card.ts";
-import { runTelegram, ENTRY_KIND as TELEGRAM_KIND } from "./adapters/telegram/index.ts";
-import { runTerminal, ENTRY_KIND as TERMINAL_KIND } from "./adapters/terminal/index.ts";
-import { SERVE_HOST, startWeb, ENTRY_KIND as WEB_KIND } from "./adapters/web/index.ts";
+import {
+	runTelegram,
+	ABILITIES as TELEGRAM_ABILITIES,
+	ENTRY_KIND as TELEGRAM_KIND,
+} from "./adapters/telegram/index.ts";
+import {
+	runTerminal,
+	ABILITIES as TERMINAL_ABILITIES,
+	ENTRY_KIND as TERMINAL_KIND,
+} from "./adapters/terminal/index.ts";
+import { SERVE_HOST, startWeb, ABILITIES as WEB_ABILITIES, ENTRY_KIND as WEB_KIND } from "./adapters/web/index.ts";
 import { dispatchOver, openAgentPort } from "./agent-side.ts";
 import { anthropicAuthContext, type Config, ConfigError, configPath, loadConfig } from "./config.ts";
 import { clock } from "./core/extensions/clock/index.ts";
@@ -17,6 +25,7 @@ import { eventBridge, handoverBridge, reconcileDispatches } from "./core/extensi
 import { foreignBridge } from "./core/extensions/dispatch/foreign.ts";
 import { reclaimer } from "./core/extensions/dispatch/reclaim.ts";
 import { inspectExtension } from "./core/extensions/inspect/index.ts";
+import { interfaces } from "./core/extensions/interfaces/index.ts";
 import { language } from "./core/extensions/language/index.ts";
 import { connectStdio, loadMcpConfig, mcpExtension } from "./core/extensions/mcp/index.ts";
 import { memory } from "./core/extensions/memory/index.ts";
@@ -83,6 +92,10 @@ const mcpClients = (
 	)
 ).flat();
 const storage = await openStorage(config.db);
+// The entry kinds of the interfaces serving the human now: a round no interface started is told what each can show.
+// Telegram is on from the start when configured, so a round the resumed tasks or the reconcile start before it polls
+// is told of it; the section never goes away, which would make the prompt planner re-add every section.
+const on = new Set<string>(config.telegram ? [TELEGRAM_KIND] : []);
 const extensions = [
 	clock(),
 	language(config.language),
@@ -98,6 +111,12 @@ const extensions = [
 	...vaultExtensions(config.vault),
 	...(await skillsExtensions(config.skillsDir)),
 	...(await Promise.all(mcpClients.map(({ name, client }) => mcpExtension(name, client)))),
+	// Last: a section new to the transcript costs one patch at the end, where in the middle the prompt planner would
+	// remove and re-add every section shown before it, on the first request after the release that added it.
+	interfaces(storage, {
+		texts: { [TELEGRAM_KIND]: TELEGRAM_ABILITIES, [TERMINAL_KIND]: TERMINAL_ABILITIES, [WEB_KIND]: WEB_ABILITIES },
+		on: () => on,
+	}),
 ];
 const harness: Harness = await openHarness(storage, extensions, context, { models });
 const root = await harness.root(context, {
@@ -158,6 +177,7 @@ const webPage =
 	config.web &&
 	(await startWeb({ ...config.web, human }).then(
 		(server) => {
+			on.add(WEB_KIND);
 			const { serve, host } = config.web ?? {};
 			console.error(
 				serve
@@ -184,6 +204,9 @@ const shutdown = () => {
 		.then(() => process.exit(0));
 };
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, shutdown);
+// Under launchd stdin is at EOF, so the terminal is on only while it reads.
+on.add(TERMINAL_KIND);
 await runTerminal({ human, input: process.stdin, output: process.stdout, programStatus: config.programStatus });
+on.delete(TERMINAL_KIND);
 // With Telegram or the web on, soma also runs without a terminal (stdin at EOF under launchd) until a signal stops it.
 if (telegram === undefined && webPage === undefined) shutdown();

@@ -43,6 +43,12 @@ export interface WebServer {
 const REQUEST_PREFIX = "web:";
 /** The entry kind of this client's inputs, by which the core says what the page does with each push. */
 export const ENTRY_KIND = "chat.web";
+/** What the page shows of what the model writes, told to the model in the system prompt. */
+export const ABILITIES = [
+	"網頁（狐狸的對話泡泡）：markdown 會顯示成格式：標題、粗體、斜體、刪除線、行內程式碼與程式碼區塊、清單、引用、分隔線、表格（太寬時在泡泡裡橫向捲動），以及 http 或 https 的連結。",
+	"原始 HTML 一律當文字顯示，所以 `<details>` 不會折疊；圖片只顯示描述文字，不載入。",
+	"文字先逐字出現（最多 4 秒）再換成格式；泡泡依長度停留 6 到 45 秒（頁面在眼前時才計時），點一下或時間到就淡出，頁面上不留紀錄。沒有長度上限，但泡泡不大，長文要捲動。",
+].join("\n");
 export const SOCKET_PATH = "/socket";
 /** A larger message closes the connection: typed text is far smaller, and nothing else is buffered without bound. */
 export const MAX_MESSAGE_BYTES = 1 << 20;

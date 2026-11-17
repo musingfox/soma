@@ -31,6 +31,11 @@ const DEVICE_ATTRIBUTES_REPLY = "\x1b[?";
 const PROGRAM_STATUS_REPLY = "\x1b]7501;?";
 /** The entry kind of this client's inputs, by which the core says what this terminal does with each push. */
 export const ENTRY_KIND = "chat.terminal";
+/** What this terminal shows of what the model writes, told to the model in the system prompt. */
+export const ABILITIES = [
+	"終端機（開發用）：回答照原樣印成純文字，markdown 不轉換，`**`、`#`、`|` 和 `<details>` 都原樣出現，不能折疊；通知前面加 `[通知]` 或 `[問題]`，失敗加 `[失敗]`。",
+	"沒有長度上限，但沒有格式，表格只在你自己對齊欄位時才好讀。",
+].join("\n");
 
 /**
  * Ask whether the terminal supports OSC 7501. Every terminal answers the device attributes query that follows it,

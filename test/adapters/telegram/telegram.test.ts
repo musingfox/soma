@@ -2383,6 +2383,36 @@ test("a stop pressed on the draft while soma writes ends the round: the reaction
 	expect(onError).not.toHaveBeenCalled();
 });
 
+test("no draft goes while a stop press is asked of the core, and the draft goes on when the press stopped nothing", async () => {
+	const human = new FakeHumanPort();
+	let answer = (_took: boolean) => {};
+	vi.spyOn(human, "stop").mockImplementation(
+		() =>
+			new Promise<boolean>((resolve) => {
+				answer = resolve;
+			}),
+	);
+	const { api, apiBase } = await bot();
+	const clock = manualClock();
+	const { onError } = streaming(human, apiBase, clock);
+
+	const { message } = api.deliver("寫長一點", CHAT);
+	const id = message.message_id;
+	const requestIds = [`telegram:${id}`];
+	await vi.waitFor(() => expect(api.drafts).toHaveLength(1));
+	api.stopGeneration(id, CHAT);
+	await vi.waitFor(() => expect(human.stop).toHaveBeenCalledWith(`telegram:${id}`));
+
+	human.emit({ type: "partial", requestIds, content: "按下之後才寫的" });
+	clock.advance(30_000);
+	await settle();
+	expect(api.drafts).toHaveLength(1);
+
+	answer(false);
+	await vi.waitFor(() => expect(api.drafts.at(-1)).toMatchObject({ text: "按下之後才寫的", can_stop: true }));
+	expect(onError).not.toHaveBeenCalled();
+});
+
 test("a stop from another chat, or pressed after the answer, does nothing", async () => {
 	const { stepped, root, human, seen } = await streamingCore();
 	// The second round's reply is never written: it runs until the test ends.

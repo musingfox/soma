@@ -452,6 +452,8 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		flight?: AbortController;
 		again: boolean;
 		closed: boolean;
+		/** A press on its stop button is being asked of the core: no draft goes meanwhile, or it would show again. */
+		held: boolean;
 	};
 	const drafts = new Map<string, Drafting>();
 	const interval = options.draftIntervalMs ?? DRAFT_INTERVAL_MS;
@@ -465,7 +467,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	 * takes the signal.
 	 */
 	const show = (round: Drafting) => {
-		if (round.closed || round.waiting !== undefined || round.messageId === undefined) return;
+		if (round.closed || round.held || round.waiting !== undefined || round.messageId === undefined) return;
 		if (round.flight !== undefined) {
 			round.again = true;
 			return;
@@ -497,7 +499,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 					round.refusals = 0;
 				},
 				(error: unknown) => {
-					if (signal.aborted || round.closed) return;
+					if (signal.aborted || round.closed || flight.signal.aborted) return;
 					if (error instanceof Refused && error.retryAfter !== undefined) {
 						onError(error);
 						const wait = error.retryAfter * 1000;
@@ -553,6 +555,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 				last: Number.NEGATIVE_INFINITY,
 				again: false,
 				closed: false,
+				held: false,
 			});
 	};
 	const close = (round: Drafting) => {
@@ -637,11 +640,26 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	const stopPress = async (draftId: number) => {
 		const requestId =
 			[...drafts].find(([, round]) => round.messageId === draftId)?.[0] ?? `${REQUEST_PREFIX}${draftId}`;
+		// The press took the draft off the screen, and a draft sent after it shows there again for up to 30 seconds
+		// (seen on a real client on 2026-11-18), so none goes while the core is asked.
+		const round = drafts.get(requestId);
+		if (round !== undefined) {
+			round.held = true;
+			round.waiting?.();
+			round.waiting = undefined;
+			round.flight?.abort();
+		}
+		let took = false;
 		try {
-			if (await human.stop(requestId)) settle(requestId);
+			took = await human.stop(requestId);
 		} catch (error) {
 			// Thrown back to the poll loop, every update after it would wait.
 			if (!signal.aborted) onError(error);
+		}
+		if (took) settle(requestId);
+		else if (round !== undefined) {
+			round.held = false;
+			show(round);
 		}
 	};
 	type CallbackQuery = NonNullable<z.infer<typeof UpdateSchema>["callback_query"]>;

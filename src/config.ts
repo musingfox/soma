@@ -52,15 +52,22 @@ const SummaryFileConfig = z.object({ idleMinutes: z.number().positive() }).parti
 /** How long the human types nowhere before what interfaces hold is summarized, unless the config says otherwise. */
 export const SUMMARY_IDLE_MINUTES = 30;
 
-/** The hangar is a rex session found by its id, never by its label, which rex does not keep unique. */
+/**
+ * The hangar is a rex session found by its id, never by its label, which rex does not keep unique. When rex says the
+ * session soma would use does not exist, soma makes a new one labelled `label`, `soma-hangar` when unset, uses it from
+ * then on, and remembers it next to the db, never in this file, which soma does not write: a restart uses the session
+ * made in place of `sessionId` while it exists, and makes one more once that one is gone too.
+ */
 export interface RexConfig {
 	readonly sessionId: string;
 	readonly socket: string;
+	readonly label?: string;
 }
 
-// Checked only when rex or acp is selected, so a herdr setup never trips over a rex block it does not use.
+// Checked only when rex or acp is selected, so a herdr setup never trips over a rex block it does not use. rex takes a
+// session label of up to 128 characters.
 const RexFileConfig = z
-	.object({ sessionId: z.string().min(1), socket: z.string().min(1) })
+	.object({ sessionId: z.string().min(1), socket: z.string().min(1), label: z.string().min(1).max(128) })
 	.partial()
 	.strict();
 
@@ -389,6 +396,7 @@ function resolveRex(
 	return {
 		sessionId,
 		socket: fromEnv("SOMA_REX_SOCKET") ?? rex?.socket ?? defaultRexSocket(home),
+		...(rex?.label !== undefined && { label: rex.label }),
 	};
 }
 

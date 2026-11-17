@@ -36,6 +36,7 @@ import {
 } from "../../ports/agent.ts";
 import { type HeldSession, type Holding, type SessionTaker, type Taken, TakeRefused } from "../../ports/handover.ts";
 import { type RexClient, RexRpcError } from "./client.ts";
+import type { HangarMemory } from "./hangar-file.ts";
 import { type ProcessStart, readProcessStart } from "./process-start.ts";
 import {
 	AttachAllResultSchema,
@@ -44,6 +45,7 @@ import {
 	BlockEventSchema,
 	BlockListSchema,
 	ClientListSchema,
+	CreateSessionResultSchema,
 	EmptyResultSchema,
 	FormatResultSchema,
 	NewWindowResultSchema,
@@ -61,8 +63,15 @@ import {
 
 export interface RexAgentPortOptions {
 	readonly client: RexClient;
-	/** The hangar: the rex session every agent gets a window in. Found by id, never by label, which is not unique. */
+	/**
+	 * The hangar the config names: the rex session every agent gets a window in. Found by id, never by label, which is
+	 * not unique. When rex says it does not exist, a new one is made in its place (`replace`).
+	 */
 	readonly sessionId: string;
+	/** The label of a hangar made in place of one that does not exist; HANGAR_LABEL by default. */
+	readonly label?: string;
+	/** Where the hangar made in place of `sessionId` is kept across restarts; this process only by default. */
+	readonly memory?: HangarMemory;
 	readonly cap?: number;
 	/** Where claude keeps its transcripts; defaults to ~/.claude/projects. */
 	readonly projectsDir?: string;
@@ -116,6 +125,12 @@ type Foreign = {
  * each other's for the human's; the exception is the port's own hangar, whose panes that are not soma's jobs are.
  */
 const SOMA_SESSION_PREFIX = "soma-";
+
+/** The label of a hangar soma makes when the config sets none: prod's, under SOMA_SESSION_PREFIX. */
+export const HANGAR_LABEL = "soma-hangar";
+
+/** The hangar does not exist and rex made none in its place; the port logs it once for each hangar lost. */
+export class HangarUnmade extends Error {}
 
 const BLOCKED_KINDS: readonly string[] = ["permission", "question", "auth"] satisfies BlockedKind[];
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -223,7 +238,7 @@ function paneOf(window: RexWindow): Pane | undefined {
  * ARCHITECTURE.md "The rex implementation" is the design.
  */
 export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & SessionTaker {
-	const { client, sessionId } = options;
+	const { client } = options;
 	const git = options.git ?? runGit;
 	const confirmMs = options.confirmMs ?? 3_000;
 	const keyGapMs = options.keyGapMs ?? 200;
@@ -237,6 +252,84 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	const foreignMs = options.foreignMs ?? 15_000;
 	const onError = options.onError ?? ((error: Error) => console.warn(`[rex] ${error.message}`));
 	const cap = options.cap ?? resolveHangarCapWithSource(undefined, readPerfCoresViaSysctl).cap;
+	const madeLabel = options.label ?? HANGAR_LABEL;
+
+	/** The hangar a soma before this one made in place of the configured one, if it did. */
+	function recalled(): string | undefined {
+		try {
+			return options.memory?.recall(options.sessionId);
+		} catch (error) {
+			onError(
+				new Error(
+					`rex hangar ${options.sessionId}: what was made in its place is unknown: ${(error as Error).message}`,
+				),
+			);
+			return undefined;
+		}
+	}
+	// The hangar now: the configured one, or the one this process or one before it made in its place.
+	let sessionId = recalled() ?? options.sessionId;
+	// The making of a hangar under way, so that calls finding the same one gone at once make one between them.
+	let making: Promise<string> | undefined;
+	// The lost hangar the last HangarUnmade was logged for.
+	let toldUnmade: string | undefined;
+
+	/**
+	 * A hangar in place of `lost`, which rex says does not exist: a new session labelled `madeLabel`, attached and
+	 * remembered, and told in one line naming both. A hangar made in its place already, by another call, is the one.
+	 * Throws HangarUnmade when rex does not make one, logged the first time for `lost`, and the next call that finds
+	 * `lost` gone asks again.
+	 */
+	function replace(lost: string): Promise<string> {
+		if (sessionId !== lost) return Promise.resolve(sessionId);
+		making ??= (async () => {
+			let made: string;
+			try {
+				({ session_id: made } = await client.call("session.create", { label: madeLabel }, CreateSessionResultSchema));
+			} catch (error) {
+				const reason = (error as Error).message;
+				const unmade = new HangarUnmade(
+					`rex hangar ${lost} does not exist, and no hangar was made in its place: ${reason}`,
+					{
+						cause: error,
+					},
+				);
+				if (toldUnmade !== lost) onError(unmade);
+				toldUnmade = lost;
+				throw unmade;
+			}
+			sessionId = made;
+			onError(
+				new Error(`rex hangar ${lost} does not exist: made ${made}, labelled ${madeLabel}, the hangar from now on`),
+			);
+			try {
+				options.memory?.remember(options.sessionId, made);
+			} catch (error) {
+				onError(
+					new Error(`rex hangar ${made} is not remembered, so a restart makes another: ${(error as Error).message}`),
+				);
+			}
+			await client.attach(made);
+			return made;
+		})().finally(() => {
+			making = undefined;
+		});
+		return making;
+	}
+
+	/**
+	 * `work` on the hangar, and once more on a hangar made in its place when rex says it does not exist. Every call `work`
+	 * makes is on the hangar, so a session_not_found is the hangar's, and the call it failed did nothing.
+	 */
+	async function onHangar<T>(work: (hangar: string) => Promise<T>): Promise<T> {
+		const hangar = sessionId;
+		try {
+			return await work(hangar);
+		} catch (error) {
+			if (!(error instanceof RexRpcError && error.code === "session_not_found")) throw error;
+			return work(await replace(hangar));
+		}
+	}
 
 	// A block of the hangar unless `session` names another.
 	const blockCall = <T>(method: string, blockId: string, schema: ZodType<T>, args = {}, session = sessionId) =>
@@ -270,8 +363,10 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 
 	/** Every pane of the hangar, by window name; a name can be on more than one window. */
 	async function panes(): Promise<Map<string, Pane[]>> {
-		await client.attach(sessionId);
-		const view = await client.call("session.view", { session_id: sessionId }, ViewSchema);
+		const view = await onHangar(async (hangar) => {
+			await client.attach(hangar);
+			return client.call("session.view", { session_id: hangar }, ViewSchema);
+		});
 		const byName = new Map<string, Pane[]>();
 		for (const window of view.windows ?? []) {
 			const pane = paneOf(window);
@@ -300,12 +395,15 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 
 	/** The hangar's blocks running claude, on every window and layer, so a block a human split off counts too. */
 	async function occupied(): Promise<number> {
-		const view = await client.call("session.view", { session_id: sessionId }, ViewSchema);
-		const blockIds = (view.windows ?? []).flatMap((window) =>
-			(window.layers ?? []).flatMap((layer) => (layer.blocks ?? []).flatMap((block) => block.block_id ?? [])),
-		);
-		const claude = await Promise.all(blockIds.map(isClaude));
-		return claude.filter(Boolean).length;
+		return onHangar(async (hangar) => {
+			await client.attach(hangar);
+			const view = await client.call("session.view", { session_id: hangar }, ViewSchema);
+			const blockIds = (view.windows ?? []).flatMap((window) =>
+				(window.layers ?? []).flatMap((layer) => (layer.blocks ?? []).flatMap((block) => block.block_id ?? [])),
+			);
+			const claude = await Promise.all(blockIds.map(isClaude));
+			return claude.filter(Boolean).length;
+		});
 	}
 
 	/**
@@ -315,11 +413,12 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	 * foreign too. A session whose label starts with `soma-` is skipped unless it is this port's own hangar. attach_all
 	 * lets the connection call any session's methods without joining it, so no session lists soma among its clients, and
 	 * with its `session` scope no block events of other sessions arrive; it is asked again on every read, since a
-	 * reconnect drops it. A session or block that went away while it was read is left out. A blocked one's status is
+	 * reconnect drops it. The hangar is not attached here: it is read as every session is, so a hangar that does not exist
+	 * is no session of the listing, and the foreign agents of the others are listed all the same, whether or not one can
+	 * be made in its place. A session or block that went away while it was read is left out. A blocked one's status is
 	 * read off its screen, as `statusOf` reads an agent's, so it carries the prompt's fingerprint and options.
 	 */
 	async function foreign(): Promise<Foreign[]> {
-		await client.attach(sessionId);
 		const { sessions } = await client.call("session.attach_all", { event_scope: "session" }, AttachAllResultSchema);
 		const found = await Promise.all(
 			(sessions ?? []).map(async (session): Promise<Foreign[]> => {
@@ -797,19 +896,28 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	/**
 	 * A window named `name` whose one block is an interactive shell typing `launch`, so the block outlives claude
 	 * exiting, as a herdr pane does. The block's label keeps the session id, which nothing else in rex records. Returns
-	 * the block's id when rex names it.
+	 * the block's id when rex names it. With `pinned`, it opens in that hangar only, and one rex says does not exist
+	 * fails it with session_not_found rather than make a hangar to open it in.
 	 */
-	async function openWindow(name: string, session: string, cwd: string, launch: string): Promise<string | undefined> {
-		const { block_ids: blocks } = await client.call(
-			"session.new_window",
-			{
-				session_id: sessionId,
-				window_label: name,
-				focus: false,
-				layout: { block: { flavor: SHELL_FLAVOR, label: session, options: { cwd, initial_input: launch } } },
-			},
-			NewWindowResultSchema,
-		);
+	async function openWindow(
+		name: string,
+		session: string,
+		cwd: string,
+		launch: string,
+		pinned?: string,
+	): Promise<string | undefined> {
+		const open = (hangar: string) =>
+			client.call(
+				"session.new_window",
+				{
+					session_id: hangar,
+					window_label: name,
+					focus: false,
+					layout: { block: { flavor: SHELL_FLAVOR, label: session, options: { cwd, initial_input: launch } } },
+				},
+				NewWindowResultSchema,
+			);
+		const { block_ids: blocks } = await (pinned === undefined ? onHangar(open) : open(pinned));
 		return blocks?.find((block) => block !== null) ?? undefined;
 	}
 
@@ -927,8 +1035,11 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		const emit = (event: AgentStatusEvent) => {
 			for (const listener of listeners) listener(event);
 		};
-		// Which window each block is in, by name; null for a name more than one window has.
+		// Which window each block of the hangar `namesOf` is in, by name; null for a name more than one window has.
 		let names: Map<string, string | null> | undefined;
+		let namesOf: string | undefined;
+		/** The names as last read, while they are the hangar's: a hangar made in place of theirs holds none of them. */
+		const cached = () => (namesOf === sessionId ? names : undefined);
 		const lastSeq = new Map<string, number>();
 		// Blocks a root record was seen for, whose trust-dialog check is over.
 		const recorded = new Set<string>();
@@ -948,7 +1059,14 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 				for (const pane of list) fresh.set(pane.blockId, list.length === 1 ? name : null);
 			}
 			names = fresh;
+			// panes() read the hangar as it is once it returns, one made in place of a lost one included.
+			namesOf = sessionId;
 			return fresh;
+		}
+		/** The names as last read when they hold the block, else read afresh. */
+		async function namesWith(blockId: string): Promise<Map<string, string | null>> {
+			const known = cached();
+			return known?.has(blockId) ? known : refresh();
 		}
 		function report(
 			blockId: string,
@@ -996,8 +1114,27 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			report(blockId, name, seen.status, last === undefined ? seen.seq : Math.max(now() * 1000, last + 1), true);
 		}
 
+		/**
+		 * The watch's work reads only the hangar, so a session_not_found from it says the hangar it read is gone, though the
+		 * connection stayed up: that is not logged, the names read from it are dropped, so no block of it is read again, and
+		 * a hangar is made in its place (`replace`, which logs it once), whose names the next look reads. A HangarUnmade was
+		 * logged as it was thrown: the trust check would otherwise log it again every trustMs, and goes on asking for one.
+		 */
 		const enqueue = (work: () => Promise<void>) => {
-			queue = queue.then(work).catch((error: Error) => onError(error));
+			queue = queue
+				.then(async () => {
+					const hangar = sessionId;
+					try {
+						await work();
+					} catch (error) {
+						if (!(error instanceof RexRpcError && error.code === "session_not_found")) throw error;
+						names = undefined;
+						await replace(hangar);
+					}
+				})
+				.catch((error: Error) => {
+					if (!(error instanceof HangarUnmade)) onError(error);
+				});
 		};
 		const resync = () =>
 			enqueue(async () => {
@@ -1019,7 +1156,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			if (closed || quiet.get(blockId) !== token) return;
 			quiet.delete(blockId);
 			const last = lastSeq.get(blockId);
-			const known = names?.has(blockId) ? names : await refresh();
+			const known = await namesWith(blockId);
 			if (last === undefined || !known.has(blockId)) return;
 			const [{ records }, claude] = await Promise.all([
 				blockCall("program_status", blockId, ProgramStatusResultSchema),
@@ -1049,7 +1186,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			checking = true;
 			enqueue(async () => {
 				try {
-					const known = names ?? (await refresh());
+					const known = cached() ?? (await refresh());
 					const unrecorded = [...known].filter(([blockId]) => !recorded.has(blockId));
 					await Promise.all(unrecorded.map(([blockId, name]) => look(blockId, name)));
 				} finally {
@@ -1074,13 +1211,14 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			const seq = seqOf(record);
 			if (seq === undefined) return;
 			enqueue(async () => {
-				const known = names?.has(blockId) ? names : await refresh();
+				const known = await namesWith(blockId);
 				if (!known.has(blockId) || !(await isClaude(blockId))) return;
 				report(blockId, known.get(blockId), await statusOf(blockId, record), seq);
 			});
 		});
 		const offConnected = client.onConnected(resync);
-		void client.attach(sessionId).then(resync, (error: Error) => onError(error));
+		// The first read attaches the hangar, or one made in its place.
+		resync();
 		return () => {
 			closed = true;
 			for (const timer of rechecks.values()) clearTimeout(timer);
@@ -1092,13 +1230,14 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	}
 
 	return {
-		hangar: sessionId,
+		get hangar() {
+			return sessionId;
+		},
 		label: hangarLabel,
 
 		async start(request: StartRequest): Promise<void> {
 			// Built first, so a card the command cannot hold leaves git and rex alone.
 			const launch = launchCommand(request, options.env, options.path);
-			await client.attach(sessionId);
 			const running = await occupied();
 			if (running >= cap) throw new Error(`hangar is full: ${running} of ${cap} agents running`);
 			const path = await openWorktree(git, request.cwd, request.card);
@@ -1149,14 +1288,16 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		 * to the cap: the human asked for this one. Throws what `takeable` would have said; past the window's opening,
 		 * nothing throws, so a claude slow to come up or a read that fails leaves the window and says `ready: false`. All
 		 * that is TakeRefused but a `session.new_window` rex did not answer with an error, which may be running still.
+		 * With `hangar`, the window opens in that hangar or nowhere, so a mark naming it names where the window is: rex
+		 * answering that it does not exist is TakeRefused, and no hangar is made for the window.
 		 */
-		async take(session: HeldSession) {
+		async take(session: HeldSession, hangar?: string) {
 			const line = await takeLine(session).catch((error: Error) => {
 				throw new TakeRefused(error.message, { cause: error });
 			});
 			if ("refused" in line) throw new TakeRefused(line.refused);
 			const { name, claudeSession, cwd } = session;
-			const opened = await openWindow(name, claudeSession, cwd, line.launch).catch((error: Error) => {
+			const opened = await openWindow(name, claudeSession, cwd, line.launch, hangar).catch((error: Error) => {
 				throw error instanceof RexRpcError ? new TakeRefused(error.message, { cause: error }) : error;
 			});
 			return brought(name, async () => opened ?? only(await panes(), name).blockId);
@@ -1182,8 +1323,16 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			});
 		},
 
+		/**
+		 * A hangar rex says does not exist, and none made in its place, holds no window: its jobs are listed as any job whose
+		 * window is gone, and the startup reconcile, which lists before anything else, does not fail with it. The refusal was
+		 * logged as it was thrown, and the next listing asks for a hangar again.
+		 */
 		async list(): Promise<readonly AgentListing[]> {
-			const byName = await panes();
+			const byName = await panes().catch((error: Error) => {
+				if (error instanceof HangarUnmade) return new Map<string, Pane[]>();
+				throw error;
+			});
 			const duplicated = [...byName].filter(([, list]) => list.length > 1).map(([name]) => name);
 			if (duplicated.length > 0) {
 				throw new Error(`rex hangar ${sessionId} has more than one window named ${duplicated.join(", ")}`);
@@ -1300,10 +1449,12 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		 * session no event arrives, so the prompt waits out confirmMs for the state read then.
 		 */
 		async promptForeign(id: string, text: string): Promise<void> {
-			return promptOn(`rex foreign agent ${id}`, text, async () => ({
-				session: (await foreignOf(id)).sessionId,
-				blockId: id,
-			}));
+			return promptOn(`rex foreign agent ${id}`, text, async () => {
+				const session = (await foreignOf(id)).sessionId;
+				// The listing just found the hangar, so attaching it, for its block events, does not find it gone.
+				if (session === sessionId) await client.attach(session);
+				return { session, blockId: id };
+			});
 		},
 
 		onForeignStatus(listener: (event: ForeignStatusEvent) => void): () => void {

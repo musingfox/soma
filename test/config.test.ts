@@ -453,6 +453,13 @@ describe("the agent-side adapter", () => {
 		expect(() => loadConfig(path, {}, HOME)).toThrow(ConfigError);
 		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: rex.sessionId: Required`);
 	});
+	test("the label of a hangar soma makes is the file's rex.label, unset when the file sets none", () => {
+		const rex = { sessionId: "session:hangar" };
+		expect(resolveConfig({ agentAdapter: "rex", rex: { ...rex, label: "fleet" } }, {}, HOME).rex?.label).toBe("fleet");
+		expect(resolveConfig({ agentAdapter: "rex", rex }, {}, HOME).rex).not.toHaveProperty("label");
+		const long = write(JSON.stringify({ agentAdapter: "rex", rex: { ...rex, label: "x".repeat(129) } }));
+		expect(() => loadConfig(long, {}, HOME)).toThrow(`${long}: rex.label:`);
+	});
 	test("the hangar's session id comes from SOMA_REX_SESSION_ID, else the file", () => {
 		const file: FileConfig = { agentAdapter: "rex", rex: { sessionId: "session:file" } };
 		expect(resolveConfig(file, { SOMA_REX_SESSION_ID: "session:env" }, HOME).rex?.sessionId).toBe("session:env");

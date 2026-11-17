@@ -130,6 +130,10 @@ export const SizeResultSchema = z
 	})
 	.passthrough();
 
+// session.create, checked 2026-11-17 against rex 0.1.0-preview.19 (ad5a836) over revision 7. It takes an optional
+// `label` and `initial_windows`, makes no window without them, and does not attach the connection to the session.
+export const CreateSessionResultSchema = z.object({ session_id: z.string() }).passthrough();
+
 export const NewWindowResultSchema = z
 	.object({ window_id: z.string().nullable(), block_ids: z.array(z.string().nullable()).nullable() })
 	.passthrough();

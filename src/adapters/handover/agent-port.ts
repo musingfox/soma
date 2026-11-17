@@ -330,7 +330,8 @@ export function createHandoverAgentPort({
 			await from.reinstate(agent);
 			return { ...backOnAcp(error as Error, await returnOf(agent)), ...cut };
 		}
-		const taken = await to.take(held).catch((error: Error) => error);
+		// In the hangar the mark names, so the mark names where any window of this take is.
+		const taken = await to.take(held, mark.hangar).catch((error: Error) => error);
 		const outcome =
 			taken instanceof Error
 				? await afterFailedTake(agent, { ...held, ...mark }, taken)

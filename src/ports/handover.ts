@@ -152,8 +152,9 @@ export interface SessionTaker {
 	// Why `take` would refuse now, with nothing done; undefined when it would not.
 	takeable(session: HeldSession): Promise<string | undefined>;
 	// Opens the session where the human can see it, and waits a bounded time for its claude to come up. Throws TakeRefused
-	// when no window of this take can still open; any other error says nothing either way, as a reply that was lost.
-	take(session: HeldSession): Promise<Taken>;
+	// when no window of this take can still open; any other error says nothing either way, as a reply that was lost. With
+	// `hangar`, the window opens in that hangar or not at all: TakeRefused when rex says it does not exist.
+	take(session: HeldSession, hangar?: string): Promise<Taken>;
 	// Where `hangar`, which need not be this side's own, holds the session, whether or not its claude still runs. A hangar
 	// that does not exist holds nothing. Reads only; throws when this side cannot answer, which says nothing either way.
 	holds(session: HeldSession, hangar: string): Promise<Holding>;

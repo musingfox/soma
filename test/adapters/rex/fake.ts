@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ZodType } from "zod";
-import type { RexClient } from "../../../src/adapters/rex/client.ts";
+import { type RexClient, RexRpcError } from "../../../src/adapters/rex/client.ts";
 import type { SessionEvent } from "../../../src/adapters/rex/schema.ts";
 
 export const HANGAR = "session:hangar";
@@ -59,13 +59,21 @@ function movedCursor(screen: string, by: 1 | -1): string {
 /**
  * An in-memory rex: the hangar's windows, each with one block, any other sessions, the clients connected, and every
  * call made on it. `hangar` is the hangar's label. Each reply reads the arrays and blocks as they are then, so a test may change them between calls.
+ * A session `lose` names exists no more: rex answers any call naming it, an attach too, with session_not_found.
+ * `session.create` makes an empty session, `session:made-<n>`, which `made` holds.
  */
 export function rex(blocks: Block[], others: Session[] = [], clients: Client[] = [], hangar = "hangar") {
 	const calls: { method: string; payload: Record<string, unknown> }[] = [];
 	const events = new Set<(event: SessionEvent) => void>();
 	const connected = new Set<() => void>();
 	const attached: string[] = [];
-	const sessions = () => [{ id: HANGAR, label: hangar, blocks }, ...others];
+	const gone = new Set<string>();
+	const made: Session[] = [];
+	const sessions = () => [{ id: HANGAR, label: hangar, blocks }, ...others, ...made].filter(({ id }) => !gone.has(id));
+	const notFound = (method: string, session: unknown) =>
+		typeof session === "string" && gone.has(session)
+			? new RexRpcError(method, "session_not_found", `session ${session} not found`, 404)
+			: undefined;
 	const of = (payload: Record<string, unknown>) =>
 		sessions().find((session) => session.id === payload.session_id)?.blocks ?? [];
 	const byId = (payload: Record<string, unknown>) => of(payload).find((each) => each.block === payload.block_id);
@@ -119,6 +127,11 @@ export function rex(blocks: Block[], others: Session[] = [], clients: Client[] =
 				updated_at,
 			})),
 		}),
+		"session.create": (payload) => {
+			const id = `session:made-${made.length + 1}`;
+			made.push({ id, label: String(payload.label ?? "quiet-meadow"), blocks: [] });
+			return { session_id: id };
+		},
 		"session.new_window": () => ({ window_id: "window:new", block_ids: ["block:new"], revision: 2 }),
 		"block.close": (payload) => ({ block_id: payload.block_id, revision: 3 }),
 		// An arrow moves the cursor drawn on the block's screen, as claude redraws it.
@@ -154,11 +167,15 @@ export function rex(blocks: Block[], others: Session[] = [], clients: Client[] =
 	const client: RexClient = {
 		async call<T>(method: string, payload: unknown, schema: ZodType<T>): Promise<T> {
 			calls.push({ method, payload: payload as Record<string, unknown> });
+			const lost = notFound(method, (payload as { session_id?: unknown } | undefined)?.session_id);
+			if (lost !== undefined) throw lost;
 			const reply = replies[method];
 			if (reply === undefined) throw new Error(`unexpected ${method}`);
 			return schema.parse(reply(payload as Record<string, unknown>));
 		},
 		async attach(sessionId) {
+			const lost = notFound("session.attach", sessionId);
+			if (lost !== undefined) throw lost;
 			attached.push(sessionId);
 		},
 		onSessionEvent(listener) {
@@ -188,6 +205,11 @@ export function rex(blocks: Block[], others: Session[] = [], clients: Client[] =
 		client,
 		calls,
 		attached,
+		made,
+		/** The session, the hangar unless named, exists no more. */
+		lose: (id = HANGAR) => {
+			gone.add(id);
+		},
 		emit: (event: SessionEvent) => {
 			for (const listener of events) listener(event);
 		},

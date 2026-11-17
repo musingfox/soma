@@ -110,7 +110,7 @@ test("listForeign names every claude block outside soma's agents, across session
 		{ id: "block:w4", session: "work", label: "loose" },
 		{ id: "block:h1", session: "home", label: "notes", status: { state: "done" } },
 	]);
-	// Read only: nothing typed, pressed, opened or closed anywhere, and no session joined but the hangar.
+	// Read only: nothing typed, pressed, opened or closed anywhere, and no session joined, the hangar neither.
 	expect(new Set(fake.methods())).toEqual(
 		new Set([
 			"session.view",
@@ -122,7 +122,7 @@ test("listForeign names every claude block outside soma's agents, across session
 			"com.superlogical.terminal.format",
 		]),
 	);
-	expect(fake.attached).toEqual([HANGAR]);
+	expect(fake.attached).toEqual([]);
 	expect(fake.calls.find((call) => call.method === "session.attach_all")?.payload).toEqual({ event_scope: "session" });
 });
 
@@ -195,7 +195,7 @@ test("readForeignScreen reads the foreign agent's block in its own session at ev
 		}),
 	);
 	expect(fake.methods().filter((method) => method.endsWith(".write") || method === "block.event")).toEqual([]);
-	expect(fake.attached).toEqual([HANGAR, HANGAR]);
+	expect(fake.attached).toEqual([]);
 });
 
 test("readForeignScreen reads a pane the human opened in soma's own hangar", async () => {

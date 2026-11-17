@@ -6,6 +6,7 @@ import { createHerdrAgentPort } from "./adapters/herdr/agent-port.ts";
 import { createHerdrClient } from "./adapters/herdr/client.ts";
 import { createRexAgentPort } from "./adapters/rex/agent-port.ts";
 import { createRexClient } from "./adapters/rex/client.ts";
+import { hangarFile } from "./adapters/rex/hangar-file.ts";
 import { createTtyAgentPort } from "./adapters/tty/agent-port.ts";
 import { spawnPty } from "./adapters/tty/pty.ts";
 import type { Config } from "./config.ts";
@@ -39,10 +40,13 @@ export function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, defer
 	// on, since the agent's own may be one its project pins.
 	const env = { SOMA_SOCKET: deferSocket, SOMA_NODE: process.execPath };
 	const path = join(dirname(dirname(fileURLToPath(import.meta.url))), "bin");
-	const rexPort = ({ socket, sessionId }: NonNullable<Config["rex"]>) => {
+	const rexPort = ({ socket, sessionId, label }: NonNullable<Config["rex"]>) => {
 		const onError = (error: Error) => console.error("[soma] rex:", error.message);
 		const client = createRexClient({ socketPath: socket, onError });
-		return createRexAgentPort({ client, sessionId, onError, env, path, ...cap });
+		// Next to the db, as the ACP sessions file is: one soma per db, so prod and a dev instance each keep the hangar
+		// they made, and the config file, which soma never writes, keeps the one the human named.
+		const memory = hangarFile(resolve(`${db}.rex-hangar.json`));
+		return createRexAgentPort({ client, sessionId, memory, onError, env, path, ...cap, ...(label && { label }) });
 	};
 	const notAcp = noHandover("not_acp", `this soma runs its jobs on ${agentAdapter}, not over ACP`);
 	if (agentAdapter === "rex") {

@@ -171,6 +171,63 @@ async function inTurn(both: Sides, prompt: string, state: "working" | "blocked" 
 	return from;
 }
 
+/**
+ * A job at rest whose hangar rex loses at `when`: as the handover cuts its turn, after the mark, or as the take opens its
+ * window. `marks` holds the hangar each mark named.
+ */
+async function lostMidHandover(when: "cut" | "window") {
+	const marks: string[] = [];
+	let lose = () => {};
+	const both = await sides({
+		from: (port) => ({
+			...port,
+			cut: async (agent) => {
+				const cut = await port.cut(agent);
+				if (when === "cut") lose();
+				return cut;
+			},
+			release: async (agent, mark) => {
+				marks.push(mark.hangar);
+				return port.release(agent, mark);
+			},
+		}),
+	});
+	lose = () => both.hangar.lose();
+	const { call } = both.hangar.client;
+	both.hangar.client.call = async (method, payload, schema) => {
+		if (when === "window" && method === "session.new_window") lose();
+		return call(method, payload, schema);
+	};
+	await both.ran();
+	return { both, marks };
+}
+
+test.each(["cut", "window"] as const)(
+	"a hangar lost at the %s of a handover opens no window outside the hangar its mark names, and the job stays on ACP",
+	async (when) => {
+		const { both, marks } = await lostMidHandover(when);
+
+		const outcome = await both.agents.handOver("card-a");
+
+		expect(outcome).toMatchObject({ handedOver: false, refusal: "cannot_resume" });
+		expect(marks).toEqual([HANGAR]);
+		const opened = both.windowsOpened().map((call) => call.payload.session_id);
+		expect(opened.filter((session) => session !== HANGAR)).toEqual([]);
+		expect((await both.entry()).handingOver).toBeUndefined();
+		expect((await both.agents.list()).map(({ name }) => name)).toEqual(["card-a"]);
+
+		// Asked again, the mark names the hangar made in place of the lost one, where the window opens.
+		await both.agents.handOver("card-a");
+		expect(marks).toEqual([HANGAR, "session:made-1"]);
+		expect(
+			both
+				.windowsOpened()
+				.map((call) => call.payload.session_id)
+				.slice(opened.length),
+		).toEqual(["session:made-1"]);
+	},
+);
+
 test("a working job has its turn cancelled, and it has stopped before the mark goes on, the session closes and a window opens", async () => {
 	const seen: { idle: boolean; cancelled: string; closed: string; mark?: true }[] = [];
 	const release = (port: AcpAgentPort): AcpAgentPort => ({

@@ -7,6 +7,8 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import type { Conversation, Harness, SubmissionDraft, SubmissionId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
+import { createRexAgentPort } from "../src/adapters/rex/agent-port.ts";
+import { RexRpcError } from "../src/adapters/rex/client.ts";
 import { HUMAN_CHOSEN, type Job } from "../src/core/domain/dispatch.ts";
 import {
 	AGENT_BLOCKED,
@@ -19,6 +21,7 @@ import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/i
 import { openHarness } from "../src/core/harness.ts";
 import { NOTICE } from "../src/core/notice.ts";
 import type { AgentState, StartRequest } from "../src/ports/agent.ts";
+import { HANGAR, rex } from "./adapters/rex/fake.ts";
 
 const context = BACKGROUND_CONTEXT;
 const open: Harness[] = [];
@@ -274,6 +277,32 @@ test("an agent gone at a restart is told to the human once, however often soma r
 		expect(soma.calls()).toBe(0);
 		await stop(soma);
 	}
+});
+
+test("a rex hangar gone at a restart, and none made in its place, reconciles its jobs as gone and fails nothing", async () => {
+	const db = await database();
+	await stop(await dispatched(db, new FakeAgentPort(), "card-a"));
+	const fake = rex([]);
+	fake.lose();
+	fake.replace("session.create", () => {
+		throw new RexRpcError("session.create", "conflict", "the server has as many sessions as it allows", 409);
+	});
+	const errors: string[] = [];
+	const onRex = createRexAgentPort({
+		client: fake.client,
+		sessionId: HANGAR,
+		cap: 4,
+		processStart: async () => undefined,
+		onError: (error) => errors.push(error.message),
+	});
+	const soma = await core(db, new FakeAgentPort());
+
+	await reconcileDispatches(soma.root, onRex, context);
+	await soma.settle();
+
+	expect(await soma.job("card-a")).toMatchObject({ status: { state: "error", msg: "agent is gone" } });
+	expect(errors).toEqual([expect.stringContaining(`rex hangar ${HANGAR} does not exist, and no hangar was made`)]);
+	await stop(soma);
 });
 
 test("a job dispatched while the reconcile lists the agents is not taken for gone", async () => {

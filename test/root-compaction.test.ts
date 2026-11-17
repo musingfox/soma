@@ -27,13 +27,13 @@ describe("the compaction soma sets from compactAt and the root model's window", 
 
 		expect(settings).toEqual({
 			modelOverrides: {
-				"anthropic/claude-haiku-5-5": { reserveTokens: 867_232, backgroundTokens: 32_768, keepRecentTokens: 20_000 },
+				"anthropic/claude-haiku-5-5": { reserveTokens: 867_232, backgroundTokens: 32_768, keepRecentTokens: 7_000 },
 			},
 		});
 		expect(thresholds(settings, { provider: "anthropic", id: "claude-haiku-5-5", contextWindow: 1_000_000 })).toEqual({
 			background: 100_000,
 			blocking: 132_768,
-			keep: 20_000,
+			keep: 7_000,
 		});
 	});
 
@@ -56,7 +56,7 @@ describe("the compaction soma sets from compactAt and the root model's window", 
 		// At the edge: a blocking threshold equal to the window less 16384 is not below it.
 		expect(rootCompaction(100_000, { provider: "faux", id: "faux-1", contextWindow: 149_152 })).toBeUndefined();
 		expect(rootCompaction(100_000, { provider: "faux", id: "faux-1", contextWindow: 149_153 })).toEqual({
-			modelOverrides: { "faux/faux-1": { reserveTokens: 16_385, backgroundTokens: 32_768, keepRecentTokens: 20_000 } },
+			modelOverrides: { "faux/faux-1": { reserveTokens: 16_385, backgroundTokens: 32_768, keepRecentTokens: 7_000 } },
 		});
 	});
 

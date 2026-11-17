@@ -41,8 +41,12 @@ export const openStorage = (path: string): Promise<Storage> => openNodeSqliteSto
 export const COMPACT_BACKGROUND_TOKENS = 32_768;
 /** pi-durable's own room for the answer, below which soma does not move the blocking threshold. */
 export const COMPACT_RESERVE_TOKENS = 16_384;
-/** Roughly how much recent context a compaction keeps verbatim (decided on 2026-11-18). */
-export const COMPACT_KEEP_RECENT_TOKENS = 20_000;
+/**
+ * What a compaction keeps verbatim, in pi-durable's estimate of 3.5 characters a token. The human decided on about
+ * 20000 real tokens (2026-11-18); measured on prod's root, which is mostly Chinese, an estimate of 20000 held 54000 to
+ * 67000 real ones, and with the summary and the restated tools that put the context back at `compactAt` at once.
+ */
+export const COMPACT_KEEP_RECENT_TOKENS = 7_000;
 
 /**
  * pi-durable's compaction for the root model: a compaction starts in the background once the context passes

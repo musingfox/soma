@@ -1,5 +1,13 @@
 import type { Context } from "@earendil-works/chord/context";
-import { defineExtension, LiveDoc, type Storage, type SubmissionId, section } from "@earendil-works/pi-durable";
+import {
+	type ConversationId,
+	type DocumentReader,
+	defineExtension,
+	LiveDoc,
+	type Storage,
+	type SubmissionId,
+	section,
+} from "@earendil-works/pi-durable";
 
 export interface InterfaceOptions {
 	/** What each interface can show and cannot, in its adapter's own words, by the entry kind of its inputs. */
@@ -13,20 +21,33 @@ const FROM_NONE = "這一輪不是人從介面發起的；要給人看的內容�
 const NONE_ON = "這一輪不是人從介面發起的，現在也沒有開著的介面。";
 
 /**
- * Shows the model what the interface a round's input came from can show; for a round no interface started, what each
- * interface on can. `storage` is the Harness's own: a section reads documents only, so the entry kinds of the run's
- * inputs are looked up from their submissions there. A run's inputs are placed, so their records and entries are stored.
- * The section is never omitted: one that comes back after it was gone is out of order, and the prompt planner then
- * removes and re-adds every section, where a changed text costs one small patch.
+ * The entry kinds of the inputs of the round running in `conversationId`, none when no round runs; one whose record or
+ * entry is not found is `undefined`. `storage` is the Harness's own: a section reads documents only, so the kinds are
+ * looked up from the inputs' submissions there. A run's inputs are placed, so their records and entries are stored.
  */
-export function interfaces(storage: Pick<Storage, "submission" | "entry">, { texts, on }: InterfaceOptions) {
-	const textOf = (kind: string | undefined) =>
-		kind !== undefined && Object.hasOwn(texts, kind) ? texts[kind] : undefined;
-	const kindOf = async (id: SubmissionId, context: Context) => {
+export async function inputKinds(
+	storage: Pick<Storage, "submission" | "entry">,
+	read: Pick<DocumentReader, "snapshot">,
+	conversationId: ConversationId,
+	context: Context,
+): Promise<(string | undefined)[]> {
+	const kindOf = async (id: SubmissionId) => {
 		const record = await storage.submission(id, context);
 		if (record?.type !== "input" || record.entry === undefined) return undefined;
 		return (await storage.entry(record.entry, context))?.entry.kind;
 	};
+	const run = (await read.snapshot(LiveDoc, conversationId, context))?.run;
+	return Promise.all((run?.inputs ?? []).map(kindOf));
+}
+
+/**
+ * Shows the model what the interface a round's input came from can show; for a round no interface started, what each
+ * interface on can (`inputKinds`). The section is never omitted: one that comes back after it was gone is out of order,
+ * and the prompt planner then removes and re-adds every section, where a changed text costs one small patch.
+ */
+export function interfaces(storage: Pick<Storage, "submission" | "entry">, { texts, on }: InterfaceOptions) {
+	const textOf = (kind: string | undefined) =>
+		kind !== undefined && Object.hasOwn(texts, kind) ? texts[kind] : undefined;
 	const render = (head: string, shown: Iterable<string | undefined>) => {
 		const lines = [...new Set(shown)].filter((text) => text !== undefined);
 		return lines.length === 0 ? undefined : [head, ...lines].join("\n\n");
@@ -36,8 +57,7 @@ export function interfaces(storage: Pick<Storage, "submission" | "entry">, { tex
 		name: "soma.interfaces",
 		sections: [
 			section("interface", async (input, context) => {
-				const run = (await input.read.snapshot(LiveDoc, input.conversationId, context))?.run;
-				const kinds = await Promise.all((run?.inputs ?? []).map((id) => kindOf(id, context)));
+				const kinds = await inputKinds(storage, input.read, input.conversationId, context);
 				return render(FROM_ONE, kinds.map(textOf)) ?? render(FROM_NONE, [...on()].map(textOf)) ?? NONE_ON;
 			}),
 		],

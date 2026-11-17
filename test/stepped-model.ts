@@ -2,8 +2,10 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	createAssistantMessageEventStream,
+	type Message,
 	type Model,
 	type ToolCall,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { createModels, createProvider } from "@earendil-works/pi-ai/models";
 
@@ -27,9 +29,18 @@ export class SteppedReply {
 		this.#attach = resolve;
 	});
 
-	attach(stream: AssistantMessageEventStream, model: Model<string>): void {
+	/** The messages of the request this response answers, once it came. */
+	messages: readonly Message[] | undefined;
+
+	attach(
+		stream: AssistantMessageEventStream,
+		model: Model<string>,
+		request: TranscriptContext,
+		signal?: AbortSignal,
+	): void {
 		this.#stream = stream;
-		this.#message = {
+		this.messages = request.messages;
+		const message: AssistantMessage = {
 			role: "assistant",
 			content: [],
 			api: model.api,
@@ -39,9 +50,26 @@ export class SteppedReply {
 			stopReason: "stop",
 			timestamp: Date.now(),
 		};
-		stream.push({ type: "start", partial: this.#message });
+		this.#message = message;
+		stream.push({ type: "start", partial: message });
+		// As a pi-ai provider ends a request its signal aborted: with the text so far and `stopReason: "aborted"`.
+		const abort = () => {
+			if (this.#stream === undefined) return;
+			this.#stream = undefined;
+			const error = { ...message, stopReason: "aborted" as const, errorMessage: "Request was aborted" };
+			stream.push({ type: "error", reason: "aborted", error });
+			stream.end(error);
+		};
+		if (signal?.aborted) abort();
+		else signal?.addEventListener("abort", abort, { once: true });
 		this.#attach();
 	}
+
+	/** Whether the request's signal ended the response before the test did. */
+	get aborted(): boolean {
+		return this.messages !== undefined && this.#stream === undefined && !this.#ended;
+	}
+	#ended = false;
 
 	/** Append `text` to the response's text, once its request came. */
 	async write(text: string): Promise<void> {
@@ -71,6 +99,18 @@ export class SteppedReply {
 		stream.push({ type: "thinking_delta", contentIndex: this.#thinking, delta: thinking, partial: message });
 	}
 
+	/** End the response with a provider error, as a request that failed. */
+	async fail(errorMessage: string): Promise<void> {
+		await this.#attached;
+		const [stream, message] = [this.#stream, this.#message];
+		if (stream === undefined || message === undefined) return;
+		this.#ended = true;
+		this.#stream = undefined;
+		const error = { ...message, stopReason: "error" as const, errorMessage };
+		stream.push({ type: "error", reason: "error", error });
+		stream.end(error);
+	}
+
 	/** End the response: an answer, or with `calls` a tool round. */
 	async end(...calls: ToolCall[]): Promise<void> {
 		await this.#attached;
@@ -92,6 +132,8 @@ export class SteppedReply {
 			stream.push({ type: "toolcall_end", contentIndex, toolCall: call, partial: message });
 		}
 		const done = { ...message, stopReason: calls.length > 0 ? ("toolUse" as const) : ("stop" as const) };
+		this.#ended = true;
+		this.#stream = undefined;
 		stream.push({ type: "done", reason: done.stopReason, message: done });
 		stream.end(done);
 	}
@@ -103,7 +145,7 @@ export class SteppedReply {
  */
 export function steppedModel() {
 	const queued: SteppedReply[] = [];
-	const stream = (model: Model<string>) => {
+	const stream = (model: Model<string>, request: TranscriptContext, options?: { signal?: AbortSignal }) => {
 		const events = createAssistantMessageEventStream();
 		const reply = queued.shift();
 		if (reply === undefined) {
@@ -122,7 +164,7 @@ export function steppedModel() {
 				events.push({ type: "error", reason: "error", error });
 				events.end(error);
 			});
-		} else queueMicrotask(() => reply.attach(events, model));
+		} else queueMicrotask(() => reply.attach(events, model, request, options?.signal));
 		return events;
 	};
 	const provider = createProvider({

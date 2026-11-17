@@ -23,7 +23,16 @@ export interface CallbackUpdate {
 	};
 }
 
-export type FakeUpdate = MessageUpdate | CallbackUpdate;
+/** A press on a draft's stop button: https://core.telegram.org/bots/api#messagegenerationstopped */
+export interface StopUpdate {
+	readonly update_id: number;
+	readonly stopped_message_generation: {
+		readonly chat: { readonly id: number; readonly type: string };
+		readonly draft_id: number;
+	};
+}
+
+export type FakeUpdate = MessageUpdate | CallbackUpdate | StopUpdate;
 
 export interface SentMessage {
 	readonly chat_id: number;
@@ -93,6 +102,12 @@ function htmlToText(html: string): string {
 		.replace(/&amp;/g, "&");
 }
 
+// A draft's stop button and whether a press keeps the draft: https://core.telegram.org/bots/api#sendmessagedraft
+const stopping = (params: Record<string, unknown>) => ({
+	...(params.can_stop === true && { can_stop: true as const }),
+	...(params.keep_on_stop === true && { keep_on_stop: true as const }),
+});
+
 const badButtonData = (markup: InlineKeyboard | undefined) =>
 	markup?.inline_keyboard.flat().some((button) => {
 		const bytes = Buffer.byteLength(button.callback_data ?? "");
@@ -102,7 +117,8 @@ const badButtonData = (markup: InlineKeyboard | undefined) =>
 /**
  * A local stand-in for the Telegram Bot API (getUpdates long polling, sendMessage and sendRichMessage with inline buttons, and the
  * answerCallbackQuery and editMessageReplyMarkup calls a button press leads to, setMessageReaction, sendMessageDraft and sendRichMessageDraft) for one bot token, so the
- * client runs over real HTTP without a bot. An update stays queued until a getUpdates offset above its id
+ * client runs over real HTTP without a bot. A draft's stop button is pressed with `stopGeneration`; getUpdates delivers
+ * only the update types its `allowed_updates` names. An update stays queued until a getUpdates offset above its id
  * confirms it, as Telegram does; `redeliver` puts one back, as Telegram does when a confirmation was lost.
  */
 export class FakeBotApi {
@@ -115,13 +131,16 @@ export class FakeBotApi {
 	readonly reactions: { readonly message_id: number; readonly emoji: string }[] = [];
 	/**
 	 * Each sendMessageDraft and sendRichMessageDraft it accepted, in the order they came; `text` as sent, absent when it
-	 * was left out, and for a rich draft its `rich_message.markdown`, marked `rich`.
+	 * was left out, and for a rich draft its `rich_message.markdown`, marked `rich`. `can_stop` and `keep_on_stop` are
+	 * present only when sent as true.
 	 */
 	readonly drafts: {
 		readonly chat_id: number;
 		readonly draft_id: number;
 		readonly text?: string;
 		readonly rich?: true;
+		readonly can_stop?: true;
+		readonly keep_on_stop?: true;
 	}[] = [];
 	/** Refuse every message that asks for a parse mode, as Telegram does for entities it cannot place. */
 	refuseEntities = false;
@@ -144,6 +163,8 @@ export class FakeBotApi {
 	readonly #markups = new Map<number, InlineKeyboard>();
 	readonly #token: string;
 	#queue: FakeUpdate[] = [];
+	/** The update types the last getUpdates that named them asked for; none named means every type. */
+	#allowed: readonly string[] = [];
 	#nextUpdate = 1;
 	#nextMessage = 1;
 	#wake = new Set<() => void>();
@@ -266,6 +287,7 @@ export class FakeBotApi {
 					chat_id: chat_id as number,
 					draft_id: draft_id as number,
 					text: text as string | undefined,
+					...stopping(params),
 				});
 				return reply(200, { ok: true, result: true });
 			}
@@ -282,7 +304,13 @@ export class FakeBotApi {
 				const markdown = rich.markdown;
 				if (forms.length !== 1 || typeof markdown !== "string" || markdown === "" || [...markdown].length > RICH_LIMIT)
 					return reply(400, { ok: false, error_code: 400, description: "Bad Request: rich message is invalid" });
-				this.drafts.push({ chat_id: chat_id as number, draft_id: draft_id as number, text: markdown, rich: true });
+				this.drafts.push({
+					chat_id: chat_id as number,
+					draft_id: draft_id as number,
+					text: markdown,
+					rich: true,
+					...stopping(params),
+				});
 				return reply(200, { ok: true, result: true });
 			}
 			reply(404, { ok: false, error_code: 404, description: "Not Found" });
@@ -325,6 +353,16 @@ export class FakeBotApi {
 		return update;
 	}
 
+	/** Queue a press on the stop button of draft `draftId`, as seen from `chatId`. */
+	stopGeneration(draftId: number, chatId: number): StopUpdate {
+		const update = {
+			update_id: this.#nextUpdate++,
+			stopped_message_generation: { chat: { id: chatId, type: "private" }, draft_id: draftId },
+		};
+		this.redeliver(update);
+		return update;
+	}
+
 	redeliver(update: FakeUpdate): void {
 		this.#queue.push(update);
 		for (const wake of this.#wake) wake();
@@ -345,6 +383,13 @@ export class FakeBotApi {
 	async #updates(params: Record<string, unknown>): Promise<FakeUpdate[]> {
 		const offset = typeof params.offset === "number" ? params.offset : undefined;
 		if (offset !== undefined) this.#queue = this.#queue.filter((update) => update.update_id >= offset);
+		// An empty list asks for every type, and none given keeps the last setting: https://core.telegram.org/bots/api#getupdates.
+		// An update of a type not asked for is dropped, never delivered.
+		if (Array.isArray(params.allowed_updates)) this.#allowed = params.allowed_updates as string[];
+		const allowed = this.#allowed;
+		const wanted = (update: FakeUpdate) =>
+			allowed.length === 0 || Object.keys(update).some((type) => type !== "update_id" && allowed.includes(type));
+		this.#queue = this.#queue.filter(wanted);
 		if (this.#queue.length === 0 && typeof params.timeout === "number" && params.timeout > 0) {
 			await new Promise<void>((resolve) => {
 				const wake = () => {
@@ -356,6 +401,7 @@ export class FakeBotApi {
 				this.#wake.add(wake);
 			});
 		}
+		this.#queue = this.#queue.filter(wanted);
 		return [...this.#queue];
 	}
 }

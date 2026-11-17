@@ -1,7 +1,8 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
+import { createRegistry, defineExtension, defineTool, Harness, MemoryStorage } from "@earendil-works/pi-durable";
+import { obj } from "@earendil-works/pi-schema";
 import { afterEach, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../../../src/adapters/fake-agent/index.ts";
 import { FakeHumanPort } from "../../../src/adapters/fake-human/index.ts";
@@ -1699,7 +1700,9 @@ test("a message from the chat gets a Thinking draft under its id once the core h
 	expect(api.drafts).toEqual([]);
 
 	admit();
-	await vi.waitFor(() => expect(api.drafts).toEqual([{ chat_id: CHAT, draft_id: message.message_id, text: "" }]));
+	await vi.waitFor(() =>
+		expect(api.drafts).toEqual([{ chat_id: CHAT, draft_id: message.message_id, text: "", can_stop: true }]),
+	);
 });
 
 test("an open round's draft is sent again until its answer or its failure, and then no more", async () => {
@@ -1821,13 +1824,9 @@ function manualClock() {
 }
 
 /** A core whose model writes its answers when the test says; every event the HumanPort emits is kept in `seen`. */
-async function streamingCore() {
+async function streamingCore(registry = createRegistry()) {
 	const stepped = steppedModel();
-	const harness = await Harness.open(
-		new MemoryStorage(),
-		{ models: stepped.models, registry: createRegistry() },
-		context,
-	);
+	const harness = await Harness.open(new MemoryStorage(), { models: stepped.models, registry }, context);
 	cleanup.push(() => harness.close(context));
 	const root = await harness.root(context, { agent: { model: stepped.model } });
 	harness.resume();
@@ -1876,8 +1875,8 @@ test("a round from the chat shows its growing answer as its draft, at most once 
 
 	const { message } = api.deliver("寫長一點", CHAT);
 	const id = message.message_id;
-	const placeholder = { chat_id: CHAT, draft_id: id, text: "" };
-	const draft = (text: string) => ({ chat_id: CHAT, draft_id: id, text, rich: true });
+	const placeholder = { chat_id: CHAT, draft_id: id, text: "", can_stop: true };
+	const draft = (text: string) => ({ chat_id: CHAT, draft_id: id, text, rich: true, can_stop: true });
 	await vi.waitFor(() => expect(api.drafts).toEqual([placeholder]));
 
 	// Within the second since the placeholder, each text waits, and only the newest goes once the second has passed.
@@ -1993,7 +1992,9 @@ test("a text longer than a draft takes is not sent, and the draft keeps the last
 	await reply.write("短");
 	await partialOf(seen, id, "短");
 	clock.advance(1_000);
-	await vi.waitFor(() => expect(api.drafts.at(-1)).toEqual({ chat_id: CHAT, draft_id: id, text: "短", rich: true }));
+	await vi.waitFor(() =>
+		expect(api.drafts.at(-1)).toEqual({ chat_id: CHAT, draft_id: id, text: "短", rich: true, can_stop: true }),
+	);
 
 	// 11,000 characters of three bytes each: past 32768 bytes, the most one rich message takes.
 	const long = `短${"字".repeat(11_000)}`;
@@ -2002,7 +2003,9 @@ test("a text longer than a draft takes is not sent, and the draft keeps the last
 	// The refresh sends the draft again, with the text that fit.
 	clock.advance(1_000);
 	await vi.waitFor(() => expect(api.drafts).toHaveLength(3));
-	expect(api.drafts.slice(1)).toEqual([1, 2].map(() => ({ chat_id: CHAT, draft_id: id, text: "短", rich: true })));
+	expect(api.drafts.slice(1)).toEqual(
+		[1, 2].map(() => ({ chat_id: CHAT, draft_id: id, text: "短", rich: true, can_stop: true })),
+	);
 	expect(onError).not.toHaveBeenCalled();
 
 	// The answer goes as today: too long for one rich message, in parts.
@@ -2038,7 +2041,9 @@ test("a draft flood control refuses waits its retry_after, then shows the newest
 	await settle();
 	expect(api.methods.filter((method) => method === "sendRichMessageDraft")).toHaveLength(1);
 	clock.advance(1);
-	await vi.waitFor(() => expect(api.drafts.at(-1)).toEqual({ chat_id: CHAT, draft_id: id, text: "一二", rich: true }));
+	await vi.waitFor(() =>
+		expect(api.drafts.at(-1)).toEqual({ chat_id: CHAT, draft_id: id, text: "一二", rich: true, can_stop: true }),
+	);
 
 	await reply.end();
 	await root.waitForIdle(context);
@@ -2067,10 +2072,10 @@ async function fakeStreaming(clock = manualClock(), draftRefreshMs?: number) {
 	const { onError } = streaming(human, apiBase, clock, draftRefreshMs);
 	const { message } = api.deliver("一", CHAT);
 	const id = message.message_id;
-	await vi.waitFor(() => expect(api.drafts).toEqual([{ chat_id: CHAT, draft_id: id, text: "" }]));
+	await vi.waitFor(() => expect(api.drafts).toEqual([{ chat_id: CHAT, draft_id: id, text: "", can_stop: true }]));
 	const partial = (content: string) => human.emit({ type: "partial", requestIds: [`telegram:${id}`], content });
 	const answer = (content: string) => human.emit({ type: "answer", requestId: `telegram:${id}`, content });
-	const draft = (text: string) => ({ chat_id: CHAT, draft_id: id, text, rich: true });
+	const draft = (text: string) => ({ chat_id: CHAT, draft_id: id, text, rich: true, can_stop: true });
 	const calls = (method: string) => api.methods.filter((each) => each === method).length;
 	return { human, api, clock, onError, id, partial, answer, draft, calls };
 }
@@ -2091,7 +2096,11 @@ test("a round's draft call waits for the one in flight, and the newest text goes
 	api.stalling.delete("sendRichMessageDraft");
 	api.release();
 	await vi.waitFor(() =>
-		expect(api.drafts).toEqual([{ chat_id: CHAT, draft_id: id, text: "" }, draft("一"), draft("一二三")]),
+		expect(api.drafts).toEqual([
+			{ chat_id: CHAT, draft_id: id, text: "", can_stop: true },
+			draft("一"),
+			draft("一二三"),
+		]),
 	);
 	expect(calls("sendRichMessageDraft")).toBe(2);
 	expect(onError).not.toHaveBeenCalled();
@@ -2118,7 +2127,7 @@ test("a draft call in flight when the answer comes is aborted and ignored, and t
 
 test("a text that is only whitespace shows the placeholder, as empty text does", async () => {
 	const { api, clock, onError, id, partial, draft } = await fakeStreaming();
-	const placeholder = { chat_id: CHAT, draft_id: id, text: "" };
+	const placeholder = { chat_id: CHAT, draft_id: id, text: "", can_stop: true };
 
 	partial("一");
 	clock.advance(1_000);
@@ -2132,7 +2141,7 @@ test("a text that is only whitespace shows the placeholder, as empty text does",
 
 test("a refused text draft is reported once a round and skipped, and a draft taken starts the count of refusals over", async () => {
 	const { api, clock, onError, id, partial, draft, calls } = await fakeStreaming(manualClock(), 20);
-	const placeholder = { chat_id: CHAT, draft_id: id, text: "" };
+	const placeholder = { chat_id: CHAT, draft_id: id, text: "", can_stop: true };
 	// Each text goes a second after the one before, once the refresh has asked for it too.
 	const next = async (text: string) => {
 		const before = calls("sendRichMessageDraft");
@@ -2235,7 +2244,7 @@ test("an answer whose waits for flood control would pass a minute in all goes by
 
 test("a draft flood control asks to wait past a minute waits a minute, and the round's text drafts stop", async () => {
 	const { api, clock, onError, id, partial, calls } = await fakeStreaming();
-	const placeholder = { chat_id: CHAT, draft_id: id, text: "" };
+	const placeholder = { chat_id: CHAT, draft_id: id, text: "", can_stop: true };
 	api.flooding.set("sendRichMessageDraft", [100_000]);
 
 	partial("一");
@@ -2275,4 +2284,167 @@ test("the fake Bot API refuses a rich draft with empty markdown, as it refuses s
 		result: true,
 	});
 	expect(api.drafts).toEqual([{ chat_id: CHAT, draft_id: 1, text: "一", rich: true }]);
+});
+
+test("a stop pressed on the draft while soma writes ends the round: the reaction becomes 🫡, and no message and no draft follow", async () => {
+	const { stepped, root, human, seen } = await streamingCore();
+	const reply = stepped.reply();
+	const { api, apiBase } = await bot();
+	const clock = manualClock();
+	const { onError } = streaming(human, apiBase, clock);
+
+	const { message } = api.deliver("寫長一點", CHAT);
+	const id = message.message_id;
+	await vi.waitFor(() => expect(api.drafts).toEqual([{ chat_id: CHAT, draft_id: id, text: "", can_stop: true }]));
+	await reply.write("寫到一半");
+	await partialOf(seen, id, "寫到一半");
+	clock.advance(1_000);
+	await vi.waitFor(() =>
+		expect(api.drafts.at(-1)).toEqual({ chat_id: CHAT, draft_id: id, text: "寫到一半", rich: true, can_stop: true }),
+	);
+
+	api.stopGeneration(id, CHAT);
+	await vi.waitFor(() => expect(seen).toContainEqual({ type: "stopped", requestId: `telegram:${id}` }));
+	await root.waitForIdle(context);
+	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "🫡"]));
+	// Past the refresh: the round's draft is over, and nothing was sent in its place.
+	clock.advance(30_000);
+	await settle();
+	expect(draftCalls(api)).toEqual(["sendMessageDraft", "sendRichMessageDraft"]);
+	expect(api.sent).toEqual([]);
+	expect(onError).not.toHaveBeenCalled();
+});
+
+test("a stop from another chat, or pressed after the answer, does nothing", async () => {
+	const { stepped, root, human, seen } = await streamingCore();
+	// The second round's reply is never written: it runs until the test ends.
+	const [reply] = [stepped.reply(), stepped.reply()];
+	const { api, apiBase } = await bot();
+	const clock = manualClock();
+	const { onError } = streaming(human, apiBase, clock);
+
+	const { message } = api.deliver("一", CHAT);
+	const id = message.message_id;
+	await vi.waitFor(() => expect(api.drafts).toHaveLength(1));
+	await reply.write("一的");
+	await partialOf(seen, id, "一的");
+	api.stopGeneration(id, 7);
+	await vi.waitFor(() => expect(api.methods.length).toBeGreaterThan(0));
+	await settle();
+	expect(seen.some((event) => event.type === "stopped")).toBe(false);
+	// The round goes on, its draft with it.
+	clock.advance(1_000);
+	await vi.waitFor(() => expect(api.drafts.at(-1)).toMatchObject({ text: "一的", can_stop: true }));
+
+	await reply.end();
+	await root.waitForIdle(context);
+	await vi.waitFor(() => expect(api.sent.map(({ text }) => text)).toEqual(["一的"]));
+	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍"]));
+	const calls = api.methods.length;
+	api.stopGeneration(id, CHAT);
+	// The next message is taken, so the press before it was too.
+	api.deliver("二", CHAT);
+	await vi.waitFor(() => expect(api.reactions).toHaveLength(3));
+	await settle();
+	expect(seen.some((event) => event.type === "stopped")).toBe(false);
+	expect(api.methods.slice(calls).sort()).toEqual(["sendMessageDraft", "setMessageReaction"]);
+	expect(api.sent.map(({ text }) => text)).toEqual(["一的"]);
+	expect(onError).not.toHaveBeenCalled();
+});
+
+test("a stop pressed while a tool runs shows no draft again while the tool finishes, then the round ends as stopped", async () => {
+	let started = () => {};
+	const running = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	let release = () => {};
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const registry = createRegistry();
+	const slow = defineTool({
+		name: "slow",
+		description: "Takes as long as the test says.",
+		parameters: obj({}),
+		replay: "safe",
+		execute: async () => {
+			started();
+			await gate;
+			return { output: [{ type: "text" as const, text: "查好了" }], isError: false };
+		},
+	});
+	registry.install(defineExtension({ name: "test.slow", tools: [slow] }));
+	const { stepped, root, human, seen } = await streamingCore(registry);
+	const [first, second] = [stepped.reply(), stepped.reply()];
+	const { api, apiBase } = await bot();
+	const clock = manualClock();
+	// Refreshed every 20 ms, so a draft still open would go as soon as the clock passes its second.
+	streaming(human, apiBase, clock, 20);
+
+	const { message } = api.deliver("查一下", CHAT);
+	const id = message.message_id;
+	await vi.waitFor(() => expect(api.drafts).toHaveLength(1));
+	await first.end(fauxToolCall("slow", {}));
+	await running;
+	api.stopGeneration(id, CHAT);
+	await vi.waitFor(() => expect(api.reactions).toHaveLength(1));
+	await settle();
+	// The refresh would show the placeholder again while the tool runs.
+	clock.advance(1_000);
+	await settle();
+	expect(draftCalls(api)).toEqual(["sendMessageDraft"]);
+	expect(seen.some((event) => event.type === "stopped")).toBe(false);
+
+	release();
+	await root.waitForIdle(context);
+	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "🫡"]));
+	expect(second.messages).toBeUndefined();
+	clock.advance(30_000);
+	await settle();
+	expect(draftCalls(api)).toEqual(["sendMessageDraft"]);
+	expect(api.sent).toEqual([]);
+});
+
+test("a stop names the round of the draft pressed, a pressed option's too; one that stops nothing leaves the draft, and a stopped event ends it", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const { onError } = drafting(human, apiBase);
+	const draftsOf = (id: number) => api.drafts.filter(({ draft_id }) => draft_id === id).length;
+
+	// Telegram's press on a draft its round no longer shows, or a round this chat never had: the core says no.
+	human.stopOutcome = false;
+	const { message } = api.deliver("一", CHAT);
+	const id = message.message_id;
+	await vi.waitFor(() => expect(draftsOf(id)).toBeGreaterThanOrEqual(2));
+	api.stopGeneration(id, CHAT);
+	await vi.waitFor(() => expect(human.stops).toEqual([`telegram:${id}`]));
+	const before = draftsOf(id);
+	await vi.waitFor(() => expect(draftsOf(id)).toBeGreaterThan(before));
+
+	// A round from a pressed option shows its draft under the message pressed, and a stop there names that round.
+	human.stopOutcome = true;
+	const press = api.press("ask/q1/o1", CHAT, 99);
+	await vi.waitFor(() => expect(draftsOf(99)).toBeGreaterThanOrEqual(1));
+	api.stopGeneration(press.callback_query.message.message_id, CHAT);
+	await vi.waitFor(() => expect(human.stops).toEqual([`telegram:${id}`, "telegram:ask/q1"]));
+	await settle();
+	const pressed = draftsOf(99);
+	await settle();
+	expect(draftsOf(99)).toBe(pressed);
+
+	// The stopped event alone ends the draft too, reacts and sends nothing.
+	human.emit({ type: "stopped", requestId: `telegram:${id}` });
+	await vi.waitFor(() => expect(api.reactions.at(-1)).toEqual({ message_id: id, emoji: "🫡" }));
+	await settle();
+	const stopped = draftsOf(id);
+	await settle();
+	expect(draftsOf(id)).toBe(stopped);
+	expect(api.sent).toEqual([]);
+
+	// A stop that throws is reported, and the updates after it are still taken.
+	vi.spyOn(human, "stop").mockRejectedValueOnce(new Error("boom"));
+	api.stopGeneration(id, CHAT);
+	api.deliver("二", CHAT);
+	await vi.waitFor(() => expect(human.inputs).toHaveLength(2));
+	expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "boom" }));
 });

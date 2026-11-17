@@ -223,6 +223,9 @@ export async function startWeb(options: WebOptions): Promise<WebServer> {
 			const delivery = deliveryTo(event, ENTRY_KIND);
 			if (event.class !== undefined && delivery !== "log")
 				return { type: "notice", kind: "report", text: event.content, loud: delivery === "ring" };
+		} else if (event.type === "stopped") {
+			// Stopped by the human: the page shows nothing, and `run` going idle ends the work it shows.
+			return undefined;
 		} else if (event.type === "failure") {
 			if (mine) return { type: "failure", id, text: readableFailure(event.reason), loud: true };
 			const delivery = deliveryTo(event, ENTRY_KIND);

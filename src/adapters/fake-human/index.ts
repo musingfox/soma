@@ -18,6 +18,9 @@ export class FakeHumanPort implements HumanPort {
 		[];
 	/** What the next `say` returns. */
 	saidOutcome: SaidOutcome = { said: true, label: "" };
+	readonly stops: string[] = [];
+	/** What the next `stop` returns. */
+	stopOutcome = true;
 	readonly #listeners = new Set<(event: SomaEvent) => void>();
 
 	async submit(input: HumanInput): Promise<void> {
@@ -42,6 +45,11 @@ export class FakeHumanPort implements HumanPort {
 	async say(question: string, option: string, input: Omit<HumanInput, "content">): Promise<SaidOutcome> {
 		this.said.push({ question, option, input });
 		return this.saidOutcome;
+	}
+
+	async stop(requestId: string): Promise<boolean> {
+		this.stops.push(requestId);
+		return this.stopOutcome;
 	}
 
 	emit(event: SomaEvent): void {

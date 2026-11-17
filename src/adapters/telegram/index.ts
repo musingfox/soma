@@ -57,7 +57,7 @@ const ENTITY_REFUSAL = /can't parse entities|can't find end tag|unsupported star
 
 // The one reaction a message from the human carries, replaced as the round moves on; a bot without premium gets one.
 // Each is in ReactionTypeEmoji's list: https://core.telegram.org/bots/api#reactiontypeemoji
-const REACTIONS = { received: "👀", forwarded: "👌", answered: "👍", failed: "👎" } as const;
+const REACTIONS = { received: "👀", forwarded: "👌", answered: "👍", failed: "👎", stopped: "🫡" } as const;
 // An empty draft shows "Thinking…" for 30 seconds, so it is sent again before it goes: https://core.telegram.org/bots/api#sendmessagedraft
 const DRAFT_REFRESH_MS = 20_000;
 // A round whose answer or failure never comes, such as a message delivered again after a restart, stops showing it.
@@ -88,6 +88,11 @@ const UpdateSchema = z
 		update_id: z.number(),
 		message: z
 			.object({ message_id: z.number(), chat: z.object({ id: z.number() }).passthrough(), text: z.string().optional() })
+			.passthrough()
+			.optional(),
+		// A press on a draft's stop button names only the chat and the draft: https://core.telegram.org/bots/api#messagegenerationstopped
+		stopped_message_generation: z
+			.object({ chat: z.object({ id: z.number() }).passthrough(), draft_id: z.number() })
 			.passthrough()
 			.optional(),
 		callback_query: z
@@ -233,7 +238,8 @@ const label = (kind: NoticeKind, content: string) => `[${kind === "question" ? "
  * The Telegram client: each text message from the configured chat is an input, and answers and failures of this
  * client's inputs, failures of rounds the core started, and notices go back to that chat. A question that offers
  * choices gets a button per option; a press from that chat goes to the agent as the human's own answer. A message Telegram delivers again keeps its requestId, so the core admits it
- * once; the update offset only lives in memory. Resolves when `signal` aborts.
+ * once; the update offset only lives in memory. A round's draft offers a stop button; a press from that chat asks the
+ * core to stop the round, which ends with only a 🫡 reaction. Resolves when `signal` aborts.
  */
 export async function runTelegram(options: TelegramOptions): Promise<void> {
 	const { human, chatId, signal } = options;
@@ -446,7 +452,8 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		round.last = now();
 		const { text } = round;
 		const rich = text.trim() !== "";
-		const body = { chat_id: chatId, draft_id: round.messageId };
+		// Every draft offers the stop button, and a press lets the draft go: no `keep_on_stop`.
+		const body = { chat_id: chatId, draft_id: round.messageId, can_stop: true };
 		const flight = new AbortController();
 		round.flight = flight;
 		const callSignal = AbortSignal.any([signal, flight.signal]);
@@ -585,8 +592,29 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 				send(`[失敗] ${event.reason}`);
 			} else if (event.class !== undefined)
 				push(`[失敗] ${event.requestId} 那一輪：${event.reason}`, deliveryTo(event, ENTRY_KIND));
+		} else if (event.type === "stopped") {
+			// The human pressed stop: the draft went with the press, and only the reaction says so.
+			if (mine) {
+				settle(event.requestId);
+				react(event.requestId, "stopped");
+			}
 		}
 	});
+	/**
+	 * A press on the stop button of draft `draftId`: the round whose open draft it is, else the message it names. One that
+	 * took ends the draft at once, so no refresh shows it again while a tool call the round waits on runs; one that
+	 * stopped nothing changes nothing.
+	 */
+	const stopPress = async (draftId: number) => {
+		const requestId =
+			[...drafts].find(([, round]) => round.messageId === draftId)?.[0] ?? `${REQUEST_PREFIX}${draftId}`;
+		try {
+			if (await human.stop(requestId)) settle(requestId);
+		} catch (error) {
+			// Thrown back to the poll loop, every update after it would wait.
+			if (!signal.aborted) onError(error);
+		}
+	};
 	type CallbackQuery = NonNullable<z.infer<typeof UpdateSchema>["callback_query"]>;
 	const settleOn = async (query: CallbackQuery, messageId: number, result: string) => {
 		await quietly("answerCallbackQuery", { callback_query_id: query.id, text: result });
@@ -658,10 +686,14 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	try {
 		while (!signal.aborted) {
 			try {
-				const updates = z
-					.array(UpdateSchema)
-					.parse(await call("getUpdates", { offset, timeout, allowed_updates: ["message", "callback_query"] }));
-				for (const { update_id, message, callback_query } of updates) {
+				const updates = z.array(UpdateSchema).parse(
+					await call("getUpdates", {
+						offset,
+						timeout,
+						allowed_updates: ["message", "callback_query", "stopped_message_generation"],
+					}),
+				);
+				for (const { update_id, message, callback_query, stopped_message_generation: stopped } of updates) {
 					if (message?.text !== undefined && message.chat.id === chatId) {
 						const requestId = `${REQUEST_PREFIX}${message.message_id}`;
 						open(requestId);
@@ -675,6 +707,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 					}
 					// A press delivered again after a restart is safe: once its answer went through, the fingerprint no longer matches.
 					if (callback_query?.message?.chat.id === chatId) await answerPress(callback_query, callback_query.message);
+					if (stopped?.chat.id === chatId) await stopPress(stopped.draft_id);
 					// Confirmed by the next getUpdates, so only once the core has admitted the input.
 					offset = update_id + 1;
 				}

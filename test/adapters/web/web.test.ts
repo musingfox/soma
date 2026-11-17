@@ -291,6 +291,20 @@ test("the answer of the page's own turn comes back over the socket, to every ope
 	expect(await page.next()).toEqual({ type: "failure", id: ID, text: "no model", loud: true });
 });
 
+test("a stopped turn of the page's own sends no failure: the page only sees the run go idle", async () => {
+	const { human, server } = await serve();
+	const page = await open(server.port);
+	human.emit({ type: "run", state: "working" });
+	human.emit({ type: "run", state: "idle" });
+	human.emit({ type: "stopped", requestId: `web:${ID}` });
+	human.emit({ type: "stopped", requestId: "telegram:7" });
+	human.emit({ type: "answer", requestId: `web:${ID2}`, content: "下一個" });
+	expect(await page.next()).toEqual({ type: "run", state: "working" });
+	expect(await page.next()).toEqual({ type: "run", state: "idle" });
+	expect(await page.next()).toEqual({ type: "answer", id: ID2, text: "下一個" });
+	expect(page.received).toHaveLength(3);
+});
+
 test("the answer of a page's turn that asked a question says so, with no text or with some", async () => {
 	const { human, server } = await serve();
 	const page = await open(server.port);

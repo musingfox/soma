@@ -8,12 +8,14 @@ import {
 	type EntryId,
 	type EntryRecord,
 	type Harness,
+	InboxDoc,
 	LiveDoc,
 	type LiveRun,
 	type LiveState,
 	type Storage,
 	type SubmissionId,
 	type SubmissionRecord,
+	type TaskId,
 } from "@earendil-works/pi-durable";
 import { type AgentPort, type AgentState, PromptRefused } from "../ports/agent.ts";
 import {
@@ -46,6 +48,7 @@ import { Questions, saidQuestions } from "./extensions/ask/index.ts";
 import { ForeignPrompts } from "./extensions/dispatch/foreign.ts";
 import { answerJob, Dispatches } from "./extensions/dispatch/index.ts";
 import { recordFact } from "./extensions/memory/index.ts";
+import { Stops, settleStops } from "./extensions/stop/index.ts";
 import { forgetHolding, Holds, holding, type Push, summaries, textOf } from "./hold.ts";
 import { isForwarded, NOTICE, noticeEntry } from "./notice.ts";
 
@@ -271,6 +274,61 @@ export async function openHumanPort(
 	// requestIds of inputs placed in the running round. A follow-up input, as every input here is, never joins a round
 	// already running: it is placed once that round answers, and starts the next.
 	const placed = new Map<SubmissionId, string>();
+	// The rounds the human stopped that have not ended, by first input, with their inputs: as the `Stops` document holds
+	// them, read at open and kept by this HumanPort. Their aborted inputs are told as `stopped`, and no partial of them is
+	// emitted.
+	const stopping = new Map<SubmissionId, readonly SubmissionId[]>();
+	// By stopped round, the task of its run this process last asked to abort, so a change of `pi.live` asks once.
+	const aborting = new Map<SubmissionId, TaskId>();
+	// The last entry of the newest stopped round (`Stops.after`): a round's entries start past it, since the continue after
+	// a stop starts its run at the stopped run's first entry.
+	let after: EntryId | undefined;
+	/**
+	 * Aborts the running round once a stop names it and none of its tool calls runs: at once while the model writes, and
+	 * at the hand-over to its next generation, before that one asks the model, while a tool call runs. Also at open,
+	 * for a stop a restart left pending.
+	 */
+	const enforce = (value: LiveState | undefined) => {
+		const run = value?.run;
+		const round = run?.inputs[0];
+		if (run === undefined || round === undefined || !stopping.has(round) || value?.tools !== undefined) return;
+		if (aborting.get(round) === run.taskId) return;
+		aborting.set(round, run.taskId);
+		harness.abortTask(run.taskId, context).catch((error: unknown) => console.error("[soma] stop:", error));
+	};
+	/** Marks the stops of `rounds` settled: their rounds ended, and were told. */
+	const settled = (rounds: ReadonlySet<SubmissionId>) => {
+		for (const round of rounds) {
+			stopping.delete(round);
+			aborting.delete(round);
+		}
+		return root
+			.commit((tx) => settleStops(tx, root.id, rounds), context)
+			.then((last) => {
+				after = last;
+			})
+			.catch((error: unknown) => console.error("[soma] settled stops:", error));
+	};
+	/**
+	 * A stopped round leaves the inputs queued behind it queued (pi-durable places them only at the next input, write or
+	 * continue), so a continue runs them now. Only when an input waits: a continue alone would answer the stopped input.
+	 */
+	const resumeQueued = () =>
+		root
+			.commit(async (tx) => {
+				if ((await tx.doc(LiveDoc, root.id)).run !== undefined) return;
+				const { items } = await tx.doc(InboxDoc, root.id);
+				if (items.some((item) => item.mode !== "write")) await root.submit(tx, { type: "continue" });
+			}, context)
+			.catch((error: unknown) => console.error("[soma] queued after a stop:", error));
+	/**
+	 * The end of stopped rounds, seen as their inputs settle or found at open: their stops are settled with their last
+	 * entry (`after`), and, when one of them ended aborted (`resume`), the inputs queued behind it run.
+	 */
+	const endStops = async (rounds: ReadonlySet<SubmissionId>, resume: boolean) => {
+		await settled(rounds);
+		if (resume) await resumeQueued();
+	};
 	/**
 	 * A round's entries from `first` to `last`, read from storage rather than kept, so a round a restart split is read
 	 * whole. A queued input gets its entry only once placed, so the range holds no other round's.
@@ -318,8 +376,10 @@ export async function openHumanPort(
 			if (entry.kind !== NOTICE) continue;
 			const { kind, content, choices, foreign, target, delivery, replyTo = [] } = entry.data as NoticeData;
 			const messageClass = classOf(entry.data as { class?: unknown });
-			// The interfaces an earlier notice of this round replied to; the round starts at its run's first entry.
-			const first = run?.first;
+			// The interfaces an earlier notice of this round replied to; the round starts at its run's first entry, and past a
+			// stopped round before it.
+			const first =
+				run?.first === undefined || after === undefined ? run?.first : (Math.max(run.first, after + 1) as EntryId);
 			const rang =
 				replyTo.length === 0 || first === undefined
 					? new Set<string>()
@@ -376,12 +436,24 @@ export async function openHumanPort(
 					console.error("[soma] round entries:", error);
 					return false;
 				});
+		let resume = false;
+		// The stopped rounds whose inputs settle in this commit, as a round's inputs all do.
+		const ended = new Set<SubmissionId>();
 		for (const record of submissions) {
 			if (record.type !== "input") continue;
 			const { requestId } = record;
 			if (record.status === "placed" && requestId !== undefined) placed.set(record.id, requestId);
 			else placed.delete(record.id);
-			if (record.status === "unanswered") {
+			const stop =
+				record.status === "done" || record.status === "unanswered"
+					? [...stopping].find(([, inputs]) => inputs.includes(record.id))?.[0]
+					: undefined;
+			if (stop !== undefined) ended.add(stop);
+			if (stop !== undefined && record.status === "unanswered" && record.reason === "aborted") {
+				// The human's stop: no failure, no push and no signal for reflection.
+				if (requestId !== undefined) emit({ type: "stopped", requestId });
+				resume = true;
+			} else if (record.status === "unanswered") {
 				const reason = failureReason(record.reason, record.detail);
 				if (requestId !== undefined && PUSHED_FAILURES.some((source) => requestId.startsWith(source))) {
 					const content = failureContent(requestId, reason);
@@ -414,6 +486,7 @@ export async function openHumanPort(
 				emit({ type: "answer", requestId, content, ...reply, ...pushed });
 			}
 		}
+		if (ended.size > 0) await endStops(ended, resume);
 		if (began) emit({ type: "run", state: "working" });
 	};
 	// Commits are handled one at a time, in order. The observer attaches before the run state is read, so no commit
@@ -425,6 +498,32 @@ export async function openHumanPort(
 		},
 		end() {},
 	});
+	// Before any commit is handled, so the settlement of a round stopped before a restart is told as stopped. A pending stop
+	// whose round ended while no HumanPort listened was told to no one, and ends as one seen ending: when it ended aborted,
+	// as a crash between its settlement and the continue leaves it, the inputs queued behind it run.
+	const stopsRead = handled
+		.then(() =>
+			root.commit(async (tx) => {
+				const doc = await tx.doc(Stops, root.id);
+				after = doc.after;
+				const live = await tx.doc(LiveDoc, root.id);
+				const running = live.run?.inputs[0];
+				const ended = new Set<SubmissionId>();
+				for (const stop of doc.stops) {
+					if (stop.settled !== undefined) continue;
+					if (stop.round === running) stopping.set(stop.round, [...stop.inputs]);
+					else ended.add(stop.round);
+				}
+				// The newest run that ended unanswered, until a later run starts.
+				const failure = live.runFailure;
+				const resume =
+					failure?.reason === "aborted" && failure.inputs.some((input) => ended.has(input as SubmissionId));
+				return { ended, resume };
+			}, context),
+		)
+		.then(({ ended, resume }) => (ended.size > 0 ? endStops(ended, resume) : undefined))
+		.catch((error: unknown) => console.error("[soma] stops:", error));
+	handled = stopsRead;
 	// Before any commit is handled, so a push it holds is never held again by the commit's handling.
 	if (hold !== undefined)
 		handled = handled.then(() => hold.catchUp()).catch((error: unknown) => console.error("[soma] held push:", error));
@@ -454,6 +553,8 @@ export async function openHumanPort(
 	// The answer as the model writes it: pi-durable commits a throttled partial into `pi.live`, which a watch sees at once
 	// and the commit observer only once stored, up to a second later. Handled behind the commits, so the round's inputs
 	// are known as placed, and a partial that comes after its round's answer finds them settled and says nothing.
+	// Once the stops are read, so the value the watch starts with can be enforced.
+	await stopsRead;
 	const live = await harness.watchDoc(LiveDoc, root.id, context);
 	if (live === undefined) throw new Error("the live document is missing");
 	// The first input of the round the last partial was of, and its text.
@@ -465,12 +566,14 @@ export async function openHumanPort(
 			streamed = undefined;
 			return;
 		}
-		if (content === (streamed?.round === round ? streamed.content : "")) return;
+		if (stopping.has(round) || content === (streamed?.round === round ? streamed.content : "")) return;
 		streamed = { round, content };
 		emit({ type: "partial", requestIds, content });
 	};
 	live.start(async (call) => {
 		if (call.kind !== "value") return;
+		// At once, not behind the commits: a stop that waits on a tool call aborts as soon as the round hands over.
+		enforce(call.value);
 		const inputs = [...(call.value?.run?.inputs ?? [])];
 		// A generation that ended, or one that has written nothing yet, has no text: the next one starts over from empty.
 		const content = (call.value?.generation?.message?.content ?? [])
@@ -480,6 +583,9 @@ export async function openHumanPort(
 			.then(() => partial(inputs, content))
 			.catch((error: unknown) => console.error("[soma] partial:", error));
 	});
+	// A watch delivers changes only: a stop a restart left pending is enforced on the value it starts with, so a round
+	// whose model writes nothing more is aborted all the same.
+	enforce(live.value);
 
 	// Each due push becomes a notice to the default interface in the commit that drops it, so a restart repeats none.
 	// One kept under a policy the config has since set to `log` is dropped.
@@ -640,6 +746,28 @@ export async function openHumanPort(
 			}
 			if (outcome.said) emit({ type: "said", question, label: outcome.label });
 			return outcome;
+		},
+		async stop(requestId) {
+			// Read and recorded in one commit, so the input is among the inputs of the run read with it, and a restart
+			// after it keeps the stop.
+			const taken = await root.commit(async (tx) => {
+				const record = await tx.submissionByRequest(root.id, requestId);
+				const { run } = await tx.doc(LiveDoc, root.id);
+				// A queued or settled input is not among them.
+				const round = run?.inputs[0];
+				if (record === undefined || round === undefined || !run?.inputs.includes(record.id)) return undefined;
+				const doc = await tx.doc(Stops, root.id);
+				if (doc.stops.some((stop) => stop.settled === undefined && stop.round === round)) return undefined;
+				const inputs = [...run.inputs];
+				doc.stops.push({ round, inputs, at: now() });
+				return { round, inputs };
+			}, context);
+			if (taken === undefined) return false;
+			stopping.set(taken.round, taken.inputs);
+			// While the model writes the run is aborted at once; while a tool call runs, aborting would abort the call too,
+			// so the watch on `pi.live` aborts it once the round's tool calls ended.
+			enforce(await harness.snapshot(LiveDoc, root.id, context));
+			return true;
 		},
 		subscribe(listener) {
 			listener({ type: "run", state: run !== undefined ? "working" : "idle" });

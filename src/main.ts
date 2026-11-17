@@ -33,6 +33,7 @@ import { memory } from "./core/extensions/memory/index.ts";
 import { REFLECTION_PERIOD_MS, reflection } from "./core/extensions/reflection/index.ts";
 import { schedule } from "./core/extensions/schedule/index.ts";
 import { sleeper } from "./core/extensions/sleeper/index.ts";
+import { stopGuard } from "./core/extensions/stop/index.ts";
 import { web } from "./core/extensions/web/index.ts";
 import { acquireDbLock, DbLockedError, openHarness, openStorage } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
@@ -104,6 +105,8 @@ const extensions = [
 	clock(),
 	language(config.language),
 	sleeper,
+	// A hook only, no tool or section: blocks the model's tool calls in a round the human stopped.
+	stopGuard,
 	memory,
 	schedule((id, c) => harness.abortTask(id, c)),
 	dispatchOver(side, readCard),

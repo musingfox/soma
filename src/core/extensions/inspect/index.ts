@@ -28,6 +28,7 @@ import {
 } from "../../domain/inspect.ts";
 import { JOB_DONE } from "../dispatch/bridge.ts";
 import { Dispatches } from "../dispatch/index.ts";
+import { Stops } from "../stop/index.ts";
 
 async function scanAll<T>(scan: (cursor?: Cursor) => Promise<{ items: readonly T[]; next?: Cursor }>): Promise<T[]> {
 	const all: T[] = [];
@@ -59,6 +60,7 @@ export function inspectExtension(storage: Pick<Storage, "scanSubmissions">) {
 			if (!inRange(at, range)) continue;
 			const { detail } = record;
 			rows.push({
+				submission: record.id,
 				evidence: `submission:${record.id}`,
 				conversationId: record.conversationId,
 				...(record.entry !== undefined && { entry: record.entry }),
@@ -144,8 +146,27 @@ export function inspectExtension(storage: Pick<Storage, "scanSubmissions">) {
 				const evidence = await api.commit((tx) => jobEvidence(tx, api.conversationId), context);
 				return json(window(jobRows(jobs, evidence), limit));
 			}
-			if (args.what === "failures")
-				return json(window(await api.commit((tx) => failures(tx, range, context), context), limit));
+			if (args.what === "failures") {
+				const found = await api.commit((tx) => failures(tx, range, context), context);
+				// A round the human stopped is not a failure, and its aborted inputs are left out: reflection reads these rows as
+				// problems. One that ended otherwise, a model error say, failed and is listed. Read after the commit, as a
+				// Harness read inside it would wait for it; only stops kept (`KEPT_STOPS`) are known.
+				const stopped = new Set<string>();
+				for (const conversationId of new Set(
+					found.flatMap((row) => (row.reason === "aborted" ? [row.conversationId] : [])),
+				))
+					for (const stop of (await api.snapshot(Stops, conversationId, context))?.stops ?? [])
+						for (const input of stop.inputs) stopped.add(`${conversationId}:${input}`);
+				const failed = found.filter(
+					(row) => row.reason !== "aborted" || !stopped.has(`${row.conversationId}:${row.submission}`),
+				);
+				return json(
+					window(
+						failed.map(({ submission: _submission, ...row }) => row),
+						limit,
+					),
+				);
+			}
 			return json(window(await api.commit((tx) => usage(tx, range, context), context), limit));
 		},
 	});

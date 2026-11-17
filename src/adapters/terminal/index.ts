@@ -164,6 +164,9 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 			if (mine.delete(event.requestId)) fail(event.reason);
 			else if (event.class !== undefined)
 				fail(`${event.requestId} 那一輪：${event.reason}`, deliveryTo(event, ENTRY_KIND));
+		} else if (event.type === "stopped") {
+			// Stopped by the human: the request's work is over, nothing failed and nothing is printed; `run` goes idle.
+			mine.delete(event.requestId);
 		} else if (event.type === "said") {
 			// Answered on another interface: the question no longer waits for the human here.
 			if (attention?.state === "blocked" && askedBy === event.question) attention = undefined;

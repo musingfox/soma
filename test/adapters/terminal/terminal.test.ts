@@ -170,6 +170,18 @@ test("a failed round of this client or of the core is printed and turns the root
 	await end();
 });
 
+test("a stopped round of this client prints nothing and the root record goes back to idle, not to error", async () => {
+	const { human, type, take, end } = await session(true);
+	const mine = await type("寫長一點");
+	take();
+
+	human.emit({ type: "run", state: "working" });
+	human.emit({ type: "run", state: "idle" });
+	human.emit({ type: "stopped", requestId: mine });
+	expect(take()).toBe(`${root({ state: "working" })}${root({ state: "idle" })}`);
+	await end();
+});
+
 test("an unsupported terminal gets no OSC 7501 bytes", async () => {
 	const { human, type, take, end } = await session(false);
 	await type("派 a");

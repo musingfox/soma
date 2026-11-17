@@ -85,6 +85,9 @@ export type SomaEvent =
 	| { readonly type: "partial"; readonly requestIds: readonly string[]; readonly content: string }
 	// The round ended without an answer: a provider error, no model, an abort or a fault. Pushed for `PUSHED_FAILURES`.
 	| ({ readonly type: "failure"; readonly requestId: string; readonly reason: string } & Partial<Pushed>)
+	// The round ended because the human asked to stop it (`HumanPort.stop`): not a failure, and nothing for reflection.
+	// No partial follows it; the inputs queued behind the round run next.
+	| { readonly type: "stopped"; readonly requestId: string }
 	| ({
 			readonly type: "notice";
 			readonly kind: NoticeKind;
@@ -111,4 +114,11 @@ export interface HumanPort {
 	 * job's agent listed, the label goes to that agent as its next prompt instead, while the job still waits on it.
 	 */
 	say(question: string, option: string, input: Omit<HumanInput, "content">): Promise<SaidOutcome>;
+	/**
+	 * The human asks to stop the round the input with `requestId` belongs to; says whether it took. It takes only while
+	 * that input is among the running round's, so a late or repeated ask, or one for a queued or settled input, stops
+	 * nothing. The model is stopped at once; a tool call running is let finish, and the round ends before the model is
+	 * asked again. Each of the round's inputs then gets a `stopped` event.
+	 */
+	stop(requestId: string): Promise<boolean>;
 }

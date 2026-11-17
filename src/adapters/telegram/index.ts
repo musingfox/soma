@@ -126,6 +126,8 @@ const ResponseSchema = z.discriminatedUnion("ok", [
 		})
 		.passthrough(),
 ]);
+// Only the id, so that an update which does not parse can still be confirmed and skipped.
+const BatchSchema = z.array(z.object({ update_id: z.number() }).passthrough());
 
 /** What a schema found wrong with a value, on one line: each issue's path and message. */
 const wrong = (error: z.ZodError) =>
@@ -703,16 +705,25 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	try {
 		while (!signal.aborted) {
 			try {
-				const updates = z.array(UpdateSchema).safeParse(
+				const batch = BatchSchema.safeParse(
 					await call("getUpdates", {
 						offset,
 						timeout,
 						allowed_updates: ["message", "callback_query", "stopped_message_generation"],
 					}),
 				);
-				if (!updates.success)
-					throw new Error(`getUpdates: the result has an unexpected shape: ${wrong(updates.error)}`);
-				for (const { update_id, message, callback_query, stopped_message_generation: stopped } of updates.data) {
+				// An update without an id cannot be confirmed, so the batch is asked for again after the wait.
+				if (!batch.success) throw new Error(`getUpdates: the result has an unexpected shape: ${wrong(batch.error)}`);
+				for (const each of batch.data) {
+					const { update_id } = each;
+					const update = UpdateSchema.safeParse(each);
+					// Asked for again, it would fail again, and every update after it would wait for ever.
+					if (!update.success) {
+						onError(new Error(`getUpdates: update ${update_id} skipped, unexpected shape: ${wrong(update.error)}`));
+						offset = update_id + 1;
+						continue;
+					}
+					const { message, callback_query, stopped_message_generation: stopped } = update.data;
 					if (message?.text !== undefined && message.chat.id === chatId) {
 						const requestId = `${REQUEST_PREFIX}${message.message_id}`;
 						open(requestId);

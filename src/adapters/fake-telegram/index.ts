@@ -34,6 +34,12 @@ export interface StopUpdate {
 
 export type FakeUpdate = MessageUpdate | CallbackUpdate | StopUpdate;
 
+/** An update as it is, whatever its fields hold. */
+export interface RawUpdate {
+	readonly update_id: number;
+	readonly [field: string]: unknown;
+}
+
 export interface SentMessage {
 	readonly chat_id: number;
 	readonly text: string;
@@ -160,6 +166,8 @@ export class FakeBotApi {
 	 * as JSON, as a Bot API whose answer the client does not expect would.
 	 */
 	readonly answering = new Map<string, unknown[]>();
+	/** The update ids each getUpdates answered with, in the order they came. */
+	readonly batches: (readonly number[])[] = [];
 	/** Methods whose calls wait unanswered until `release`, as a slow network looks to the client. */
 	readonly stalling = new Set<string>();
 	/** Each held call whose client closed the connection before `release`, by method; it is never handled. */
@@ -167,7 +175,7 @@ export class FakeBotApi {
 	#held: (() => void)[] = [];
 	readonly #markups = new Map<number, InlineKeyboard>();
 	readonly #token: string;
-	#queue: FakeUpdate[] = [];
+	#queue: (FakeUpdate | RawUpdate)[] = [];
 	/** The update types the last getUpdates that named them asked for; none named means every type. */
 	#allowed: readonly string[] = [];
 	#nextUpdate = 1;
@@ -375,7 +383,14 @@ export class FakeBotApi {
 		return update;
 	}
 
-	redeliver(update: FakeUpdate): void {
+	/** Queue an update holding `fields` as they are, such as one the client cannot parse. */
+	deliverRaw(fields: Record<string, unknown>): RawUpdate {
+		const update = { ...fields, update_id: this.#nextUpdate++ };
+		this.redeliver(update);
+		return update;
+	}
+
+	redeliver(update: FakeUpdate | RawUpdate): void {
 		this.#queue.push(update);
 		for (const wake of this.#wake) wake();
 	}
@@ -392,14 +407,14 @@ export class FakeBotApi {
 		await new Promise((resolve) => this.#server?.close(resolve));
 	}
 
-	async #updates(params: Record<string, unknown>): Promise<FakeUpdate[]> {
+	async #updates(params: Record<string, unknown>): Promise<(FakeUpdate | RawUpdate)[]> {
 		const offset = typeof params.offset === "number" ? params.offset : undefined;
 		if (offset !== undefined) this.#queue = this.#queue.filter((update) => update.update_id >= offset);
 		// An empty list asks for every type, and none given keeps the last setting: https://core.telegram.org/bots/api#getupdates.
 		// An update of a type not asked for is dropped, never delivered.
 		if (Array.isArray(params.allowed_updates)) this.#allowed = params.allowed_updates as string[];
 		const allowed = this.#allowed;
-		const wanted = (update: FakeUpdate) =>
+		const wanted = (update: FakeUpdate | RawUpdate) =>
 			allowed.length === 0 || Object.keys(update).some((type) => type !== "update_id" && allowed.includes(type));
 		this.#queue = this.#queue.filter(wanted);
 		if (this.#queue.length === 0 && typeof params.timeout === "number" && params.timeout > 0) {
@@ -414,6 +429,7 @@ export class FakeBotApi {
 			});
 		}
 		this.#queue = this.#queue.filter(wanted);
+		this.batches.push(this.#queue.map((update) => update.update_id));
 		return [...this.#queue];
 	}
 }

@@ -450,6 +450,39 @@ test("a getUpdates answer of an unexpected shape is reported once per attempt, a
 	]);
 });
 
+test("an update that does not parse is reported and skipped, the rest of its batch is handled, and it is not asked for again", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const { onError } = start(human, apiBase);
+
+	const bad = api.deliverRaw({ message: { message_id: "7", chat: { id: CHAT }, text: "壞的" } });
+	const good = api.deliver("好的", CHAT);
+
+	await vi.waitFor(() => expect(human.inputs.map((input) => input.content)).toEqual(["好的"]));
+	expect(human.inputs[0]?.requestId).toBe(`telegram:${good.message.message_id}`);
+	expect(api.batches.filter((ids) => ids.includes(bad.update_id))).toEqual([[bad.update_id, good.update_id]]);
+	expect(onError).toHaveBeenCalledOnce();
+	expect(onError).toHaveBeenCalledWith(
+		expect.objectContaining({
+			message: `getUpdates: update ${bad.update_id} skipped, unexpected shape: message.message_id: Expected number, received string`,
+		}),
+	);
+});
+
+test("an update that does not parse, last in its batch, is confirmed by the next poll and not asked for again", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const { onError } = start(human, apiBase);
+
+	const bad = api.deliverRaw({ stopped_message_generation: { chat: { id: CHAT }, draft_id: "1" } });
+	await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+	api.deliver("之後", CHAT);
+
+	await vi.waitFor(() => expect(human.inputs.map((input) => input.content)).toEqual(["之後"]));
+	expect(api.batches.filter((ids) => ids.includes(bad.update_id))).toEqual([[bad.update_id]]);
+	expect(onError).toHaveBeenCalledOnce();
+});
+
 const choices = {
 	card: "card-a",
 	fingerprint: "f00d",

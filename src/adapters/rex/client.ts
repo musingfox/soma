@@ -51,7 +51,10 @@ export interface RexClientOptions {
 
 export interface RexClient {
 	call<T>(method: string, payload: unknown, schema: ZodType<T>): Promise<T>;
-	/** Attaches this and every later connection to the session, so its methods work and its events arrive. */
+	/**
+	 * Attaches this and every later connection to the session, so its methods work and its events arrive, until rex says
+	 * the session does not exist.
+	 */
 	attach(sessionId: string): Promise<void>;
 	/** While any listener is registered, a dropped connection is opened again. */
 	onSessionEvent(listener: (event: SessionEvent) => void): () => void;
@@ -153,7 +156,7 @@ export function createRexClient(options: RexClientOptions): RexClient {
 		conn = { ws, pending: new Map(), attached: new Set() };
 		const ready = conn;
 		try {
-			for (const sessionId of sessions) await attachOn(ready, sessionId);
+			for (const sessionId of sessions) await attachOn(ready, sessionId).catch(forgetGone(sessionId));
 		} catch (error) {
 			ws.close();
 			throw error;
@@ -241,14 +244,28 @@ export function createRexClient(options: RexClientOptions): RexClient {
 		conn.attached.add(sessionId);
 	}
 
+	/**
+	 * A session rex says does not exist is attached no more, on this connection or a later one: rex does not remember
+	 * destroyed sessions, so it never will, and attaching it again would fail every connection opened from then on.
+	 */
+	const forgetGone = (sessionId: string) => (error: Error) => {
+		if (error instanceof RexRpcError && error.code === "session_not_found") sessions.delete(sessionId);
+		else throw error;
+	};
+
 	return {
 		async call<T>(method: string, payload: unknown, schema: ZodType<T>): Promise<T> {
 			return schema.parse(await send(await ensure(), method, payload));
 		},
 
 		async attach(sessionId: string): Promise<void> {
+			// Added once the connection is open, so a first connection does not attach it ahead of this call.
+			const conn = await ensure();
 			sessions.add(sessionId);
-			await attachOn(await ensure(), sessionId);
+			await attachOn(conn, sessionId).catch((error: Error) => {
+				forgetGone(sessionId)(error);
+				throw error;
+			});
 		},
 
 		onSessionEvent(listener) {

@@ -135,6 +135,47 @@ test("a dropped connection is opened again while events are listened to, attache
 	expect(rex.requests.filter((request) => request.method === "session.attach")).toHaveLength(2);
 });
 
+test("a session rex says does not exist is attached no more, so it fails no connection opened after", async () => {
+	const gone = new Set(["session:gone"]);
+	const rex = fakeRex((request) => {
+		if (request.method !== "session.attach") return { payload: {} };
+		return gone.has(String(request.payload?.session_id))
+			? { error: { code: "session_not_found", message: "no session", status: 404 } }
+			: { payload: view };
+	});
+	await rex.listening;
+	const errors: string[] = [];
+	const client = createRexClient({
+		socketPath: rex.path,
+		reconnectMs: 5,
+		onError: (error) => errors.push(error.message),
+	});
+	closers.push(() => client.close(), rex.close);
+	client.onSessionEvent(() => {});
+	let connections = 0;
+	client.onConnected(() => {
+		connections += 1;
+	});
+	const opened = async (count: number) => {
+		while (connections < count) await new Promise((resolve) => setTimeout(resolve, 5));
+	};
+	const attaches = () =>
+		rex.requests.filter((request) => request.method === "session.attach").map((request) => request.payload?.session_id);
+
+	await expect(client.attach("session:gone")).rejects.toMatchObject({ code: "session_not_found" });
+	await client.attach("session:h");
+	await opened(1);
+	// Gone while attached: the next connection finds it so, and the one after does not ask.
+	gone.add("session:h");
+	rex.peers[0]?.drop();
+	await opened(2);
+	rex.peers[1]?.drop();
+	await opened(3);
+
+	expect(attaches()).toEqual(["session:gone", "session:h", "session:h"]);
+	expect(errors.filter((message) => message.includes("session_not_found"))).toEqual([]);
+});
+
 test("a request in flight when the connection drops rejects as a transport error", async () => {
 	const rex = fakeRex((_request, peer) => {
 		peer.drop();

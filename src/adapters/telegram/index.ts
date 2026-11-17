@@ -115,7 +115,8 @@ const UpdateSchema = z
 			.optional(),
 	})
 	.passthrough();
-const ResponseSchema = z.union([
+// By `ok`, so a response that has neither shape is refused for what its `ok` is, not as a mere "Invalid input".
+const ResponseSchema = z.discriminatedUnion("ok", [
 	z.object({ ok: z.literal(true), result: z.unknown() }).passthrough(),
 	z
 		.object({
@@ -125,6 +126,12 @@ const ResponseSchema = z.union([
 		})
 		.passthrough(),
 ]);
+
+/** What a schema found wrong with a value, on one line: each issue's path and message. */
+const wrong = (error: z.ZodError) =>
+	error.issues
+		.map((issue) => `${issue.path.length === 0 ? "(root)" : issue.path.join(".")}: ${issue.message}`)
+		.join("; ");
 
 /** Cut text into sendMessage-sized parts, at a line break when one is near, never inside a surrogate pair. */
 export function splitMessage(text: string, limit = MESSAGE_LIMIT): string[] {
@@ -251,7 +258,17 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			body: JSON.stringify(body),
 			signal: callSignal,
 		});
-		const parsed = ResponseSchema.parse(await response.json());
+		let answer: unknown;
+		try {
+			answer = await response.json();
+		} catch (error) {
+			if (!(error instanceof SyntaxError)) throw error;
+			throw new Error(`${method}: the response (${response.status}) is not JSON: ${error.message}`);
+		}
+		const checked = ResponseSchema.safeParse(answer);
+		if (!checked.success)
+			throw new Error(`${method}: the response (${response.status}) has an unexpected shape: ${wrong(checked.error)}`);
+		const parsed = checked.data;
 		if (!parsed.ok)
 			throw new Refused(`${method}: ${parsed.description ?? response.status}`, parsed.parameters?.retry_after);
 		return parsed.result;
@@ -686,14 +703,16 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	try {
 		while (!signal.aborted) {
 			try {
-				const updates = z.array(UpdateSchema).parse(
+				const updates = z.array(UpdateSchema).safeParse(
 					await call("getUpdates", {
 						offset,
 						timeout,
 						allowed_updates: ["message", "callback_query", "stopped_message_generation"],
 					}),
 				);
-				for (const { update_id, message, callback_query, stopped_message_generation: stopped } of updates) {
+				if (!updates.success)
+					throw new Error(`getUpdates: the result has an unexpected shape: ${wrong(updates.error)}`);
+				for (const { update_id, message, callback_query, stopped_message_generation: stopped } of updates.data) {
 					if (message?.text !== undefined && message.chat.id === chatId) {
 						const requestId = `${REQUEST_PREFIX}${message.message_id}`;
 						open(requestId);

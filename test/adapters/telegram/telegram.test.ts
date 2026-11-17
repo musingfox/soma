@@ -415,6 +415,41 @@ test("a failing Bot API is reported and polled again", async () => {
 	await running;
 });
 
+test("a getUpdates answer of an unexpected shape is reported once per attempt, and the next poll's updates are handled", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	api.answering.set("getUpdates", [
+		{ result: [] },
+		{ ok: true, result: { update_id: 1 } },
+		"<html>502 Bad Gateway</html>",
+	]);
+	const onError = vi.fn();
+	const controller = new AbortController();
+	const running = runTelegram({
+		human,
+		token: TOKEN,
+		chatId: CHAT,
+		apiBase,
+		signal: controller.signal,
+		retryMs: 10,
+		onError,
+	});
+	cleanup.push(() => {
+		controller.abort();
+		return running;
+	});
+
+	const { message } = api.deliver("你好", CHAT);
+
+	await vi.waitFor(() => expect(human.inputs.map((input) => input.content)).toEqual(["你好"]));
+	expect(human.inputs[0]?.requestId).toBe(`telegram:${message.message_id}`);
+	expect(onError.mock.calls.map(([error]) => (error as Error).message)).toEqual([
+		"getUpdates: the response (200) has an unexpected shape: ok: Invalid discriminator value. Expected true | false",
+		"getUpdates: the result has an unexpected shape: (root): Expected array, received object",
+		expect.stringMatching(/^getUpdates: the response \(200\) is not JSON: /),
+	]);
+});
+
 const choices = {
 	card: "card-a",
 	fingerprint: "f00d",

@@ -155,6 +155,11 @@ export class FakeBotApi {
 	 * answers: https://core.telegram.org/bots/api#responseparameters
 	 */
 	readonly flooding = new Map<string, number[]>();
+	/**
+	 * Methods whose next calls are answered with a 200 and these bodies, one each, a string as it is and anything else
+	 * as JSON, as a Bot API whose answer the client does not expect would.
+	 */
+	readonly answering = new Map<string, unknown[]>();
 	/** Methods whose calls wait unanswered until `release`, as a slow network looks to the client. */
 	readonly stalling = new Set<string>();
 	/** Each held call whose client closed the connection before `release`, by method; it is never handled. */
@@ -193,6 +198,13 @@ export class FakeBotApi {
 					response.on("close", () => resolve(true));
 				});
 				if (closed) return void this.aborted.push(method);
+			}
+			const answers = method === undefined ? undefined : this.answering.get(method);
+			if (answers !== undefined && answers.length > 0) {
+				const answer = answers.shift();
+				return void response
+					.writeHead(200, { "content-type": "application/json" })
+					.end(typeof answer === "string" ? answer : JSON.stringify(answer));
 			}
 			const retryAfter = method === undefined ? undefined : this.flooding.get(method)?.shift();
 			if (method !== undefined && retryAfter !== undefined) {

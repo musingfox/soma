@@ -1,8 +1,23 @@
 import { PassThrough } from "node:stream";
-import { expect, test, vi } from "vitest";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createModels } from "@earendil-works/pi-ai/models";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
+import { afterEach, expect, test, vi } from "vitest";
+import { FakeAgentPort } from "../../../src/adapters/fake-agent/index.ts";
 import { FakeHumanPort } from "../../../src/adapters/fake-human/index.ts";
 import { detectProgramStatus, jobRecordId, runTerminal } from "../../../src/adapters/terminal/index.ts";
 import { formatProgramStatus } from "../../../src/adapters/terminal/program-status.ts";
+import { PRESETS } from "../../../src/core/domain/push.ts";
+import { askExtension } from "../../../src/core/extensions/ask/index.ts";
+import { openHumanPort } from "../../../src/core/human-port.ts";
+import type { SomaEvent } from "../../../src/ports/human.ts";
+
+const context = BACKGROUND_CONTEXT;
+const cleanup: (() => Promise<unknown>)[] = [];
+afterEach(async () => {
+	for (const close of cleanup.splice(0).reverse()) await close();
+});
 
 const QUERY = "\x1b]7501;?\x1b\\\x1b[c";
 const DA_REPLY = "\x1b[?62;22c";
@@ -235,5 +250,127 @@ test("a round that asked a question here and wrote nothing after it prints no em
 	const plain = await type("嗯");
 	human.emit({ type: "answer", requestId: plain, content: "" });
 	expect(take()).toBe("想好再說。\n\n");
+	await end();
+});
+
+/**
+ * A terminal fed by a real core whose model can ask, the terminal at `summary`, so a question reaches it only as part
+ * of the reply to its own input. Every event is kept in `seen`.
+ */
+async function coreSession() {
+	const storage = new MemoryStorage();
+	const registry = createRegistry();
+	registry.install(askExtension({ storage, interfaces: ["chat.terminal", "chat.telegram"] }));
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const harness = await Harness.open(storage, { models, registry }, context);
+	cleanup.push(() => harness.close(context));
+	const conversation = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+	harness.resume();
+	const human = await openHumanPort(harness, conversation, new FakeAgentPort(), context, {
+		policies: { "chat.terminal": PRESETS.summary },
+		storage,
+	});
+	cleanup.push(() => human.close());
+	const seen: SomaEvent[] = [];
+	human.subscribe((event) => seen.push(event));
+	const submit = vi.spyOn(human, "submit");
+	const input = new PassThrough();
+	const output = new PassThrough();
+	let written = "";
+	output.on("data", (chunk: Buffer) => {
+		written += chunk.toString();
+	});
+	const running = runTerminal({ human, input, output, programStatus: true });
+	cleanup.push(() => {
+		input.end();
+		return running;
+	});
+	const type = async (line: string) => {
+		const count = submit.mock.calls.length;
+		input.write(`${line}\n`);
+		await vi.waitFor(() => expect(submit.mock.calls.length).toBe(count + 1));
+		await submit.mock.results.at(-1)?.value;
+		await conversation.waitForIdle(context);
+	};
+	const take = () => {
+		const value = written;
+		written = "";
+		return value;
+	};
+	return { faux, human, conversation, seen, type, take };
+}
+
+test("from a real core: a question asked in reply here rings, nothing follows it, and a press elsewhere clears it", async () => {
+	const { faux, human, conversation, seen, type, take } = await coreSession();
+	faux.setResponses([
+		fauxAssistantMessage([fauxToolCall("ask", { question: "晚餐吃什麼？", options: ["拉麵", "咖哩"] })], {
+			stopReason: "toolUse",
+		}),
+		fauxAssistantMessage(""),
+		fauxAssistantMessage("好，拉麵。"),
+	]);
+	// The terminal hears each event in the same emit as `seen`, after it.
+	const answered = (prefix: string) =>
+		vi.waitFor(() =>
+			expect(seen.some((event) => event.type === "answer" && event.requestId.startsWith(prefix))).toBe(true),
+		);
+	await type("問我晚餐");
+	await answered("terminal:");
+	expect(seen.find((event) => event.type === "answer")).toMatchObject({ content: "", asked: true });
+	const blocked = root({ state: "blocked", kind: "question", message: "晚餐吃什麼？" });
+	// No empty line after the options; the question holds the root record over the round's end.
+	expect(take()).toBe(
+		`${root({ state: "idle" })}${root({ state: "working" })}[問題] 晚餐吃什麼？\n  1. 拉麵\n  2. 咖哩\n${blocked}`,
+	);
+
+	const [question = ""] = seen.flatMap((event) =>
+		event.type === "notice" && event.kind === "question" && event.choices && "question" in event.choices
+			? [event.choices.question]
+			: [],
+	);
+	await human.say(question, "1", { entry: { kind: "chat.telegram" }, requestId: "telegram:ask/1" });
+	await conversation.waitForIdle(context);
+	await answered("telegram:");
+	// Said on Telegram: the terminal stops waiting, and the round it started, Telegram's, is not printed here.
+	expect(take().endsWith(root({ state: "idle" }))).toBe(true);
+});
+
+test("a question that blocks the terminal stays blocked when another question is said, and a prompt is not cleared by a press", async () => {
+	const { human, take, end } = await session(true);
+	const options = [
+		{ id: "1", label: "好" },
+		{ id: "2", label: "不用" },
+	];
+	human.emit({
+		type: "notice",
+		kind: "question",
+		class: "action",
+		content: "問一",
+		choices: { question: "q1", options },
+	});
+	human.emit({
+		type: "notice",
+		kind: "question",
+		class: "action",
+		content: "權限？",
+		choices: { card: "c", fingerprint: "f", options },
+	});
+	take();
+	human.emit({ type: "said", question: "q1", label: "好" });
+	expect(take()).toBe("");
+	human.emit({
+		type: "notice",
+		kind: "question",
+		class: "action",
+		content: "問二",
+		choices: { question: "q2", options },
+	});
+	take();
+	human.emit({ type: "said", question: "q1", label: "好" });
+	expect(take()).toBe("");
+	human.emit({ type: "said", question: "q2", label: "不用" });
+	expect(take()).toBe(root({ state: "idle" }));
 	await end();
 });

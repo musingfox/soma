@@ -112,6 +112,8 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 	// What waits for the human: a question blocks soma, a report is done and a failed round is an error until the
 	// human types again.
 	let attention: ProgramStatus | undefined;
+	// The question soma asked whose ring set `attention`, which a press on any interface settles.
+	let askedBy: string | undefined;
 	let lastRoot = "";
 	const report = (status: ProgramStatus) => {
 		if (programStatus) output.write(formatProgramStatus(status));
@@ -133,6 +135,7 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 			for (const [index, { label }] of choices.options.entries()) print(`  ${index + 1}. ${label}`);
 		if (delivery === "quiet") return;
 		if (attention?.state !== "blocked" || kind === "question") {
+			askedBy = kind === "question" && choices !== undefined && !isPrompt(choices) ? choices.question : undefined;
 			attention =
 				kind === "question"
 					? { state: "blocked", kind: "question", message: firstLine(content) }
@@ -161,6 +164,9 @@ export async function runTerminal(options: TerminalOptions): Promise<void> {
 			if (mine.delete(event.requestId)) fail(event.reason);
 			else if (event.class !== undefined)
 				fail(`${event.requestId} 那一輪：${event.reason}`, deliveryTo(event, ENTRY_KIND));
+		} else if (event.type === "said") {
+			// Answered on another interface: the question no longer waits for the human here.
+			if (attention?.state === "blocked" && askedBy === event.question) attention = undefined;
 		} else if (event.type === "job") report(jobStatus(event.card, event.status));
 		reportRoot();
 	};

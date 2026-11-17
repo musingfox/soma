@@ -124,3 +124,69 @@ export function jobQuestions(
 		open.join("\n")
 	);
 }
+
+/** The version of the jobs file's shape; a reader of another version must not guess at it. */
+export const JOBS_FILE_VERSION = 1;
+
+/**
+ * One job as the jobs file shows it, for programs on this machine that draw soma's work. Only what no one needs soma's
+ * conversation to read: never `launch`, `ticket`, a status's `msg` or options, or a decision's words, which carry the
+ * card's text or the agent's. `kind` is set for a blocked job, `repo` when the job's repo was recorded,
+ * `created` when its time was, and `outcome` once a turn finished; each is null otherwise. There is no worktree: soma
+ * cannot state its path without asking git, so a reader finds it from the agent process's cwd.
+ */
+export type JobEntry = {
+	readonly card: string;
+	readonly agent: string;
+	readonly sessionId: string;
+	readonly status: AgentState["state"];
+	readonly kind: BlockedKind | null;
+	readonly outcome: string | null;
+	readonly repo: string | null;
+	readonly created: string | null;
+	// When the entry last changed in any field above; not a finer clock than the file's own writes.
+	readonly updated: string;
+};
+
+export type JobsFile = { readonly version: typeof JOBS_FILE_VERSION; readonly jobs: readonly JobEntry[] };
+
+/** The `updated` time of each card's entry in `previous`, which is whatever the last run left in the file. */
+function previousEntries(previous: unknown): Map<string, Record<string, unknown>> {
+	const entries = new Map<string, Record<string, unknown>>();
+	const listed = (previous as { jobs?: unknown } | null)?.jobs;
+	if (!Array.isArray(listed)) return entries;
+	for (const each of listed) {
+		const entry = each as Record<string, unknown> | null;
+		if (typeof entry?.card === "string" && typeof entry.updated === "string") entries.set(entry.card, entry);
+	}
+	return entries;
+}
+
+/**
+ * The jobs file for the dispatch list as it stands at `now`. A job's `updated` is when its entry last changed: the one
+ * `previous` (the file as last written, also by an earlier run) holds when the entry is otherwise the same, else `now`.
+ * A job `previous` has no entry for is first seen, whether or not it has `created`: its `updated` is `now`, the time
+ * the writer first sees it, since a file that was deleted or unreadable at startup says nothing of when a job last
+ * changed.
+ */
+export function jobsSidecar(jobs: readonly Job[], previous: unknown, now: string): JobsFile {
+	const before = previousEntries(previous);
+	return {
+		version: JOBS_FILE_VERSION,
+		jobs: jobs.map((job) => {
+			const entry = {
+				card: job.card,
+				agent: job.agent,
+				sessionId: job.sessionId,
+				status: job.status.state,
+				kind: job.status.state === "blocked" ? job.status.kind : null,
+				outcome: job.outcome ?? null,
+				repo: job.repo ?? null,
+				created: job.createdAt ?? null,
+			};
+			const seen = before.get(job.card);
+			const same = seen !== undefined && Object.entries(entry).every(([key, value]) => seen[key] === value);
+			return { ...entry, updated: same ? (seen.updated as string) : now };
+		}),
+	};
+}

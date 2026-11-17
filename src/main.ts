@@ -1,9 +1,11 @@
 import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import type { Harness } from "@earendil-works/pi-durable";
 import { serveDefer } from "./adapters/defer-socket/index.ts";
+import { jobsFile } from "./adapters/jobs/jobs-file.ts";
 import { createCard, readCard } from "./adapters/obsidian/card.ts";
 import {
 	runTelegram,
@@ -25,6 +27,7 @@ import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, handoverBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
 import { foreignBridge } from "./core/extensions/dispatch/foreign.ts";
 import { reclaimer } from "./core/extensions/dispatch/reclaim.ts";
+import { keepJobsFile } from "./core/extensions/dispatch/sidecar.ts";
 import { inspectExtension } from "./core/extensions/inspect/index.ts";
 import { interfaces } from "./core/extensions/interfaces/index.ts";
 import { language } from "./core/extensions/language/index.ts";
@@ -164,6 +167,15 @@ const human = await startCore(
 		...(config.reflection ? [() => reflections.startReflection(root, REFLECTION_PERIOD_MS, context)] : []),
 	],
 );
+// Next to the db, as the other sidecars are: the dispatch list for programs on this machine, rewritten now from the
+// stored list and on each change. Before the reconcile, so what it changes shows too. A file that cannot be kept leaves
+// soma running without it.
+const stopJobsFile = await keepJobsFile(harness, root, jobsFile(resolve(`${config.db}.jobs.json`)), context, {
+	onError: (error) => console.error("[soma]", error.message),
+}).catch((error: unknown) => {
+	console.error("[soma] jobs file not kept:", error);
+	return async () => {};
+});
 // Before the reconcile, so that it finds a move a crash left unrecorded recorded, and tells what it tells of the rest.
 const unlistenSettled =
 	side.settling &&
@@ -211,6 +223,7 @@ const webPage =
 	));
 const shutdown = () => {
 	unlisten();
+	void stopJobsFile();
 	unlistenSettled?.();
 	unlistenForeign();
 	stopTelegram.abort();

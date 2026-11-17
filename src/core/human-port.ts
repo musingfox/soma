@@ -451,6 +451,36 @@ export async function openHumanPort(
 		if (call.kind === "value") updateJobs(call.value);
 	});
 
+	// The answer as the model writes it: pi-durable commits a throttled partial into `pi.live`, which a watch sees at once
+	// and the commit observer only once stored, up to a second later. Handled behind the commits, so the round's inputs
+	// are known as placed, and a partial that comes after its round's answer finds them settled and says nothing.
+	const live = await harness.watchDoc(LiveDoc, root.id, context);
+	if (live === undefined) throw new Error("the live document is missing");
+	// The first input of the round the last partial was of, and its text.
+	let streamed: { round: SubmissionId; content: string } | undefined;
+	const partial = (inputs: readonly SubmissionId[], content: string) => {
+		const round = inputs[0];
+		const requestIds = inputs.flatMap((id) => placed.get(id) ?? []);
+		if (round === undefined || requestIds.length === 0) {
+			streamed = undefined;
+			return;
+		}
+		if (content === (streamed?.round === round ? streamed.content : "")) return;
+		streamed = { round, content };
+		emit({ type: "partial", requestIds, content });
+	};
+	live.start(async (call) => {
+		if (call.kind !== "value") return;
+		const inputs = [...(call.value?.run?.inputs ?? [])];
+		// A generation that ended, or one that has written nothing yet, has no text: the next one starts over from empty.
+		const content = (call.value?.generation?.message?.content ?? [])
+			.flatMap((block) => (block.type === "text" ? [block.text] : []))
+			.join("");
+		handled = handled
+			.then(() => partial(inputs, content))
+			.catch((error: unknown) => console.error("[soma] partial:", error));
+	});
+
 	// Each due push becomes a notice to the default interface in the commit that drops it, so a restart repeats none.
 	// One kept under a policy the config has since set to `log` is dropped.
 	let checking = false;
@@ -635,6 +665,7 @@ export async function openHumanPort(
 			clearInterval(summarizer);
 			commits.detach();
 			await watch.stop();
+			await live.stop();
 		},
 	};
 }

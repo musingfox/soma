@@ -79,6 +79,10 @@ export type SomaEvent =
 			readonly content: string;
 			readonly asked?: true;
 	  } & Partial<Pushed>)
+	// The answer of the running round as the model writes it: the requestIds of the round's inputs, and the whole text
+	// so far of the current generation, never a delta; a new generation of the round starts over from empty. Sent only
+	// when the text changed, never stored and never replayed: the round still ends with its `answer` or `failure`.
+	| { readonly type: "partial"; readonly requestIds: readonly string[]; readonly content: string }
 	// The round ended without an answer: a provider error, no model, an abort or a fault. Pushed for `PUSHED_FAILURES`.
 	| ({ readonly type: "failure"; readonly requestId: string; readonly reason: string } & Partial<Pushed>)
 	| ({

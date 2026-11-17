@@ -38,9 +38,12 @@ import { web } from "./core/extensions/web/index.ts";
 import { acquireDbLock, DbLockedError, openHarness, openStorage } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
 import { startCore } from "./core/startup.ts";
+import { installErrorPrinting } from "./error-printing.ts";
 import { skillsExtensions } from "./skills.ts";
 import { vaultExtensions } from "./vault.ts";
 
+// First, so no error soma prints can throw: a throw in a catch handler would end the process.
+installErrorPrinting();
 let config: Config;
 try {
 	config = loadConfig(configPath(process.env, homedir()), process.env, homedir());

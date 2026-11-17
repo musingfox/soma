@@ -27,8 +27,11 @@ import { ForeignPrompts } from "./extensions/dispatch/foreign.ts";
 import { Dispatches } from "./extensions/dispatch/index.ts";
 import { noticeEntry } from "./notice.ts";
 
-/** A push as an interface would hold it, before it is keyed, timed and given its holders. */
-export type Push = Omit<HeldPush, "key" | "at" | "to">;
+/**
+ * A push as an interface would hold it, before it is keyed, timed and given its holders. `replyTo` names the interfaces
+ * it is part of the reply to, which got it at once and never hold it.
+ */
+export type Push = Omit<HeldPush, "key" | "at" | "to"> & { readonly replyTo?: readonly string[] };
 
 type Settled = Extract<SubmissionRecord, { type: "input"; status: "done" | "unanswered" }>;
 
@@ -93,14 +96,15 @@ export interface HoldOptions {
 }
 
 /**
- * Keeps each push in the doc for the interfaces that hold its class, once (ARCHITECTURE.md "Whom to push to"). Every
+ * Keeps each push in the doc for the interfaces that hold its class, once, but not for one it replies to
+ * (ARCHITECTURE.md "Whom to push to"). Every
  * notice entry handled moves `entry` past it in the commit that holds it, and every pushed round is marked handled in
  * the commit that holds it; `catchUp`, run before any commit is handled, holds what a crash left between a push's own
  * commit and that one. So no held push is lost or held twice, as if it were written with the push itself.
  */
 export function holding({ root, context, policies, now, storage, ofEntry, ofRound }: HoldOptions) {
-	const hold = (doc: HoldState, key: string, push: Push) => {
-		const to = holders(policies, push.class);
+	const hold = (doc: HoldState, key: string, { replyTo = [], ...push }: Push) => {
+		const to = holders(policies, push.class).filter((kind) => !replyTo.includes(kind));
 		if (to.length > 0 && !doc.held.some((each) => each.key === key)) doc.held.push({ key, at: now(), ...push, to });
 	};
 

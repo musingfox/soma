@@ -354,8 +354,9 @@ test("a question soma asks reaches the page with its options; a press is the hum
 	const models = createModels();
 	models.setProvider(faux.provider);
 	const registry = createRegistry();
-	registry.install(askExtension());
-	const harness = await Harness.open(new MemoryStorage(), { models, registry }, context);
+	const storage = new MemoryStorage();
+	registry.install(askExtension({ storage, interfaces: ["chat.web"] }));
+	const harness = await Harness.open(storage, { models, registry }, context);
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
 	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);

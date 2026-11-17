@@ -1,9 +1,17 @@
 import { createHash } from "node:crypto";
-import { type ConversationId, defineDoc, defineExtension, defineTool, type Tx } from "@earendil-works/pi-durable";
+import {
+	type ConversationId,
+	defineDoc,
+	defineExtension,
+	defineTool,
+	type Storage,
+	type Tx,
+} from "@earendil-works/pi-durable";
 import { arr, obj, str } from "@earendil-works/pi-schema";
 import type { Choice } from "../../../ports/agent.ts";
 import type { SaidChoices } from "../../../ports/human.ts";
 import { noticeEntry } from "../../notice.ts";
+import { inputKinds } from "../interfaces/index.ts";
 
 export const MIN_OPTIONS = 2;
 export const MAX_OPTIONS = 4;
@@ -46,11 +54,20 @@ function refusal(options: readonly string[]): string | undefined {
 	return undefined;
 }
 
+export interface AskOptions {
+	/** The Harness's own storage, where the entry kinds of the running round's inputs are looked up. */
+	readonly storage: Pick<Storage, "submission" | "entry">;
+	/** The entry kinds of the interfaces' inputs: a question asked in a round one of them started replies to it. */
+	readonly interfaces: readonly string[];
+}
+
 /**
  * The `ask` tool: one question to the human with a few options, as a `question` notice of class `action` whose choices
- * name no card. A press comes back as the human's input through `HumanPort.say`; no agent is involved.
+ * name no card. Asked in a round an interface's input started, it is part of the reply to that input: the notice names
+ * that interface in `replyTo`, each one when a steered round mixes them. A press comes back as the human's input through
+ * `HumanPort.say`; no agent is involved.
  */
-export function askExtension() {
+export function askExtension({ storage, interfaces }: AskOptions) {
 	const ask = defineTool({
 		name: "ask",
 		description:
@@ -73,6 +90,8 @@ export function askExtension() {
 			const refused = refusal(args.options);
 			if (refused !== undefined) return text({ asked: false, error: refused }, true);
 			const question = createHash("sha256").update(api.callId).digest("hex").slice(0, 16);
+			const kinds = await inputKinds(storage, api, api.conversationId, context);
+			const replyTo = interfaces.filter((kind) => kinds.includes(kind));
 			const choices: SaidChoices = {
 				question,
 				options: args.options.map((label, index) => ({ id: String(index + 1), label: label.trim() })),
@@ -81,7 +100,10 @@ export function askExtension() {
 				const doc = await tx.doc(Questions, api.conversationId);
 				if (doc.questions[question] !== undefined) return;
 				doc.questions[question] = { options: choices.options };
-				await tx.appendEntry(api.conversationId, noticeEntry("question", "action", args.question, choices));
+				await tx.appendEntry(
+					api.conversationId,
+					noticeEntry("question", "action", args.question, choices, undefined, replyTo),
+				);
 			}, context);
 			return text({ asked: true });
 		},

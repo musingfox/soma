@@ -98,6 +98,8 @@ const storage = await openStorage(config.db);
 // is told of it. With nothing on, the section still shows its fixed line, so it never goes away and comes back,
 // which would make the prompt planner re-add every section.
 const on = new Set<string>(config.telegram ? [TELEGRAM_KIND] : []);
+// What each interface can show, by the entry kind of its inputs; a round one of them started is that interface's.
+const texts = { [TELEGRAM_KIND]: TELEGRAM_ABILITIES, [TERMINAL_KIND]: TERMINAL_ABILITIES, [WEB_KIND]: WEB_ABILITIES };
 const extensions = [
 	clock(),
 	language(config.language),
@@ -114,13 +116,10 @@ const extensions = [
 	...(await skillsExtensions(config.skillsDir)),
 	...(await Promise.all(mcpClients.map(({ name, client }) => mcpExtension(name, client)))),
 	// After the other tools: a tool new to the transcript is appended, where in the middle the planner re-adds every tool.
-	askExtension(),
+	askExtension({ storage, interfaces: Object.keys(texts) }),
 	// Last: a section new to the transcript costs one patch at the end, where in the middle the prompt planner would
 	// remove and re-add every section shown before it, on the first request after the release that added it.
-	interfaces(storage, {
-		texts: { [TELEGRAM_KIND]: TELEGRAM_ABILITIES, [TERMINAL_KIND]: TERMINAL_ABILITIES, [WEB_KIND]: WEB_ABILITIES },
-		on: () => on,
-	}),
+	interfaces(storage, { texts, on: () => on }),
 ];
 const harness: Harness = await openHarness(storage, extensions, context, { models });
 const root = await harness.root(context, {

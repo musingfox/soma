@@ -5,16 +5,21 @@ import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durab
 import { afterEach, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../../../src/adapters/fake-agent/index.ts";
 import { FakeHumanPort } from "../../../src/adapters/fake-human/index.ts";
-import { FakeBotApi } from "../../../src/adapters/fake-telegram/index.ts";
+import { FakeBotApi, type SentMessage } from "../../../src/adapters/fake-telegram/index.ts";
 import { runTelegram, splitMessage } from "../../../src/adapters/telegram/index.ts";
+import { PRESETS, type Preset } from "../../../src/core/domain/push.ts";
 import { askExtension } from "../../../src/core/extensions/ask/index.ts";
 import { Dispatches, dispatchExtension } from "../../../src/core/extensions/dispatch/index.ts";
+import { Holds } from "../../../src/core/hold.ts";
 import { openHumanPort } from "../../../src/core/human-port.ts";
-import type { HumanPort } from "../../../src/ports/human.ts";
+import type { HumanPort, SomaEvent } from "../../../src/ports/human.ts";
 
 const context = BACKGROUND_CONTEXT;
 const TOKEN = "123:test";
 const CHAT = 42;
+const TELEGRAM = "chat.telegram";
+const TERMINAL = "chat.terminal";
+const MIN = 60_000;
 const cleanup: (() => Promise<unknown>)[] = [];
 afterEach(async () => {
 	for (const close of cleanup.splice(0).reverse()) await close();
@@ -38,11 +43,11 @@ function start(human: HumanPort, apiBase: string, onError = vi.fn()) {
 	return { stop, onError };
 }
 
-async function core(registry = createRegistry()) {
+async function core(registry = createRegistry(), storage = new MemoryStorage()) {
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
-	const harness = await Harness.open(new MemoryStorage(), { models, registry }, context);
+	const harness = await Harness.open(storage, { models, registry }, context);
 	cleanup.push(() => harness.close(context));
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
@@ -50,6 +55,55 @@ async function core(registry = createRegistry()) {
 	cleanup.push(() => human.close());
 	return { faux, root, human };
 }
+
+/**
+ * A core whose model can ask, with Telegram as the default target at `summary` and the terminal at `terminal`, on a
+ * clock the test moves; a due summary is checked for every 10 ms. Every event the HumanPort emits is kept in `seen`.
+ */
+async function summaryCore(terminal: Preset = "instant") {
+	const storage = new MemoryStorage();
+	const registry = createRegistry();
+	registry.install(askExtension({ storage, interfaces: [TELEGRAM, TERMINAL] }));
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const harness = await Harness.open(storage, { models, registry }, context);
+	cleanup.push(() => harness.close(context));
+	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+	harness.resume();
+	let clock = 100 * MIN;
+	const human = await openHumanPort(harness, root, new FakeAgentPort(), context, {
+		defaultTarget: TELEGRAM,
+		policies: { [TELEGRAM]: PRESETS.summary, [TERMINAL]: PRESETS[terminal] },
+		now: () => clock,
+		checkMs: 10,
+		summaryIdleMs: 30 * MIN,
+		storage,
+	});
+	cleanup.push(() => human.close());
+	const seen: SomaEvent[] = [];
+	human.subscribe((event) => seen.push(event));
+	const held = () =>
+		root.commit(async (tx) => JSON.parse(JSON.stringify((await tx.doc(Holds, root.id)).held)) as unknown[], context);
+	return {
+		faux,
+		root,
+		human,
+		seen,
+		held,
+		advance: (ms: number) => {
+			clock += ms;
+		},
+	};
+}
+
+const dinner = fauxAssistantMessage([fauxToolCall("ask", { question: "晚餐吃什麼？", options: ["拉麵", "咖哩"] })], {
+	stopReason: "toolUse",
+});
+const pause = () => new Promise((resolve) => setTimeout(resolve, 150));
+/** The question id in the callback data of the first button of `message`. */
+const questionOf = (message: SentMessage | undefined) =>
+	/^ask\/([0-9a-f]{16})\/1$/.exec(message?.reply_markup?.inline_keyboard[0]?.[0]?.callback_data ?? "")?.[1];
 
 test("splitMessage cuts at a line break near the limit, keeps pairs whole, and never sends empty text", () => {
 	expect(splitMessage("short")).toEqual(["short"]);
@@ -519,8 +573,9 @@ test("a prompt's buttons go once its job leaves that prompt, unless a press here
 
 test("a question soma asks arrives with a button per option; a press is the human's answer and runs a round", async () => {
 	const registry = createRegistry();
-	registry.install(askExtension());
-	const { faux, root, human } = await core(registry);
+	const storage = new MemoryStorage();
+	registry.install(askExtension({ storage, interfaces: [TELEGRAM, TERMINAL] }));
+	const { faux, root, human } = await core(registry, storage);
 	let heard = "";
 	faux.setResponses([
 		fauxAssistantMessage([fauxToolCall("ask", { question: "要我稍後再試一次嗎？", options: ["好", "不用"] })], {
@@ -752,6 +807,174 @@ test("a press that throws leaves settled a message an event settled while the pr
 	await vi.waitFor(() => expect(api.calls).toHaveLength(3));
 	expect(api.calls.at(-1)?.params.text).toBeUndefined();
 	expect(human.say).toHaveBeenCalledOnce();
+});
+
+test("at summary, a question asked in reply to a message from the chat comes at once with its buttons, and is never held", async () => {
+	const { faux, root, human, seen, held, advance } = await summaryCore();
+	faux.setResponses([
+		dinner,
+		fauxAssistantMessage("選一個吧。"),
+		fauxAssistantMessage("好，拉麵。"),
+		fauxAssistantMessage("不該有第四輪"),
+	]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	api.deliver("用選項題問我：晚餐吃拉麵還是咖哩？", CHAT);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	const question = questionOf(api.sent[0]);
+	// Quiet: the answer after it rings, as every answer to the human's own message does.
+	expect(api.sent).toEqual([
+		{
+			chat_id: CHAT,
+			text: "[問題] 晚餐吃什麼？",
+			rich: true,
+			disable_notification: true,
+			reply_markup: {
+				inline_keyboard: [
+					[{ text: "拉麵", callback_data: `ask/${question}/1` }],
+					[{ text: "咖哩", callback_data: `ask/${question}/2` }],
+				],
+			},
+		},
+		{ chat_id: CHAT, text: "選一個吧。", rich: true },
+	]);
+	expect(seen.find((event) => event.type === "notice" && event.kind === "question")).toMatchObject({
+		delivery: { [TELEGRAM]: "quiet", [TERMINAL]: "quiet" },
+	});
+	await root.waitForIdle(context);
+	expect(await held()).toEqual([]);
+
+	// Long past the idle time, unpressed: nothing was held, so no summary comes and the question is not offered again.
+	advance(31 * MIN);
+	await pause();
+	expect(faux.state.callCount).toBe(2);
+	expect(api.sent).toHaveLength(2);
+
+	const press = api.press(`ask/${question}/1`, CHAT);
+	await vi.waitFor(() => expect(api.sent.map(({ text }) => text)).toContain("好，拉麵。"));
+	expect(api.calls.at(-1)).toEqual({
+		method: "editMessageReplyMarkup",
+		params: { chat_id: CHAT, message_id: press.callback_query.message.message_id, reply_markup: chosen("已選：拉麵") },
+	});
+	await root.waitForIdle(context);
+	advance(31 * MIN);
+	await pause();
+	expect(faux.state.callCount).toBe(3);
+	expect(api.sent).toHaveLength(3);
+});
+
+test("at summary, a question asked in a schedule round is held, then offered again with its buttons after the summary", async () => {
+	const { faux, root, human, held, advance } = await summaryCore();
+	faux.setResponses([
+		dinner,
+		fauxAssistantMessage("問了晚餐。"),
+		fauxAssistantMessage("摘要：有一個問題等你。"),
+		fauxAssistantMessage("好，咖哩。"),
+		fauxAssistantMessage("不該有第五輪"),
+	]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	await root.submit(
+		{ type: "input", content: "晚餐提醒", entry: { kind: "schedule" }, requestId: "schedule:1" },
+		context,
+	);
+	await root.waitForIdle(context);
+	await vi.waitFor(async () => expect(await held()).toHaveLength(2));
+	await pause();
+	expect(api.sent).toEqual([]);
+
+	advance(31 * MIN);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	const question = questionOf(api.sent[1]);
+	expect(api.sent).toEqual([
+		{ chat_id: CHAT, text: "[通知] 摘要：有一個問題等你。", rich: true },
+		{
+			chat_id: CHAT,
+			text: "[問題] 晚餐吃什麼？",
+			rich: true,
+			disable_notification: true,
+			reply_markup: {
+				inline_keyboard: [
+					[{ text: "拉麵", callback_data: `ask/${question}/1` }],
+					[{ text: "咖哩", callback_data: `ask/${question}/2` }],
+				],
+			},
+		},
+	]);
+	expect(await held()).toEqual([]);
+
+	api.press(`ask/${question}/2`, CHAT);
+	await vi.waitFor(() => expect(api.sent.map(({ text }) => text)).toContain("好，咖哩。"));
+	expect(api.calls.at(-1)?.params.reply_markup).toEqual(chosen("已選：咖哩"));
+});
+
+test("with two interfaces at summary, the one whose message the round answers gets the question at once, the other holds it", async () => {
+	const { faux, root, human, seen, held, advance } = await summaryCore("summary");
+	faux.setResponses([
+		dinner,
+		fauxAssistantMessage("選一個吧。"),
+		fauxAssistantMessage("摘要：有一個問題等你。"),
+		fauxAssistantMessage("不該有第四輪"),
+	]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	await human.submit({ content: "晚餐吃什麼？", entry: { kind: TERMINAL }, requestId: "terminal:1" });
+	await root.waitForIdle(context);
+	const asked = seen.filter((event) => event.type === "notice" && event.kind === "question");
+	expect(asked).toEqual([expect.objectContaining({ delivery: { [TELEGRAM]: "log", [TERMINAL]: "quiet" } })]);
+	await vi.waitFor(async () => expect(await held()).toMatchObject([{ kind: "question", to: [TELEGRAM] }]));
+	await pause();
+	expect(api.sent).toEqual([]);
+
+	advance(31 * MIN);
+	await vi.waitFor(() => expect(api.sent).toHaveLength(2));
+	expect(api.sent.map(({ text, disable_notification }) => [text, disable_notification])).toEqual([
+		["[通知] 摘要：有一個問題等你。", undefined],
+		["[問題] 晚餐吃什麼？", true],
+	]);
+	expect(questionOf(api.sent[1])).toMatch(/^[0-9a-f]{16}$/);
+	// The terminal, which got the question at once, is shown neither the summary nor the question again.
+	const after = seen.filter((event) => event.type === "notice" && event.kind !== "forwarded").slice(-2);
+	expect(after.map((event) => ("delivery" in event ? event.delivery?.[TERMINAL] : undefined))).toEqual(["log", "log"]);
+});
+
+test("a steered round answering both interfaces sends its question at once to each, and neither holds it", async () => {
+	const { faux, root, human, seen, held, advance } = await summaryCore("summary");
+	let release = () => {};
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	faux.setResponses([
+		async () => {
+			await gate;
+			return fauxAssistantMessage([fauxToolCall("nothing", {})], { stopReason: "toolUse" });
+		},
+		dinner,
+		fauxAssistantMessage("選一個吧。"),
+		fauxAssistantMessage("不該有第四輪"),
+	]);
+	const { api, apiBase } = await bot();
+	start(human, apiBase);
+
+	await human.submit({ content: "晚餐", entry: { kind: TERMINAL }, requestId: "terminal:1" });
+	await vi.waitFor(() => expect(faux.state.callCount).toBe(1));
+	await root.submit(
+		{ type: "input", content: "吃什麼？", entry: { kind: TELEGRAM }, requestId: "telegram:steer", whenBusy: "steer" },
+		context,
+	);
+	release();
+	await root.waitForIdle(context);
+	await vi.waitFor(() => expect(api.sent.some(({ reply_markup }) => reply_markup !== undefined)).toBe(true));
+	const asked = seen.filter((event) => event.type === "notice" && event.kind === "question");
+	expect(asked).toEqual([expect.objectContaining({ delivery: { [TELEGRAM]: "quiet", [TERMINAL]: "quiet" } })]);
+	expect(await held()).toEqual([]);
+
+	advance(31 * MIN);
+	await pause();
+	expect(faux.state.callCount).toBe(3);
 });
 
 const markdownAnswer =

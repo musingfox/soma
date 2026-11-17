@@ -20,8 +20,9 @@ async function setup() {
 	const models = createModels();
 	models.setProvider(faux.provider);
 	const registry = createRegistry();
-	registry.install(askExtension());
-	const harness = await Harness.open(new MemoryStorage(), { models, registry }, context);
+	const storage = new MemoryStorage();
+	registry.install(askExtension({ storage, interfaces: ["chat.terminal"] }));
+	const harness = await Harness.open(storage, { models, registry }, context);
 	cleanup.push(() => harness.close(context));
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	harness.resume();
@@ -76,6 +77,8 @@ test("ask appends a question notice of class action carrying its options, naming
 				{ id: "2", label: "不用" },
 			],
 		},
+		// The round's input came from the terminal: the question is part of the reply to it.
+		replyTo: ["chat.terminal"],
 	});
 	await vi.waitFor(() => expect(choicesOf(seen.find((event) => event.type === "notice"))).toBeDefined());
 	expect(seen).toContainEqual({
@@ -88,7 +91,7 @@ test("ask appends a question notice of class action carrying its options, naming
 });
 
 test("the tool's description names no interface: each says what it shows in its own text", () => {
-	const description = askExtension().tools?.[0]?.description ?? "";
+	const description = askExtension({ storage: new MemoryStorage(), interfaces: [] }).tools?.[0]?.description ?? "";
 	expect(description).toContain("one press");
 	expect(description).not.toMatch(/telegram|web|terminal|chat\./i);
 });

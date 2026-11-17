@@ -120,16 +120,34 @@ type NoticeData = {
 	foreign?: PendingPush["foreign"];
 	target?: string;
 	delivery?: Record<string, Delivery>;
+	replyTo?: string[];
 };
 
 /** What a notice entry pushes, when the policies decide on it: an escalation and a summary carry their own delivery. */
 function pushOf(entry: EntryRecord): Push | undefined {
 	if (entry.kind !== NOTICE) return undefined;
-	const { kind, content, choices, foreign, target, delivery } = entry.data as NoticeData;
+	const { kind, content, choices, foreign, target, delivery, replyTo } = entry.data as NoticeData;
 	if (target !== undefined || delivery !== undefined) return undefined;
 	const messageClass = classOf(entry.data as { class?: unknown });
-	return { kind, class: messageClass, content, ...(choices && { choices }), ...(foreign && { foreign }) };
+	return {
+		kind,
+		class: messageClass,
+		content,
+		...(choices && { choices }),
+		...(foreign && { foreign }),
+		...(replyTo && { replyTo }),
+	};
 }
+
+/**
+ * A notice that is part of the reply to an interface's input goes to that interface at once, whatever its policy, and
+ * quietly: the round's own answer or failure rings there as answers do, so the notice adds no ring of its own. Every
+ * other interface keeps the delivery its policy gave. Without push options every client rings, as for any notice.
+ */
+const replying = (pushed: Delivered, replyTo: readonly string[]): Delivered =>
+	pushed.delivery === undefined || replyTo.length === 0
+		? pushed
+		: { delivery: { ...pushed.delivery, ...Object.fromEntries(replyTo.map((kind) => [kind, "quiet" as const])) } };
 
 const failureContent = (requestId: string, reason: string) => `${requestId} 那一輪失敗：${reason}`;
 const pushedFailure = (requestId: string, reason: string): Push => ({
@@ -264,7 +282,7 @@ export async function openHumanPort(
 			);
 			if (forwarded) for (const requestId of placed.values()) emit({ type: "notice", kind: "forwarded", requestId });
 			if (entry.kind !== NOTICE) continue;
-			const { kind, content, choices, foreign, target, delivery } = entry.data as NoticeData;
+			const { kind, content, choices, foreign, target, delivery, replyTo = [] } = entry.data as NoticeData;
 			const messageClass = classOf(entry.data as { class?: unknown });
 			// An escalation names its target and a summary its delivery; reports never escalate.
 			const pushed =
@@ -272,12 +290,15 @@ export async function openHumanPort(
 					? { delivery }
 					: target !== undefined
 						? { delivery: deliveries(policies, messageClass, target) }
-						: await deliveryOf(
-								`notice:${entry.id}`,
-								messageClass,
-								kind === "question"
-									? { kind, content, ...(choices && { choices }), ...(foreign && { foreign }) }
-									: undefined,
+						: replying(
+								await deliveryOf(
+									`notice:${entry.id}`,
+									messageClass,
+									kind === "question"
+										? { kind, content, ...(choices && { choices }), ...(foreign && { foreign }) }
+										: undefined,
+								),
+								replyTo,
 							);
 			await hold?.notice(entry.id, pushOf(entry)).catch((error: unknown) => console.error("[soma] held push:", error));
 			emit({ type: "notice", kind, class: messageClass, content, ...(choices && { choices }), ...pushed });

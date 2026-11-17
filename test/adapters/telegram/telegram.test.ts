@@ -15,6 +15,7 @@ import { Dispatches, dispatchExtension } from "../../../src/core/extensions/disp
 import { Holds } from "../../../src/core/hold.ts";
 import { openHumanPort } from "../../../src/core/human-port.ts";
 import type { HumanPort, SomaEvent } from "../../../src/ports/human.ts";
+import { steppedModel } from "../../stepped-model.ts";
 
 const context = BACKGROUND_CONTEXT;
 const TOKEN = "123:test";
@@ -1263,9 +1264,8 @@ test("at summary, a round from the chat that asks and then writes nothing sends 
 	]);
 	expect(ringing(api)).toHaveLength(1);
 	expect(api.reactions.every(({ message_id }) => message_id === message.message_id)).toBe(true);
-	// The Thinking draft was shown and is sent no more.
+	// No Thinking draft follows the answer; one still in flight when the answer came was aborted.
 	const drafts = api.drafts.length;
-	expect(drafts).toBeGreaterThan(0);
 	await settle();
 	expect(api.drafts).toHaveLength(drafts);
 	expect(onError).not.toHaveBeenCalled();
@@ -1661,12 +1661,13 @@ test("a refusal that is not about entities is reported and not resent", async ()
 	expect(api.sent).toEqual([]);
 });
 
-// The draft refreshed every few milliseconds, so a test sees several refreshes of an open round.
+// The draft refreshed every few milliseconds, with no least time between two calls, so a test sees several refreshes
+// of an open round.
 function drafting(human: HumanPort, apiBase: string, limit: { draftLimitMs?: number } = {}) {
 	const onError = vi.fn();
 	const controller = new AbortController();
 	const options = { human, token: TOKEN, chatId: CHAT, apiBase, signal: controller.signal, onError };
-	const running = runTelegram({ ...options, draftRefreshMs: 20, ...limit });
+	const running = runTelegram({ ...options, draftRefreshMs: 20, draftIntervalMs: 0, ...limit });
 	cleanup.push(() => {
 		controller.abort();
 		return running;
@@ -1753,21 +1754,26 @@ test("a round answered before its submit resolves shows no draft", async () => {
 });
 
 test("a refused draft is reported, and the answers and the reactions still go through", async () => {
-	const { faux, human } = await core();
-	faux.setResponses([fauxAssistantMessage("一。"), fauxAssistantMessage("二。")]);
+	const { stepped, human } = await streamingCore();
+	const replies = [stepped.reply(), stepped.reply()];
 	const { api, apiBase } = await bot();
 	api.failing.add("sendMessageDraft");
 	const { onError } = start(human, apiBase);
+	const refused = expect.objectContaining({ message: expect.stringContaining("sendMessageDraft") });
 
-	api.deliver("一", CHAT);
-	await vi.waitFor(() => expect(api.sent).toHaveLength(1));
-	api.deliver("二", CHAT);
+	// Each round answers once its placeholder was refused: a draft call still in flight at the answer is ignored.
+	for (const [index, reply] of replies.entries()) {
+		const text = `${index + 1}。`;
+		api.deliver(String(index + 1), CHAT);
+		await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(index + 1));
+		expect(onError).toHaveBeenLastCalledWith(refused);
+		await reply.write(text);
+		await reply.end();
+		await vi.waitFor(() => expect(api.sent.map((message) => message.text)).toContain(text));
+	}
 
-	await vi.waitFor(() => expect(api.sent.map((message) => message.text)).toEqual(["一。", "二。"]));
+	expect(api.sent.map((message) => message.text)).toEqual(["1。", "2。"]);
 	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍", "👀", "👍"]));
-	expect(onError).toHaveBeenCalledWith(
-		expect.objectContaining({ message: expect.stringContaining("sendMessageDraft") }),
-	);
 });
 
 test("a round whose answer does not come stops getting the draft after the limit, and its answer still arrives", async () => {
@@ -1788,4 +1794,483 @@ test("a round whose answer does not come stops getting the draft after the limit
 	human.emit({ type: "answer", requestId: `telegram:${message.message_id}`, content: "好" });
 	await vi.waitFor(() => expect(api.sent.map((sent) => sent.text)).toEqual(["好"]));
 	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍"]));
+});
+
+/** A clock the test moves; a timer set on it runs once the clock passes its time. */
+function manualClock() {
+	let at = 0;
+	const timers = new Set<{ at: number; run: () => void }>();
+	return {
+		now: () => at,
+		setTimer: (run: () => void, ms: number) => {
+			const timer = { at: at + ms, run };
+			timers.add(timer);
+			return () => void timers.delete(timer);
+		},
+		advance(ms: number) {
+			at += ms;
+			for (const timer of [...timers].sort((a, b) => a.at - b.at)) {
+				if (timer.at > at) continue;
+				timers.delete(timer);
+				timer.run();
+			}
+		},
+	};
+}
+
+/** A core whose model writes its answers when the test says; every event the HumanPort emits is kept in `seen`. */
+async function streamingCore() {
+	const stepped = steppedModel();
+	const harness = await Harness.open(
+		new MemoryStorage(),
+		{ models: stepped.models, registry: createRegistry() },
+		context,
+	);
+	cleanup.push(() => harness.close(context));
+	const root = await harness.root(context, { agent: { model: stepped.model } });
+	harness.resume();
+	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
+	cleanup.push(() => human.close());
+	const seen: SomaEvent[] = [];
+	human.subscribe((event) => seen.push(event));
+	return { stepped, root, human, seen };
+}
+
+/** Telegram over `human` with its drafts timed by `clock`; the refresh keeps its 20 s unless `draftRefreshMs` says. */
+function streaming(human: HumanPort, apiBase: string, clock: ReturnType<typeof manualClock>, draftRefreshMs?: number) {
+	const onError = vi.fn();
+	const controller = new AbortController();
+	const running = runTelegram({
+		human,
+		token: TOKEN,
+		chatId: CHAT,
+		apiBase,
+		signal: controller.signal,
+		onError,
+		now: clock.now,
+		setTimer: clock.setTimer,
+		...(draftRefreshMs !== undefined && { draftRefreshMs }),
+	});
+	cleanup.push(() => {
+		controller.abort();
+		return running;
+	});
+	return { onError };
+}
+
+/** Waits until the HumanPort has emitted `content` as the partial of the round of message `messageId`. */
+const partialOf = (seen: SomaEvent[], messageId: number, content: string) =>
+	vi.waitFor(() => expect(seen).toContainEqual({ type: "partial", requestIds: [`telegram:${messageId}`], content }));
+
+const draftCalls = (api: FakeBotApi) =>
+	api.methods.filter((method) => /Draft$|^sendRichMessage$|^sendMessage$/.test(method));
+
+test("a round from the chat shows its growing answer as its draft, at most once a second, then the answer as today", async () => {
+	const { stepped, root, human, seen } = await streamingCore();
+	const reply = stepped.reply();
+	const { api, apiBase } = await bot();
+	const clock = manualClock();
+	const { onError } = streaming(human, apiBase, clock);
+
+	const { message } = api.deliver("寫長一點", CHAT);
+	const id = message.message_id;
+	const placeholder = { chat_id: CHAT, draft_id: id, text: "" };
+	const draft = (text: string) => ({ chat_id: CHAT, draft_id: id, text, rich: true });
+	await vi.waitFor(() => expect(api.drafts).toEqual([placeholder]));
+
+	// Within the second since the placeholder, each text waits, and only the newest goes once the second has passed.
+	await reply.write("## 標題\n\n第一");
+	await partialOf(seen, id, "## 標題\n\n第一");
+	await reply.write("段");
+	await partialOf(seen, id, "## 標題\n\n第一段");
+	clock.advance(999);
+	await settle();
+	expect(api.drafts).toEqual([placeholder]);
+	clock.advance(1);
+	await vi.waitFor(() => expect(api.drafts).toEqual([placeholder, draft("## 標題\n\n第一段")]));
+
+	await reply.write("，**第二段**");
+	await partialOf(seen, id, "## 標題\n\n第一段，**第二段**");
+	clock.advance(500);
+	await settle();
+	expect(api.drafts).toHaveLength(2);
+	clock.advance(500);
+	await vi.waitFor(() => expect(api.drafts.at(-1)).toEqual(draft("## 標題\n\n第一段，**第二段**")));
+
+	await reply.end();
+	await root.waitForIdle(context);
+	await vi.waitFor(() =>
+		expect(api.sent).toEqual([{ chat_id: CHAT, text: "## 標題\n\n第一段，**第二段**", rich: true }]),
+	);
+	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍"]));
+	clock.advance(5_000);
+	await settle();
+	expect(draftCalls(api)).toEqual([
+		"sendMessageDraft",
+		"sendRichMessageDraft",
+		"sendRichMessageDraft",
+		"sendRichMessage",
+	]);
+	expect(onError).not.toHaveBeenCalled();
+});
+
+test("a text still waiting for its second when the answer comes is never sent, and no draft follows the answer", async () => {
+	const { stepped, root, human, seen } = await streamingCore();
+	const reply = stepped.reply();
+	const { api, apiBase } = await bot();
+	const clock = manualClock();
+	streaming(human, apiBase, clock);
+
+	const { message } = api.deliver("一", CHAT);
+	await vi.waitFor(() => expect(api.drafts).toHaveLength(1));
+	await reply.write("快寫完");
+	await partialOf(seen, message.message_id, "快寫完");
+	await reply.end();
+	await root.waitForIdle(context);
+	await vi.waitFor(() => expect(api.sent.map(({ text }) => text)).toEqual(["快寫完"]));
+
+	clock.advance(5_000);
+	await settle();
+	expect(draftCalls(api)).toEqual(["sendMessageDraft", "sendRichMessage"]);
+});
+
+test("three text drafts refused in a row stop the round's text drafts, the placeholder goes on, and the answer still arrives", async () => {
+	const { stepped, root, human, seen } = await streamingCore();
+	const reply = stepped.reply();
+	const { api, apiBase } = await bot();
+	api.failing.add("sendRichMessageDraft");
+	const clock = manualClock();
+	const { onError } = streaming(human, apiBase, clock, 20);
+	const richCalls = () => api.methods.filter((method) => method === "sendRichMessageDraft").length;
+
+	const { message } = api.deliver("一", CHAT);
+	const id = message.message_id;
+	await vi.waitFor(() => expect(api.drafts).toHaveLength(1));
+	let written = "";
+	for (const [index, text] of ["第一段", "，第二段", "，第三段"].entries()) {
+		written += text;
+		await reply.write(text);
+		await partialOf(seen, id, written);
+		clock.advance(1_000);
+		await vi.waitFor(() => expect(richCalls()).toBe(index + 1));
+		await settle();
+	}
+	expect(onError).toHaveBeenCalledTimes(1);
+	expect(onError).toHaveBeenCalledWith(
+		expect.objectContaining({ message: expect.stringContaining("sendRichMessageDraft") }),
+	);
+
+	await reply.write("，第四段");
+	await partialOf(seen, id, `${written}，第四段`);
+	clock.advance(1_000);
+	await vi.waitFor(() => expect(api.drafts).toHaveLength(2));
+	clock.advance(1_000);
+	await vi.waitFor(() => expect(api.drafts).toHaveLength(3));
+	expect(api.drafts.every(({ text, rich }) => text === "" && rich === undefined)).toBe(true);
+	expect(richCalls()).toBe(3);
+
+	await reply.end();
+	await root.waitForIdle(context);
+	await vi.waitFor(() =>
+		expect(api.sent).toEqual([{ chat_id: CHAT, text: "第一段，第二段，第三段，第四段", rich: true }]),
+	);
+	await vi.waitFor(() => expect(api.reactions.map(({ emoji }) => emoji)).toEqual(["👀", "👍"]));
+	expect(onError).toHaveBeenCalledTimes(1);
+});
+
+test("a text longer than a draft takes is not sent, and the draft keeps the last text that fit", async () => {
+	const { stepped, root, human, seen } = await streamingCore();
+	const reply = stepped.reply();
+	const { api, apiBase } = await bot();
+	const clock = manualClock();
+	const { onError } = streaming(human, apiBase, clock, 20);
+
+	const { message } = api.deliver("一", CHAT);
+	const id = message.message_id;
+	await vi.waitFor(() => expect(api.drafts).toHaveLength(1));
+	await reply.write("短");
+	await partialOf(seen, id, "短");
+	clock.advance(1_000);
+	await vi.waitFor(() => expect(api.drafts.at(-1)).toEqual({ chat_id: CHAT, draft_id: id, text: "短", rich: true }));
+
+	// 11,000 characters of three bytes each: past 32768 bytes, the most one rich message takes.
+	const long = `短${"字".repeat(11_000)}`;
+	await reply.write("字".repeat(11_000));
+	await partialOf(seen, id, long);
+	// The refresh sends the draft again, with the text that fit.
+	clock.advance(1_000);
+	await vi.waitFor(() => expect(api.drafts).toHaveLength(3));
+	expect(api.drafts.slice(1)).toEqual([1, 2].map(() => ({ chat_id: CHAT, draft_id: id, text: "短", rich: true })));
+	expect(onError).not.toHaveBeenCalled();
+
+	// The answer goes as today: too long for one rich message, in parts.
+	await reply.end();
+	await root.waitForIdle(context);
+	await vi.waitFor(() => expect(api.sent.map(({ text }) => text).join("")).toBe(long));
+	expect(api.sent.length).toBeGreaterThan(1);
+	expect(api.sent.every(({ rich }) => rich === undefined)).toBe(true);
+});
+
+test("a draft flood control refuses waits its retry_after, then shows the newest text", async () => {
+	const { stepped, root, human, seen } = await streamingCore();
+	const reply = stepped.reply();
+	const { api, apiBase } = await bot();
+	api.flooding.set("sendRichMessageDraft", [3]);
+	const clock = manualClock();
+	const { onError } = streaming(human, apiBase, clock);
+
+	const { message } = api.deliver("一", CHAT);
+	const id = message.message_id;
+	await vi.waitFor(() => expect(api.drafts).toHaveLength(1));
+	await reply.write("一");
+	await partialOf(seen, id, "一");
+	clock.advance(1_000);
+	await vi.waitFor(() =>
+		expect(onError).toHaveBeenCalledWith(
+			expect.objectContaining({ message: expect.stringContaining("retry after 3") }),
+		),
+	);
+	await reply.write("二");
+	await partialOf(seen, id, "一二");
+	clock.advance(2_999);
+	await settle();
+	expect(api.methods.filter((method) => method === "sendRichMessageDraft")).toHaveLength(1);
+	clock.advance(1);
+	await vi.waitFor(() => expect(api.drafts.at(-1)).toEqual({ chat_id: CHAT, draft_id: id, text: "一二", rich: true }));
+
+	await reply.end();
+	await root.waitForIdle(context);
+	await vi.waitFor(() => expect(api.sent.map(({ text }) => text)).toEqual(["一二"]));
+});
+
+test("a partial of a round from elsewhere, or of one the chat has no draft for, sends no draft", async () => {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const clock = manualClock();
+	const { onError } = streaming(human, apiBase, clock);
+
+	human.emit({ type: "partial", requestIds: ["terminal:1"], content: "別處" });
+	human.emit({ type: "partial", requestIds: ["telegram:99"], content: "重啟前" });
+	clock.advance(5_000);
+	await settle();
+	expect(api.drafts).toEqual([]);
+	expect(api.methods).toEqual([]);
+	expect(onError).not.toHaveBeenCalled();
+});
+
+/** Telegram over a fake HumanPort with drafts timed by `clock`, once a message from the chat shows its placeholder. */
+async function fakeStreaming(clock = manualClock(), draftRefreshMs?: number) {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	const { onError } = streaming(human, apiBase, clock, draftRefreshMs);
+	const { message } = api.deliver("一", CHAT);
+	const id = message.message_id;
+	await vi.waitFor(() => expect(api.drafts).toEqual([{ chat_id: CHAT, draft_id: id, text: "" }]));
+	const partial = (content: string) => human.emit({ type: "partial", requestIds: [`telegram:${id}`], content });
+	const answer = (content: string) => human.emit({ type: "answer", requestId: `telegram:${id}`, content });
+	const draft = (text: string) => ({ chat_id: CHAT, draft_id: id, text, rich: true });
+	const calls = (method: string) => api.methods.filter((each) => each === method).length;
+	return { human, api, clock, onError, id, partial, answer, draft, calls };
+}
+
+test("a round's draft call waits for the one in flight, and the newest text goes once it ends", async () => {
+	const { api, clock, onError, id, partial, draft, calls } = await fakeStreaming();
+	api.stalling.add("sendRichMessageDraft");
+
+	partial("一");
+	clock.advance(1_000);
+	await vi.waitFor(() => expect(calls("sendRichMessageDraft")).toBe(1));
+	partial("一二");
+	partial("一二三");
+	clock.advance(5_000);
+	await settle();
+	expect(calls("sendRichMessageDraft")).toBe(1);
+
+	api.stalling.delete("sendRichMessageDraft");
+	api.release();
+	await vi.waitFor(() =>
+		expect(api.drafts).toEqual([{ chat_id: CHAT, draft_id: id, text: "" }, draft("一"), draft("一二三")]),
+	);
+	expect(calls("sendRichMessageDraft")).toBe(2);
+	expect(onError).not.toHaveBeenCalled();
+});
+
+test("a draft call in flight when the answer comes is aborted and ignored, and the answer does not wait for it", async () => {
+	const { api, clock, onError, partial, answer, calls } = await fakeStreaming();
+	api.stalling.add("sendRichMessageDraft");
+
+	partial("快寫完");
+	clock.advance(1_000);
+	await vi.waitFor(() => expect(calls("sendRichMessageDraft")).toBe(1));
+	answer("快寫完了");
+	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "快寫完了", rich: true }]));
+	await vi.waitFor(() => expect(api.aborted).toEqual(["sendRichMessageDraft"]));
+
+	api.release();
+	clock.advance(30_000);
+	await settle();
+	expect(api.drafts).toHaveLength(1);
+	expect(draftCalls(api)).toEqual(["sendMessageDraft", "sendRichMessageDraft", "sendRichMessage"]);
+	expect(onError).not.toHaveBeenCalled();
+});
+
+test("a text that is only whitespace shows the placeholder, as empty text does", async () => {
+	const { api, clock, onError, id, partial, draft } = await fakeStreaming();
+	const placeholder = { chat_id: CHAT, draft_id: id, text: "" };
+
+	partial("一");
+	clock.advance(1_000);
+	await vi.waitFor(() => expect(api.drafts).toEqual([placeholder, draft("一")]));
+	// As after a tool call, when the next generation has written only a line break so far.
+	partial(" \n\n");
+	clock.advance(1_000);
+	await vi.waitFor(() => expect(api.drafts).toEqual([placeholder, draft("一"), placeholder]));
+	expect(onError).not.toHaveBeenCalled();
+});
+
+test("a refused text draft is reported once a round and skipped, and a draft taken starts the count of refusals over", async () => {
+	const { api, clock, onError, id, partial, draft, calls } = await fakeStreaming(manualClock(), 20);
+	const placeholder = { chat_id: CHAT, draft_id: id, text: "" };
+	// Each text goes a second after the one before, once the refresh has asked for it too.
+	const next = async (text: string) => {
+		const before = calls("sendRichMessageDraft");
+		partial(text);
+		clock.advance(1_000);
+		await vi.waitFor(() => expect(calls("sendRichMessageDraft")).toBe(before + 1));
+		await settle();
+	};
+
+	api.refusing.set("sendRichMessageDraft", 2);
+	await next("一");
+	await next("一二");
+	await next("一二三");
+	expect(api.drafts).toEqual([placeholder, draft("一二三")]);
+	// Two refusals, a draft taken, two more: never three in a row, so text drafts go on.
+	api.refusing.set("sendRichMessageDraft", 2);
+	await next("一二三四");
+	await next("一二三四五");
+	await next("一二三四五六");
+	expect(api.drafts).toEqual([placeholder, draft("一二三"), draft("一二三四五六")]);
+
+	// A refused text is not shown again: the refresh sends what the draft showed.
+	api.refusing.set("sendRichMessageDraft", 1);
+	await next("一二三四五六七");
+	clock.advance(1_000);
+	await vi.waitFor(() => expect(api.drafts).toHaveLength(4));
+	expect(api.drafts.at(-1)).toEqual(draft("一二三四五六"));
+	expect(onError).toHaveBeenCalledTimes(1);
+	expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining("can't parse") }));
+});
+
+/** Telegram over a fake HumanPort on a clock the test moves, with what a 429 of `sendRichMessage` should answer. */
+async function flooded(retryAfters: number[]) {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	api.flooding.set("sendRichMessage", retryAfters);
+	const clock = manualClock();
+	const { onError } = streaming(human, apiBase, clock);
+	const answer = (requestId: string, content: string) => human.emit({ type: "answer", requestId, content });
+	const floodedFor = (seconds: number) =>
+		vi.waitFor(() =>
+			expect(onError).toHaveBeenLastCalledWith(
+				expect.objectContaining({ message: expect.stringContaining(`retry after ${seconds}`) }),
+			),
+		);
+	return { api, clock, onError, answer, floodedFor };
+}
+
+test("an answer flood control refuses waits each retry_after and goes again, and the messages after it wait their turn", async () => {
+	const { api, clock, onError, answer, floodedFor } = await flooded([3, 5]);
+
+	answer("telegram:1", "答案");
+	answer("telegram:2", "下一則");
+	await floodedFor(3);
+	clock.advance(2_999);
+	await settle();
+	expect(api.sent).toEqual([]);
+	clock.advance(1);
+	await floodedFor(5);
+	clock.advance(4_999);
+	await settle();
+	expect(api.sent).toEqual([]);
+	clock.advance(1);
+	await vi.waitFor(() =>
+		expect(api.sent).toEqual([
+			{ chat_id: CHAT, text: "答案", rich: true },
+			{ chat_id: CHAT, text: "下一則", rich: true },
+		]),
+	);
+	expect(onError).toHaveBeenCalledTimes(2);
+});
+
+test("an answer flood control refuses a third time goes by the HTML path at once", async () => {
+	const { api, clock, onError, answer, floodedFor } = await flooded([1, 1, 1]);
+
+	answer("telegram:1", "答案");
+	await floodedFor(1);
+	clock.advance(1_000);
+	await vi.waitFor(() => expect(api.methods.filter((method) => method === "sendRichMessage")).toHaveLength(2));
+	clock.advance(1_000);
+	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "答案", parse_mode: "HTML" }]));
+	expect(api.methods.filter((method) => method === "sendRichMessage")).toHaveLength(3);
+	expect(onError).toHaveBeenCalledTimes(3);
+});
+
+test("an answer whose waits for flood control would pass a minute in all goes by the HTML path at once", async () => {
+	const { api, clock, answer, floodedFor } = await flooded([40, 30, 61]);
+
+	answer("telegram:1", "一");
+	await floodedFor(40);
+	clock.advance(40_000);
+	// 40 s and 30 s more would pass the minute: no wait.
+	await vi.waitFor(() => expect(api.sent).toEqual([{ chat_id: CHAT, text: "一", parse_mode: "HTML" }]));
+
+	// One retry_after past the minute alone gets no wait either.
+	answer("telegram:2", "二");
+	await vi.waitFor(() => expect(api.sent.map(({ text }) => text)).toEqual(["一", "二"]));
+	expect(api.sent[1]).toEqual({ chat_id: CHAT, text: "二", parse_mode: "HTML" });
+});
+
+test("a draft flood control asks to wait past a minute waits a minute, and the round's text drafts stop", async () => {
+	const { api, clock, onError, id, partial, calls } = await fakeStreaming();
+	const placeholder = { chat_id: CHAT, draft_id: id, text: "" };
+	api.flooding.set("sendRichMessageDraft", [100_000]);
+
+	partial("一");
+	clock.advance(1_000);
+	await vi.waitFor(() =>
+		expect(onError).toHaveBeenCalledWith(
+			expect.objectContaining({ message: expect.stringContaining("retry after 100000") }),
+		),
+	);
+	partial("一二");
+	clock.advance(59_999);
+	await settle();
+	expect(api.drafts).toEqual([placeholder]);
+	clock.advance(1);
+	await vi.waitFor(() => expect(api.drafts).toEqual([placeholder, placeholder]));
+	partial("一二三");
+	clock.advance(5_000);
+	await settle();
+	expect(calls("sendRichMessageDraft")).toBe(1);
+	expect(onError).toHaveBeenCalledTimes(1);
+});
+
+test("the fake Bot API refuses a rich draft with empty markdown, as it refuses such a message", async () => {
+	const { api, apiBase } = await bot();
+	const post = (method: string, body: object) =>
+		fetch(`${apiBase}/bot${TOKEN}/${method}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		}).then((response) => response.json());
+
+	const empty = { chat_id: CHAT, draft_id: 1, rich_message: { markdown: "" } };
+	expect(await post("sendRichMessageDraft", empty)).toMatchObject({ ok: false, error_code: 400 });
+	expect(await post("sendRichMessage", { chat_id: CHAT, rich_message: { markdown: "" } })).toMatchObject({ ok: false });
+	expect(await post("sendRichMessageDraft", { ...empty, rich_message: { markdown: "一" } })).toEqual({
+		ok: true,
+		result: true,
+	});
+	expect(api.drafts).toEqual([{ chat_id: CHAT, draft_id: 1, text: "一", rich: true }]);
 });

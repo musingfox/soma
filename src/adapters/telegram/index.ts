@@ -27,6 +27,12 @@ export interface TelegramOptions extends TelegramConfig {
 	readonly retryMs?: number;
 	readonly draftRefreshMs?: number;
 	readonly draftLimitMs?: number;
+	/** The least time between two draft calls of one round. */
+	readonly draftIntervalMs?: number;
+	/** The clock a round's drafts and a message's wait for flood control are timed by, `Date.now` by default. */
+	readonly now?: () => number;
+	/** Runs `run` in `ms` on that clock and returns what cancels it; `setTimeout` by default. */
+	readonly setTimer?: (run: () => void, ms: number) => () => void;
 	readonly onError?: (error: unknown) => void;
 }
 
@@ -56,6 +62,17 @@ const REACTIONS = { received: "👀", forwarded: "👌", answered: "👍", faile
 const DRAFT_REFRESH_MS = 20_000;
 // A round whose answer or failure never comes, such as a message delivered again after a restart, stops showing it.
 const DRAFT_LIMIT_MS = 10 * 60_000;
+// The answer's text as it grows goes at most once a second per round, the newest text first. The only figure Telegram
+// gives is about one message per second per chat: https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this
+const DRAFT_INTERVAL_MS = 1_000;
+// A draft may hold half-written markdown, such as an open fence or a table in progress, that Telegram might refuse while
+// the next text is fine: text drafts stop for the round only after this many refusals in a row.
+const DRAFT_REFUSALS = 3;
+// A message flood control refuses is tried again after its retry_after, this many times and waiting this long in all at
+// most, before it goes the way of any other refusal. A draft waits this long at most too: a longer retry_after stops
+// the round's text drafts, and a timer that long would overflow and fire at once.
+const SEND_RETRIES = 2;
+const FLOOD_WAIT_MS = 60_000;
 
 // callback_data takes 1-64 bytes: https://core.telegram.org/bots/api#inlinekeyboardbutton
 const CALLBACK_DATA_LIMIT = 64;
@@ -95,7 +112,13 @@ const UpdateSchema = z
 	.passthrough();
 const ResponseSchema = z.union([
 	z.object({ ok: z.literal(true), result: z.unknown() }).passthrough(),
-	z.object({ ok: z.literal(false), description: z.string().optional() }).passthrough(),
+	z
+		.object({
+			ok: z.literal(false),
+			description: z.string().optional(),
+			parameters: z.object({ retry_after: z.number().optional() }).passthrough().optional(),
+		})
+		.passthrough(),
 ]);
 
 /** Cut text into sendMessage-sized parts, at a line break when one is near, never inside a surrogate pair. */
@@ -129,8 +152,17 @@ export function messageParts(text: string): string[] {
 	return splitMessage(source).map(escapeHtml);
 }
 
-/** A call the Bot API answered with `ok: false`, as opposed to one that never got an answer. */
-class Refused extends Error {}
+/**
+ * A call the Bot API answered with `ok: false`, as opposed to one that never got an answer. `retryAfter`: flood
+ * control's seconds to wait before the next call: https://core.telegram.org/bots/api#responseparameters
+ */
+class Refused extends Error {
+	readonly retryAfter: number | undefined;
+	constructor(message: string, retryAfter?: number) {
+		super(message);
+		this.retryAfter = retryAfter;
+	}
+}
 
 const REFUSALS: Record<Extract<HumanAnswerOutcome, { sent: false }>["refusal"], string> = {
 	not_blocked: "agent 已經不在等回答",
@@ -206,15 +238,16 @@ const label = (kind: NoticeKind, content: string) => `[${kind === "question" ? "
 export async function runTelegram(options: TelegramOptions): Promise<void> {
 	const { human, chatId, signal } = options;
 	const onError = options.onError ?? ((error) => console.error("[soma] telegram:", error));
-	const call = async (method: string, body: object): Promise<unknown> => {
+	const call = async (method: string, body: object, callSignal = signal): Promise<unknown> => {
 		const response = await fetch(`${options.apiBase}/bot${options.token}/${method}`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(body),
-			signal,
+			signal: callSignal,
 		});
 		const parsed = ResponseSchema.parse(await response.json());
-		if (!parsed.ok) throw new Refused(`${method}: ${parsed.description ?? response.status}`);
+		if (!parsed.ok)
+			throw new Refused(`${method}: ${parsed.description ?? response.status}`, parsed.parameters?.retry_after);
 		return parsed.result;
 	};
 
@@ -228,16 +261,52 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	const shown = new Map<string, { card: string; fingerprint: string; messageIds: number[] }>();
 	// By question, the messages here showing the options of a question soma asked; lost on a restart.
 	const asked = new Map<string, number[]>();
+	const now = options.now ?? Date.now;
+	const setTimer =
+		options.setTimer ??
+		((run: () => void, ms: number) => {
+			const timer = setTimeout(run, ms);
+			return () => clearTimeout(timer);
+		});
+	// Ends early once `signal` aborts.
+	const pause = (ms: number) =>
+		new Promise<void>((resolve) => {
+			let cancel = () => {};
+			const done = () => {
+				cancel();
+				signal.removeEventListener("abort", done);
+				resolve();
+			};
+			signal.addEventListener("abort", done);
+			cancel = setTimer(done, ms);
+		});
+	// A message call flood control refuses waits its retry_after and goes again, within SEND_RETRIES and FLOOD_WAIT_MS;
+	// each such refusal is reported. Past them it throws as any refusal.
+	const patiently = async (method: string, body: object): Promise<unknown> => {
+		let waited = 0;
+		for (let retries = 0; ; retries++) {
+			try {
+				return await call(method, body);
+			} catch (error) {
+				if (!(error instanceof Refused) || error.retryAfter === undefined || signal.aborted) throw error;
+				const wait = error.retryAfter * 1000;
+				if (retries >= SEND_RETRIES || waited + wait > FLOOD_WAIT_MS) throw error;
+				onError(error);
+				waited += wait;
+				await pause(wait);
+			}
+		}
+	};
 	// A part Telegram refuses for its entities goes again as the text it shows, so formatting never loses a message.
 	const sendPart = async (html: string, extra: object): Promise<unknown> => {
 		try {
-			return await call("sendMessage", { chat_id: chatId, text: html, parse_mode: "HTML", ...extra });
+			return await patiently("sendMessage", { chat_id: chatId, text: html, parse_mode: "HTML", ...extra });
 		} catch (error) {
 			if (!(error instanceof Error) || !ENTITY_REFUSAL.test(error.message)) throw error;
-			return call("sendMessage", { chat_id: chatId, text: htmlToPlain(html), ...extra });
+			return patiently("sendMessage", { chat_id: chatId, text: htmlToPlain(html), ...extra });
 		}
 	};
-	// One at a time, so a long answer's parts and the messages after it arrive in order.
+	// One at a time, so a long answer's parts and the messages after it arrive in order, a wait for flood control included.
 	let sending = Promise.resolve();
 	const send = (
 		text: string,
@@ -264,7 +333,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			if (Buffer.byteLength(markdown) <= RICH_LIMIT) {
 				try {
 					return show(
-						await call("sendRichMessage", {
+						await patiently("sendRichMessage", {
 							chat_id: chatId,
 							rich_message: { markdown },
 							...(markup !== undefined ? { reply_markup: markup } : {}),
@@ -323,21 +392,142 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		};
 		reacting = reacting.then(() => quietly("setMessageReaction", body).then(() => {}));
 	};
-	// By requestId, the refresh of the "Thinking…" draft of each round from this chat still open; lost on a restart.
-	// The entry is made before the input is submitted, so an answer that comes before the submit resolves still ends it.
-	const drafts = new Map<string, ReturnType<typeof setInterval> | undefined>();
-	// A call after `signal` aborts is never sent: fetch takes the signal.
-	const draft = (messageId: number) =>
-		void quietly("sendMessageDraft", { chat_id: chatId, draft_id: messageId, text: "" });
+	// The draft of each round from this chat still open, by requestId; lost on a restart. The entry is made before the
+	// input is submitted, so an answer that comes before the submit resolves still ends it.
+	type Drafting = {
+		/** The message the draft is shown under, once the core has admitted the input. */
+		messageId?: number;
+		refresh?: ReturnType<typeof setInterval>;
+		/** What the draft shows: the newest text of the answer that fits a draft; one empty after trimming is "Thinking…". */
+		text: string;
+		/** What the last draft taken showed, which the draft keeps when a text is refused. */
+		taken: string;
+		/** Text drafts refused since the last draft taken, and whether one was reported for the round. */
+		refusals: number;
+		reported: boolean;
+		/**
+		 * `DRAFT_REFUSALS` text drafts were refused in a row, or flood control asked for more than `FLOOD_WAIT_MS`: the
+		 * round shows only "Thinking…" from then on.
+		 */
+		refused: boolean;
+		/** When its last draft call went, and the call waiting for the interval to pass. */
+		last: number;
+		waiting?: () => void;
+		/** What aborts the draft call in flight, and whether one is wanted once it ends. */
+		flight?: AbortController;
+		again: boolean;
+		closed: boolean;
+	};
+	const drafts = new Map<string, Drafting>();
+	const interval = options.draftIntervalMs ?? DRAFT_INTERVAL_MS;
+	// Flood control's wait, which every draft of this chat keeps; the messages do not.
+	let floodUntil = Number.NEGATIVE_INFINITY;
+	/**
+	 * Sends what the round's draft shows, once the interval since its last call has passed and that call has ended: a
+	 * text in the markdown the answer goes in, or the "Thinking…" placeholder. One call of a round at a time, so an older
+	 * text never lands after a newer one; the round's close aborts it and its outcome is ignored. Never on the `sending`
+	 * queue, so a draft neither waits for a message nor holds one back. A call after `signal` aborts is never sent: fetch
+	 * takes the signal.
+	 */
+	const show = (round: Drafting) => {
+		if (round.closed || round.waiting !== undefined || round.messageId === undefined) return;
+		if (round.flight !== undefined) {
+			round.again = true;
+			return;
+		}
+		const wait = Math.max(round.last + interval, floodUntil) - now();
+		if (wait > 0) {
+			round.waiting = setTimer(() => {
+				round.waiting = undefined;
+				show(round);
+			}, wait);
+			return;
+		}
+		round.last = now();
+		const { text } = round;
+		const rich = text.trim() !== "";
+		const body = { chat_id: chatId, draft_id: round.messageId };
+		const flight = new AbortController();
+		round.flight = flight;
+		const callSignal = AbortSignal.any([signal, flight.signal]);
+		const sent = rich
+			? call("sendRichMessageDraft", { ...body, rich_message: { markdown: text } }, callSignal)
+			: call("sendMessageDraft", { ...body, text: "" }, callSignal);
+		sent
+			.then(
+				() => {
+					if (round.closed) return;
+					round.taken = rich ? text : "";
+					round.refusals = 0;
+				},
+				(error: unknown) => {
+					if (signal.aborted || round.closed) return;
+					if (error instanceof Refused && error.retryAfter !== undefined) {
+						onError(error);
+						const wait = error.retryAfter * 1000;
+						floodUntil = Math.max(floodUntil, now() + Math.min(wait, FLOOD_WAIT_MS));
+						if (wait > FLOOD_WAIT_MS) {
+							round.refused = true;
+							round.text = "";
+						}
+						round.again = true;
+					} else if (error instanceof Refused && rich) {
+						// Reported once a round and skipped: the draft keeps what it showed, and the next text goes.
+						if (!round.reported) onError(error);
+						round.reported = true;
+						round.refusals += 1;
+						if (round.refusals >= DRAFT_REFUSALS) {
+							round.refused = true;
+							round.text = "";
+						} else if (round.text === text) round.text = round.taken;
+					} else onError(error);
+				},
+			)
+			.then(() => {
+				round.flight = undefined;
+				if (!round.again) return;
+				round.again = false;
+				show(round);
+			});
+	};
 	const think = (requestId: string, messageId: number) => {
-		if (!drafts.has(requestId) || drafts.get(requestId) !== undefined) return;
-		draft(messageId);
-		const until = Date.now() + (options.draftLimitMs ?? DRAFT_LIMIT_MS);
-		const refresh = () => (Date.now() > until ? settle(requestId) : draft(messageId));
-		drafts.set(requestId, setInterval(refresh, options.draftRefreshMs ?? DRAFT_REFRESH_MS));
+		const round = drafts.get(requestId);
+		if (round === undefined || round.messageId !== undefined) return;
+		round.messageId = messageId;
+		show(round);
+		const until = now() + (options.draftLimitMs ?? DRAFT_LIMIT_MS);
+		const refresh = () => (now() > until ? settle(requestId) : show(round));
+		round.refresh = setInterval(refresh, options.draftRefreshMs ?? DRAFT_REFRESH_MS);
+	};
+	// A text longer than one rich message stops the updates, and the draft keeps the last text that fit.
+	const stream = (requestId: string, text: string) => {
+		const round = drafts.get(requestId);
+		if (round === undefined || round.refused || text === round.text || Buffer.byteLength(text) > RICH_LIMIT) return;
+		round.text = text;
+		show(round);
+	};
+	const open = (requestId: string) => {
+		if (!drafts.has(requestId))
+			drafts.set(requestId, {
+				text: "",
+				taken: "",
+				refusals: 0,
+				reported: false,
+				refused: false,
+				last: Number.NEGATIVE_INFINITY,
+				again: false,
+				closed: false,
+			});
+	};
+	const close = (round: Drafting) => {
+		round.closed = true;
+		clearInterval(round.refresh);
+		round.waiting?.();
+		round.flight?.abort();
 	};
 	const settle = (requestId: string) => {
-		clearInterval(drafts.get(requestId));
+		const round = drafts.get(requestId);
+		if (round !== undefined) close(round);
 		drafts.delete(requestId);
 	};
 
@@ -376,6 +566,9 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 					await settleShown(prompt.messageIds, ELSEWHERE);
 				}
 			});
+		} else if (event.type === "partial") {
+			for (const requestId of event.requestIds)
+				if (requestId.startsWith(REQUEST_PREFIX)) stream(requestId, event.content);
 		} else if (event.type === "answer") {
 			if (mine) {
 				settle(event.requestId);
@@ -415,7 +608,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	// job's agent listed goes to that agent instead, and starts no round here.
 	const sayPress = async (query: CallbackQuery, messageId: number, pressed: { question: string; option: string }) => {
 		const requestId = `${REQUEST_PREFIX}${SAID_PREFIX}${pressed.question}`;
-		if (!drafts.has(requestId)) drafts.set(requestId, undefined);
+		open(requestId);
 		const outcome = await human.say(pressed.question, pressed.option, {
 			entry: { kind: ENTRY_KIND, data: { pressed: messageId } },
 			requestId,
@@ -471,7 +664,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 				for (const { update_id, message, callback_query } of updates) {
 					if (message?.text !== undefined && message.chat.id === chatId) {
 						const requestId = `${REQUEST_PREFIX}${message.message_id}`;
-						if (!drafts.has(requestId)) drafts.set(requestId, undefined);
+						open(requestId);
 						await human.submit({
 							content: message.text,
 							entry: { kind: ENTRY_KIND, data: { messageId: message.message_id } },
@@ -493,7 +686,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		}
 	} finally {
 		unsubscribe();
-		for (const refresh of drafts.values()) clearInterval(refresh);
+		for (const round of drafts.values()) close(round);
 		await Promise.all([sending, reacting]);
 	}
 }

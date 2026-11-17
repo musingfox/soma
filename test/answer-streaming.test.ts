@@ -1,6 +1,6 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
+import { type Conversation, createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
 import { afterEach, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { openHumanPort } from "../src/core/human-port.ts";
@@ -13,7 +13,8 @@ afterEach(async () => {
 	for (const close of cleanup.splice(0).reverse()) await close();
 });
 
-async function setup() {
+/** `slow` makes the root the HumanPort is given in place of the real one. */
+async function setup(slow?: (root: Conversation) => Conversation) {
 	const stepped = steppedModel();
 	const harness = await Harness.open(
 		new MemoryStorage(),
@@ -23,7 +24,7 @@ async function setup() {
 	cleanup.push(() => harness.close(context));
 	const root = await harness.root(context, { agent: { model: stepped.model } });
 	harness.resume();
-	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
+	const human = await openHumanPort(harness, slow?.(root) ?? root, new FakeAgentPort(), context);
 	cleanup.push(() => human.close());
 	const seen: SomaEvent[] = [];
 	human.subscribe((event) => seen.push(event));
@@ -115,5 +116,55 @@ test("a follow-up's round streams under its own requestId", async () => {
 		{ type: "answer", requestId: "terminal:1", content: "一的" },
 		{ type: "partial", requestIds: ["telegram:2"], content: "一的" },
 		{ type: "answer", requestId: "telegram:2", content: "一的" },
+	]);
+});
+
+test("partials wait behind a slow commit handler, so each comes after the answer before its round and none after its own", async () => {
+	// The handling of an answer reads its round's entries; while `gate` is shut, that read waits, and so do the commits
+	// and partials behind it.
+	let open = () => {};
+	let gate: Promise<void> | undefined;
+	const { stepped, root, human, seen } = await setup(
+		(real) =>
+			new Proxy(real, {
+				get(target, key) {
+					const value: unknown = Reflect.get(target, key, target);
+					if (typeof value !== "function") return value;
+					if (key !== "entries") return value.bind(target);
+					return async (...args: unknown[]) => {
+						await gate;
+						return value.apply(target, args);
+					};
+				},
+			}),
+	);
+	const [first, second] = [stepped.reply(), stepped.reply()];
+	const outcomes = () => seen.filter((event) => event.type === "partial" || event.type === "answer");
+
+	await human.submit({ content: "一", entry: { kind: "chat.terminal" }, requestId: "terminal:1" });
+	await first.write("一的");
+	await vi.waitFor(() => expect(outcomes()).toHaveLength(1));
+	await human.submit({ content: "二", entry: { kind: "chat.telegram" }, requestId: "telegram:2" });
+	gate = new Promise((resolve) => {
+		open = resolve;
+	});
+	// A failed check leaves it shut; the HumanPort cannot close behind it.
+	cleanup.push(async () => open());
+	await first.end();
+	// The next round streams while the first one's answer is still being handled.
+	await second.write("二的");
+	await settle();
+	expect(outcomes()).toEqual([{ type: "partial", requestIds: ["terminal:1"], content: "一的" }]);
+	open();
+	await vi.waitFor(() => expect(outcomes()).toHaveLength(3));
+	await second.end();
+	await root.waitForIdle(context);
+	await vi.waitFor(() => expect(outcomes()).toHaveLength(4));
+	await settle();
+	expect(outcomes()).toEqual([
+		{ type: "partial", requestIds: ["terminal:1"], content: "一的" },
+		{ type: "answer", requestId: "terminal:1", content: "一的" },
+		{ type: "partial", requestIds: ["telegram:2"], content: "二的" },
+		{ type: "answer", requestId: "telegram:2", content: "二的" },
 	]);
 });

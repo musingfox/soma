@@ -101,7 +101,7 @@ const badButtonData = (markup: InlineKeyboard | undefined) =>
 
 /**
  * A local stand-in for the Telegram Bot API (getUpdates long polling, sendMessage and sendRichMessage with inline buttons, and the
- * answerCallbackQuery and editMessageReplyMarkup calls a button press leads to, setMessageReaction and sendMessageDraft) for one bot token, so the
+ * answerCallbackQuery and editMessageReplyMarkup calls a button press leads to, setMessageReaction, sendMessageDraft and sendRichMessageDraft) for one bot token, so the
  * client runs over real HTTP without a bot. An update stays queued until a getUpdates offset above its id
  * confirms it, as Telegram does; `redeliver` puts one back, as Telegram does when a confirmation was lost.
  */
@@ -113,14 +113,34 @@ export class FakeBotApi {
 	readonly calls: { readonly method: string; readonly params: Record<string, unknown> }[] = [];
 	/** Each setMessageReaction as the message and its one emoji, in the order they came. */
 	readonly reactions: { readonly message_id: number; readonly emoji: string }[] = [];
-	/** Each sendMessageDraft it accepted, in the order they came; `text` as sent, absent when it was left out. */
-	readonly drafts: { readonly chat_id: number; readonly draft_id: number; readonly text?: string }[] = [];
+	/**
+	 * Each sendMessageDraft and sendRichMessageDraft it accepted, in the order they came; `text` as sent, absent when it
+	 * was left out, and for a rich draft its `rich_message.markdown`, marked `rich`.
+	 */
+	readonly drafts: {
+		readonly chat_id: number;
+		readonly draft_id: number;
+		readonly text?: string;
+		readonly rich?: true;
+	}[] = [];
 	/** Refuse every message that asks for a parse mode, as Telegram does for entities it cannot place. */
 	refuseEntities = false;
 	/** Methods answered with a 400, as Telegram answers a callback query that is too old. */
 	readonly failing = new Set<string>();
+	/** Methods whose next calls, this many of them, are answered with a 400, as Telegram refuses a text it cannot parse. */
+	readonly refusing = new Map<string, number>();
 	/** Methods whose connection is cut without an answer, as a network failure looks to the client. */
 	readonly dropping = new Set<string>();
+	/**
+	 * Methods whose next calls are answered with a 429 and these `retry_after`s in seconds, one each, as flood control
+	 * answers: https://core.telegram.org/bots/api#responseparameters
+	 */
+	readonly flooding = new Map<string, number[]>();
+	/** Methods whose calls wait unanswered until `release`, as a slow network looks to the client. */
+	readonly stalling = new Set<string>();
+	/** Each held call whose client closed the connection before `release`, by method; it is never handled. */
+	readonly aborted: string[] = [];
+	#held: (() => void)[] = [];
 	readonly #markups = new Map<number, InlineKeyboard>();
 	readonly #token: string;
 	#queue: FakeUpdate[] = [];
@@ -146,6 +166,28 @@ export class FakeBotApi {
 			const params = JSON.parse(body || "{}") as Record<string, unknown>;
 			if (method !== undefined && method !== "getUpdates") this.methods.push(method);
 			if (method !== undefined && this.dropping.has(method)) return void response.destroy();
+			if (method !== undefined && this.stalling.has(method)) {
+				const closed = await new Promise<boolean>((resolve) => {
+					this.#held.push(() => resolve(false));
+					response.on("close", () => resolve(true));
+				});
+				if (closed) return void this.aborted.push(method);
+			}
+			const retryAfter = method === undefined ? undefined : this.flooding.get(method)?.shift();
+			if (method !== undefined && retryAfter !== undefined) {
+				return reply(429, {
+					ok: false,
+					error_code: 429,
+					description: `Too Many Requests: retry after ${retryAfter}`,
+					parameters: { retry_after: retryAfter },
+				});
+			}
+			const refusals = method === undefined ? undefined : this.refusing.get(method);
+			if (method !== undefined && refusals !== undefined) {
+				if (refusals <= 1) this.refusing.delete(method);
+				else this.refusing.set(method, refusals - 1);
+				return reply(400, { ok: false, error_code: 400, description: "Bad Request: can't parse rich message" });
+			}
 			if (method !== undefined && this.failing.has(method))
 				return reply(400, { ok: false, error_code: 400, description: "Bad Request: query is too old" });
 			if (method === "getUpdates") return reply(200, { ok: true, result: await this.#updates(params) });
@@ -227,6 +269,22 @@ export class FakeBotApi {
 				});
 				return reply(200, { ok: true, result: true });
 			}
+			// The rich form of a draft takes draft_id as sendMessageDraft and rich_message as sendRichMessage:
+			// https://core.telegram.org/bots/api#sendrichmessagedraft. Only the markdown form, as for sendRichMessage, with
+			// its limit of 32768 characters. The docs state no other limit for a draft and no minimum; empty markdown is
+			// refused as sendRichMessage refuses it, the stricter reading, so a client that sends one finds out.
+			if (method === "sendRichMessageDraft") {
+				const { chat_id, draft_id } = params;
+				if (!Number.isInteger(draft_id) || draft_id === 0)
+					return reply(400, { ok: false, error_code: 400, description: "Bad Request: invalid draft_id" });
+				const rich = (params.rich_message ?? {}) as Record<string, unknown>;
+				const forms = ["html", "markdown", "blocks"].filter((field) => field in rich);
+				const markdown = rich.markdown;
+				if (forms.length !== 1 || typeof markdown !== "string" || markdown === "" || [...markdown].length > RICH_LIMIT)
+					return reply(400, { ok: false, error_code: 400, description: "Bad Request: rich message is invalid" });
+				this.drafts.push({ chat_id: chat_id as number, draft_id: draft_id as number, text: markdown, rich: true });
+				return reply(200, { ok: true, result: true });
+			}
 			reply(404, { ok: false, error_code: 404, description: "Not Found" });
 		});
 		this.#server = server;
@@ -272,7 +330,13 @@ export class FakeBotApi {
 		for (const wake of this.#wake) wake();
 	}
 
+	/** Handles every call `stalling` holds, in the order they came. */
+	release(): void {
+		for (const handle of this.#held.splice(0)) handle();
+	}
+
 	async close(): Promise<void> {
+		this.release();
 		for (const wake of this.#wake) wake();
 		this.#server?.closeAllConnections();
 		await new Promise((resolve) => this.#server?.close(resolve));

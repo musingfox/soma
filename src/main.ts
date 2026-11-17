@@ -36,7 +36,7 @@ import { sleeper } from "./core/extensions/sleeper/index.ts";
 import { stopGuard } from "./core/extensions/stop/index.ts";
 import { tools } from "./core/extensions/tools/index.ts";
 import { web } from "./core/extensions/web/index.ts";
-import { acquireDbLock, DbLockedError, openHarness, openStorage } from "./core/harness.ts";
+import { acquireDbLock, DbLockedError, openHarness, openStorage, rootCompaction } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
 import { startCore } from "./core/startup.ts";
 import { installErrorPrinting } from "./error-printing.ts";
@@ -130,7 +130,13 @@ const extensions = [
 	// After it for the same reason: added on 2026-11-18, when `interface` was already in the root's transcript.
 	tools,
 ];
-const harness: Harness = await openHarness(storage, extensions, context, { models });
+// The root compacts past `compactAt`, with pi-durable's own summary prompt; after a summary the prompt planner states
+// every section and tool once more, so soma writes no line of its own about what the model can do.
+const compaction = rootCompaction(config.compactAt, models.getModel("anthropic", config.model));
+const harness: Harness = await openHarness(storage, extensions, context, {
+	models,
+	...(compaction !== undefined && { settings: { compaction } }),
+});
 const root = await harness.root(context, {
 	agent: { model: { provider: "anthropic", modelId: config.model } },
 });

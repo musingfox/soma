@@ -73,6 +73,8 @@ test("dispatch starts an agent named after the card and records the job with its
 			status: { state: "idle" },
 			launch: expect.stringMatching(/以下是任務卡：\n\n# card-a$/),
 			decisions: [],
+			repo: "/repo",
+			createdAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/),
 		},
 	]);
 });

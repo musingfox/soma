@@ -38,6 +38,9 @@ export type Job = {
 	readonly agent: string;
 	readonly sessionId: string;
 	readonly status: AgentState;
+	// The repo the job was dispatched into, and when; absent from a job recorded before either was kept.
+	readonly repo?: string;
+	readonly createdAt?: string;
 	// Names the observation that set `status`; an event carrying the same one was already handled.
 	readonly seq?: number;
 	// The first prompt, held until the agent can take it: claude refuses prompts until its trust dialog is answered.

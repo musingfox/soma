@@ -103,6 +103,8 @@ export async function startJob(
 		agent: card,
 		sessionId: listed?.sessionId ?? sessionId,
 		status: listed?.status ?? { state: "idle" },
+		repo,
+		createdAt: new Date().toISOString(),
 		launch,
 		...(ticket === undefined ? {} : { ticket }),
 		decisions: [],

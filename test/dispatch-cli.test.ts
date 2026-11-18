@@ -72,10 +72,41 @@ test("a relative repo is taken from the directory the command runs in", async ()
 	expect(run.sent).toEqual([{ path: "/data/dev.sqlite.defer.sock", request: { repo: REPO, card: "card-a" } }]);
 });
 
-test("in the shell of an agent soma dispatched, SOMA_SOCKET names the soma to ask", async () => {
+test("SOMA_SOCKET is not consulted: soma is found by its config, as for any human caller", async () => {
 	const run = await cli(["--repo", REPO, "card-a"], STARTED, { ...ENV, SOMA_SOCKET: "/run/other.sock" });
 
-	expect(run.sent).toEqual([{ path: "/run/other.sock", request: { repo: REPO, card: "card-a" } }]);
+	expect(run.sent).toEqual([{ path: "/data/dev.sqlite.defer.sock", request: { repo: REPO, card: "card-a" } }]);
+});
+
+test("in the shell of an agent soma dispatched, nothing is sent and the refusal names the card", async () => {
+	const run = await cli(["--repo", REPO, "card-a"], STARTED, {
+		...ENV,
+		SOMA_AGENT: "card-b",
+		SOMA_SOCKET: "/run/s.sock",
+	});
+
+	expect(run).toEqual({
+		status: 1,
+		out: [],
+		err: ["soma dispatch: not dispatched: an agent soma dispatched cannot start jobs (SOMA_AGENT=card-b)"],
+		sent: [],
+	});
+});
+
+test("an agent is refused before the arguments are read or the config is, and a blank SOMA_AGENT is no agent", async () => {
+	const broken = join(dir, "broken-agent.json");
+	writeFileSync(broken, "{");
+
+	const agent = await cli(["card-a"], STARTED, { SOMA_CONFIG: broken, SOMA_AGENT: "card-b" });
+	expect([agent.status, agent.err, agent.sent]).toEqual([
+		1,
+		["soma dispatch: not dispatched: an agent soma dispatched cannot start jobs (SOMA_AGENT=card-b)"],
+		[],
+	]);
+
+	const blank = await cli(["--repo", REPO, "card-a"], STARTED, { ...ENV, SOMA_AGENT: "  " });
+	expect([blank.status, blank.err]).toEqual([0, []]);
+	expect(blank.sent).toEqual([{ path: "/data/dev.sqlite.defer.sock", request: { repo: REPO, card: "card-a" } }]);
 });
 
 test("a card that has a job, or whose agent was running, says so and exits 0", async () => {

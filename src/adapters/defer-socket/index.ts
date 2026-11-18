@@ -3,14 +3,20 @@ import { connect, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
 import { z } from "zod";
 import type { DeferReply, DeferRequest } from "../../ports/defer.ts";
-import type { DispatchReply, DispatchRequest } from "../../ports/dispatch.ts";
+import { type DispatchReply, type DispatchRequest, refusedForAgent } from "../../ports/dispatch.ts";
 
 // One request per connection: a JSON line from the CLI, a JSON line back, then the server ends the connection. A
 // request with `kind: "dispatch"` is `soma dispatch`'s; any other is `soma defer`'s, whose CLI, in the shell of an agent
-// an older release started, sends no kind.
+// an older release started, sends no kind. A dispatch request carries the caller's SOMA_AGENT when it had one, and the
+// CLI of an older release sends none.
 const RequestSchema = z.object({ agent: z.string().min(1), at: z.string(), instruction: z.string() }).strict();
 const DispatchRequestSchema = z
-	.object({ kind: z.literal("dispatch"), repo: z.string().min(1), card: z.string().min(1) })
+	.object({
+		kind: z.literal("dispatch"),
+		repo: z.string().min(1),
+		card: z.string().min(1),
+		agent: z.string().optional(),
+	})
 	.strict();
 const ReplySchema = z.union([
 	z.object({ accepted: z.literal(true), id: z.string(), at: z.string() }),
@@ -132,6 +138,8 @@ export async function serveDefer(options: {
 				}
 				if (dispatch === undefined)
 					return reply({ dispatched: false, reason: "this soma does not serve soma dispatch" });
+				const agent = request.data.agent?.trim();
+				if (agent) return reply({ dispatched: false, reason: refusedForAgent(agent) });
 				const { repo, card } = request.data;
 				dispatch({ repo, card }).then(reply, (error: Error) => {
 					onError(error);

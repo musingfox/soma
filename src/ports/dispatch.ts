@@ -5,7 +5,15 @@
 export interface DispatchRequest {
 	readonly repo: string;
 	readonly card: string;
+	/**
+	 * The caller's `SOMA_AGENT`, when it had one: soma sets it for every agent it starts, and an agent soma dispatched
+	 * may not start jobs, so soma refuses a request that carries it. A caller that sends none is taken for a human's.
+	 */
+	readonly agent?: string;
 }
+
+/** Why a dispatch is refused when its caller is the agent of `card`; the CLI and the server say it alike. */
+export const refusedForAgent = (card: string) => `an agent soma dispatched cannot start jobs (SOMA_AGENT=${card})`;
 
 /**
  * `how` the card has its job now: `started` by this request; `found`, an agent of the card's name already running,

@@ -1,14 +1,15 @@
 // `soma dispatch --repo <path> <card>`: asks the running soma to start a job on <card> in the git repo at <path>, as
 // its dispatch tool would, with no turn of its model. bin/soma runs it. The repo must be directly under the config's
-// reposDir; soma checks that, not this CLI. soma is found on the socket its config names, as `soma defer` finds it, or
-// on SOMA_SOCKET in the shell of an agent it dispatched.
+// reposDir; soma checks that, not this CLI. soma is found on the socket its config names, never on SOMA_SOCKET: an agent
+// soma dispatched must not start jobs, and refuses itself here when SOMA_AGENT, which soma sets for every agent, is set.
+// That is a check by a cooperative caller, not a boundary: see ARCHITECTURE.md, "Decided 2026-11-17".
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DeferUnreachable, requestDispatch } from "./adapters/defer-socket/index.ts";
 import { configPath, loadConfig } from "./config.ts";
-import type { DispatchReply, DispatchRequest } from "./ports/dispatch.ts";
+import { type DispatchReply, type DispatchRequest, refusedForAgent } from "./ports/dispatch.ts";
 
 const USAGE = "usage: soma dispatch --repo <git repo directly under reposDir> <card>";
 
@@ -62,23 +63,26 @@ export async function runDispatch(
 		send?: (path: string, request: DispatchRequest) => Promise<DispatchReply>;
 	} = {},
 ): Promise<number> {
+	const agent = env.SOMA_AGENT?.trim();
+	if (agent) {
+		io.err(`soma dispatch: not dispatched: ${refusedForAgent(agent)}`);
+		return 1;
+	}
 	const parsed = parseDispatchArgs(args);
 	if ("error" in parsed) {
 		io.err(`soma dispatch: ${parsed.error}\n${USAGE}`);
 		return 2;
 	}
-	let socket = env.SOMA_SOCKET?.trim();
-	if (!socket) {
-		try {
-			socket = loadConfig(configPath(env, home), env, home, io.err).deferSocket;
-		} catch (error) {
-			io.err(`soma dispatch: ${(error as Error).message}`);
-			return 1;
-		}
+	let socket: string;
+	try {
+		socket = loadConfig(configPath(env, home), env, home, io.err).deferSocket;
+	} catch (error) {
+		io.err(`soma dispatch: ${(error as Error).message}`);
+		return 1;
 	}
 	let reply: DispatchReply;
 	try {
-		reply = await send(socket, { repo: resolve(cwd, parsed.repo), card: parsed.card });
+		reply = await send(socket, { repo: resolve(cwd, parsed.repo), card: parsed.card, ...(agent ? { agent } : {}) });
 	} catch (error) {
 		const message = (error as Error).message;
 		if (error instanceof DeferUnreachable) {

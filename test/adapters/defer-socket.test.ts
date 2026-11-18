@@ -161,27 +161,85 @@ test("a soma serving no dispatch refuses one, and a core that throws is a refusa
 	await throwing.close();
 });
 
-test("bin/soma dispatch sends the repo and card to SOMA_SOCKET and prints soma's reply", async () => {
+test("a dispatch request that carries a SOMA_AGENT is refused, and none reaches the core", async () => {
+	const { path, deferred, dispatched, server } = await servingBoth();
+	const refused = {
+		dispatched: false,
+		reason: "an agent soma dispatched cannot start jobs (SOMA_AGENT=card-b)",
+	};
+
+	expect(await requestDispatch(path, { repo: "/w/soma", card: "card-a", agent: "card-b" })).toEqual(refused);
+	expect(
+		JSON.parse(
+			await raw(path, `${JSON.stringify({ kind: "dispatch", repo: "/w/soma", card: "a", agent: "card-b" })}\n`),
+		),
+	).toEqual(refused);
+	expect([deferred, dispatched]).toEqual([[], []]);
+
+	// A request with no such field, as an older CLI sends, is served; so is one a current CLI sends for a human.
+	const old = JSON.parse(await raw(path, `${JSON.stringify({ kind: "dispatch", repo: "/w/soma", card: "card-a" })}\n`));
+	expect(old).toEqual(STARTED);
+	expect(await requestDispatch(path, { repo: "/w/soma", card: "card-a" })).toEqual(STARTED);
+	expect(dispatched).toEqual([
+		{ repo: "/w/soma", card: "card-a" },
+		{ repo: "/w/soma", card: "card-a" },
+	]);
+	await server.close();
+});
+
+test("a dispatch request with a blank SOMA_AGENT is no agent's and is served", async () => {
+	const { path, dispatched, server } = await servingBoth();
+
+	expect(await requestDispatch(path, { repo: "/w/soma", card: "card-a", agent: " " })).toEqual(STARTED);
+	expect(dispatched).toEqual([{ repo: "/w/soma", card: "card-a" }]);
+	await server.close();
+});
+
+/** Runs bin/soma dispatch with `env` against a soma serving both kinds; its config names the served socket. */
+async function binDispatch(env: Record<string, string>) {
 	let server: DeferServer | undefined;
 	try {
 		const served = await servingBoth();
 		server = served.server;
 		const bin = resolve(import.meta.dirname, "../../bin/soma");
-		const config = join(dir, "dispatch-config.json");
-		writeFileSync(config, "{}");
+		const config = join(dir, `dispatch-config-${sockets++}.json`);
+		writeFileSync(config, JSON.stringify({ deferSocket: served.path }));
 		const run = await promisify(execFile)(bin, ["dispatch", "--repo", "/w/soma", "card-a"], {
 			encoding: "utf8",
-			env: { PATH: process.env.PATH, SOMA_CONFIG: config, SOMA_SOCKET: served.path, SOMA_NODE: process.execPath },
-		});
-
-		expect(run.stderr).toBe("");
-		expect(run.stdout).toBe(
-			"soma dispatch: started agent card-a for card card-a in /w/soma, session s-1; soma sends it the card's launch prompt once it is ready.\n",
+			env: { PATH: process.env.PATH, SOMA_CONFIG: config, SOMA_NODE: process.execPath, ...env },
+		}).then(
+			({ stdout, stderr }) => ({ code: 0, stdout, stderr }),
+			(error: { code: number; stdout: string; stderr: string }) => error,
 		);
-		expect(served.dispatched).toEqual([{ repo: "/w/soma", card: "card-a" }]);
+		return { run, dispatched: served.dispatched, path: served.path };
 	} finally {
 		await server?.close();
 	}
+}
+
+test("bin/soma dispatch sends the repo and card to the socket soma's config names and prints soma's reply", async () => {
+	const { run, dispatched } = await binDispatch({});
+
+	expect(run.stderr).toBe("");
+	expect(run.stdout).toBe(
+		"soma dispatch: started agent card-a for card card-a in /w/soma, session s-1; soma sends it the card's launch prompt once it is ready.\n",
+	);
+	expect(dispatched).toEqual([{ repo: "/w/soma", card: "card-a" }]);
+});
+
+test("bin/soma dispatch ignores SOMA_SOCKET, and in an agent's shell refuses and sends nothing", async () => {
+	const other = socketPath();
+	const ignored = await binDispatch({ SOMA_SOCKET: other });
+	expect(ignored.run.code).toBe(0);
+	expect(ignored.dispatched).toEqual([{ repo: "/w/soma", card: "card-a" }]);
+
+	const agent = await binDispatch({ SOMA_AGENT: "card-b", SOMA_SOCKET: ignored.path });
+	expect(agent.run).toMatchObject({
+		code: 1,
+		stdout: "",
+		stderr: "soma dispatch: not dispatched: an agent soma dispatched cannot start jobs (SOMA_AGENT=card-b)\n",
+	});
+	expect(agent.dispatched).toEqual([]);
 });
 
 /** A client that connects and sends nothing; resolves when the server ends or drops the connection. */

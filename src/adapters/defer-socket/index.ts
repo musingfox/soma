@@ -3,12 +3,35 @@ import { connect, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
 import { z } from "zod";
 import type { DeferReply, DeferRequest } from "../../ports/defer.ts";
+import type { DispatchReply, DispatchRequest } from "../../ports/dispatch.ts";
 
-// One request per connection: a JSON line from the CLI, a JSON line back, then the server ends the connection.
+// One request per connection: a JSON line from the CLI, a JSON line back, then the server ends the connection. A
+// request with `kind: "dispatch"` is `soma dispatch`'s; any other is `soma defer`'s, whose CLI, in the shell of an agent
+// an older release started, sends no kind.
 const RequestSchema = z.object({ agent: z.string().min(1), at: z.string(), instruction: z.string() }).strict();
+const DispatchRequestSchema = z
+	.object({ kind: z.literal("dispatch"), repo: z.string().min(1), card: z.string().min(1) })
+	.strict();
 const ReplySchema = z.union([
 	z.object({ accepted: z.literal(true), id: z.string(), at: z.string() }),
 	z.object({ accepted: z.literal(false), reason: z.string() }),
+]);
+const DispatchReplySchema = z.union([
+	z.object({
+		dispatched: z.literal(true),
+		how: z.enum(["started", "found", "existing"]),
+		card: z.string(),
+		agent: z.string(),
+		sessionId: z.string(),
+		repo: z.string().optional(),
+		state: z.string(),
+	}),
+	z.object({ dispatched: z.literal(false), reason: z.string() }),
+	// What the server answers before it knows the request's kind, such as one too long.
+	z.object({ accepted: z.literal(false), reason: z.string() }).transform(({ reason }) => ({
+		dispatched: false as const,
+		reason,
+	})),
 ]);
 // Far above any instruction an agent types; a client that sends more is not one of soma's.
 const MAX_REQUEST_BYTES = 64 * 1024;
@@ -49,17 +72,19 @@ function listen(server: Server, path: string): Promise<void> {
 }
 
 /**
- * Serves `soma defer` on the unix socket `path`, mode 0600, so only the user soma runs as can connect. A socket file
- * nobody answers on, as a killed soma leaves, is replaced; one another process serves, or any file not a socket, is not.
+ * Serves `soma defer`, and `soma dispatch` when given `dispatch`, on the unix socket `path`, mode 0600, so only the user
+ * soma runs as can connect. A socket file nobody answers on, as a killed soma leaves, is replaced; one another process
+ * serves, or any file not a socket, is not.
  */
 export async function serveDefer(options: {
 	readonly path: string;
 	readonly defer: (request: DeferRequest) => Promise<DeferReply>;
+	readonly dispatch?: (request: DispatchRequest) => Promise<DispatchReply>;
 	readonly onError?: (error: Error) => void;
 	/** How long a connection may sit idle, before its request or after its reply, before it is dropped. */
 	readonly readTimeoutMs?: number;
 }): Promise<DeferServer> {
-	const { path, defer } = options;
+	const { path, defer, dispatch } = options;
 	const onError = options.onError ?? ((error: Error) => console.error(`[soma] defer socket: ${error.message}`));
 	const readTimeoutMs = options.readTimeoutMs ?? READ_TIMEOUT_MS;
 	// Connections whose request is not read yet, which close drops; one being answered ends with its reply.
@@ -68,7 +93,7 @@ export async function serveDefer(options: {
 		let buffered = "";
 		// The timeout is off only while the core records the request; a client that never closes after the reply is
 		// dropped as one that never sends is.
-		const reply = (value: DeferReply) => {
+		const reply = (value: DeferReply | DispatchReply) => {
 			socket.setTimeout(readTimeoutMs);
 			socket.end(`${JSON.stringify(value)}\n`);
 		};
@@ -98,10 +123,25 @@ export async function serveDefer(options: {
 			} catch {
 				return reply({ accepted: false, reason: "the request is not JSON" });
 			}
+			const fields = (error: z.ZodError) =>
+				error.issues.map((issue) => issue.path.join(".") || "(top level)").join(", ");
+			if ((json as { kind?: unknown } | null)?.kind === "dispatch") {
+				const request = DispatchRequestSchema.safeParse(json);
+				if (!request.success) {
+					return reply({ dispatched: false, reason: `the request is malformed at ${fields(request.error)}` });
+				}
+				if (dispatch === undefined)
+					return reply({ dispatched: false, reason: "this soma does not serve soma dispatch" });
+				const { repo, card } = request.data;
+				dispatch({ repo, card }).then(reply, (error: Error) => {
+					onError(error);
+					reply({ dispatched: false, reason: `soma failed to dispatch it: ${error.message}` });
+				});
+				return;
+			}
 			const request = RequestSchema.safeParse(json);
 			if (!request.success) {
-				const fields = request.error.issues.map((issue) => issue.path.join(".") || "(top level)").join(", ");
-				return reply({ accepted: false, reason: `the request is malformed at ${fields}` });
+				return reply({ accepted: false, reason: `the request is malformed at ${fields(request.error)}` });
 			}
 			defer(request.data).then(reply, (error: Error) => {
 				onError(error);
@@ -133,7 +173,10 @@ export async function serveDefer(options: {
 	};
 }
 
-/** What `requestDefer` rejects with when it could not connect: the request never went out, so nothing was deferred. */
+/**
+ * What `requestDefer` and `requestDispatch` reject with when they could not connect: the request never went out, so
+ * nothing was deferred or dispatched.
+ */
 export class DeferUnreachable extends Error {}
 
 /**
@@ -141,6 +184,24 @@ export class DeferUnreachable extends Error {}
  * before the request went out is a DeferUnreachable: after it, soma may have recorded the request whatever the error.
  */
 export function requestDefer(path: string, request: DeferRequest, timeoutMs = 10_000): Promise<DeferReply> {
+	return send(path, request, ReplySchema, "soma defer", timeoutMs);
+}
+
+/**
+ * Sends one `soma dispatch` request to the soma serving `path`, as `requestDefer` sends a defer. Its timeout is longer,
+ * since soma reads the card and starts the agent before it replies.
+ */
+export function requestDispatch(path: string, request: DispatchRequest, timeoutMs = 60_000): Promise<DispatchReply> {
+	return send(path, { kind: "dispatch", ...request }, DispatchReplySchema, "soma dispatch", timeoutMs);
+}
+
+function send<T>(
+	path: string,
+	request: object,
+	schema: z.ZodType<T, z.ZodTypeDef, unknown>,
+	command: string,
+	timeoutMs: number,
+): Promise<T> {
 	return new Promise((resolve, reject) => {
 		const socket = connect(path);
 		let buffered = "";
@@ -156,7 +217,7 @@ export function requestDefer(path: string, request: DeferRequest, timeoutMs = 10
 		});
 		socket.once("error", (error) => reject(sent ? error : new DeferUnreachable(error.message)));
 		socket.once("end", () => {
-			const reply = ReplySchema.safeParse(
+			const reply = schema.safeParse(
 				(() => {
 					try {
 						return JSON.parse(buffered);
@@ -166,7 +227,7 @@ export function requestDefer(path: string, request: DeferRequest, timeoutMs = 10
 				})(),
 			);
 			if (reply.success) resolve(reply.data);
-			else reject(new Error(`${path} sent no reply soma defer can read`));
+			else reject(new Error(`${path} sent no reply ${command} can read`));
 		});
 	});
 }

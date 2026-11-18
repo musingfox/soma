@@ -14,9 +14,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, expect, test } from "vitest";
-import { type DeferServer, requestDefer, serveDefer } from "../../src/adapters/defer-socket/index.ts";
+import { type DeferServer, requestDefer, requestDispatch, serveDefer } from "../../src/adapters/defer-socket/index.ts";
 import { runDefer } from "../../src/defer-cli.ts";
 import type { DeferReply, DeferRequest } from "../../src/ports/defer.ts";
+import type { DispatchReply, DispatchRequest } from "../../src/ports/dispatch.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "soma-defer-socket-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -39,6 +40,36 @@ async function serving(
 		...(readTimeoutMs === undefined ? {} : { readTimeoutMs }),
 	});
 	return { path, seen, server };
+}
+
+const STARTED: DispatchReply = {
+	dispatched: true,
+	how: "started",
+	card: "card-a",
+	agent: "card-a",
+	sessionId: "s-1",
+	repo: "/w/soma",
+	state: "idle",
+};
+
+/** A socket serving both kinds of request, each recorded as the core received it. */
+async function servingBoth(reply: (request: DispatchRequest) => DispatchReply = () => STARTED) {
+	const path = socketPath();
+	const deferred: DeferRequest[] = [];
+	const dispatched: DispatchRequest[] = [];
+	const server = await serveDefer({
+		path,
+		defer: async (request) => {
+			deferred.push(request);
+			return { accepted: true, id: "1", at: "x" };
+		},
+		dispatch: async (request) => {
+			dispatched.push(request);
+			return reply(request);
+		},
+		onError: () => {},
+	});
+	return { path, deferred, dispatched, server };
 }
 
 /** Sends raw text and reads what the server answers before it ends the connection. */
@@ -78,6 +109,56 @@ test("a malformed request is refused without reaching the core", async () => {
 	});
 	expect(seen).toEqual([]);
 	await server.close();
+});
+
+test("a dispatch request reaches the core's dispatch and its reply comes back; a defer still reaches defer", async () => {
+	const { path, deferred, dispatched, server } = await servingBoth();
+
+	expect(await requestDispatch(path, { repo: "/w/soma", card: "card-a" })).toEqual(STARTED);
+	expect(await requestDefer(path, { agent: "card-a", at: "PT2M", instruction: "x" })).toEqual({
+		accepted: true,
+		id: "1",
+		at: "x",
+	});
+
+	expect(dispatched).toEqual([{ repo: "/w/soma", card: "card-a" }]);
+	expect(deferred).toEqual([{ agent: "card-a", at: "PT2M", instruction: "x" }]);
+	await server.close();
+});
+
+test("a malformed dispatch request is refused in dispatch's shape without reaching the core", async () => {
+	const { path, deferred, dispatched, server } = await servingBoth();
+
+	expect(JSON.parse(await raw(path, `${JSON.stringify({ kind: "dispatch", card: "card-a" })}\n`))).toEqual({
+		dispatched: false,
+		reason: "the request is malformed at repo",
+	});
+	expect([deferred, dispatched]).toEqual([[], []]);
+	await server.close();
+});
+
+test("a soma serving no dispatch refuses one, and a core that throws is a refusal naming the error", async () => {
+	const { path, server } = await serving();
+	expect(await requestDispatch(path, { repo: "/w/soma", card: "card-a" })).toEqual({
+		dispatched: false,
+		reason: "this soma does not serve soma dispatch",
+	});
+	await server.close();
+
+	const failing = socketPath();
+	const throwing = await serveDefer({
+		path: failing,
+		defer: async () => ({ accepted: false, reason: "" }),
+		dispatch: async () => {
+			throw new Error("database is locked");
+		},
+		onError: () => {},
+	});
+	expect(await requestDispatch(failing, { repo: "/w/soma", card: "card-a" })).toEqual({
+		dispatched: false,
+		reason: "soma failed to dispatch it: database is locked",
+	});
+	await throwing.close();
 });
 
 /** A client that connects and sends nothing; resolves when the server ends or drops the connection. */

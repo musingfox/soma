@@ -67,35 +67,49 @@ export class JobNameTaken extends Error {
 }
 
 /**
- * Starts the card's agent unless the dispatch list or the agents listed already have it. Shared by every tool that
- * dispatches: a rerun after a crash checks both before it starts anything, and memoizes the session id under the call.
- * With a `ticket`, the agent's brief is the human's request for a card it is to write, and no card is read. A recorded
- * job of the name with another request throws `JobNameTaken`: the same call rerun has the same request, so it still
- * gets its own job back.
+ * Where `startJobIn` reads and records, for a tool call or for host code with no turn. `sessionId` is the id to start
+ * the agent with, stored before it is returned, so a rerun after a crash gets the same one; `recorded` runs in the
+ * commit that records the job.
  */
-export async function startJob(
+export interface JobLedger {
+	readonly conversationId: Conversation["id"];
+	commit<T>(change: (tx: Tx) => Promise<T>): Promise<T>;
+	sessionId(): Promise<string>;
+	recorded?(tx: Tx): Promise<void>;
+}
+
+/** A card's job as `startJobIn` left it: `existing` it was recorded before, `started` soma started its agent now. */
+export type JobStart = { readonly job: Job; readonly existing: boolean; readonly started: boolean };
+
+/**
+ * Starts the card's agent unless the dispatch list or the agents listed already have it. Shared by every tool that
+ * dispatches and by host dispatch: a rerun after a crash checks both before it starts anything, and starts the agent
+ * with the session id the ledger stored. With a `ticket`, the agent's brief is the human's request for a card it is to
+ * write, and no card is read. A recorded job of the name with another request throws `JobNameTaken`: the same call
+ * rerun has the same request, so it still gets its own job back.
+ */
+export async function startJobIn(
 	agents: AgentPort,
 	readCard: (repo: string, card: string) => Promise<string>,
-	api: ToolExecutionApi,
+	ledger: JobLedger,
 	{ card, repo, ticket }: { card: string; repo: string; ticket?: string },
-	context: Context,
-): Promise<Job> {
-	const sessionId = await api.memo("sessionId", randomUUID(), context);
-	const recorded = await api.commit(async (tx) => {
-		const found = (await tx.doc(Dispatches, api.conversationId)).jobs.find((job) => job.card === card);
+): Promise<JobStart> {
+	const recorded = await ledger.commit(async (tx) => {
+		const found = (await tx.doc(Dispatches, ledger.conversationId)).jobs.find((job) => job.card === card);
 		// Copied out as JSON: a doc is a live proxy only valid inside its commit.
 		return found && (JSON.parse(JSON.stringify(found)) as Job);
-	}, context);
+	});
 	if (recorded) {
 		if (recorded.ticket !== ticket) {
 			const kind = (each?: string) => (each === undefined ? "card" : "ticket");
 			throw new JobNameTaken(card, { taken: kind(recorded.ticket), asked: kind(ticket) });
 		}
-		return recorded;
+		return { job: recorded, existing: true, started: false };
 	}
 
 	// Read before anything starts, so a card that does not exist starts nothing.
 	const launch = ticket === undefined ? composeLaunchPrompt(await readCard(repo, card)) : composeTicketPrompt(ticket);
+	const sessionId = await ledger.sessionId();
 	const listed = (await agents.list()).find((agent) => agent.name === card);
 	if (listed === undefined) await agents.start({ name: card, card, cwd: repo, sessionId });
 	const job: Job = {
@@ -109,10 +123,27 @@ export async function startJob(
 		...(ticket === undefined ? {} : { ticket }),
 		decisions: [],
 	};
-	await api.commit(async (tx) => {
-		(await tx.doc(Dispatches, api.conversationId)).jobs.push(job);
-	}, context);
-	return job;
+	await ledger.commit(async (tx) => {
+		(await tx.doc(Dispatches, ledger.conversationId)).jobs.push(job);
+		await ledger.recorded?.(tx);
+	});
+	return { job, existing: false, started: listed === undefined };
+}
+
+/** `startJobIn` under a tool call, which memoizes the session id under the call. */
+export async function startJob(
+	agents: AgentPort,
+	readCard: (repo: string, card: string) => Promise<string>,
+	api: ToolExecutionApi,
+	request: { card: string; repo: string; ticket?: string },
+	context: Context,
+): Promise<Job> {
+	const ledger: JobLedger = {
+		conversationId: api.conversationId,
+		commit: (change) => api.commit(change, context),
+		sessionId: () => api.memo("sessionId", randomUUID(), context),
+	};
+	return (await startJobIn(agents, readCard, ledger, request)).job;
 }
 
 const decide = (job: Job, decision: Omit<Decision, "at" | "kind">): Decision => ({

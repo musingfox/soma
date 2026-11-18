@@ -161,6 +161,29 @@ test("a soma serving no dispatch refuses one, and a core that throws is a refusa
 	await throwing.close();
 });
 
+test("bin/soma dispatch sends the repo and card to SOMA_SOCKET and prints soma's reply", async () => {
+	let server: DeferServer | undefined;
+	try {
+		const served = await servingBoth();
+		server = served.server;
+		const bin = resolve(import.meta.dirname, "../../bin/soma");
+		const config = join(dir, "dispatch-config.json");
+		writeFileSync(config, "{}");
+		const run = await promisify(execFile)(bin, ["dispatch", "--repo", "/w/soma", "card-a"], {
+			encoding: "utf8",
+			env: { PATH: process.env.PATH, SOMA_CONFIG: config, SOMA_SOCKET: served.path, SOMA_NODE: process.execPath },
+		});
+
+		expect(run.stderr).toBe("");
+		expect(run.stdout).toBe(
+			"soma dispatch: started agent card-a for card card-a in /w/soma, session s-1; soma sends it the card's launch prompt once it is ready.\n",
+		);
+		expect(served.dispatched).toEqual([{ repo: "/w/soma", card: "card-a" }]);
+	} finally {
+		await server?.close();
+	}
+});
+
 /** A client that connects and sends nothing; resolves when the server ends or drops the connection. */
 function idle(path: string): Promise<void> {
 	return new Promise((done, fail) => {

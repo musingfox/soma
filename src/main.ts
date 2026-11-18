@@ -7,6 +7,7 @@ import type { Harness } from "@earendil-works/pi-durable";
 import { serveDefer } from "./adapters/defer-socket/index.ts";
 import { jobsFile } from "./adapters/jobs/jobs-file.ts";
 import { createCard, readCard } from "./adapters/obsidian/card.ts";
+import { repoUnder } from "./adapters/repos/folder.ts";
 import {
 	runTelegram,
 	ABILITIES as TELEGRAM_ABILITIES,
@@ -26,6 +27,7 @@ import { deferExtension } from "./core/extensions/defer/index.ts";
 import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, handoverBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
 import { foreignBridge } from "./core/extensions/dispatch/foreign.ts";
+import { hostDispatcher } from "./core/extensions/dispatch/host.ts";
 import { reclaimer } from "./core/extensions/dispatch/reclaim.ts";
 import { keepJobsFile } from "./core/extensions/dispatch/sidecar.ts";
 import { inspectExtension } from "./core/extensions/inspect/index.ts";
@@ -188,11 +190,14 @@ const unlisten = eventBridge(root, agents, context).listen((error) => console.er
 const unlistenForeign = foreignBridge(root, agents, context).listen((error) =>
 	console.error("[soma] foreign bridge:", error),
 );
-// Served after the reconcile, so a defer is checked against a dispatch list caught up with the hangar. A socket that
-// cannot be served leaves soma running without `soma defer`, as the web page does.
+// Served after the reconcile, so a defer is checked against a dispatch list caught up with the hangar, and a dispatch
+// finds an agent the hangar runs already recorded. A socket that cannot be served leaves soma running without
+// `soma defer` and `soma dispatch`, as the web page does.
+const dispatchFromHost = hostDispatcher(agents, readCard, repoUnder(config.reposDir));
 const deferServer = await serveDefer({
 	path: config.deferSocket,
 	defer: (request) => defers.defer(root, request, context),
+	dispatch: (request) => dispatchFromHost(root, request, context),
 }).catch((error: unknown) => {
 	console.error("[soma] soma defer not served:", error);
 	return undefined;

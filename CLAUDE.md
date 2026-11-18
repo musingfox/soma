@@ -9,6 +9,7 @@
 
 - The launchd agent `dev.musingfox.soma` runs `~/.local/share/soma/releases/current/bin/soma`. `scripts/release.sh [ref]` unpacks a commit there and moves `current`; releasing an already unpacked commit is a rollback. Edits in this repo reach prod only through a release and a restart.
 - Do not run `release.sh`, restart or unload prod (`launchctl kickstart` / `bootout`), or open prod's db `~/.local/share/soma/soma.sqlite` without asking. prod's log is `~/Library/Logs/soma.log`; its config sets `repo` to this checkout.
+- Before proposing a release, check the ref contains what prod runs: `git merge-base --is-ancestor "$(readlink ~/.local/share/soma/releases/current)" <ref>` must exit 0, or the release is a rollback. Other sessions release too, so `current` can be ahead of the commit you merged.
 - Installing or reloading the LaunchAgent (`launchctl bootstrap`) is blocked by auto mode; ask the human to run it in their own terminal.
 
 ## Running dev

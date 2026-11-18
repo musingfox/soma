@@ -206,10 +206,19 @@ export function dream({ storage, model, periodMs, language, timeZone, readLog }:
 				}
 				const head = `soma 的 dream：${windowLine(window.since, window.until, zone)}`;
 				// A failed call is told, and its window is not asked about again: the next dream covers the time after it.
-				const report =
+				// An empty answer is such a failure, not a report that found nothing.
+				const failure =
 					settled?.type === "input" && settled.status === "done"
+						? answer.trim() === ""
+							? "dream 的模型回了空的答案"
+							: undefined
+						: settled?.status === "unanswered"
+							? reasonOf(settled as Extract<SubmissionRecord, { status: "unanswered" }>)
+							: "找不到 dream 的對話";
+				const report =
+					failure === undefined
 						? `${head}\n\n${answer}`
-						: `${head}\n\ndream 沒有完成（${settled?.status === "unanswered" ? reasonOf(settled as Extract<SubmissionRecord, { status: "unanswered" }>) : "找不到 dream 的對話"}）。這段時間不會再看，下一次 dream 從這段時間之後開始。`;
+						: `${head}\n\ndream 沒有完成（${failure}）。這段時間不會再看，下一次 dream 從這段時間之後開始。`;
 				await runtime.commit(async (tx, current) => {
 					await tx.appendEntry(current.conversationId, noticeEntry("report", "ambient", report));
 					return {

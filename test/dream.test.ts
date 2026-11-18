@@ -261,6 +261,19 @@ test("a dream whose call fails tells the human why, and its window is not asked 
 	expect(soma.notices()).toHaveLength(1);
 });
 
+test("a dream whose model answers nothing tells the human it did not finish, not an empty report", async () => {
+	const soma = await core({ dreamAnswer: () => fauxAssistantMessage(" \n") });
+	await say(soma, "你好");
+
+	const notice = await dreamOnce(soma);
+
+	expect(dreamRequests(soma)).toHaveLength(1);
+	expect(notice?.content).toMatch(/^soma 的 dream：.*\n\ndream 沒有完成（dream 的模型回了空的答案）。/s);
+	const checkpoint = await soma.checkpoint();
+	expect(checkpoint?.next).toBe((checkpoint?.since ?? 0) + 24 * 60 * 60_000);
+	expect(soma.notices()).toHaveLength(1);
+});
+
 test("a dream task held while dream is off stays pending, and when it is on again one dream covers the gap", {
 	timeout: 30_000,
 }, async () => {

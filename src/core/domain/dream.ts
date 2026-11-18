@@ -54,22 +54,25 @@ const STAMPED = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) (.*)$/;
 const STARTED = "[soma] started";
 
 /**
- * Secrets and addresses replaced before the input leaves the process: provider keys, Telegram bot tokens, any token of
- * 40 or more characters, tailnet host names and email addresses.
+ * Secrets and addresses replaced before the input leaves the process: provider keys, Telegram bot tokens (also inside
+ * an API URL, `/bot<id>:<secret>/`), any token of 40 or more characters, tailnet host names and email addresses.
  */
 export function redact(text: string): string {
 	return text
 		.replace(/sk-ant-[A-Za-z0-9_-]{10,}/g, "[secret]")
 		.replace(/\bsk-[A-Za-z0-9_-]{20,}/g, "[secret]")
-		.replace(/\b\d{8,10}:[A-Za-z0-9_-]{30,}\b/g, "[secret]")
+		.replace(/(?<!\d)\d{8,10}:[A-Za-z0-9_-]{30,}/g, "[secret]")
 		.replace(/[A-Za-z0-9_-]{40,}/g, "[long-token]")
 		.replace(/[\w-]+\.tail\w+\.ts\.net/g, "[host]")
 		.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "[email]");
 }
 
-/** `text` on one line, cut to `n` characters with how many were left out. */
+/**
+ * `text` redacted and on one line, cut to `n` characters with how many were left out. Redacted first: a token cut
+ * short would fall under the 40-character rule.
+ */
 export function cut(text: string, n: number): string {
-	const flat = text.replace(/\s+/g, " ").trim();
+	const flat = redact(text).replace(/\s+/g, " ").trim();
 	return flat.length > n ? `${flat.slice(0, n)}…(+${flat.length - n})` : flat;
 }
 
@@ -178,9 +181,12 @@ function transcript(records: DreamRecords) {
 	return { lines, days };
 }
 
-/** Ids, uuids and long numbers blanked, so lines that differ only in them count as one pattern. */
+/**
+ * Ids, uuids and long numbers blanked, so lines that differ only in them count as one pattern. Redacted first: blanking
+ * a key's segments that hold a digit leaves the rest no secret pattern matches.
+ */
 const pattern = (line: string) =>
-	stripVTControlCharacters(line)
+	redact(stripVTControlCharacters(line))
 		.replace(/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/gi, "<uuid>")
 		.replace(/\b(?=\w*\d)(?=\w*[a-z])\w{8,}\b/gi, "<id>")
 		.replace(/\d{4,}/g, "<n>")

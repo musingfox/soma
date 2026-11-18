@@ -176,6 +176,9 @@ test("a crash between the dream's answer and its commit gives one notice on rest
 	expect(checkpoint.until).toBeUndefined();
 });
 
+const LOG_KEY =
+	"sk-ant-api03-Zq8vKxLmNpRtWyBcDfGhJk-QwErTyUiOpAsDfGhJkLzXcVbNm-Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0KkLlMmNnOoPp-QqRrSsTtAA";
+
 test("with a log, only its lines stamped in the window are profiled and starts counted; secrets reach no request", async () => {
 	const now = Date.now();
 	const at = (ms: number) => new Date(ms).toISOString();
@@ -187,6 +190,9 @@ test("with a log, only its lines stamped in the window are profiled and starts c
 		`${at(now - 60 * 60_000)} [soma] event bridge: request req011CVf9e8d7c6b5a failed after 67890 ms`,
 		"    at handle (file:///soma/src/core/extensions/dispatch/bridge.ts:120:5)",
 		`${at(now - 30 * 60_000)} [soma] telegram: 123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawQ refused`,
+		// Secrets the profile's id erasing leaves whole or in part, so only redaction keeps them out.
+		`${at(now - 20 * 60_000)} [soma] anthropic: 401 for key ${LOG_KEY}`,
+		`${at(now - 10 * 60_000)} [soma] mail to log-mark@example.com bounced`,
 		`${at(now + 60 * 60_000)} [soma] FUTURE-LINE-MARK`,
 	].join("\n");
 	const soma = await core({ dream: { readLog: async () => log } });
@@ -202,8 +208,16 @@ test("with a log, only its lines stamped in the window are profiled and starts c
 	expect(input).not.toContain("FUTURE-LINE-MARK");
 	expect(input).not.toContain("handle (file://");
 	const sent = JSON.stringify(dreamRequests(soma));
-	for (const secret of ["sk-ant-api03", "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawQ", "me@example.com"])
+	for (const secret of [
+		"sk-ant-api03",
+		"AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawQ",
+		"me@example.com",
+		"QwErTyUiOpAsDfGhJkLzXcVbNm",
+		"QqRrSsTtAA",
+	])
 		expect(sent).not.toContain(secret);
+	expect(input).toContain("1｜[soma] anthropic: 401 for key [secret]");
+	expect(input).toContain("1｜[soma] mail to [email] bounced");
 	expect(input).toContain("[secret]");
 	expect(input).toContain("[email]");
 });

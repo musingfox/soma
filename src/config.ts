@@ -55,6 +55,23 @@ export const SUMMARY_IDLE_MINUTES = 30;
 /** The root conversation's size in tokens past which it is compacted, unless the config says otherwise (2026-11-18). */
 export const COMPACT_AT = 100_000;
 
+/** The dream's model and period unless `dream` says otherwise; see "Dream" in ARCHITECTURE.md. */
+export const DREAM_MODEL = "claude-opus-5-5";
+export const DREAM_PERIOD_DAYS = 7;
+
+const DreamFileConfig = z
+	.object({ model: z.string().min(1), periodDays: z.number().int().positive(), log: z.string().min(1) })
+	.partial()
+	.strict();
+
+/** The periodic review of soma's own records; set only when `dream` is an object. */
+export interface DreamConfig {
+	readonly model: string;
+	readonly periodDays: number;
+	/** soma's log file, whose lines in the window the dream profiles; unset, no log is read. */
+	readonly log?: string;
+}
+
 /**
  * The hangar is a rex session found by its id, never by its label, which rex does not keep unique. When rex says the
  * session soma would use does not exist, soma makes a new one labelled `label`, `soma-hangar` when unset, uses it from
@@ -88,6 +105,7 @@ const FileConfig = z
 		repo: z.string().min(1),
 		reposDir: z.string().refine(isAbsolute, "Expected an absolute path"),
 		reflection: z.boolean(),
+		dream: z.unknown(),
 		agentAdapter: z.enum(AGENT_ADAPTERS),
 		rex: z.unknown(),
 		push: z.unknown(),
@@ -151,6 +169,8 @@ export interface Config {
 	 */
 	readonly reposDir?: string;
 	readonly reflection: boolean;
+	/** Off unless the file's `dream` is an object; file only, so it costs nothing unless written there. */
+	readonly dream?: DreamConfig;
 	readonly anthropicApiKey?: string;
 	readonly exaApiKey?: string;
 	/** Set only when both a bot token and a chat id are. */
@@ -294,6 +314,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		file?.agentAdapter ??
 		"herdr";
 	const db = fromEnv("SOMA_DB") ?? file?.db ?? "soma.sqlite";
+	const dream = resolveDream(file?.dream, path);
 	return {
 		agentAdapter,
 		// The hangar session, never $HERDR_SOCKET_PATH: that names whichever session soma itself runs in.
@@ -317,6 +338,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 			rex: resolveRex(file, fromEnv, home, path),
 		}),
 		...(reposDir !== undefined && { reposDir }),
+		...(dream !== undefined && { dream }),
 		...(hangarCap !== undefined && { hangarCap }),
 		...(programStatus !== undefined && { programStatus }),
 		...(anthropicApiKey !== undefined && { anthropicApiKey }),
@@ -346,6 +368,22 @@ function resolvePush(push: unknown, path: string): Record<Interface, PolicyTable
 		return parseOrThrow(PolicyTableFile, value, path, ["push", name]) as PolicyTable;
 	};
 	return { telegram: policyOf("telegram"), terminal: policyOf("terminal"), web: policyOf("web") };
+}
+
+/** The file only: absent or `false` is off; an object turns it on, each field it leaves out at its default. */
+function resolveDream(dream: unknown, path: string): DreamConfig | undefined {
+	if (dream === undefined || dream === false) return undefined;
+	if (typeof dream !== "object" || dream === null || Array.isArray(dream)) {
+		throw new ConfigError(
+			`${path}: dream: Expected false or an object such as { "model": "${DREAM_MODEL}", "periodDays": ${DREAM_PERIOD_DAYS} }`,
+		);
+	}
+	const set = parseOrThrow(DreamFileConfig, dream, path, ["dream"]);
+	return {
+		model: set.model ?? DREAM_MODEL,
+		periodDays: set.periodDays ?? DREAM_PERIOD_DAYS,
+		...(set.log !== undefined && { log: resolve(set.log) }),
+	};
 }
 
 function resolveSummaryIdle(push: unknown, path: string): number {

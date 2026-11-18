@@ -434,6 +434,34 @@ describe("the config file", () => {
 	});
 });
 
+describe("dream", () => {
+	test("absent or false, it is off", () => {
+		expect(resolveConfig(undefined, {}, HOME).dream).toBeUndefined();
+		expect(resolveConfig({ dream: false }, {}, HOME).dream).toBeUndefined();
+	});
+	test("an object turns it on, each field it leaves out at its default", () => {
+		expect(resolveConfig({ dream: {} }, {}, HOME).dream).toEqual({ model: "claude-opus-5-5", periodDays: 7 });
+		expect(
+			resolveConfig({ dream: { model: "claude-sonnet-5-5", periodDays: 3, log: "/logs/soma.log" } }, {}, HOME).dream,
+		).toEqual({ model: "claude-sonnet-5-5", periodDays: 3, log: "/logs/soma.log" });
+	});
+	test.each([
+		[true, "dream: Expected false or an object"],
+		["on", "dream: Expected false or an object"],
+		[null, "dream: Expected false or an object"],
+		[[], "dream: Expected false or an object"],
+		[{ periodDays: 0 }, "dream.periodDays:"],
+		[{ periodDays: 1.5 }, "dream.periodDays:"],
+		[{ periodDays: "7" }, "dream.periodDays:"],
+		[{ model: "" }, "dream.model:"],
+		[{ model: "x", days: 7 }, "dream.days: Unrecognized key"],
+	])("a dream of %j throws with the path and the field", (dream, message) => {
+		const path = write(JSON.stringify({ dream }));
+		expect(() => loadConfig(path, {}, HOME)).toThrow(ConfigError);
+		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: ${message}`);
+	});
+});
+
 describe("the agent-side adapter", () => {
 	test("unset, it is herdr, and no rex setting is read", () => {
 		const config = resolveConfig(undefined, { SOMA_REX_SESSION_ID: "not an id" }, HOME);

@@ -28,7 +28,7 @@ class CardUnread extends Error {}
 
 /**
  * `soma dispatch`: starts a job as the dispatch tool does, from host code, with no turn of the model, and replies what
- * the CLI prints (ARCHITECTURE.md "Decisions made", 2026-11-18). `checkRepo` says whether the repo may take a job and
+ * the CLI prints (ARCHITECTURE.md "Decisions made", 2026-11-17). `checkRepo` says whether the repo may take a job and
  * where it really is; the job records that path. Nothing is told to the human: the job shows in the jobs file and in
  * later reports as any job does. Card status and `blocked_by` are not checked, as the tool does not check them.
  */

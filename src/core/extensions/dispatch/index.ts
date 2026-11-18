@@ -81,14 +81,34 @@ export interface JobLedger {
 /** A card's job as `startJobIn` left it: `existing` it was recorded before, `started` soma started its agent now. */
 export type JobStart = { readonly job: Job; readonly existing: boolean; readonly started: boolean };
 
+// The card's dispatch under way in this process, which the next one of the card waits for: a second one at once would
+// find neither a job nor an agent listed yet, and start the agent twice.
+const starting = new Map<string, Promise<unknown>>();
+
 /**
  * Starts the card's agent unless the dispatch list or the agents listed already have it. Shared by every tool that
  * dispatches and by host dispatch: a rerun after a crash checks both before it starts anything, and starts the agent
  * with the session id the ledger stored. With a `ticket`, the agent's brief is the human's request for a card it is to
  * write, and no card is read. A recorded job of the name with another request throws `JobNameTaken`: the same call
- * rerun has the same request, so it still gets its own job back.
+ * rerun has the same request, so it still gets its own job back. Dispatches of one card run one at a time.
  */
 export async function startJobIn(
+	agents: AgentPort,
+	readCard: (repo: string, card: string) => Promise<string>,
+	ledger: JobLedger,
+	request: { card: string; repo: string; ticket?: string },
+): Promise<JobStart> {
+	const before = starting.get(request.card) ?? Promise.resolve();
+	const run = before.then(() => startOne(agents, readCard, ledger, request));
+	const settled = run.catch(() => {});
+	starting.set(request.card, settled);
+	void settled.then(() => {
+		if (starting.get(request.card) === settled) starting.delete(request.card);
+	});
+	return run;
+}
+
+async function startOne(
 	agents: AgentPort,
 	readCard: (repo: string, card: string) => Promise<string>,
 	ledger: JobLedger,

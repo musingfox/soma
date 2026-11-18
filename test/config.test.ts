@@ -103,6 +103,13 @@ const fields = [
 		values: ["/env/soma", "/file/soma", resolve(import.meta.dirname, "..")],
 	},
 	{
+		name: "reposDir",
+		env: ["SOMA_REPOS_DIR", "/env/workspace"],
+		file: { reposDir: "/file/workspace" },
+		read: (c) => c.reposDir,
+		values: ["/env/workspace", "/file/workspace", undefined],
+	},
+	{
 		name: "reflection",
 		env: ["SOMA_REFLECTION", "1"],
 		file: { reflection: false },
@@ -369,6 +376,13 @@ describe("the vault", () => {
 	});
 });
 
+describe("reposDir", () => {
+	test("a relative folder in the file throws: soma dispatch checks repos against it wherever it runs from", () => {
+		const path = write(JSON.stringify({ reposDir: "~/workspace" }));
+		expect(() => loadConfig(path, {}, HOME)).toThrow(`${path}: reposDir: Expected an absolute path`);
+	});
+});
+
 describe("invalid environment variables", () => {
 	test.each([
 		["SOMA_HANGAR_CAP", "0"],
@@ -384,6 +398,8 @@ describe("invalid environment variables", () => {
 		["SOMA_AGENT_ADAPTER", "tmux"],
 		["SOMA_WEB_PORT", "0"],
 		["SOMA_WEB_PORT", "65536"],
+		["SOMA_REPOS_DIR", "workspace"],
+		["SOMA_REPOS_DIR", "~/workspace"],
 	])("%s=%s throws naming the variable", (name, value) => {
 		expect(() => resolveConfig(undefined, { [name]: value }, HOME)).toThrow(new ConfigError(`${name} must be`).message);
 	});

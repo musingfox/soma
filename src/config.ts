@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { BlockList, isIP } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type AuthContext, defaultProviderAuthContext } from "@earendil-works/pi-ai";
 import { z } from "zod";
@@ -86,6 +86,7 @@ const FileConfig = z
 		compactAt: z.number().int().positive(),
 		programStatus: z.boolean(),
 		repo: z.string().min(1),
+		reposDir: z.string().refine(isAbsolute, "Expected an absolute path"),
 		reflection: z.boolean(),
 		agentAdapter: z.enum(AGENT_ADAPTERS),
 		rex: z.unknown(),
@@ -144,6 +145,11 @@ export interface Config {
 	readonly programStatus?: boolean;
 	/** soma's own repository: the reflection's code-change cards go to the vault project its `.obsidian.yaml` names. */
 	readonly repo: string;
+	/**
+	 * The folder whose direct children are the git repos `soma dispatch` may start a job in; unset, it starts none.
+	 * Absolute, since the CLI and soma resolve it from different directories.
+	 */
+	readonly reposDir?: string;
 	readonly reflection: boolean;
 	readonly anthropicApiKey?: string;
 	readonly exaApiKey?: string;
@@ -251,6 +257,8 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		COMPACT_AT;
 	const programStatus =
 		parseEnv("SOMA_PROGRAM_STATUS", (v) => ({ 1: true, 0: false })[v], "1 or 0") ?? file?.programStatus;
+	const reposDir =
+		parseEnv("SOMA_REPOS_DIR", (v) => (isAbsolute(v) ? v : undefined), "an absolute path") ?? file?.reposDir;
 	const reflection = parseEnv("SOMA_REFLECTION", (v) => ({ 1: true, 0: false })[v], "1 or 0") ?? file?.reflection;
 	const anthropicApiKey = file?.anthropic?.apiKey;
 	const exaApiKey = fromEnv("EXA_API_KEY") ?? file?.exa?.apiKey;
@@ -308,6 +316,7 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		...((agentAdapter === "rex" || (agentAdapter === "acp" && namesHangar(file, fromEnv, path))) && {
 			rex: resolveRex(file, fromEnv, home, path),
 		}),
+		...(reposDir !== undefined && { reposDir }),
 		...(hangarCap !== undefined && { hangarCap }),
 		...(programStatus !== undefined && { programStatus }),
 		...(anthropicApiKey !== undefined && { anthropicApiKey }),

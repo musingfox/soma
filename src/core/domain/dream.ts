@@ -76,6 +76,16 @@ export function cut(text: string, n: number): string {
 	return flat.length > n ? `${flat.slice(0, n)}…(+${flat.length - n})` : flat;
 }
 
+/** `text` with no fence marker left, so it cannot end the fence early; one pass would let nested markers rebuild one. */
+function unfenced(text: string): string {
+	let last: string;
+	do {
+		last = text;
+		text = text.replaceAll(FENCE_OPEN, "").replaceAll(FENCE_CLOSE, "");
+	} while (text !== last);
+	return text;
+}
+
 const textOf = (content: unknown): string =>
 	typeof content === "string"
 		? content
@@ -275,8 +285,9 @@ export function renderDreamInput(records: DreamRecords): string {
 		"",
 		...memorySection(records),
 	].join("\n");
-	// Observed text that names the fence would end it early, so it is taken out.
-	return redact(input.replaceAll(FENCE_OPEN, "").replaceAll(FENCE_CLOSE, ""));
+	// Observed text that names the fence would end it early, so it is taken out; redacted again, as taking it out can
+	// join the parts of a secret.
+	return redact(unfenced(input));
 }
 
 /** The backtest's prompt (card dream-backtest, 2026-11-18), answering in the human's language. */

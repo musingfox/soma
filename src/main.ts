@@ -44,6 +44,7 @@ import { web } from "./core/extensions/web/index.ts";
 import { acquireDbLock, DbLockedError, openHarness, openStorage, rootCompaction } from "./core/harness.ts";
 import { openHumanPort } from "./core/human-port.ts";
 import { startCore } from "./core/startup.ts";
+import { dreamWiring } from "./dream.ts";
 import { installErrorPrinting } from "./error-printing.ts";
 import { skillsExtensions } from "./skills.ts";
 import { vaultExtensions } from "./vault.ts";
@@ -103,6 +104,7 @@ const mcpClients = (
 	)
 ).flat();
 const storage = await openStorage(config.db);
+const dreams = dreamWiring(config, storage);
 // The entry kinds of the interfaces serving the human now: a round no interface started is told what each can show.
 // Telegram is on from the start when configured, so a round the resumed tasks or the reconcile start before it polls
 // is told of it. With nothing on, the section still shows its fixed line, so it never goes away and comes back,
@@ -122,6 +124,7 @@ const extensions = [
 	digests.extension,
 	defers.extension,
 	...(config.reflection ? [reflections.extension] : []),
+	...dreams.extensions,
 	inspectExtension(storage),
 	web({ exaApiKey: config.exaApiKey }),
 	...vaultExtensions(config.vault),
@@ -167,6 +170,7 @@ const human = await startCore(
 	[
 		() => digests.startDigest(root, DIGEST_PERIOD_MS, context),
 		...(config.reflection ? [() => reflections.startReflection(root, REFLECTION_PERIOD_MS, context)] : []),
+		() => dreams.start(root, context),
 	],
 );
 // Next to the db, as the other sidecars are: the dispatch list for programs on this machine, rewritten now from the

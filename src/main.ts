@@ -46,11 +46,14 @@ import { openHumanPort } from "./core/human-port.ts";
 import { startCore } from "./core/startup.ts";
 import { dreamWiring } from "./dream.ts";
 import { installErrorPrinting } from "./error-printing.ts";
+import { installTimestamps, runningFrom, startedLine } from "./log-lines.ts";
 import { skillsExtensions } from "./skills.ts";
 import { vaultExtensions } from "./vault.ts";
 
 // First, so no error soma prints can throw: a throw in a catch handler would end the process.
 installErrorPrinting();
+installTimestamps();
+console.error(startedLine(runningFrom()));
 let config: Config;
 try {
 	config = loadConfig(configPath(process.env, homedir()), process.env, homedir());

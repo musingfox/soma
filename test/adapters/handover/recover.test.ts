@@ -5,6 +5,7 @@ import { createHandoverAgentPort, HANDOVER_GRACE_MS } from "../../../src/adapter
 import { seqOf } from "../../../src/adapters/rex/agent-port.ts";
 import { RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
 import { type AgentStatusEvent, PromptRefused } from "../../../src/ports/agent.ts";
+import type { Settled } from "../../../src/ports/handover.ts";
 import { cleanUp, SESSION } from "../acp/fake.ts";
 import { type Block, fixture, HANGAR } from "../rex/fake.ts";
 import { AT_IDLE, alive, fakeClock, sides, sleep } from "./fake.ts";
@@ -599,6 +600,128 @@ test("a look that fails at the end of the grace period gives nothing back, and t
 	both.rexUp();
 	await both.agents.list();
 	expect((await both.entry()).handingOver).toBeUndefined();
+});
+
+/** A take whose window may have opened, after which rex stopped answering, so the job is held for rex. */
+async function rexGoneAtTake(both: Sides, opens: boolean) {
+	aroundWindow(both, async (open) => {
+		if (opens) await open();
+		both.rexDown();
+		throw new RexTransportError("session.new_window: no response within 10000 ms");
+	});
+	expect(await both.agents.handOver("card-a")).toMatchObject({
+		reason: expect.stringContaining("whether its window opened is not known"),
+	});
+}
+
+/** Every Settled the port tells from now on. */
+function settledOf(both: Sides) {
+	const settled: Settled[] = [];
+	both.agents.onSettled((each) => {
+		settled.push(each);
+	});
+	return settled;
+}
+
+test("a job rex did not answer about at its take is looked at with no caller at the end of the grace period: on rex, told once", async () => {
+	const clock = fakeClock();
+	const both = await sides({ clock, graceMs: 40 });
+	await both.ran();
+	const settled = settledOf(both);
+	await rexGoneAtTake(both, true);
+	both.rexUp();
+	clock.advance(40);
+
+	await until(async () => (await both.entry()).handedOver === true, "a look with no caller");
+
+	await until(() => settled.length > 0, "the Settled of the look");
+	await sleep(100);
+	expect(settled).toEqual([expect.objectContaining({ agent: "card-a", onto: "rex", window: "card-a" })]);
+	expect((await both.entry()).handingOver).toBeUndefined();
+	expect(both.said.filter((line) => line.includes("undecided"))).toHaveLength(1);
+});
+
+test.each([
+	["after", "rex"],
+	["before", "acp"],
+] as const)(
+	"at startup with rex down, a soma killed %s the window opened is looked at with no caller once rex is back: on %s, told once",
+	async (when, onto) => {
+		const clock = fakeClock();
+		const first = await died(when, { clock });
+		const both = await restarted(first, { clock, graceMs: 40, rexDown: true });
+		const settled = settledOf(both);
+		expect((await both.entry()).handingOver).toBe(true);
+		both.rexUp();
+		clock.advance(40);
+
+		await until(async () => (await both.entry()).handingOver === undefined, "a look with no caller");
+
+		await until(() => settled.length > 0, "the Settled of the look");
+		await sleep(100);
+		expect(settled).toEqual([expect.objectContaining({ agent: "card-a", onto })]);
+		expect((await both.entry()).handedOver).toBe(onto === "rex" ? true : undefined);
+		expect(both.said.filter((line) => line.includes("undecided"))).toEqual([
+			expect.stringContaining("card-a is undecided: rex does not answer"),
+		]);
+	},
+);
+
+test("rex still not answering: the job stays undecided and is looked at again every interval, logged once, until a look settles it", async () => {
+	const clock = fakeClock();
+	const looks: number[] = [];
+	const both = await sides({
+		clock,
+		graceMs: 40,
+		to: (port) => ({
+			...port,
+			holds: (session, hangar) => {
+				looks.push(Date.now());
+				return port.holds(session, hangar);
+			},
+		}),
+	});
+	await both.ran();
+	await rexGoneAtTake(both, true);
+	clock.advance(40);
+
+	await until(() => looks.length >= 4, "three looks with no caller");
+
+	for (const [i, at] of looks.slice(1).entries()) expect(at - (looks[i] as number)).toBeGreaterThanOrEqual(35);
+	expect((await both.entry()).handingOver).toBe(true);
+	expect(both.said.filter((line) => line.includes("undecided"))).toEqual([
+		expect.stringContaining("card-a is undecided: rex does not answer"),
+	]);
+
+	both.rexUp();
+	await until(async () => (await both.entry()).handedOver === true, "the look once rex answers");
+	const settledAt = looks.length;
+	await sleep(150);
+	expect(looks).toHaveLength(settledAt);
+});
+
+test("a job rex did not answer about is looked at again no sooner than the end of its grace period, however short the interval", async () => {
+	const clock = fakeClock();
+	const looks: number[] = [];
+	const both = await sides({
+		clock,
+		graceMs: 300,
+		relookMs: 20,
+		to: (port) => ({
+			...port,
+			holds: (session, hangar) => {
+				looks.push(Date.now());
+				return port.holds(session, hangar);
+			},
+		}),
+	});
+	await both.ran();
+	await rexGoneAtTake(both, true);
+
+	await sleep(150);
+	expect(looks).toHaveLength(1);
+	await until(() => looks.length >= 3, "looks past the grace period");
+	expect((looks[1] as number) - (looks[0] as number)).toBeGreaterThanOrEqual(250);
 });
 
 test("a restart inside the grace period waits out the rest, and one past it is resolved at once", async () => {

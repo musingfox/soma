@@ -39,6 +39,8 @@ export async function sides(
 		clock?: ReturnType<typeof fakeClock>;
 		/** None by default, so a job with no window goes back to ACP at the first look. */
 		graceMs?: number;
+		/** How often a job rex did not answer about is looked at again: `graceMs`, or 60 s where that is none. */
+		relookMs?: number;
 		/** How long a cut waits for a turn to stop. */
 		cutMs?: number;
 		/** Each side as the handover sees it, to hang or fail one of its calls. */
@@ -98,11 +100,13 @@ export async function sides(
 	const said: string[] = [];
 	const onError = (error: Error) => said.push(error.message);
 	const { clock, graceMs = clock === undefined ? 0 : HANDOVER_GRACE_MS } = options;
+	const { relookMs = graceMs || HANDOVER_GRACE_MS } = options;
 	const agents = createHandoverAgentPort({
 		from: options.from?.(acp.port) ?? acp.port,
 		to: options.to?.(onRex) ?? onRex,
 		onError,
 		graceMs,
+		relookMs,
 		...(clock === undefined ? {} : { now: clock.now }),
 	});
 	return {

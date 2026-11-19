@@ -29,6 +29,8 @@ export interface HandoverAgentPortOptions {
 	readonly onError?: (error: Error) => void;
 	/** Set in tests; HANDOVER_GRACE_MS otherwise. */
 	readonly graceMs?: number;
+	/** How long after a look rex did not answer the next one is made with no caller; `graceMs` otherwise. */
+	readonly relookMs?: number;
 	readonly now?: () => number;
 }
 
@@ -54,14 +56,15 @@ type Undecided = HandingOver & { readonly why: Why };
  * A handover cut short leaves `from`'s mark of one in progress, and only a look at `to` ends it: a window there, the job
  * is on `to`; `to` answers and no block of it there at or after the end of the grace period, it goes back to `from`. Until
  * then, while `to` cannot answer, or while it holds a block of the job in no window yet, the job is undecided: as one under
- * way, and looked at again at the end of the grace period and at the next listing, prompt, answer or handover of it, each
- * of which goes on on the side the look finds or refuses saying why.
+ * way, and looked at again at the end of the grace period, while `to` does not answer every `relookMs` after, and at the
+ * next listing, prompt, answer or handover of it, each of which goes on on the side the look finds or refuses saying why.
  */
 export function createHandoverAgentPort({
 	from,
 	to,
 	onError = (error) => console.warn(`[handover] ${error.message}`),
 	graceMs = HANDOVER_GRACE_MS,
+	relookMs = graceMs,
 	now = Date.now,
 }: HandoverAgentPortOptions): AgentPort & AgentHandover & HandoverSettling & { dormant(): Promise<readonly string[]> } {
 	const moved = new Map<string, HeldSession>();
@@ -219,19 +222,26 @@ export function createHandoverAgentPort({
 		if (undecided.size === 0) return Promise.resolve();
 		looking ??= Promise.all([...undecided.values()].map(settle)).finally(() => {
 			looking = undefined;
-			atGraceEnd();
+			lookLater();
 		});
 		return looking;
 	}
 
-	let graceTimer: NodeJS.Timeout | undefined;
-	/** Looks when the first grace period under way ends, so a job waiting it out needs no caller to leave undecided. */
-	function atGraceEnd(): void {
-		clearTimeout(graceTimer);
-		const ends = [...undecided.values()].filter(({ why }) => why === "grace").map(graceEnds);
-		if (ends.length === 0) return;
-		graceTimer = setTimeout(() => void look().catch(onError), Math.max(0, Math.min(...ends) - now()));
-		graceTimer.unref();
+	let lookTimer: NodeJS.Timeout | undefined;
+	/**
+	 * Looks when the first grace period under way ends, and while rex does not answer about a job, `relookMs` after the
+	 * last look and not before that job's grace period ends: a job waiting either out needs no caller to leave undecided.
+	 * Called after every look, so a look with a caller puts the next one off.
+	 */
+	function lookLater(): void {
+		clearTimeout(lookTimer);
+		const at = [...undecided.values()].flatMap((job) => {
+			if (job.why === "grace") return [graceEnds(job)];
+			return job.why === "rex" ? [Math.max(graceEnds(job), now() + relookMs)] : [];
+		});
+		if (at.length === 0) return;
+		lookTimer = setTimeout(() => void look().catch(onError), Math.max(0, Math.min(...at) - now()));
+		lookTimer.unref();
 	}
 
 	// The names the startup's look gave back to `from`: dormant as those it found itself are, to the core's reconcile.
@@ -301,6 +311,7 @@ export function createHandoverAgentPort({
 		}
 		if (there instanceof Error) {
 			hold(job, "rex", `: ${there.message}`);
+			lookLater();
 			return refused(
 				"cannot_resume",
 				`${error.message}. Its ACP process has ended, and rex does not answer (${there.message}), so whether its ` +
@@ -309,7 +320,7 @@ export function createHandoverAgentPort({
 			);
 		}
 		hold(job, there === "loose" ? "loose" : "grace");
-		atGraceEnd();
+		lookLater();
 		return refused(
 			"cannot_resume",
 			`${error.message}. Its ACP process has ended and the job is undecided: ${stillMoving(agent)}. It takes no ` +

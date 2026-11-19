@@ -597,16 +597,24 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	/**
 	 * Looks at the foreign agents at once and then every foreignMs, and emits each one's status that is new or whose seq
 	 * changed, and a blocked one's again when a rex app begins or ceases to show its pane (`shown`, read only while one
-	 * is blocked). Polled, not streamed: no event tells that an app shows another block, so presence needs a poll anyway,
-	 * and the block events of other sessions would need the connection's attach_all scope widened to every block event
-	 * of the server, which the hangar watch's listener would then take in too, and which a reconnect drops.
+	 * is blocked). A blocked one first emitted without a fingerprint, its prompt read half drawn, is emitted once more
+	 * when a later poll reads the fingerprint under the same record, so the core can wake the model for it. That status
+	 * is another observation than the record's first, so it goes under the record's seq plus one, which no later record
+	 * of the block can carry, since rex stamps a later one after the poll that read this one unchanged; it keeps that seq
+	 * while the record stays. Polled, not streamed: no event tells that an app shows another block, so presence needs a
+	 * poll anyway, and the block events of other sessions would need the connection's attach_all scope widened to every
+	 * block event of the server, which the hangar watch's listener would then take in too, and which a reconnect drops.
 	 *
 	 * When presence cannot be read (client.list, list_blocks or size failing, or a reply off its schema) the pane counts
 	 * as not looked at, so the prompt is pushed: a deliberate choice of the human's, 2026-11-05, since a missed push costs
 	 * more than an extra one.
 	 */
 	function watchForeign(): () => void {
-		const emitted = new Map<string, { readonly seq: number; readonly watched: boolean }>();
+		// By agent id, the record's seq last emitted, whether a fingerprint was read under it, and whether it went out late.
+		const emitted = new Map<
+			string,
+			{ readonly seq: number; readonly watched: boolean; readonly fingerprinted: boolean; readonly late: boolean }
+		>();
 		let polling = false;
 		async function poll(): Promise<void> {
 			if (polling) return;
@@ -625,10 +633,15 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 					const { status } = agent;
 					if (status === undefined || seq === undefined) continue;
 					const watched = status.state === "blocked" && looked.has(agent.id);
+					const fingerprinted = status.state === "blocked" && status.fingerprint !== undefined;
 					const last = emitted.get(agent.id);
-					if (last?.seq === seq && last.watched === watched) continue;
-					emitted.set(agent.id, { seq, watched });
-					for (const listener of foreignListeners) listener({ agent: { ...agent, status }, seq, watched });
+					const before = last?.seq === seq ? last : undefined;
+					const late = before !== undefined && (before.late || (!before.fingerprinted && fingerprinted));
+					if (before !== undefined && before.watched === watched && before.late === late) continue;
+					emitted.set(agent.id, { seq, watched, fingerprinted: fingerprinted || before?.fingerprinted === true, late });
+					for (const listener of foreignListeners) {
+						listener({ agent: { ...agent, status }, seq: late ? seq + 1 : seq, watched });
+					}
 				}
 			} catch (error) {
 				onError(error as Error);

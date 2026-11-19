@@ -105,8 +105,11 @@ export interface RexAgentPortOptions {
 
 type Seen = { readonly status: AgentState; readonly seq: number };
 
-/** One agent: a window named after it, holding the block its claude runs in. */
+/** A window of the hangar, with the block an agent would run in. */
 type Pane = { readonly name: string; readonly blockId: string; readonly label?: string };
+
+/** One of soma's jobs: a window named after its card, whose block carries the claude session id it was started with. */
+type JobPane = Pane & { readonly label: string };
 
 /**
  * A foreign agent as found, its id the block's, with the session the block is in, its claude's pid, and the seq of the
@@ -134,6 +137,8 @@ export class HangarUnmade extends Error {}
 
 const BLOCKED_KINDS: readonly string[] = ["permission", "question", "auth"] satisfies BlockedKind[];
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Whether the pane is a job's: the label `openWindow` gives a job's block, by which `foreign` leaves jobs out too. */
+const isJob = (pane: Pane): pane is JobPane => pane.label !== undefined && SESSION_ID.test(pane.label);
 // Any of these can change which window a block is in, or what the window is called.
 const VIEW_EVENTS = new Set(["session_view_changed", "window_created", "window_closed", "window_label_changed"]);
 
@@ -225,10 +230,19 @@ export function seqOf(record: StatusRecord): number | undefined {
 	return microsOf(record.updated_at);
 }
 
-/** The block claude runs in: the window's first tiled block, the only one start() makes. */
+/** Every block placed in the window, on every layer. */
+const blocksOf = (window: RexWindow) => (window.layers ?? []).flatMap((layer) => layer.blocks ?? []);
+
+/**
+ * The block claude runs in: the one labelled with a claude session id wherever it sits in the window, as `openWindow`
+ * labels a job's and `foreign` finds it, so a block the human split off before it does not hide it; else the window's
+ * first tiled block, the only one start() makes.
+ */
 function paneOf(window: RexWindow): Pane | undefined {
 	const tiled = window.layers?.find((layer) => layer.kind === "tiled") ?? window.layers?.[0];
-	const block = tiled?.blocks?.find((each) => each.block_id !== null);
+	const block =
+		blocksOf(window).find((each) => each.block_id != null && each.label !== undefined && SESSION_ID.test(each.label)) ??
+		tiled?.blocks?.find((each) => each.block_id !== null);
 	if (window.label === undefined || block?.block_id == null) return undefined;
 	return { name: window.label, blockId: block.block_id, ...(block.label === undefined ? {} : { label: block.label }) };
 }
@@ -361,26 +375,48 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	// the transcript of a window closed since, as a reclaim closes one, can still be read. This process's only.
 	const sessions = new Map<string, { readonly id: string; readonly cwd?: string }>();
 
-	/** Every pane of the hangar, by window name; a name can be on more than one window. */
-	async function panes(): Promise<Map<string, Pane[]>> {
+	/** Every pane of the hangar, by window name, jobs or not; a name can be on more than one window. */
+	const panes = async () => panesOf(await hangarWindows());
+
+	/** The hangar's windows, read now. */
+	async function hangarWindows(): Promise<RexWindow[]> {
 		const view = await onHangar(async (hangar) => {
 			await client.attach(hangar);
 			return client.call("session.view", { session_id: hangar }, ViewSchema);
 		});
+		return view.windows ?? [];
+	}
+
+	function panesOf(windows: readonly RexWindow[]): Map<string, Pane[]> {
 		const byName = new Map<string, Pane[]>();
-		for (const window of view.windows ?? []) {
+		for (const window of windows) {
 			const pane = paneOf(window);
 			if (pane !== undefined) byName.set(pane.name, [...(byName.get(pane.name) ?? []), pane]);
-		}
-		for (const [name, [pane, ...others]] of byName) {
-			const label = pane?.label;
-			if (others.length > 0 || label === undefined || !SESSION_ID.test(label)) continue;
-			if (sessions.get(name)?.id !== label) sessions.set(name, { id: label });
 		}
 		return byName;
 	}
 
-	function only(byName: Map<string, Pane[]>, agent: string): Pane {
+	/**
+	 * The jobs among `byName`, by window name; a name can be on more than one job. Any other window, as one the human
+	 * opened in the hangar, is no agent of the port whatever its label, so it neither hides a job nor makes a name of
+	 * the jobs' ambiguous; `listForeign` lists it, when claude runs in it.
+	 */
+	function jobsOf(byName: Map<string, Pane[]>): Map<string, JobPane[]> {
+		const jobs = new Map<string, JobPane[]>();
+		for (const [name, list] of byName) {
+			const held = list.filter(isJob);
+			if (held.length > 0) jobs.set(name, held);
+		}
+		for (const [name, [pane, ...others]] of jobs) {
+			if (others.length > 0 || pane === undefined) continue;
+			if (sessions.get(name)?.id !== pane.label) sessions.set(name, { id: pane.label });
+		}
+		return jobs;
+	}
+
+	const jobs = async () => jobsOf(await panes());
+
+	function only(byName: Map<string, JobPane[]>, agent: string): JobPane {
 		const found = byName.get(agent) ?? [];
 		if (found.length > 1) throw new Error(`rex hangar ${sessionId} has ${found.length} windows named ${agent}`);
 		const [pane] = found;
@@ -1038,8 +1074,11 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		const emit = (event: AgentStatusEvent) => {
 			for (const listener of listeners) listener(event);
 		};
-		// Which window each block of the hangar `namesOf` is in, by name; null for a name more than one window has.
+		// Which window each job's block of the hangar `namesOf` is in, by name; null for a name more than one job has.
 		let names: Map<string, string | null> | undefined;
+		// The hangar's other blocks in a window as `names` was read, a block split off a job's included, whose reports the
+		// watch drops without reading again.
+		let others = new Set<string>();
 		let namesOf: string | undefined;
 		/** The names as last read, while they are the hangar's: a hangar made in place of theirs holds none of them. */
 		const cached = () => (namesOf === sessionId ? names : undefined);
@@ -1057,19 +1096,23 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		// since; a newer read cut short replaces it.
 		const quiet = new Map<string, object>();
 		async function refresh(): Promise<Map<string, string | null>> {
+			const windows = await hangarWindows();
 			const fresh = new Map<string, string | null>();
-			for (const [name, list] of await panes()) {
+			for (const [name, list] of jobsOf(panesOf(windows))) {
 				for (const pane of list) fresh.set(pane.blockId, list.length === 1 ? name : null);
 			}
 			names = fresh;
-			// panes() read the hangar as it is once it returns, one made in place of a lost one included.
+			others = new Set(
+				windows.flatMap(blocksOf).flatMap(({ block_id: id }) => (id == null || fresh.has(id) ? [] : id)),
+			);
+			// hangarWindows() read the hangar as it is once it returns, one made in place of a lost one included.
 			namesOf = sessionId;
 			return fresh;
 		}
-		/** The names as last read when they hold the block, else read afresh. */
+		/** The names as last read when they hold the block or knew it for no job's, else read afresh. */
 		async function namesWith(blockId: string): Promise<Map<string, string | null>> {
 			const known = cached();
-			return known?.has(blockId) ? known : refresh();
+			return known !== undefined && (known.has(blockId) || others.has(blockId)) ? known : refresh();
 		}
 		function report(
 			blockId: string,
@@ -1303,7 +1346,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			const opened = await openWindow(name, claudeSession, cwd, line.launch, hangar).catch((error: Error) => {
 				throw error instanceof RexRpcError ? new TakeRefused(error.message, { cause: error }) : error;
 			});
-			return brought(name, async () => opened ?? only(await panes(), name).blockId);
+			return brought(name, async () => opened ?? only(await jobs(), name).blockId);
 		},
 
 		/**
@@ -1332,8 +1375,8 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		 * logged as it was thrown, and the next listing asks for a hangar again.
 		 */
 		async list(): Promise<readonly AgentListing[]> {
-			const byName = await panes().catch((error: Error) => {
-				if (error instanceof HangarUnmade) return new Map<string, Pane[]>();
+			const byName = await jobs().catch((error: Error) => {
+				if (error instanceof HangarUnmade) return new Map<string, JobPane[]>();
 				throw error;
 			});
 			const duplicated = [...byName].filter(([, list]) => list.length > 1).map(([name]) => name);
@@ -1342,13 +1385,9 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			}
 			return Promise.all(
 				[...byName.values()].map(async ([pane]) => {
-					const { name, blockId, label } = pane as Pane;
+					const { name, blockId, label } = pane as JobPane;
 					const { seen } = await observe(blockId);
-					return {
-						name,
-						...(seen === undefined ? {} : seen),
-						...(label !== undefined && SESSION_ID.test(label) ? { sessionId: label } : {}),
-					};
+					return { name, ...(seen === undefined ? {} : seen), sessionId: label };
 				}),
 			);
 		},
@@ -1356,7 +1395,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		async prompt(agent: string, text: string): Promise<void> {
 			return promptOn(`rex agent ${agent}`, text, async () => ({
 				session: sessionId,
-				blockId: only(await panes(), agent).blockId,
+				blockId: only(await jobs(), agent).blockId,
 			}));
 		},
 
@@ -1386,7 +1425,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		 * when this process never saw one, as after a restart.
 		 */
 		async readResult(agent: string): Promise<AgentResult | undefined> {
-			const byName = await panes();
+			const byName = await jobs();
 			if (!byName.has(agent)) {
 				// No window to wait on: its transcript, when this process saw its session, is read as it is.
 				const session = sessions.get(agent);
@@ -1394,7 +1433,6 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 				return path === undefined ? undefined : readLastRecord(path);
 			}
 			const { blockId, label } = only(byName, agent);
-			if (label === undefined || !SESSION_ID.test(label)) return undefined;
 			const { foreground, child } = await blockCall("process", blockId, ProcessResultSchema);
 			const cwd = foreground?.cwd ?? child?.cwd;
 			if (cwd !== undefined) sessions.set(agent, { id: label, cwd });
@@ -1419,16 +1457,16 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 
 		/** The screen of the agent's block in the hangar, read now, whatever runs in it, even after claude exited. */
 		async readScreen(agent: string): Promise<string> {
-			return screenText(only(await panes(), agent).blockId);
+			return screenText(only(await jobs(), agent).blockId);
 		},
 
 		async respond(agent: string, answer: Answer): Promise<AnswerOutcome> {
-			const { blockId } = only(await panes(), agent);
+			const { blockId } = only(await jobs(), agent);
 			return answerOn(sessionId, blockId, answer, true);
 		},
 
 		async stop(agent: string): Promise<void> {
-			const { blockId } = only(await panes(), agent);
+			const { blockId } = only(await jobs(), agent);
 			await client.call("block.close", { session_id: sessionId, block_id: blockId }, BlockClosedResultSchema);
 		},
 

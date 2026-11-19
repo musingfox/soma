@@ -204,9 +204,9 @@ test("a hangar rex will not make is logged once, however often the watch reads t
 	]);
 });
 
-/** A watched hangar holding a block with no root record, which the trust check reads every trustMs. */
+/** A watched hangar holding a job's block with no root record, which the trust check reads every trustMs. */
 async function watchedShell() {
-	const fake = rex([{ name: "shell", block: "block:s", argv0: "-fish", records: [] }]);
+	const fake = rex([{ name: "shell", block: "block:s", label: SESSION, argv0: "-fish", records: [] }]);
 	const errors: string[] = [];
 	const watched = port(fake, { trustMs: 5, onError: (error) => errors.push(error.message) });
 	const off = watched.onStatus(() => {});

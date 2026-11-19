@@ -31,6 +31,8 @@ export interface HandoverAgentPortOptions {
 	readonly graceMs?: number;
 	/** How long after a look rex did not answer the next one is made with no caller; `graceMs` otherwise. */
 	readonly relookMs?: number;
+	/** How long after a listing for a job on rex failed the next one is made: 5 s, the rex adapter's `retryMs`, otherwise. */
+	readonly relistMs?: number;
 	readonly now?: () => number;
 }
 
@@ -65,6 +67,7 @@ export function createHandoverAgentPort({
 	onError = (error) => console.warn(`[handover] ${error.message}`),
 	graceMs = HANDOVER_GRACE_MS,
 	relookMs = graceMs,
+	relistMs = 5_000,
 	now = Date.now,
 }: HandoverAgentPortOptions): AgentPort & AgentHandover & HandoverSettling & { dormant(): Promise<readonly string[]> } {
 	const moved = new Map<string, HeldSession>();
@@ -76,19 +79,36 @@ export function createHandoverAgentPort({
 	// Why each job was last told undecided: once per reason, however many looks find it the same.
 	const told = new Map<string, Why>();
 	const statusListeners = new Set<(event: AgentStatusEvent) => void>();
-	// The jobs a status of went out since `passOn` began.
+	// The jobs a status of went out since `passOn` began, from the side each is on: an ACP one's late exit says nothing
+	// of its window.
 	const heard = new Set<string>();
+	// Jobs on rex whose listing for `passOn` failed, each with the timer that lists it again.
+	const relisting = new Map<string, NodeJS.Timeout>();
 	/**
 	 * What the job reports now goes out, as nothing did while it was held, unless something newer already has. A side that
-	 * has nothing to say, or does not answer, says nothing; the core reads a seq it holds as the observation it recorded.
+	 * has nothing to say says nothing; the core reads a seq it holds as the observation it recorded. Where rex does not
+	 * answer, it is asked again `relistMs` on, until it answers or a status of the window has gone out since: what the
+	 * window reached during the move, such as a prompt, is no less there for a listing lost.
 	 */
-	async function passOn(agent: string): Promise<void> {
-		if (unrecorded.has(agent)) return;
+	async function passOn(agent: string, again = false): Promise<void> {
+		clearTimeout(relisting.get(agent));
+		relisting.delete(agent);
+		if (unrecorded.has(agent) || (again && heard.has(agent))) return;
 		heard.delete(agent);
-		const listed = await (moved.has(agent) ? to : from).list().catch(() => []);
+		const onRex = moved.has(agent);
+		const listed = await (onRex ? to : from).list().catch(() => undefined);
+		if (listed === undefined) {
+			if (onRex) relistLater(agent);
+			return;
+		}
 		const { status, seq } = listed.find(({ name }) => name === agent) ?? {};
 		if (status === undefined || seq === undefined || heard.has(agent)) return;
 		for (const listener of statusListeners) listener({ agent, status, seq });
+	}
+	function relistLater(agent: string): void {
+		const timer = setTimeout(() => void passOn(agent, true).catch(onError), relistMs);
+		timer.unref();
+		relisting.set(agent, timer);
 	}
 
 	/** What names a return of the agent, as `givenBack` says it at every startup: the one value a return is told by. */
@@ -457,12 +477,12 @@ export function createHandoverAgentPort({
 
 		onStatus(listener: (event: AgentStatusEvent) => void): () => void {
 			statusListeners.add(listener);
-			const pass = (event: AgentStatusEvent) => {
-				heard.add(event.agent);
+			const pass = (event: AgentStatusEvent, onItsSide = true) => {
+				if (onItsSide) heard.add(event.agent);
 				listener(event);
 			};
 			const offFrom = from.onStatus((event) => {
-				if (!moving.has(event.agent)) pass(event);
+				if (!moving.has(event.agent)) pass(event, !moved.has(event.agent));
 			});
 			const offTo = to.onStatus((event) => {
 				if (!moved.has(event.agent) || moving.has(event.agent)) return;

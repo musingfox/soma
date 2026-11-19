@@ -563,6 +563,147 @@ test("what the window said while its status was being read is not overtaken by t
 	off();
 });
 
+const PROMPTED = { state: "blocked", kind: "permission", updated_at: "2026-10-27T01:02:05.000000+08:00" };
+
+test("a prompt the window reached during the move reaches the listener once, though the first listing after fails", async () => {
+	let listings = 0;
+	const both = await sides({
+		opened: { records: [PROMPTED] },
+		relistMs: 20,
+		to: (port) => ({
+			...port,
+			list: async () => {
+				if (++listings === 1) throw new Error("rex is away");
+				return port.list();
+			},
+		}),
+	});
+	const heard: AgentStatusEvent[] = [];
+	const off = both.agents.onStatus((event) => heard.push(event));
+	await inTurn(both, "SPIN");
+	const from = heard.length;
+
+	expect(await both.agents.handOver("card-a")).toMatchObject({ handedOver: true });
+	for (const deadline = Date.now() + 2_000; heard.length === from && Date.now() < deadline; ) await sleep(5);
+	await sleep(60);
+
+	expect(heard.slice(from)).toMatchObject([{ agent: "card-a", status: { state: "blocked" }, seq: seqOf(PROMPTED) }]);
+	expect(heard.slice(from)).toHaveLength(1);
+	expect(listings).toBe(2);
+	off();
+});
+
+test("what the window says before a listing after a failed one answers is not overtaken by that older listing", async () => {
+	let answer = () => {};
+	const answered = new Promise<void>((resolve) => {
+		answer = resolve;
+	});
+	let listings = 0;
+	let asked = false;
+	const both = await sides({
+		opened: { records: [PROMPTED] },
+		relistMs: 20,
+		to: (port) => ({
+			...port,
+			list: async () => {
+				if (++listings === 1) throw new Error("rex is away");
+				const listed = await port.list();
+				asked = true;
+				await answered;
+				return listed;
+			},
+		}),
+	});
+	const heard: AgentStatusEvent[] = [];
+	const off = both.agents.onStatus((event) => heard.push(event));
+	await inTurn(both, "SPIN");
+	const from = heard.length;
+
+	await both.agents.handOver("card-a");
+	await until(() => asked);
+	const window = both.blocks[0] as Block;
+	window.records = [WORKING];
+	both.hangar.emit(both.hangar.status(window.block, WORKING));
+	await until(() => heard.length > from);
+	answer();
+	await sleep(60);
+
+	expect(heard.slice(from)).toEqual([{ agent: "card-a", status: { state: "working" }, seq: seqOf(WORKING) }]);
+	off();
+});
+
+test("a status of the window that goes out before a listing after a failed one is made ends the listings", async () => {
+	let listings = 0;
+	const both = await sides({
+		opened: { records: [PROMPTED] },
+		relistMs: 200,
+		to: (port) => ({
+			...port,
+			list: async () => {
+				if (++listings === 1) throw new Error("rex is away");
+				return port.list();
+			},
+		}),
+	});
+	const heard: AgentStatusEvent[] = [];
+	const off = both.agents.onStatus((event) => heard.push(event));
+	await inTurn(both, "SPIN");
+	const from = heard.length;
+
+	await both.agents.handOver("card-a");
+	const window = both.blocks[0] as Block;
+	window.records = [WORKING];
+	both.hangar.emit(both.hangar.status(window.block, WORKING));
+	await until(() => heard.length > from);
+	await sleep(300);
+
+	expect(heard.slice(from)).toEqual([{ agent: "card-a", status: { state: "working" }, seq: seqOf(WORKING) }]);
+	expect(listings).toBe(1);
+	off();
+});
+
+test("a late status of the ACP side does not end the listings for the window it was handed over to", async () => {
+	let listings = 0;
+	const acpListeners = new Set<(event: AgentStatusEvent) => void>();
+	const both = await sides({
+		opened: { records: [PROMPTED] },
+		relistMs: 20,
+		from: (port) => ({
+			...port,
+			onStatus: (listener) => {
+				acpListeners.add(listener);
+				const offPort = port.onStatus(listener);
+				return () => {
+					acpListeners.delete(listener);
+					offPort();
+				};
+			},
+		}),
+		to: (port) => ({
+			...port,
+			list: async () => {
+				if (++listings === 1) throw new Error("rex is away");
+				return port.list();
+			},
+		}),
+	});
+	const heard: AgentStatusEvent[] = [];
+	const off = both.agents.onStatus((event) => heard.push(event));
+	await inTurn(both, "SPIN");
+	const from = heard.length;
+
+	await both.agents.handOver("card-a");
+	const exited = { agent: "card-a", status: { state: "error", msg: "the ACP process exited" }, seq: 1 } as const;
+	for (const listener of acpListeners) listener(exited);
+	for (const deadline = Date.now() + 2_000; heard.length < from + 2 && Date.now() < deadline; ) await sleep(5);
+
+	expect(heard.slice(from)).toMatchObject([
+		exited,
+		{ agent: "card-a", status: { state: "blocked" }, seq: seqOf(PROMPTED) },
+	]);
+	off();
+});
+
 test("each listener hears a status once, what passes after a move as well", async () => {
 	const both = await sides();
 	const one: AgentStatusEvent[] = [];

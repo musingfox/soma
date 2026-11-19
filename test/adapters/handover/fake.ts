@@ -41,6 +41,8 @@ export async function sides(
 		graceMs?: number;
 		/** How often a job rex did not answer about is looked at again: `graceMs`, or 60 s where that is none. */
 		relookMs?: number;
+		/** How soon a failed listing of a job on rex is made again: 5 s by default. */
+		relistMs?: number;
 		/** How long a cut waits for a turn to stop. */
 		cutMs?: number;
 		/** Each side as the handover sees it, to hang or fail one of its calls. */
@@ -107,6 +109,7 @@ export async function sides(
 		onError,
 		graceMs,
 		relookMs,
+		...(options.relistMs === undefined ? {} : { relistMs: options.relistMs }),
 		...(clock === undefined ? {} : { now: clock.now }),
 	});
 	return {

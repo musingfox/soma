@@ -173,6 +173,8 @@ export function launchCommand(
 }
 
 const isRoot = (record: StatusRecord) => record.id === undefined || record.id === "";
+// A record claude sent, as it names itself in OSC 7501; a shell's prompt mark can clear records too.
+const isClaudes = (record: StatusRecord) => record.app === "claude-code";
 
 // The tail of the screen and scrollback that is read: a prompt is drawn at the bottom.
 const SCREEN_BYTES = 65_536;
@@ -348,9 +350,18 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		}
 	}
 
-	// A block of the hangar unless `session` names another.
-	const blockCall = <T>(method: string, blockId: string, schema: ZodType<T>, args = {}, session = sessionId) =>
-		client.call(`${TERMINAL}.${method}`, { session_id: session, block_id: blockId, args }, schema);
+	// A block of the hangar unless `session` names another. A read of a hangar block that shows claude, in the
+	// foreground or by a record it sent, ends the slot a start holds for the block. Both replies passed their schema.
+	const blockCall = async <T>(method: string, blockId: string, schema: ZodType<T>, args = {}, session = sessionId) => {
+		const result = await client.call(`${TERMINAL}.${method}`, { session_id: session, block_id: blockId, args }, schema);
+		const shown = result as { foreground?: { argv0?: string } | null; records?: StatusRecord[] };
+		const claude =
+			method === "process"
+				? shown.foreground?.argv0 === "claude"
+				: method === "program_status" && !!shown.records?.some(isClaudes);
+		if (session === sessionId && claude) sawClaude(blockId);
+		return result;
+	};
 
 	// By block, the seq of the done, idle or error the watch last reported, when it saw a working before it: when the
 	// turn readResult waits for ended. Absent when the watch cannot tell that report ended a turn: a re-stamp of an end,
@@ -432,17 +443,55 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		return foreground?.argv0 === "claude";
 	}
 
-	/** The hangar's blocks running claude, on every window and layer, so a block a human split off counts too. */
+	// The slots this port's starts hold, from their count until the port has seen their claude, their window is gone or
+	// the start failed. `block`: the window's block, once it has opened; its shell is in the foreground until the typed
+	// claude line execs, so the count of claude blocks misses it till then.
+	const slots = new Set<{ block?: string }>();
+	// The count and the slot it grants, one start at a time, so two starts never both take the last slot.
+	let counting: Promise<unknown> = Promise.resolve();
+
+	/**
+	 * Frees the slot of the block, whose claude a read or the watch has seen: from then on it counts as a claude block
+	 * while it runs, and not once it has exited, even if no count saw it run.
+	 */
+	function sawClaude(blockId: string): void {
+		for (const slot of slots) if (slot.block === blockId) slots.delete(slot);
+	}
+
+	/**
+	 * The hangar's blocks running claude, on every window and layer, so a block a human split off counts too, and the
+	 * slots of starts whose claude has not been seen yet. A slot whose block is gone from a view read after its window
+	 * opened is freed.
+	 */
 	async function occupied(): Promise<number> {
-		return onHangar(async (hangar) => {
+		const opened = new Set([...slots].filter(({ block }) => block !== undefined));
+		const running = await onHangar(async (hangar) => {
 			await client.attach(hangar);
 			const view = await client.call("session.view", { session_id: hangar }, ViewSchema);
 			const blockIds = (view.windows ?? []).flatMap((window) =>
 				(window.layers ?? []).flatMap((layer) => (layer.blocks ?? []).flatMap((block) => block.block_id ?? [])),
 			);
 			const claude = await Promise.all(blockIds.map(isClaude));
-			return claude.filter(Boolean).length;
+			return new Map(blockIds.map((blockId, at) => [blockId, claude[at] as boolean]));
 		});
+		for (const slot of slots) {
+			if (slot.block === undefined) continue;
+			if (!running.has(slot.block) && opened.has(slot)) slots.delete(slot);
+		}
+		return [...running.values()].filter(Boolean).length + slots.size;
+	}
+
+	/** A slot of the cap for a start, or `hangar is full` when none is left. */
+	function reserve(): Promise<{ block?: string }> {
+		const reserved = counting.then(async () => {
+			const running = await occupied();
+			if (running >= cap) throw new Error(`hangar is full: ${running} of ${cap} agents running`);
+			const slot: { block?: string } = {};
+			slots.add(slot);
+			return slot;
+		});
+		counting = reserved.catch(() => undefined);
+		return reserved;
 	}
 
 	/**
@@ -1316,6 +1365,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			const block = BlockEventSchema.safeParse(event.event.payload);
 			if (!block.success || block.data.name !== "program_status_changed") return;
 			const changed = ProgramStatusChangedSchema.safeParse(block.data.payload);
+			if (changed.success && isClaudes(changed.data.record)) sawClaude(block.data.block_id);
 			if (!changed.success || changed.data.id !== "") return;
 			const { block_id: blockId } = block.data;
 			const { record } = changed.data;
@@ -1352,16 +1402,24 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		async start(request: StartRequest): Promise<void> {
 			// Built first, so a card the command cannot hold leaves git and rex alone.
 			const launch = launchCommand(request, options.env, options.path);
-			const running = await occupied();
-			if (running >= cap) throw new Error(`hangar is full: ${running} of ${cap} agents running`);
-			const path = await openWorktree(git, request.cwd, request.card);
-			// obw finds its vault through this untracked file, which a fresh worktree lacks.
-			await copyFile(join(request.cwd, ".obsidian.yaml"), join(path, ".obsidian.yaml"), constants.COPYFILE_EXCL).catch(
-				(error: NodeJS.ErrnoException) => {
+			const slot = await reserve();
+			try {
+				const path = await openWorktree(git, request.cwd, request.card);
+				// obw finds its vault through this untracked file, which a fresh worktree lacks.
+				await copyFile(
+					join(request.cwd, ".obsidian.yaml"),
+					join(path, ".obsidian.yaml"),
+					constants.COPYFILE_EXCL,
+				).catch((error: NodeJS.ErrnoException) => {
 					if (error.code !== "ENOENT" && error.code !== "EEXIST") throw error;
-				},
-			);
-			await openWindow(request.name, request.sessionId, path, launch);
+				});
+				slot.block = await openWindow(request.name, request.sessionId, path, launch);
+			} catch (error) {
+				slots.delete(slot);
+				throw error;
+			}
+			// A window rex named no block of cannot be watched for its claude.
+			if (slot.block === undefined) slots.delete(slot);
 		},
 
 		/**

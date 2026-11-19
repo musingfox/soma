@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Tx } from "@earendil-works/pi-durable";
 import { afterAll, describe, expect, test } from "vitest";
+import type { ZodType } from "zod";
 import { createRexAgentPort, launchCommand, seqOf, stateOf } from "../../../src/adapters/rex/agent-port.ts";
 import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
 import type { Job } from "../../../src/core/domain/dispatch.ts";
@@ -121,6 +122,252 @@ test("start does not count a hangar block whose foreground is not claude", async
 	);
 
 	expect(fake.methods()).toContain("session.new_window");
+});
+
+// A window that opens with its shell in the foreground, as the typed claude line has not exec'd yet.
+function opensShells(fake: ReturnType<typeof rex>, blocks: Block[]) {
+	fake.replace("session.new_window", (payload) => {
+		const block = `block:${payload.window_label}`;
+		blocks.push({ name: String(payload.window_label), block, label: SESSION, argv0: "-fish" });
+		return { window_id: `window:${block}`, block_ids: [block], revision: 2 };
+	});
+}
+
+test("two starts at once with one slot left open one window, and the other is refused hangar is full", async () => {
+	const fake = rex([{ name: "card-b", block: "block:b", argv0: "claude" }]);
+	const { git: run } = git();
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		cap: 2,
+	});
+
+	const started = await Promise.allSettled([
+		port.start(request),
+		port.start({ ...request, name: "card-c", card: "card-c" }),
+	]);
+
+	expect(started.map(({ status }) => status).sort()).toEqual(["fulfilled", "rejected"]);
+	expect(started.find((each) => each.status === "rejected")?.reason).toEqual(
+		new Error("hangar is full: 2 of 2 agents running"),
+	);
+	expect(fake.methods().filter((method) => method === "session.new_window")).toHaveLength(1);
+});
+
+test("a start whose window still shows its shell holds its slot, which its claude takes over once in the foreground", async () => {
+	const blocks: Block[] = [{ name: "card-b", block: "block:b", argv0: "claude" }];
+	const fake = rex(blocks);
+	opensShells(fake, blocks);
+	const { git: run } = git();
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		cap: 2,
+	});
+	const other = { ...request, name: "card-c", card: "card-c" };
+
+	await port.start(request);
+	await expect(port.start(other)).rejects.toThrow("hangar is full: 2 of 2 agents running");
+
+	// card-a's claude execs and card-b's window closes: card-a is counted once, as a claude block.
+	(blocks.find(({ name }) => name === "card-a") as Block).argv0 = "claude";
+	blocks.splice(0, 1);
+	await port.start(other);
+
+	expect(fake.methods().filter((method) => method === "session.new_window")).toHaveLength(2);
+});
+
+test("a start's claude the watch saw report frees its slot, though it exited before any count", async () => {
+	const blocks: Block[] = [{ name: "card-b", block: "block:b", argv0: "claude" }];
+	const fake = rex(blocks);
+	opensShells(fake, blocks);
+	const { git: run } = git();
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		cap: 2,
+	});
+	const off = port.onStatus(() => {});
+	await settle();
+
+	await port.start(request);
+	// card-a's claude reports a turn and exits, its window back at the shell, before the next start counts.
+	fake.emit(fake.status("block:card-a", { state: "working", app: "claude-code", updated_at: AT }));
+	await settle();
+	await port.start({ ...request, name: "card-c", card: "card-c" });
+	off();
+
+	expect(fake.methods().filter((method) => method === "session.new_window")).toHaveLength(2);
+});
+
+test("a start's claude another read saw in the foreground frees its slot, though it exited before any count", async () => {
+	const blocks: Block[] = [{ name: "card-b", block: "block:b", label: SESSION, argv0: "claude" }];
+	const fake = rex(blocks);
+	opensShells(fake, blocks);
+	const { git: run } = git();
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		cap: 2,
+		redrawMs: 0,
+	});
+
+	await port.start(request);
+	const opened = blocks.find(({ name }) => name === "card-a") as Block;
+	opened.argv0 = "claude";
+	await port.list();
+	opened.argv0 = "-fish";
+	await port.start({ ...request, name: "card-c", card: "card-c" });
+
+	expect(fake.methods().filter((method) => method === "session.new_window")).toHaveLength(2);
+});
+
+test("a record an exited claude left on its start's block, found by a read, frees the start's slot", async () => {
+	const blocks: Block[] = [{ name: "card-b", block: "block:b", label: SESSION, argv0: "claude" }];
+	const fake = rex(blocks);
+	opensShells(fake, blocks);
+	const { git: run } = git();
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		cap: 2,
+		redrawMs: 0,
+	});
+
+	await port.start(request);
+	(blocks.find(({ name }) => name === "card-a") as Block).records = [
+		{ state: "idle", app: "claude-code", updated_at: AT },
+	];
+	await port.list();
+	await port.start({ ...request, name: "card-c", card: "card-c" });
+
+	expect(fake.methods().filter((method) => method === "session.new_window")).toHaveLength(2);
+});
+
+test("a status on a start's block that is not claude's, by event or read, leaves the start's slot held", async () => {
+	const blocks: Block[] = [{ name: "card-b", block: "block:b", label: SESSION, argv0: "claude" }];
+	const fake = rex(blocks);
+	opensShells(fake, blocks);
+	const { git: run } = git();
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		cap: 2,
+		redrawMs: 0,
+	});
+	const off = port.onStatus(() => {});
+	await settle();
+
+	await port.start(request);
+	// The shell's own marks: another app's record, one naming no app, and one that is no record at all.
+	fake.emit(fake.status("block:card-a", { state: "clear", app: "fish", updated_at: AT }));
+	fake.emit(fake.status("block:card-a", { state: "clear", updated_at: AT }));
+	fake.emit(fake.status("block:card-a", { app: "claude-code" }));
+	(blocks.find(({ name }) => name === "card-a") as Block).records = [
+		{ state: "clear", app: "fish", updated_at: AT },
+		{ id: "mark", state: "clear", updated_at: AT },
+	];
+	await settle();
+	await port.list();
+	await expect(port.start({ ...request, name: "card-c", card: "card-c" })).rejects.toThrow(
+		"hangar is full: 2 of 2 agents running",
+	);
+	off();
+});
+
+test("a start's window that opens after another start's count read the hangar still holds its slot there", async () => {
+	const blocks: Block[] = [{ name: "card-b", block: "block:b", argv0: "claude" }];
+	const fake = rex(blocks);
+	opensShells(fake, blocks);
+	// card-a's window opens once card-c's count has read the hangar's view, and before that count ends.
+	let viewed = () => {};
+	let opened = () => {};
+	const read = new Promise<void>((resolve) => {
+		viewed = resolve;
+	});
+	const open = new Promise<void>((resolve) => {
+		opened = resolve;
+	});
+	let views = 0;
+	const client = {
+		...fake.client,
+		async call<T>(method: string, payload: unknown, schema: ZodType<T>): Promise<T> {
+			if (method === "session.new_window") await read;
+			const reply = await fake.client.call(method, payload, schema);
+			if (method === "session.new_window") opened();
+			if (method === "session.view" && views++ === 1) {
+				viewed();
+				await open;
+			}
+			return reply;
+		},
+	};
+	const { git: run } = git();
+	const port = createRexAgentPort({ processStart: unstarted, client, sessionId: HANGAR, git: run, cap: 2 });
+
+	const started = await Promise.allSettled([
+		port.start(request),
+		port.start({ ...request, name: "card-c", card: "card-c" }),
+	]);
+
+	expect(started.map(({ status }) => status)).toEqual(["fulfilled", "rejected"]);
+	expect(blocks.map(({ name }) => name)).toEqual(["card-b", "card-a"]);
+});
+
+test("a start's window closed before its claude came frees its slot", async () => {
+	const blocks: Block[] = [{ name: "card-b", block: "block:b", argv0: "claude" }];
+	const fake = rex(blocks);
+	opensShells(fake, blocks);
+	const { git: run } = git();
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		cap: 2,
+	});
+
+	await port.start(request);
+	blocks.splice(
+		blocks.findIndex(({ name }) => name === "card-a"),
+		1,
+	);
+	await port.start({ ...request, name: "card-c", card: "card-c" });
+
+	expect(fake.methods().filter((method) => method === "session.new_window")).toHaveLength(2);
+});
+
+test("a start that fails frees its slot for the next start", async () => {
+	const fake = rex([{ name: "card-b", block: "block:b", argv0: "claude" }]);
+	const { git: run } = git();
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		cap: 2,
+	});
+	fake.replace("session.new_window", () => {
+		throw new Error("new_window refused");
+	});
+
+	await expect(port.start(request)).rejects.toThrow("new_window refused");
+	fake.replace("session.new_window", fake.original("session.new_window"));
+	await port.start({ ...request, name: "card-c", card: "card-c" });
+
+	expect(fake.methods().filter((method) => method === "session.new_window")).toHaveLength(2);
 });
 
 test("start reopens the worktree an earlier attempt left on the branch", async () => {

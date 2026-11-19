@@ -43,7 +43,10 @@ export function readBlockedScreen(text: string): BlockedScreen {
 	return { kind: AUTH_WORDING.test(tail) ? "auth" : "permission", msg: tail };
 }
 
-/** claude's folder-trust dialog, which it draws before it reports any status (ARCHITECTURE.md "The rex implementation"). */
+/**
+ * claude's folder-trust dialog, which it draws before it reports any status, or since 2.1.328 as a blocked permission
+ * (ARCHITECTURE.md "The rex implementation").
+ */
 export const isTrustDialog = (screen: BlockedScreen) =>
 	screen.kind === "permission" &&
 	screen.prompt?.options.some((option) => /trust this folder/i.test(option.label)) === true;

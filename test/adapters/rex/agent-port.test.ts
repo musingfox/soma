@@ -1876,6 +1876,38 @@ test("onStatus reports the trust dialog once claude ran trustMs without a record
 	off();
 });
 
+test("a trust dialog claude reports a blocked record for names the repository root, as it is reported and listed", async () => {
+	// Claude Code 2.1.328 reports this record while its dialog is on screen, fresh and on --resume alike.
+	const record = { state: "blocked", kind: "permission", msg: "trust this folder", updated_at: AT };
+	const block: Block = {
+		name: "card-a",
+		block: "block:a",
+		label: SESSION,
+		argv0: "claude",
+		cwd: WORKTREE,
+		records: [],
+		screen: TRUST,
+	};
+	const fake = rex([block]);
+	const seen: AgentStatusEvent[] = [];
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: mainGit.git,
+	});
+	const off = port.onStatus((event) => seen.push(event));
+	await settle();
+
+	block.records = [record];
+	fake.emit(fake.status("block:a", record));
+	await until(() => seen.length > 0);
+	off();
+
+	expect(seen).toEqual([{ agent: "card-a", status: TRUSTED, seq: AT_US }]);
+	expect(await port.list()).toEqual([{ name: "card-a", status: TRUSTED, seq: AT_US, sessionId: SESSION }]);
+});
+
 /** A rex whose screen reads wait, while `hold` is on, until `release`; `held` counts the reads that waited. */
 function heldScreen(fake: ReturnType<typeof rex>) {
 	const gate = { hold: false, held: 0, release: () => {} };
@@ -2258,6 +2290,91 @@ describe("taking over a session another side ran", () => {
 		expect(await created.take(session)).toMatchObject({ ready: true });
 
 		expect(pressed).toEqual(["arrow_down", "enter"]);
+		rmSync(projectsDir, { recursive: true, force: true });
+	});
+
+	test("take answers yes the trust dialog claude reports a blocked record for, and is ready at the record after it", async () => {
+		const { projectsDir, session } = held();
+		// Claude Code 2.1.328 reports this record while its dialog is on screen.
+		const trusting = { state: "blocked", kind: "permission", msg: "trust this folder", updated_at: AT };
+		const { fake, blocks, created } = port(projectsDir, { records: [trusting], screen: TRUST_SCREEN });
+		const pressed: string[] = [];
+		fake.replace("block.event", (payload) => {
+			const { key, action } = (payload.event as { payload: { key: string; action: string } }).payload;
+			const block = blocks[0] as Block;
+			if (action === "press") pressed.push(key);
+			if (action === "press" && key === "enter" && /❯ Yes/.test(block.screen ?? "")) {
+				setTimeout(() => {
+					block.records = [idle];
+				}, 40);
+			}
+			return fake.original("block.event")(payload);
+		});
+
+		expect(await created.take(session)).toMatchObject({ ready: true });
+
+		expect(pressed).toEqual(["arrow_down", "enter"]);
+		expect((blocks[0] as Block).records).toEqual([idle]);
+		rmSync(projectsDir, { recursive: true, force: true });
+	});
+
+	test("take reads again a blocked record whose dialog is not drawn yet, then answers it yes", async () => {
+		const { projectsDir, session } = held();
+		const trusting = { state: "blocked", kind: "permission", msg: "trust this folder", updated_at: AT };
+		const { fake, blocks, created } = port(projectsDir, { records: [trusting], screen: "$ claude --resume" });
+		const format = "com.superlogical.terminal.format";
+		let reads = 0;
+		fake.replace(format, (payload) => {
+			const block = blocks[0] as Block;
+			if (++reads === 3 && block.screen === "$ claude --resume") block.screen = TRUST_SCREEN;
+			return fake.original(format)(payload);
+		});
+		const pressed: string[] = [];
+		fake.replace("block.event", (payload) => {
+			const { key, action } = (payload.event as { payload: { key: string; action: string } }).payload;
+			if (action === "press") pressed.push(key);
+			if (action === "press" && key === "enter") (blocks[0] as Block).records = [idle];
+			return fake.original("block.event")(payload);
+		});
+
+		expect(await created.take(session)).toMatchObject({ ready: true });
+
+		expect(pressed).toEqual(["arrow_down", "enter"]);
+		rmSync(projectsDir, { recursive: true, force: true });
+	});
+
+	test("take is ready at a blocked record on the prompt that comes after its yes", async () => {
+		const { projectsDir, session } = held();
+		const trusting = { state: "blocked", kind: "permission", msg: "trust this folder", updated_at: AT };
+		const asking = { state: "blocked", kind: "permission", msg: "approve Bash: ls", updated_at: AT };
+		const { fake, blocks, created } = port(projectsDir, { records: [trusting], screen: TRUST_SCREEN }, [], 60_000);
+		fake.replace("block.event", (payload) => {
+			const { key, action } = (payload.event as { payload: { key: string; action: string } }).payload;
+			const block = blocks[0] as Block;
+			if (action === "press" && key === "enter") {
+				block.records = [asking];
+				block.screen = BASH;
+			}
+			return fake.original("block.event")(payload);
+		});
+		const started = Date.now();
+
+		expect(await created.take(session)).toMatchObject({ ready: true });
+
+		expect(Date.now() - started).toBeLessThan(5_000);
+		rmSync(projectsDir, { recursive: true, force: true });
+	});
+
+	test("take is ready at once at a blocked record on any other prompt, and presses nothing", async () => {
+		const { projectsDir, session } = held();
+		const asking = { state: "blocked", kind: "permission", msg: "approve Bash: ls", updated_at: AT };
+		const { fake, created } = port(projectsDir, { records: [asking], screen: BASH }, [], 60_000);
+		const started = Date.now();
+
+		expect(await created.take(session)).toMatchObject({ ready: true });
+
+		expect(Date.now() - started).toBeLessThan(5_000);
+		expect(fake.methods()).not.toContain("block.event");
 		rmSync(projectsDir, { recursive: true, force: true });
 	});
 

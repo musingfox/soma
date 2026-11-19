@@ -542,7 +542,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 							if (foreground?.argv0 !== "claude") return [];
 							const { records } = await call("program_status", ProgramStatusResultSchema);
 							const root = records.find(isRoot);
-							const status = root && (await statusOf(blockId, root, session.session_id));
+							const status = root && (await statusOf(blockId, root, foreground.cwd ?? child?.cwd, session.session_id));
 							const seq = root && seqOf(root);
 							const window = block.window_id == null ? undefined : windows.get(block.window_id);
 							const name = block.label ?? blockId;
@@ -707,7 +707,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	/**
 	 * What the block shows while claude is in the foreground: the root record's status (subagents leave child records
 	 * with an id), or, while claude has reported none, its folder-trust dialog. `recorded` says a root record is there,
-	 * which ends the dialog check for the block.
+	 * which ends the dialog check for the block: a dialog claude reports a record for is told by `statusOf`.
 	 */
 	async function observe(blockId: string): Promise<{ seen?: Seen; recorded: boolean }> {
 		const [{ records }, { foreground }] = await Promise.all([
@@ -723,7 +723,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 				? await trustDialog(blockId, foreground.pid, foreground.cwd)
 				: seq === undefined
 					? undefined
-					: { status: await statusOf(blockId, root), seq };
+					: { status: await statusOf(blockId, root, foreground.cwd), seq };
 		return seen === undefined ? { recorded } : { seen, recorded };
 	}
 
@@ -731,9 +731,15 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	 * A root record's status. A blocked one carries the prompt read off the screen, its options and fingerprint, as
 	 * herdr's does, since rex's record names neither and respond needs the fingerprint. claude may report the block
 	 * before it has drawn the prompt, so a screen that does not parse is read again, as herdr's is; one that still does
-	 * not, or cannot be read, leaves the record's own status, a block nobody can answer.
+	 * not, or cannot be read, leaves the record's own status, a block nobody can answer. A trust dialog, which claude
+	 * reports since 2.1.328, names what a yes trusts as `trustDialog`'s does; `cwd` is where claude runs.
 	 */
-	async function statusOf(blockId: string, record: StatusRecord, session = sessionId): Promise<AgentState> {
+	async function statusOf(
+		blockId: string,
+		record: StatusRecord,
+		cwd: string | undefined,
+		session = sessionId,
+	): Promise<AgentState> {
 		const status = stateOf(record);
 		if (status.state !== "blocked") return status;
 		try {
@@ -742,7 +748,8 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 				await new Promise((resolve) => setTimeout(resolve, redrawMs));
 				screen = await readScreen(blockId, session);
 			}
-			return screen.prompt === undefined ? status : blockedOf(screen);
+			if (screen.prompt === undefined) return status;
+			return isTrustDialog(screen) ? await trusting(screen, cwd) : blockedOf(screen);
 		} catch (error) {
 			onError(error as Error);
 			return status;
@@ -750,19 +757,27 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	}
 
 	/**
-	 * claude's folder-trust dialog, for which claude reports no record, read off the screen once claude has been in the
-	 * foreground for trustMs. Its seq is the time that first held, in microseconds: every read of one dialog, by any soma
-	 * process, names it alike, so a restarted core wakes the model under the requestId the first one did. Its msg ends
-	 * naming what a yes trusts: claude records the trust for the repo's main checkout, not the worktree it runs in.
+	 * claude's folder-trust dialog, for which claude before 2.1.328 reports no record, read off the screen once claude
+	 * has been in the foreground for trustMs. Its seq is the time that first held, in microseconds: every read of one
+	 * dialog, by any soma process, names it alike, so a restarted core wakes the model under the requestId the first one
+	 * did.
 	 */
 	async function trustDialog(blockId: string, pid: number, cwd: string | undefined): Promise<Seen | undefined> {
 		const started = await processStart(pid);
 		if (started === undefined || now() - started < trustMs) return undefined;
 		const screen = await readScreen(blockId);
 		if (!isTrustDialog(screen)) return undefined;
+		return { status: await trusting(screen, cwd), seq: (started + trustMs) * 1000 };
+	}
+
+	/**
+	 * The trust dialog on `screen` as a status whose msg ends naming what a yes trusts: claude records the trust for the
+	 * repo's main checkout, not the worktree it runs in.
+	 */
+	async function trusting(screen: BlockedScreen, cwd: string | undefined): Promise<AgentState> {
 		const root = cwd === undefined ? "of the folder claude runs in" : await rootOf(cwd);
 		const msg = `${screen.msg}\nAnswering yes trusts the repository root ${root}, and with it every worktree of that repository.`;
-		return { status: blockedOf({ ...screen, msg }), seq: (started + trustMs) * 1000 };
+		return blockedOf({ ...screen, msg });
 	}
 
 	// By cwd, so every report of one dialog names the same root, the fallback too: a msg that changed is a new prompt.
@@ -1062,11 +1077,13 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	}
 
 	/**
-	 * Waits for claude to report itself up in a window `take` opened: true once the block has a root record, which it
-	 * reports with no dialog in its way, false when takeMs passes first or as soon as a claude seen in the block has left
-	 * it, since no record comes then. The CLI asks for workspace trust where ACP never does, and has reported nothing
-	 * while it asks, so a dialog on screen is answered yes, with the checks `respond` makes, until an answer is sent: the
-	 * job has run in this worktree all along, and only the human's asking brought it here.
+	 * Waits for claude to report itself up in a window `take` opened: true once the block has a root record that is not
+	 * blocked, or is blocked on a prompt other than the trust dialog, false when takeMs passes first or as soon as a
+	 * claude seen in the block has left it, since no record comes then. The CLI asks for workspace trust where ACP never
+	 * does, reporting nothing while it asks before Claude Code 2.1.328 and a blocked permission since, so a dialog on
+	 * screen is answered yes, with the checks `respond` makes, until an answer is sent: the job has run in this worktree
+	 * all along, and only the human's asking brought it here. A blocked record whose screen does not parse yet is read
+	 * again, as claude may report a prompt before it has drawn it.
 	 */
 	async function comeUp(blockId: string): Promise<boolean> {
 		let answered = false;
@@ -1076,11 +1093,14 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 				blockCall("program_status", blockId, ProgramStatusResultSchema),
 				isClaude(blockId),
 			]);
-			if (records.some(isRoot)) return true;
+			const root = records.find(isRoot);
+			if (root !== undefined && root.state !== "blocked") return true;
 			if (arrived && !claude) return false;
 			arrived = claude;
-			if (answered) continue;
+			if (answered && root === undefined) continue;
 			const screen = await readScreen(blockId);
+			if (root !== undefined && screen.prompt !== undefined && !isTrustDialog(screen)) return true;
+			if (answered) continue;
 			const yes = screen.prompt?.options.find((option) => /^yes\b.*trust this folder/i.test(option.label));
 			if (screen.prompt === undefined || yes === undefined || !isTrustDialog(screen)) continue;
 			const answer = { option: yes.id, fingerprint: screen.prompt.fingerprint };
@@ -1341,7 +1361,8 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			rechecks.set(blockId, timer);
 		};
 
-		// claude draws the trust dialog without reporting anything, so a block without a record is looked at again.
+		// claude before 2.1.328 draws the trust dialog without reporting anything, so a block without a record is looked at
+		// again; since 2.1.328 it reports the dialog as a blocked record, which `statusOf` reads.
 		let checking = false;
 		const trustCheck = setInterval(() => {
 			if (checking) return;
@@ -1375,8 +1396,10 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			if (seq === undefined) return;
 			enqueue(async () => {
 				const known = await namesWith(blockId);
-				if (!known.has(blockId) || !(await isClaude(blockId))) return;
-				report(blockId, known.get(blockId), await statusOf(blockId, record), seq);
+				if (!known.has(blockId)) return;
+				const { foreground } = await blockCall("process", blockId, ProcessResultSchema);
+				if (foreground?.argv0 !== "claude") return;
+				report(blockId, known.get(blockId), await statusOf(blockId, record, foreground.cwd), seq);
 			}, reading(blockId));
 		});
 		const offConnected = client.onConnected(resync);

@@ -5,7 +5,7 @@ import { afterAll, expect, test, vi } from "vitest";
 import { createRexAgentPort } from "../../../src/adapters/rex/agent-port.ts";
 import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
 import { type ForeignStatusEvent, PromptRefused } from "../../../src/ports/agent.ts";
-import { AT, AT_US, type Block, type Client, fixture, HANGAR, rex, SESSION, type Session } from "./fake.ts";
+import { AT, AT_US, type Block, type Client, fixture, git, HANGAR, rex, SESSION, type Session } from "./fake.ts";
 
 const root = mkdtempSync(join(tmpdir(), "soma-rex-foreign-"));
 const projects = join(root, "projects");
@@ -258,6 +258,35 @@ test("a blocked foreign agent's status carries the prompt read off its screen, i
 	expect(fake.calls.find((call) => call.method.endsWith(".format"))?.payload).toMatchObject({
 		session_id: "session:work",
 		block_id: "block:w1",
+	});
+});
+
+test("a foreign agent's trust dialog, which claude reports a record for, names the repository root a yes trusts", async () => {
+	const trust = fixture("claude-trust-dialog-2.1.302.txt");
+	const human: Block = {
+		name: "w",
+		block: "block:w1",
+		argv0: "claude",
+		cwd: "/repo/one/.claude/worktrees/x",
+		records: [{ state: "blocked", kind: "permission", msg: "trust this folder", updated_at: AT }],
+		screen: trust,
+	};
+	const fake = rex([], [{ id: "session:work", label: "work", blocks: [human] }]);
+	const { git: run } = git("worktree /repo/one\nHEAD abc\nbranch refs/heads/main\n");
+
+	const [listed] = await createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		redrawMs: 0,
+	}).listForeign();
+
+	expect(listed?.status).toMatchObject({
+		state: "blocked",
+		kind: "permission",
+		msg: `${readBlockedScreen(trust).msg}\nAnswering yes trusts the repository root /repo/one, and with it every worktree of that repository.`,
+		fingerprint: readBlockedScreen(trust).prompt?.fingerprint,
 	});
 });
 

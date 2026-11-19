@@ -82,6 +82,11 @@ export interface RexAgentPortOptions {
 	readonly confirmMs?: number;
 	/** Pause between the keys of one answer, and between the reads that look for the cursor its arrows moved. */
 	readonly keyGapMs?: number;
+	/**
+	 * How long after an answer first reads a prompt answered by arrows its first arrow may go: claude puts its dialog's
+	 * cursor back on the first option about 150 ms after drawing it.
+	 */
+	readonly settleMs?: number;
 	/** How long claude may be in the foreground without a record before its screen is read for the trust dialog. */
 	readonly trustMs?: number;
 	readonly processStart?: ProcessStart;
@@ -180,7 +185,8 @@ const isClaudes = (record: StatusRecord) => record.app === "claude-code";
 const SCREEN_BYTES = 65_536;
 // Reads of a blocked record's screen, redrawMs apart, before it is taken not to parse.
 const BLOCKED_READS = 3;
-// Reads of a screen, keyGapMs apart, for the cursor an answer's arrows moved, before the answer is given up.
+// Reads of a screen, keyGapMs apart, for a prompt to settle or for the cursor an answer's arrows moved, before the answer
+// is given up.
 const CURSOR_READS = 10;
 
 // rex's key event is client.key's `key` object, as a keyboard reports it; block.event takes it under type `key`.
@@ -260,6 +266,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	const git = options.git ?? runGit;
 	const confirmMs = options.confirmMs ?? 3_000;
 	const keyGapMs = options.keyGapMs ?? 200;
+	const settleMs = options.settleMs ?? 500;
 	const trustMs = options.trustMs ?? 3_000;
 	const processStart = options.processStart ?? readProcessStart;
 	const now = options.now ?? Date.now;
@@ -855,9 +862,36 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	}
 
 	/**
+	 * The prompt `fingerprint` names, read once an arrow may go to it: settleMs after `seen`, when the answer's first
+	 * read of it came back, once two reads running, keyGapMs apart, show the same screen; else the refusal. Claude Code draws
+	 * its trust dialog, then 142 to 154 ms later puts the cursor back on the first option, undoing an arrow pressed before
+	 * then, and since 2.1.328 it reports the dialog as it draws it, so an answer can come that soon. The first arrow
+	 * waits for that instead of being pressed again after it: an arrow pressed again cannot be told from one still on
+	 * its way, and claude's list wraps, so the two together could carry the cursor past the option.
+	 */
+	async function settled(
+		session: string,
+		blockId: string,
+		fingerprint: string,
+		seen: number,
+	): Promise<NonNullable<BlockedScreen["prompt"]> | AnswerRefusal> {
+		const wait = seen + settleMs - now();
+		if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+		let last: string | undefined;
+		for (let read = 0; read < CURSOR_READS; read++) {
+			if (read > 0) await new Promise((resolve) => setTimeout(resolve, keyGapMs));
+			const text = await screenText(blockId, session);
+			const { prompt } = readBlockedScreen(text);
+			if (prompt !== undefined && prompt.fingerprint !== fingerprint) return "stale";
+			if (prompt !== undefined && text === last) return prompt;
+			last = text;
+		}
+		return "unreadable";
+	}
+
+	/**
 	 * Whether the prompt `fingerprint` names shows its cursor on option `index`, on two reads running: undefined when it
-	 * does, else the refusal. An arrow on screen is no promise. Claude Code 2.1.319 draws its trust dialog, then about
-	 * 140 ms later puts the cursor back on the first option, so one read could see an arrow that is about to be undone.
+	 * does, else the refusal. An arrow on screen is no promise: claude may still put the cursor back (`settled`).
 	 */
 	async function cursorHolds(
 		session: string,
@@ -881,9 +915,10 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	 * Answers the prompt on a block of `session`, as herdr's adapter does: fresh status, fresh screen, then the keys read
 	 * off that screen. An auth prompt is refused whether the record or the screen names it. With `trust`, a block with
 	 * no record is answered when its screen shows claude's trust dialog, the one block claude reports nothing for.
-	 * Enter after arrows goes only once `cursorHolds` says the cursor reached the option; a refusal then leaves the prompt
-	 * unanswered and the cursor wherever it is. Arrows are not pressed again here: claude's list wraps, so one more could
-	 * carry a slow first arrow past the option, and the next answer travels from a fresh read anyway.
+	 * An option with a key of its own gets that key. Any other is reached by arrows from the cursor, read once the prompt
+	 * has `settled`, and gets its Enter only once `cursorHolds` says the cursor reached it; a refusal then leaves the
+	 * prompt unanswered and the cursor wherever it is. Arrows are not pressed again here: claude's list wraps, so one more
+	 * could carry a slow first arrow past the option, and the next answer travels from a fresh read anyway.
 	 */
 	async function answerOn(session: string, blockId: string, answer: Answer, trust: boolean): Promise<AnswerOutcome> {
 		const [{ records }, { foreground }] = await Promise.all([
@@ -895,6 +930,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		if (!dialog && root?.state !== "blocked") return { sent: false, refusal: "not_blocked" };
 		if (root?.kind === "auth") return { sent: false, refusal: "auth" };
 		const screen = await readScreen(blockId, session);
+		const seen = now();
 		if (dialog && !isTrustDialog(screen)) return { sent: false, refusal: "not_blocked" };
 		const { kind, prompt } = screen;
 		if (kind === "auth") return { sent: false, refusal: "auth" };
@@ -903,7 +939,11 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		if (!prompt.options.some((option) => option.id === answer.option)) {
 			return { sent: false, refusal: "unknown_option" };
 		}
-		const keys = answerKeys(prompt, answer.option)?.map(keyOf);
+		const chosen = prompt.options.findIndex((option) => option.id === answer.option);
+		const own = prompt.options[chosen]?.keystroke;
+		const held = own === undefined ? await settled(session, blockId, prompt.fingerprint, seen) : prompt;
+		if (typeof held === "string") return { sent: false, refusal: held };
+		const keys = answerKeys(held, answer.option)?.map(keyOf);
 		if (keys === undefined || keys.some((key) => key === undefined)) return { sent: false, refusal: "unreadable" };
 		const pressKey = (key: (typeof keys)[number]) => press(session, blockId, key as NonNullable<typeof key>);
 		const arrows = keys.slice(0, -1);
@@ -912,7 +952,6 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			await pressKey(key);
 		}
 		if (arrows.length > 0) {
-			const chosen = prompt.options.findIndex((option) => option.id === answer.option);
 			const refusal = await cursorHolds(session, blockId, prompt.fingerprint, chosen);
 			if (refusal !== undefined) return { sent: false, refusal };
 		}

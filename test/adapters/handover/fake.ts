@@ -96,6 +96,7 @@ export async function sides(
 		recheckMs: 50,
 		redrawMs: 5,
 		keyGapMs: 1,
+		settleMs: 0,
 		takeMs: options.takeMs ?? 200,
 		onError: () => {},
 	});

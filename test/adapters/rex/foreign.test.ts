@@ -66,6 +66,7 @@ function port(fake: ReturnType<typeof rex>, foreignMs = 60_000) {
 		sessionsDir,
 		redrawMs: 0,
 		keyGapMs: 0,
+		settleMs: 0,
 		confirmMs: 10,
 		foreignMs,
 	});

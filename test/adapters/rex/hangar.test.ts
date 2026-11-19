@@ -45,6 +45,7 @@ function port(fake: ReturnType<typeof rex>, options: Partial<RexAgentPortOptions
 		git: git().git,
 		confirmMs: 5,
 		keyGapMs: 1,
+		settleMs: 0,
 		redrawMs: 1,
 		takeMs: 200,
 		onError: () => {},

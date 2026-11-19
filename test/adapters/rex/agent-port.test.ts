@@ -1487,7 +1487,13 @@ const keys = (fake: ReturnType<typeof rex>) =>
 
 async function respond(block: Omit<Block, "name" | "block">, option: string, fingerprint: string) {
 	const fake = rex([{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude", ...block }]);
-	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, keyGapMs: 0 });
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		keyGapMs: 0,
+		settleMs: 0,
+	});
 	return { outcome: await port.respond("card-a", { option, fingerprint }), fake };
 }
 
@@ -1561,7 +1567,7 @@ describe("an answer that needs an arrow", () => {
 		screen: TRUST,
 	});
 	const answering = (fake: ReturnType<typeof rex>) =>
-		createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, keyGapMs: 0 });
+		createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, keyGapMs: 0, settleMs: 0 });
 	const onYes = (block: Block) => /❯ Yes, I trust this folder/.test(block.screen ?? "");
 
 	test("the arrow the pane drops gets no Enter, and the next answer travels from a fresh read", async () => {
@@ -1595,7 +1601,8 @@ describe("an answer that needs an arrow", () => {
 		expect(await answering(fake).respond("card-a", answerYes)).toEqual({ sent: false, refusal: "unreadable" });
 
 		expect(pressedOf(fake)).toEqual(["arrow_down"]);
-		expect(fake.methods().filter((method) => method.endsWith(".format")).length).toBeLessThanOrEqual(11);
+		// The answer's first read, two that find the dialog settled, and ten that look for the cursor.
+		expect(fake.methods().filter((method) => method.endsWith(".format")).length).toBeLessThanOrEqual(13);
 	});
 
 	test("a cursor seen on the option and then put back gets no Enter", async () => {
@@ -1612,6 +1619,104 @@ describe("an answer that needs an arrow", () => {
 		expect(await answering(fake).respond("card-a", answerYes)).toEqual({ sent: false, refusal: "unreadable" });
 
 		expect(pressedOf(fake)).toEqual(["arrow_down"]);
+	});
+
+	test("an arrow that shows late gets its Enter on the option, with no arrow pressed after it", async () => {
+		const block = dialog();
+		const fake = rex([block]);
+		const format = "com.superlogical.terminal.format";
+		// claude takes keys in the order they were pressed: an arrow shows only at the third read after it, or after the
+		// one before it, and an Enter is taken after every arrow still on its way.
+		const late: { payload: Record<string, unknown>; reads: number }[] = [];
+		let enteredOn: boolean | undefined;
+		fake.replace("block.event", (payload) => {
+			const { key, action } = (payload.event as { payload: { key: string; action: string } }).payload;
+			if (key === "arrow_down") {
+				if (action === "press") late.push({ payload, reads: 3 });
+				return {};
+			}
+			if (key === "enter" && action === "press") {
+				for (const arrow of late.splice(0)) fake.original("block.event")(arrow.payload);
+				enteredOn = onYes(block);
+			}
+			return fake.original("block.event")(payload);
+		});
+		fake.replace(format, (payload) => {
+			const first = late[0];
+			if (first !== undefined && --first.reads === 0) {
+				late.shift();
+				fake.original("block.event")(first.payload);
+			}
+			return fake.original(format)(payload);
+		});
+
+		expect(await answering(fake).respond("card-a", answerYes)).toEqual({ sent: true });
+
+		expect(enteredOn).toBe(true);
+		expect(pressedOf(fake)).toEqual(["arrow_down", "enter"]);
+	});
+
+	test("an answer to a dialog drawn just now holds its arrow until the cursor's put-back is past", async () => {
+		const block = dialog();
+		const fake = rex([block]);
+		const drawn = Date.now();
+		let back = false;
+		// As Claude Code 2.1.328 does, scaled down: 60 ms after the draw it puts the cursor back on the first option, once.
+		const putBack = () => {
+			if (back || Date.now() - drawn < 60) return;
+			back = true;
+			block.screen = TRUST;
+		};
+		const format = "com.superlogical.terminal.format";
+		fake.replace(format, (payload) => {
+			putBack();
+			return fake.original(format)(payload);
+		});
+		let enteredOn: boolean | undefined;
+		fake.replace("block.event", (payload) => {
+			putBack();
+			const { key, action } = (payload.event as { payload: { key: string; action: string } }).payload;
+			if (key === "enter" && action === "press") enteredOn = onYes(block);
+			return fake.original("block.event")(payload);
+		});
+		const port = createRexAgentPort({
+			processStart: unstarted,
+			client: fake.client,
+			sessionId: HANGAR,
+			keyGapMs: 40,
+			settleMs: 150,
+		});
+
+		expect(await port.respond("card-a", answerYes)).toEqual({ sent: true });
+
+		expect(pressedOf(fake)).toEqual(["arrow_down", "enter"]);
+		expect(enteredOn).toBe(true);
+	});
+
+	test("the first arrow waits for two reads running of the same screen, and travels from the later", async () => {
+		const block = dialog();
+		const fake = rex([block]);
+		const format = "com.superlogical.terminal.format";
+		let reads = 0;
+		fake.replace(format, (payload) => {
+			// A Down pressed at the pane lands between the answer's first two reads after its wait.
+			if (++reads === 3) {
+				const event = { type: "key", payload: { key: "arrow_down", action: "press" } };
+				fake.original("block.event")({ session_id: HANGAR, block_id: "block:a", event });
+			}
+			return fake.original(format)(payload);
+		});
+		let enteredOn: boolean | undefined;
+		fake.replace("block.event", (payload) => {
+			const { key, action } = (payload.event as { payload: { key: string; action: string } }).payload;
+			if (key === "enter" && action === "press") enteredOn = onYes(block);
+			return fake.original("block.event")(payload);
+		});
+
+		expect(await answering(fake).respond("card-a", answerYes)).toEqual({ sent: true });
+
+		expect(pressedOf(fake)).toEqual(["enter"]);
+		expect(enteredOn).toBe(true);
 	});
 
 	test("another prompt drawn while the cursor is awaited is stale, and gets no Enter", async () => {
@@ -1661,6 +1766,7 @@ test("respond reads only the tail of a scrollback too long for one reply", async
 		client: fake.client,
 		sessionId: HANGAR,
 		keyGapMs: 0,
+		settleMs: 0,
 	}).respond("card-a", {
 		option: "1",
 		fingerprint: fingerprintOf(BASH),
@@ -1676,7 +1782,13 @@ test("respond reads only the tail of a scrollback too long for one reply", async
 test("a blocked record carries the prompt read off the screen, whose fingerprint respond then answers", async () => {
 	const block: Block = { name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [], screen: BASH };
 	const fake = rex([block]);
-	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, keyGapMs: 0 });
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		keyGapMs: 0,
+		settleMs: 0,
+	});
 	const seen: AgentStatusEvent[] = [];
 	const off = port.onStatus((event) => seen.push(event));
 	await settle();
@@ -2196,6 +2308,7 @@ describe("taking over a session another side ran", () => {
 			projectsDir,
 			redrawMs: 5,
 			keyGapMs: 1,
+			settleMs: 0,
 			takeMs,
 			env: { SOMA_SOCKET: "/run/soma.sock" },
 			path: "/opt/soma/bin",

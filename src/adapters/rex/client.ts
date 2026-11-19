@@ -115,6 +115,9 @@ export function createRexClient(options: RexClientOptions): RexClient {
 			failed = reject;
 		});
 		let conn: Connection | undefined;
+		// Frames of one chunk are handled in one go, so a close can come right behind the welcome or an attach's answer,
+		// while `conn` is not set or not handed out yet; a connection closed by then is not handed out.
+		let lost: Error | undefined;
 		const ws = await open(
 			{ socketPath: options.socketPath, path: "/api/control", protocol: CONTROL_PROTOCOL },
 			{
@@ -133,6 +136,7 @@ export function createRexClient(options: RexClientOptions): RexClient {
 					const reason = new RexTransportError(`rex connection closed${error ? `: ${error.message}` : ""}`, {
 						cause: error,
 					});
+					lost = reason;
 					failed(reason);
 					if (conn !== undefined) dropped(conn, reason);
 				},
@@ -157,6 +161,7 @@ export function createRexClient(options: RexClientOptions): RexClient {
 		const ready = conn;
 		try {
 			for (const sessionId of sessions) await attachOn(ready, sessionId).catch(forgetGone(sessionId));
+			if (lost !== undefined) throw lost;
 		} catch (error) {
 			ws.close();
 			throw error;

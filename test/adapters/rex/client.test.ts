@@ -7,7 +7,13 @@ import { afterAll, afterEach, expect, test } from "vitest";
 import { z } from "zod";
 import { createRexClient, RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
 import type { SessionEvent } from "../../../src/adapters/rex/schema.ts";
-import { acceptKey, createFrameDecoder, encodeFrame, OPCODE } from "../../../src/adapters/rex/websocket.ts";
+import {
+	acceptKey,
+	createFrameDecoder,
+	encodeFrame,
+	OPCODE,
+	type OpenWebSocket,
+} from "../../../src/adapters/rex/websocket.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "soma-rex-client-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -67,6 +73,46 @@ function fakeRex(answer: (request: Request, peer: Peer) => object | undefined) {
 	return { path, hellos, requests, peers, listening, close };
 }
 
+type FakePeer = { message(message: object): void; close(error?: Error): void };
+
+/**
+ * An `open` with no socket: each attempt hands every frame soma sends to `serve(attempt)`, which may answer and close in
+ * one synchronous step, as frames that came in one chunk are.
+ */
+function fakeOpen(serve: (attempt: number) => (message: Request & { type: string }, peer: FakePeer) => void) {
+	let attempts = 0;
+	const peers: FakePeer[] = [];
+	const open: OpenWebSocket = async (_options, handlers) => {
+		const handle = serve(++attempts);
+		let closed = false;
+		const peer: FakePeer = {
+			message: (message) => handlers.onMessage(JSON.stringify(message)),
+			close(error) {
+				if (closed) return;
+				closed = true;
+				handlers.onClose(error);
+			},
+		};
+		peers.push(peer);
+		return {
+			send(text) {
+				if (closed) throw new Error("WebSocket is closed");
+				handle(JSON.parse(text), peer);
+			},
+			close: () => peer.close(),
+			ref() {},
+			unref() {},
+		};
+	};
+	return { open, peers, attempts: () => attempts };
+}
+
+const welcome = {
+	type: "welcome",
+	protocol: "rex.control.v1",
+	limits: { max_message_bytes: 1 << 20 },
+	api_revision: 7,
+};
 const view = { client_id: "client:1", view: { revision: 0, session_id: "session:h", windows: [] } };
 const closers: (() => unknown)[] = [];
 afterEach(async () => {
@@ -186,6 +232,51 @@ test("a request in flight when the connection drops rejects as a transport error
 	closers.push(() => client.close(), rex.close);
 
 	await expect(client.call("session.view", {}, z.object({}))).rejects.toBeInstanceOf(RexTransportError);
+});
+
+/** A rex that welcomes, answers every request with `{ ok: true }` and a `session.attach` with a view. */
+const serving = (message: Request & { type: string }, peer: FakePeer) => {
+	if (message.type === "hello") peer.message(welcome);
+	else
+		peer.message({
+			type: "response",
+			id: message.id,
+			seq: 0,
+			payload: message.method === "session.attach" ? view : { ok: true },
+		});
+};
+const ok = z.object({ ok: z.literal(true) });
+
+test("a connection closed in its welcome's own chunk counts as dropped, and is opened again", async () => {
+	const rex = fakeOpen((attempt) => (message, peer) => {
+		serving(message, peer);
+		if (attempt === 1) peer.close(new Error("WebSocket closed by the server: 1001 going away"));
+	});
+	const client = createRexClient({ socketPath: "unused", open: rex.open, reconnectMs: 5, onError: () => {} });
+	closers.push(() => client.close());
+	client.onSessionEvent(() => {});
+	const connected = new Promise<void>((resolve) => client.onConnected(resolve));
+
+	await expect(client.attach("session:h")).rejects.toThrow(/^rex connection closed: WebSocket closed by the server/);
+	await connected;
+
+	await expect(client.call("x", {}, ok)).resolves.toEqual({ ok: true });
+	expect(rex.attempts()).toBe(2);
+});
+
+test("a connection closed in its attach's own chunk is not handed out", async () => {
+	const rex = fakeOpen((attempt) => (message, peer) => {
+		serving(message, peer);
+		if (attempt === 2 && message.method === "session.attach") peer.close();
+	});
+	const client = createRexClient({ socketPath: "unused", open: rex.open, reconnectMs: 5, onError: () => {} });
+	closers.push(() => client.close());
+	await client.attach("session:h");
+	rex.peers[0]?.close(new Error("WebSocket connection dropped"));
+
+	await expect(client.call("x", {}, ok)).rejects.toThrow(/^rex connection closed$/);
+	await expect(client.call("x", {}, ok)).resolves.toEqual({ ok: true });
+	expect(rex.attempts()).toBe(3);
 });
 
 test("frames round-trip through the codec at every length encoding", () => {

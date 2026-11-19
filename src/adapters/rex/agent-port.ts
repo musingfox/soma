@@ -89,6 +89,8 @@ export interface RexAgentPortOptions {
 	readonly replyMs?: number;
 	/** How long after a read that replyMs cut short the block's end is reported again, so the core reads it once more. */
 	readonly recheckMs?: number;
+	/** How long after the watch failed to read a block, for a reason other than a lost hangar, it reads the block again. */
+	readonly retryMs?: number;
 	/** Pause between reads of a blocked screen that did not parse yet; claude may still be drawing it. */
 	readonly redrawMs?: number;
 	/** How long `take` waits, a redrawMs at a time, for claude to report itself up in the window it opened. */
@@ -261,6 +263,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	const now = options.now ?? Date.now;
 	const replyMs = options.replyMs ?? 2_000;
 	const recheckMs = options.recheckMs ?? 10_000;
+	const retryMs = options.retryMs ?? 5_000;
 	const redrawMs = options.redrawMs ?? 500;
 	const takeMs = options.takeMs ?? 30_000;
 	const foreignMs = options.foreignMs ?? 15_000;
@@ -1165,14 +1168,21 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		 * connection stayed up: that is not logged, the names read from it are dropped, so no block of it is read again, and
 		 * a hangar is made in its place (`replace`, which logs it once), whose names the next look reads. A HangarUnmade was
 		 * logged as it was thrown: the trust check would otherwise log it again every trustMs, and goes on asking for one.
+		 * Work for a block (`streak`) that fails otherwise, as on a request rex left unanswered, is tried again (`failed`).
 		 */
-		const enqueue = (work: () => Promise<void>) => {
+		const hangarGone = (error: unknown) =>
+			(error instanceof RexRpcError && error.code === "session_not_found") || error instanceof HangarUnmade;
+		const enqueue = (work: () => Promise<void>, streak?: Streak) => {
 			queue = queue
 				.then(async () => {
 					const hangar = sessionId;
 					try {
 						await work();
+						if (streak !== undefined) settle(streak);
 					} catch (error) {
+						if (streak !== undefined && !hangarGone(error)) return failed(streak, error as Error);
+						// The block went with its hangar.
+						if (streak !== undefined) settle(streak);
 						if (!(error instanceof RexRpcError && error.code === "session_not_found")) throw error;
 						names = undefined;
 						await replace(hangar);
@@ -1185,8 +1195,49 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		const resync = () =>
 			enqueue(async () => {
 				const fresh = await refresh();
-				await Promise.all([...fresh].map(([blockId, name]) => look(blockId, name)));
+				await Promise.all(
+					[...fresh].map(([blockId, name]) =>
+						look(blockId, name).then(
+							() => settle(reading(blockId)),
+							(error: Error) => {
+								if (hangarGone(error)) throw error;
+								failed(reading(blockId), error);
+							},
+						),
+					),
+				);
 			});
+
+		/** Work for a block that is tried again while it fails: its key, one streak per key, and the work to try. */
+		type Streak = { readonly key: string; readonly work: () => Promise<void> };
+		// The block's status, which a failed read may have dropped: read afresh.
+		const reading = (blockId: string): Streak => ({ key: blockId, work: () => reread(blockId) });
+		// The block's re-check, as `again` itself, so it still reports above the last seq, and a newer token ends it.
+		const rechecking = (blockId: string, token: object): Streak => ({
+			key: `again ${blockId}`,
+			work: () => again(blockId, token, true),
+		});
+		// By streak key, the timer of the work pending since it failed: the streak's first error was logged.
+		const failing = new Map<string, NodeJS.Timeout>();
+		/** A failure of the streak's work: logged when it starts the streak, and tried again retryMs later. */
+		function failed(streak: Streak, error: Error): void {
+			if (closed) return;
+			if (!failing.has(streak.key)) onError(error);
+			clearTimeout(failing.get(streak.key));
+			const timer = setTimeout(() => enqueue(streak.work, streak), retryMs);
+			timer.unref();
+			failing.set(streak.key, timer);
+		}
+		function settle(streak: Streak): void {
+			clearTimeout(failing.get(streak.key));
+			failing.delete(streak.key);
+		}
+		/** Reports the block's root record under its own seq, as a resync does; a block the hangar no longer holds ends there. */
+		async function reread(blockId: string): Promise<void> {
+			const fresh = await refresh();
+			const name = fresh.get(blockId);
+			if (name !== undefined) await look(blockId, name);
+		}
 
 		// By block, the timer of the one re-check pending.
 		const rechecks = new Map<string, NodeJS.Timeout>();
@@ -1197,17 +1248,20 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		 * in the foreground and a done, idle or error on record, whatever its updated_at: a done that settled into idle
 		 * is the usual end of a turn. It goes through track with no working seen, so the core reads the transcript at
 		 * once. A block that went on to work or to a prompt gets nothing: the watch reported that turn's end already.
+		 * The token is spent only once the block is read, so a re-check whose reads failed is tried again (`rechecking`),
+		 * with the names read afresh (`fresh`), so a block the hangar no longer holds ends it.
 		 */
-		async function again(blockId: string, token: object): Promise<void> {
+		async function again(blockId: string, token: object, fresh = false): Promise<void> {
 			if (closed || quiet.get(blockId) !== token) return;
-			quiet.delete(blockId);
 			const last = lastSeq.get(blockId);
-			const known = await namesWith(blockId);
-			if (last === undefined || !known.has(blockId)) return;
-			const [{ records }, claude] = await Promise.all([
-				blockCall("program_status", blockId, ProgramStatusResultSchema),
-				isClaude(blockId),
-			]);
+			const known = fresh ? await refresh() : await namesWith(blockId);
+			const read =
+				last !== undefined && known.has(blockId)
+					? await Promise.all([blockCall("program_status", blockId, ProgramStatusResultSchema), isClaude(blockId)])
+					: undefined;
+			if (quiet.get(blockId) === token) quiet.delete(blockId);
+			if (last === undefined || read === undefined) return;
+			const [{ records }, claude] = read;
 			const root = records.find(isRoot);
 			const status = root && stateOf(root);
 			if (!claude || status === undefined || status.state === "working" || status.state === "blocked") return;
@@ -1219,7 +1273,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			quiet.set(blockId, token);
 			const timer = setTimeout(() => {
 				rechecks.delete(blockId);
-				enqueue(() => again(blockId, token));
+				enqueue(() => again(blockId, token), rechecking(blockId, token));
 			}, recheckMs);
 			timer.unref();
 			rechecks.set(blockId, timer);
@@ -1260,7 +1314,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 				const known = await namesWith(blockId);
 				if (!known.has(blockId) || !(await isClaude(blockId))) return;
 				report(blockId, known.get(blockId), await statusOf(blockId, record), seq);
-			});
+			}, reading(blockId));
 		});
 		const offConnected = client.onConnected(resync);
 		// The first read attaches the hangar, or one made in its place.
@@ -1268,6 +1322,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		return () => {
 			closed = true;
 			for (const timer of rechecks.values()) clearTimeout(timer);
+			for (const timer of failing.values()) clearTimeout(timer);
 			recheck = undefined;
 			clearInterval(trustCheck);
 			offEvent();

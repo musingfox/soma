@@ -234,6 +234,28 @@ test("a hangar lost under the watch, the connection up, is made anew once, and i
 	]);
 });
 
+test("a status event read from a hangar lost since makes it anew and is not retried as a failed read", async () => {
+	const block: Block = { name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [] };
+	const fake = rex([block]);
+	const errors: string[] = [];
+	const watched = port(fake, { retryMs: 5, onError: (error) => errors.push(error.message) });
+	const off = watched.onStatus(() => {});
+	await new Promise((resolve) => setTimeout(resolve, 20));
+
+	fake.lose();
+	fake.emit(fake.status("block:a", { state: "done", updated_at: AT }));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	off();
+
+	expect(creates(fake)).toHaveLength(1);
+	expect(watched.hangar).toBe(MADE);
+	const made = fake.calls.findIndex((call) => call.method === "session.create");
+	expect(fake.calls.slice(made).filter((call) => call.payload.block_id === "block:a")).toEqual([]);
+	expect(errors).toEqual([
+		`rex hangar ${HANGAR} does not exist: made ${MADE}, labelled soma-hangar, the hangar from now on`,
+	]);
+});
+
 test("a hangar another call made anew holds none of the blocks the watch read from the lost one", async () => {
 	const { fake, errors, watched, off, afterMade } = await watchedShell();
 

@@ -271,6 +271,131 @@ test("onStatus drops a report older than one a resync already emitted", async ()
 	]);
 });
 
+const TIMEOUT = "com.superlogical.terminal.process: no response within 10000 ms";
+
+test("a status the watch failed to read is read again, with no new event and no reconnect", async () => {
+	const block: Block = { name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [] };
+	const fake = rex([block]);
+	const errors: string[] = [];
+	const seen: AgentStatusEvent[] = [];
+	createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		retryMs: 20,
+		onError: (error) => errors.push(error.message),
+	}).onStatus((event) => seen.push(event));
+	await settle();
+	const working = { state: "working", updated_at: AT };
+	block.records = [working];
+	fake.emit(fake.status("block:a", working));
+	await until(() => seen.length === 1);
+
+	// rex is slow for one request while the turn's done arrives, and the connection stays up.
+	let slow = true;
+	fake.replace("com.superlogical.terminal.process", (payload) => {
+		if (!slow) return fake.original("com.superlogical.terminal.process")(payload);
+		slow = false;
+		throw new Error(TIMEOUT);
+	});
+	const done = { state: "done", updated_at: "2026-10-27T01:02:04Z" };
+	block.records = [done];
+	fake.emit(fake.status("block:a", done));
+	await settle();
+	expect(slow).toBe(false);
+	expect(seen).toHaveLength(1);
+
+	await until(() => seen.length === 2);
+	expect(seen).toEqual([
+		{ agent: "card-a", status: { state: "working" }, seq: AT_US },
+		{ agent: "card-a", status: { state: "done" }, seq: Date.parse("2026-10-27T01:02:04Z") * 1000 },
+	]);
+	expect(errors).toEqual([TIMEOUT]);
+	await sleep(100);
+	expect(seen).toHaveLength(2);
+});
+
+test("a block a reconnect's re-read failed to read is read again, while the others are reported at once", async () => {
+	const block: Block = { name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [] };
+	const other: Block = { name: "card-b", block: "block:b", label: SESSION, argv0: "claude", records: [] };
+	const fake = rex([block, other]);
+	const errors: string[] = [];
+	const seen: AgentStatusEvent[] = [];
+	createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		retryMs: 20,
+		onError: (error) => errors.push(error.message),
+	}).onStatus((event) => seen.push(event));
+	await settle();
+	let slow = true;
+	fake.replace("com.superlogical.terminal.process", (payload) => {
+		if (!slow || payload.block_id !== "block:a") return fake.original("com.superlogical.terminal.process")(payload);
+		slow = false;
+		throw new Error(TIMEOUT);
+	});
+
+	block.records = [{ state: "done", updated_at: AT }];
+	other.records = [{ state: "idle", updated_at: AT }];
+	fake.reconnect();
+	await until(() => seen.length === 1);
+	expect(seen).toEqual([{ agent: "card-b", status: { state: "idle" }, seq: AT_US }]);
+
+	await until(() => seen.length === 2);
+	expect(seen[1]).toEqual({ agent: "card-a", status: { state: "done" }, seq: AT_US });
+	expect(errors).toEqual([TIMEOUT]);
+});
+
+test("a block whose status keeps failing is logged once per streak, and is read no more once it is gone", async () => {
+	const block: Block = { name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [] };
+	const blocks = [block];
+	const fake = rex(blocks);
+	const errors: string[] = [];
+	const seen: AgentStatusEvent[] = [];
+	createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		retryMs: 10,
+		onError: (error) => errors.push(error.message),
+	}).onStatus((event) => seen.push(event));
+	await settle();
+	let failing = true;
+	fake.replace("com.superlogical.terminal.process", (payload) => {
+		if (failing) throw new Error(TIMEOUT);
+		return fake.original("com.superlogical.terminal.process")(payload);
+	});
+	const processes = () => fake.methods().filter((method) => method.endsWith(".process")).length;
+
+	const working = { state: "working", updated_at: AT };
+	block.records = [working];
+	fake.emit(fake.status("block:a", working));
+	await until(() => processes() >= 4);
+	expect(errors).toEqual([TIMEOUT]);
+
+	// A read that succeeds ends the streak; the next failure starts another, logged once again.
+	failing = false;
+	await until(() => seen.length === 1);
+	expect(seen).toEqual([{ agent: "card-a", status: { state: "working" }, seq: AT_US }]);
+	failing = true;
+	const done = { state: "done", updated_at: "2026-10-27T01:02:04Z" };
+	block.records = [done];
+	fake.emit(fake.status("block:a", done));
+	const atSecond = processes();
+	await until(() => processes() >= atSecond + 3);
+	expect(errors).toEqual([TIMEOUT, TIMEOUT]);
+
+	// The block closed while it failed: once the hangar no longer holds it, it is not read again.
+	blocks.splice(0);
+	await sleep(50);
+	const atGone = processes();
+	await sleep(100);
+	expect(processes()).toBe(atGone);
+	expect(errors).toEqual([TIMEOUT, TIMEOUT]);
+	expect(seen).toHaveLength(1);
+});
+
 test("prompt pastes the text and presses \\r, and presses it once more when claude is still idle", async () => {
 	const fake = rex([
 		{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [{ state: "idle", updated_at: AT }] },
@@ -513,6 +638,142 @@ test.each([
 	setTimeout(() => writeFileSync(path, line(user("go")) + line(reply("msg_2", "結果：完成")), { flag: "a" }), 150);
 
 	expect(await port.readResult("card-b")).toEqual({ id: "a-msg_2", text: "結果：完成" });
+	off();
+});
+
+test("a re-check that failed to read the block is tried again, and reports the block's settled end", async () => {
+	const { cwd } = transcript([user("go")]);
+	const block: Block = { name: "card-r", block: "block:r", label: SESSION, argv0: "claude", cwd, records: [] };
+	const fake = rex([block]);
+	const errors: string[] = [];
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+		replyMs: 30,
+		recheckMs: 50,
+		retryMs: 20,
+		onError: (error) => errors.push(error.message),
+	});
+	const seen: AgentStatusEvent[] = [];
+	const off = port.onStatus((event) => seen.push(event));
+	const at = new Date(Date.now() + 20).toISOString();
+	const offTurn = await turnOver(fake, port, block, at);
+	// The turn ended on the user, so replyMs cuts the read short, which schedules the re-check.
+	expect(await port.readResult("card-r")).toEqual({ id: "u-go" });
+	const count = seen.length;
+	// rex is slow for the re-check's one request; the done stays on record, and no event comes.
+	let slow = true;
+	fake.replace("com.superlogical.terminal.process", (payload) => {
+		if (!slow) return fake.original("com.superlogical.terminal.process")(payload);
+		slow = false;
+		throw new Error(TIMEOUT);
+	});
+
+	await until(() => seen.length > count);
+	expect(slow).toBe(false);
+	expect(seen.slice(count)).toEqual([{ agent: "card-r", status: { state: "done" }, seq: Date.parse(at) * 1000 + 1 }]);
+	expect(errors).toEqual([TIMEOUT]);
+	await sleep(150);
+	expect(seen).toHaveLength(count + 1);
+	offTurn();
+	off();
+});
+
+test.each([
+	["a working reported since supersedes it", "working"],
+	["the block's closing ends it", "closed"],
+] as const)("a re-check that keeps failing is logged once, and %s", async (_case, how) => {
+	const { cwd } = transcript([user("go")]);
+	const block: Block = { name: "card-q", block: "block:q", label: SESSION, argv0: "claude", cwd, records: [] };
+	const blocks = [block];
+	const fake = rex(blocks);
+	const errors: string[] = [];
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+		replyMs: 30,
+		recheckMs: 30,
+		retryMs: 10,
+		onError: (error) => errors.push(error.message),
+	});
+	const seen: AgentStatusEvent[] = [];
+	const off = port.onStatus((event) => seen.push(event));
+	const offTurn = await turnOver(fake, port, block, new Date(Date.now() + 20).toISOString());
+	expect(await port.readResult("card-q")).toEqual({ id: "u-go" });
+	// Only the re-check reads program_status: the event path reads it for no record but a blocked one.
+	const failure = "com.superlogical.terminal.program_status: no response within 10000 ms";
+	fake.replace("com.superlogical.terminal.program_status", () => {
+		throw new Error(failure);
+	});
+	const reads = () => fake.methods().filter((method) => method.endsWith(".program_status")).length;
+	await until(() => reads() >= 3);
+	expect(errors).toEqual([failure]);
+
+	const count = seen.length;
+	if (how === "working") {
+		const working = { state: "working", updated_at: new Date(Date.now() + 50).toISOString() };
+		block.records = [working];
+		fake.emit(fake.status("block:q", working));
+		await until(() => seen.length > count);
+	} else blocks.splice(0);
+	await sleep(50);
+	const atEnd = reads();
+	await sleep(100);
+	expect(reads()).toBe(atEnd);
+	expect(errors).toEqual([failure]);
+	expect(seen.slice(count).map((event) => event.status.state)).toEqual(how === "working" ? ["working"] : []);
+	offTurn();
+	off();
+});
+
+test("a re-check that fails while a failed read of its block is pending does not replace that read", async () => {
+	const { cwd } = transcript([user("go")]);
+	const block: Block = { name: "card-p", block: "block:p", label: SESSION, argv0: "claude", cwd, records: [] };
+	const fake = rex([block]);
+	const errors: string[] = [];
+	const port = createRexAgentPort({
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+		replyMs: 30,
+		recheckMs: 60,
+		retryMs: 40,
+		onError: (error) => errors.push(error.message),
+	});
+	const seen: AgentStatusEvent[] = [];
+	const off = port.onStatus((event) => seen.push(event));
+	const at = new Date(Date.now() + 20).toISOString();
+	const offTurn = await turnOver(fake, port, block, at);
+	// The read cut short schedules the re-check recheckMs from now.
+	expect(await port.readResult("card-p")).toEqual({ id: "u-go" });
+	let failing = true;
+	fake.replace("com.superlogical.terminal.process", (payload) => {
+		if (failing) throw new Error(TIMEOUT);
+		return fake.original("com.superlogical.terminal.process")(payload);
+	});
+
+	// A later done, which only a read of the block reports under its own seq: a re-check reports above the last seq.
+	const later = new Date(Date.parse(at) + 1_000).toISOString();
+	block.records = [{ state: "done", updated_at: later }];
+	fake.emit(fake.status("block:p", { state: "done", updated_at: later }));
+	// The event's read fails, and is retried every retryMs; the re-check comes due meanwhile and fails too.
+	await sleep(160);
+	failing = false;
+
+	await until(() => seen.some((event) => event.seq === Date.parse(later) * 1000));
+	expect(seen.find((event) => event.seq === Date.parse(later) * 1000)).toEqual({
+		agent: "card-p",
+		status: { state: "done" },
+		seq: Date.parse(later) * 1000,
+	});
+	// One streak each: the block's read, and its re-check.
+	expect(errors).toEqual([TIMEOUT, TIMEOUT]);
+	offTurn();
 	off();
 });
 

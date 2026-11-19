@@ -1006,8 +1006,8 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 
 		/**
 		 * Records the handover in progress, so no restart lists the agent until a look at the other side says where it is,
-		 * then closes the session and ends the process, and returns only once the process is gone: the side that takes the
-		 * session must not write its transcript beside it. A dormant agent has none to end. Refuses, with nothing done, what
+		 * then closes the session and ends the process, waiting for its exit up to `closeMs` after the SIGKILL: the side that
+		 * takes the session must not write its transcript beside it. A dormant agent has none to end. Refuses, with nothing done, what
 		 * `releasable` would refuse now and an agent in a turn, but for one whose process exited, which has stopped whatever
 		 * turn it ran and is released as a dormant one is: the check and the taking of the agent off this side are one
 		 * synchronous step, so no turn can begin between them. A mark that does not reach the file puts the agent back and

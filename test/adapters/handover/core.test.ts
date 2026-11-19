@@ -23,7 +23,7 @@ import { reclaimer } from "../../../src/core/extensions/dispatch/reclaim.ts";
 import { openHarness } from "../../../src/core/harness.ts";
 import { NOTICE } from "../../../src/core/notice.ts";
 import type { AgentState } from "../../../src/ports/agent.ts";
-import type { AgentHandover } from "../../../src/ports/handover.ts";
+import type { AgentHandover, HandoverSettling, Settled } from "../../../src/ports/handover.ts";
 import { cleanUp } from "../acp/fake.ts";
 import { type Block, fixture, HANGAR } from "../rex/fake.ts";
 import { AT_IDLE, alive, fakeClock, sides, sleep } from "./fake.ts";
@@ -1857,6 +1857,203 @@ test("a job whose process exited mid-turn and a mark that will not write: told o
 	soma.off();
 });
 
+test("a turn cut, a window rex refuses and a record that fails, then a commit: the job is done and back, the cut told once", async () => {
+	const times = { left: 0 };
+	const soma = await core({ settledOn: commitsFail(times), relookMs: 30 });
+	const { turns } = await busy(soma, "SPIN");
+	failsWindow(soma, new RexRpcError("session.new_window", "refused", "no window for you", 400));
+	times.left = 1;
+
+	const outcome = await soma.agents.handOver("card-a", () => Promise.reject(new Error("the db is away")));
+
+	expect(outcome).toMatchObject({ handedOver: false, refusal: "cannot_resume", cut: {}, back: expect.any(Number) });
+	expect(soma.said).toContain("the db is away");
+	expect(await soma.agents.list()).toEqual([{ name: "card-a", sessionId: expect.any(String) }]);
+	await soma.until(async () => (await soma.notices()).length > 0, "the refusal's notice");
+	await sleep(100);
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining("no window for you")]);
+	expect(notices[0]).toContain(cutTurn);
+	expect(notices[0]).toContain("stays on ACP");
+	expect(await soma.job()).toMatchObject({
+		status: { state: "done", msg: expect.stringContaining("did not land") },
+		outcome: "未知",
+		toldBack: outcome.handedOver ? undefined : outcome.back,
+	});
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: true }]);
+	await soma.say("回覆 card-a RECALL");
+	expect(soma.results.at(-1)).toEqual({ sent: true });
+
+	const next = await again(soma);
+	await sleep(50);
+	expect(counted(await next.notices(), backOnAcp)).toBe(0);
+	expect(counted(await next.notices(), cutTurn)).toBe(1);
+	next.off();
+});
+
+test("a turn cut, a mark that will not write and a record that fails: the human is told the cut once, the job idle on ACP", async () => {
+	const times = { left: 0 };
+	const soma = await core({ settledOn: commitsFail(times), relookMs: 30 });
+	const { turns } = await busy(soma, "SPIN");
+	const [pid] = await soma.pids();
+	await mkdir(`${soma.acp.sessionsFile}.tmp`);
+	times.left = 1;
+
+	const outcome = await soma.agents.handOver("card-a", () => Promise.reject(new Error("the db is away")));
+
+	expect(outcome).toMatchObject({ handedOver: false, refusal: "cannot_resume", cut: {} });
+	expect(outcome).not.toHaveProperty("back");
+	await expect(soma.agents.prompt("card-a", "RECALL")).rejects.toThrow("not recorded yet");
+	await soma.until(async () => (await soma.job())?.status.state === "idle", "the idle the turn ended on");
+	await sleep(100);
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining("could not be recorded")]);
+	expect(notices[0]).toContain(cutTurn);
+	expect(alive(pid as number)).toBe(true);
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: true }]);
+	await rmdir(`${soma.acp.sessionsFile}.tmp`);
+	soma.off();
+});
+
+/** A handover bridge whose first commit once armed fails and whose next ones wait for `open`, each counted. */
+function heldBridge() {
+	let open = () => {};
+	const opened = new Promise<void>((resolve) => {
+		open = resolve;
+	});
+	const held = { armed: false, calls: 0, waiting: false, open };
+	const settledOn = (root: Conversation) =>
+		({
+			id: root.id,
+			commit: async (change: never, on: never) => {
+				if (!held.armed) return root.commit(change, on);
+				held.calls++;
+				if (held.calls === 1) throw new Error("the db is away");
+				held.waiting = true;
+				await opened;
+				return root.commit(change, on);
+			},
+		}) as unknown as Conversation;
+	return { held, settledOn };
+}
+
+test("a refusal held while its retry is under way: no status, every call refused, one try at a time, the cut told once", async () => {
+	const { held, settledOn } = heldBridge();
+	const soma = await core({ settledOn, relookMs: 30 });
+	const { turns, before } = await busy(soma, "SPIN");
+	const [pid] = await soma.pids();
+	await mkdir(`${soma.acp.sessionsFile}.tmp`);
+	held.armed = true;
+
+	const outcome = await soma.agents.handOver("card-a", () => Promise.reject(new Error("the db is away")));
+
+	expect(outcome).toMatchObject({ handedOver: false, refusal: "cannot_resume", cut: {} });
+	await soma.until(() => held.waiting, "the retry under way");
+	const notRecorded = "how it ended is not recorded yet";
+	expect(await soma.agents.list()).toEqual([{ name: "card-a", sessionId: expect.any(String) }]);
+	await expect(soma.agents.prompt("card-a", "RECALL")).rejects.toThrow(notRecorded);
+	await expect(soma.agents.readScreen("card-a")).rejects.toThrow(notRecorded);
+	await expect(soma.agents.stop("card-a")).rejects.toThrow(notRecorded);
+	const resume = { name: "card-a", card: "card-a", sessionId: before?.sessionId as string };
+	await expect(soma.agents.resume(resume)).rejects.toThrow(notRecorded);
+	expect(await soma.agents.respond("card-a", { option: "1", fingerprint: "any" })).toEqual({
+		sent: false,
+		refusal: "not_blocked",
+		reason: expect.stringContaining(notRecorded),
+	});
+	expect(await soma.agents.handOver("card-a")).toEqual({
+		handedOver: false,
+		refusal: "cannot_resume",
+		reason: expect.stringContaining(notRecorded),
+	});
+	expect(alive(pid as number)).toBe(true);
+	// Its process exits while the job is held: ACP reports it, and none of it reaches the core until the refusal lands.
+	process.kill(pid as number, "SIGKILL");
+	await soma.until(
+		async () => (await soma.acp.port.list()).some((agent) => agent.status?.state === "error"),
+		"ACP to report the exit",
+	);
+	await sleep(100);
+	expect((await soma.job())?.status.state).toBe("working");
+	expect(await soma.notices()).toEqual([]);
+
+	held.open();
+
+	await soma.until(async () => (await soma.notices()).length > 0, "the refusal's notice");
+	await soma.until(async () => (await soma.job())?.status.state === "error", "the exit, passed on once it landed");
+	await sleep(100);
+	expect(held.calls).toBe(2);
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining("could not be recorded")]);
+	expect(notices[0]).toContain(cutTurn);
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: true }]);
+	await rmdir(`${soma.acp.sessionsFile}.tmp`);
+	soma.off();
+});
+
+test("a refusal said twice to the handover bridge is told once: the second finds its id on the job", async () => {
+	let conversation: Conversation | undefined;
+	const soma = await core({
+		settledOn: (root) => {
+			conversation = root;
+			return root;
+		},
+	});
+	const { turns } = await busy(soma, "SPIN");
+	let say: (settled: Settled) => void | Promise<void> = () => {};
+	const settling: HandoverSettling = {
+		onSettled: (listener) => {
+			say = listener;
+			return () => {};
+		},
+		heard: async () => {},
+	};
+	handoverBridge(conversation as Conversation, settling, context).listen(() => {});
+	const outcome = { handedOver: false, refusal: "cannot_resume", reason: "no window for you", cut: {} } as const;
+	const refused = { agent: "card-a", onto: "refused", id: "refusal-1", outcome } as const;
+
+	await say(refused);
+	await say(refused);
+
+	const notices = await soma.notices();
+	expect(notices).toEqual([expect.stringContaining("no window for you")]);
+	expect(notices[0]).toContain(cutTurn);
+	expect(await soma.job()).toMatchObject({ status: { state: "done" }, outcome: "未知", toldRefusal: "refusal-1" });
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: true }]);
+	await say({ ...refused, id: "refusal-2" });
+	expect(await soma.notices()).toHaveLength(2);
+	soma.off();
+});
+
+test("a turn cut, a take that gave up and a record whose retry fails as the job is given back: the cut is told once", async () => {
+	const clock = fakeClock();
+	const times = { left: 0 };
+	// Due 5 s of this clock after the failed try, so the retry waits on the clock, which moves only past the look below.
+	const soma = await core({ clock, settledOn: commitsFail(times), relookMs: 5_000 });
+	const { turns } = await busy(soma, "SPIN");
+	failsWindow(soma, new RexTransportError("no response within 10000 ms"));
+	times.left = 1;
+
+	const outcome = await soma.agents.handOver("card-a", () => Promise.reject(new Error("the db is away")));
+	await soma.until(
+		() => soma.said.filter((said) => said === "the db is away").length === 2,
+		"the bridge's try to fail",
+	);
+	expect(await soma.notices()).toEqual([]);
+	// The look gives the job back and tells the return before the retry is due; its end sets the timer for the retry.
+	clock.advance(60_000);
+	await soma.agents.list();
+
+	expect(outcome).toMatchObject({ handedOver: false, cut: {}, reason: expect.stringContaining("undecided") });
+	await soma.until(async () => counted(await soma.notices(), backOnAcp) === 1, "the notice of the return");
+	await sleep(100);
+	expect(counted(await soma.notices(), cutTurn)).toBe(1);
+	expect(await soma.notices()).toHaveLength(2);
+	expect((await soma.turns()).slice(turns.length)).toHaveLength(1);
+	expect((await soma.job())?.status.state).toBe("done");
+	soma.off();
+});
+
 test("a cut that does not stop, then an exit: the next show_job quotes the cancelled prompt, once", async () => {
 	const soma = await core({ cutMs: 50 });
 	const { told, turns } = await busy(soma, "ASKHANG", "blocked");
@@ -2659,10 +2856,19 @@ test("a job never handed over gets nothing new at a restart, done by a real turn
 });
 
 test("a new mark takes the last return off: one never told is not told after the job has landed", async () => {
-	const soma = await core();
+	// A bridge that answers the refusal its record failed to keep and writes nothing: a return never told.
+	const drops = { left: 0 };
+	const soma = await core({
+		settledOn: (root) =>
+			({
+				id: root.id,
+				commit: (change: never, on: never) => (drops.left-- > 0 ? Promise.resolve() : root.commit(change, on)),
+			}) as unknown as Conversation,
+	});
 	await dispatched(soma);
 	const call = soma.hangar.client.call;
 	failsWindow(soma, new RexRpcError("session.new_window", "refused", "no window for you", 400));
+	drops.left = 1;
 	await soma.agents.handOver("card-a", () => Promise.reject(new Error("the db is away")));
 	expect((await soma.entry()).givenBack).toEqual(expect.any(Number));
 	expect(await soma.notices()).toEqual([]);

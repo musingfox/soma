@@ -62,6 +62,8 @@ export type Job = {
 	readonly reclaim?: Reclaim;
 	// The time of the handover mark whose return to ACP the human was last told of; a return of that time is not told again.
 	readonly toldBack?: number;
+	// The id of the refusal the handover bridge last told, for a show_job that could not record it: not told again.
+	readonly toldRefusal?: string;
 	readonly decisions: Decision[];
 };
 

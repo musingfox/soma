@@ -276,6 +276,33 @@ export async function commitCut(
 	});
 }
 
+/**
+ * A handover that did not land and cut a turn or gave the job back, in one commit: a soma killed before the tool's result
+ * still told the human, and the next tells it no more. `show_job` commits it, or the handover bridge when that failed.
+ */
+export async function commitRefusal(
+	tx: Tx,
+	conversationId: Conversation["id"],
+	job: Pick<Job, "agent" | "card">,
+	outcome: Extract<HandoverOutcome, { handedOver: false }>,
+): Promise<void> {
+	if (outcome.cut !== undefined) await commitCut(tx, conversationId, job);
+	const cut = outcome.cut === undefined ? "" : `${cutSentence(outcome.cut)} `;
+	await tx.appendEntry(
+		conversationId,
+		noticeEntry(
+			"report",
+			outcome.cut === undefined ? "outcome" : "action",
+			`agent ${job.agent} (card ${job.card}): ${cut}Its handover did not land: ${outcome.reason}`,
+		),
+	);
+	if (outcome.back === undefined) return;
+	const doc = await tx.doc(Dispatches, conversationId);
+	const index = doc.jobs.findIndex((each) => each.agent === job.agent);
+	const current = doc.jobs[index];
+	if (current !== undefined) doc.jobs[index] = { ...current, toldBack: outcome.back };
+}
+
 /** A soma given no handover has no rex hangar to hand over to. */
 const NO_HANGAR: AgentHandover = {
 	handOver: async () => ({
@@ -616,24 +643,7 @@ export function dispatchExtension(
 					return;
 				}
 				if (outcome.cut === undefined && outcome.back === undefined) return;
-				// One commit: a soma killed before the tool's result still told the human, and the next tells it no more.
-				await api.commit(async (tx) => {
-					if (outcome.cut !== undefined) await commitCut(tx, api.conversationId, job);
-					const cut = outcome.cut === undefined ? "" : `${cutSentence(outcome.cut)} `;
-					await tx.appendEntry(
-						api.conversationId,
-						noticeEntry(
-							"report",
-							outcome.cut === undefined ? "outcome" : "action",
-							`agent ${job.agent} (card ${job.card}): ${cut}Its handover did not land: ${outcome.reason}`,
-						),
-					);
-					if (outcome.back === undefined) return;
-					const doc = await tx.doc(Dispatches, api.conversationId);
-					const index = doc.jobs.findIndex((each) => each.agent === job.agent);
-					const current = doc.jobs[index];
-					if (current !== undefined) doc.jobs[index] = { ...current, toldBack: outcome.back };
-				}, context);
+				await api.commit((tx) => commitRefusal(tx, api.conversationId, job, outcome), context);
 			};
 			let moved: HandoverOutcome;
 			try {

@@ -51,7 +51,9 @@ export interface AgentHandover {
  * A job on a side no `handOver` answered for. rex: its window is `window` in the session labelled `session`, and it runs
  * the claude session `sessionId`. acp: a look gave it back, and its next prompt goes on in its session; `at` names this
  * return, and `startup` says it was found as this soma started, when the restart's notice names an unfinished job. gone:
- * it went to rex for good, and no window of it is there now.
+ * it went to rex for good, and no window of it is there now. refused: a `handOver` refused it after it cut its turn or
+ * gave it back, and the `record` of that failed: `outcome` is what the record was to keep, and `id` names this refusal,
+ * the one value it is told by.
  */
 export type Settled =
 	| {
@@ -66,15 +68,22 @@ export type Settled =
 			readonly answered?: true;
 	  }
 	| { readonly agent: string; readonly onto: "acp"; readonly at: number; readonly startup: boolean }
-	| { readonly agent: string; readonly onto: "gone"; readonly sessionId: string };
+	| { readonly agent: string; readonly onto: "gone"; readonly sessionId: string }
+	| {
+			readonly agent: string;
+			readonly onto: "refused";
+			readonly id: string;
+			readonly outcome: Extract<HandoverOutcome, { handedOver: false }>;
+	  };
 
 /** Beside AgentHandover: tells whoever keeps the jobs what no `handOver` answered. */
 export interface HandoverSettling {
 	// Each job as a look settles it, and what settled before the listener came. Every job on rex at startup and every job
 	// given back and not handed over since is said again, since a soma can die before the listener's commit: the listener
 	// tells a job on rex it has told by the session the job holds, and a return it has told by its `at`. So is a job a
-	// `record` that failed could not keep. A listener that rejects has not recorded a job on rex: its window reports nothing
-	// from then on, for what it says would read as the end of a turn on a job recorded as it was before the move.
+	// `record` that failed could not keep, and a refusal it could not keep is said until a listener answers it, which tells
+	// one it has told by its `id`. A listener that rejects has not recorded a job on rex: its window reports nothing from
+	// then on, for what it says would read as the end of a turn on a job recorded as it was before the move.
 	onSettled(listener: (settled: Settled) => void | Promise<void>): () => void;
 	// Once what settled before the listener came has been said and the listener has answered.
 	heard(): Promise<void>;

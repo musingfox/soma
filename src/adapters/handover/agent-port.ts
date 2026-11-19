@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { type AgentListing, type AgentPort, type AgentStatusEvent, PromptRefused } from "../../ports/agent.ts";
 import {
 	type AgentHandover,
@@ -53,7 +54,9 @@ type Undecided = HandingOver & { readonly why: Why };
  * handover runs at a time. While one is under way its job is listed with no status, takes no prompt and reports nothing,
  * from the cut of its turn until the caller has recorded how it ended, so the core sees neither a vanished agent, nor the
  * end of a cut turn as a finished one, nor the trust dialog the handover is about to answer; what the job reports then is
- * passed on once, as the observation it is (ARCHITECTURE.md "The ACP implementation").
+ * passed on once, as the observation it is (ARCHITECTURE.md "The ACP implementation"). A refusal that cut a turn or gave
+ * the job back and that the caller failed to record is said to the `onSettled` listeners instead, and the job stays held
+ * as one under way until they answer, tried again `relookMs` after each try that fails.
  *
  * A handover cut short leaves `from`'s mark of one in progress, and only a look at `to` ends it: a window there, the job
  * is on `to`; `to` answers and no block of it there at or after the end of the grace period, it goes back to `from`. Until
@@ -76,6 +79,9 @@ export function createHandoverAgentPort({
 	// Jobs on rex whose landing the listeners have not answered yet, or whose answer failed: what their window says waits
 	// for that, and where it failed, is what tries it again.
 	const unrecorded = new Map<string, Unrecorded>();
+	// Jobs a handover refused after it cut their turn or gave them back, whose record failed: held as one under way until
+	// the listeners answer the refusal, which the look timer tries again after a try that failed.
+	const unsaid = new Map<string, Unsaid>();
 	// Why each job was last told undecided: once per reason, however many looks find it the same.
 	const told = new Map<string, Why>();
 	const statusListeners = new Set<(event: AgentStatusEvent) => void>();
@@ -93,7 +99,7 @@ export function createHandoverAgentPort({
 	async function passOn(agent: string, again = false): Promise<void> {
 		clearTimeout(relisting.get(agent));
 		relisting.delete(agent);
-		if (unrecorded.has(agent) || (again && heard.has(agent))) return;
+		if (unrecorded.has(agent) || unsaid.has(agent) || (again && heard.has(agent))) return;
 		heard.delete(agent);
 		const onRex = moved.has(agent);
 		const listed = await (onRex ? to : from).list().catch(() => undefined);
@@ -167,7 +173,7 @@ export function createHandoverAgentPort({
 	 * `released`: only a final mark says it is there, which holds nothing of a window that closed since.
 	 */
 	type Telling =
-		| Extract<Settled, { onto: "acp" }>
+		| Extract<Settled, { onto: "acp" | "refused" }>
 		| {
 				readonly agent: string;
 				readonly onto: "rex";
@@ -180,11 +186,21 @@ export function createHandoverAgentPort({
 	 * the status a listing withheld of it. `answered`: rex answered that telling and a listener failed.
 	 */
 	type Unrecorded = { readonly said: AgentStatusEvent[]; again?: Telling; listed?: number; answered?: boolean };
+	/**
+	 * A refusal not recorded: the session it holds, the refusal, what was settled of the job since, told once the refusal
+	 * is, and when the refusal is tried again, set while no try is under way and the last one failed.
+	 */
+	type Unsaid = {
+		readonly session: HeldSession;
+		readonly refusal: Extract<Telling, { onto: "refused" }>;
+		readonly later: Telling[];
+		due?: number;
+	};
 	const listeners = new Set<(settled: Settled) => void | Promise<void>>();
 	const unheard: Telling[] = [];
 	/** Throws when rex cannot say whether a released job's window is there: the job's next status tries it again. */
 	async function settledOf(telling: Telling): Promise<Settled> {
-		if (telling.onto === "acp") return telling;
+		if (telling.onto !== "rex") return telling;
 		const { agent, sessionId, released, answered } = telling;
 		if (released !== undefined && (await to.holds(released, to.hangar)) !== "window") {
 			return { agent, onto: "gone", sessionId };
@@ -210,7 +226,18 @@ export function createHandoverAgentPort({
 			if (telling.onto === "rex") {
 				unrecorded.set(telling.agent, { said: [], ...unrecorded.get(telling.agent), again: telling, answered });
 			}
+			const refusal = telling.onto === "refused" ? unsaid.get(telling.agent) : undefined;
+			if (refusal !== undefined) {
+				refusal.due = now() + relookMs;
+				lookLater();
+			}
 			throw error;
+		}
+		if (telling.onto === "refused") {
+			const { later = [] } = unsaid.get(telling.agent) ?? {};
+			unsaid.delete(telling.agent);
+			for (const each of later) tell(each);
+			return passOn(telling.agent);
 		}
 		const held = unrecorded.get(telling.agent);
 		if (held === undefined) return;
@@ -218,8 +245,11 @@ export function createHandoverAgentPort({
 		if (held.said.length === 0) return passOn(telling.agent);
 		for (const event of held.said) for (const listener of statusListeners) listener(event);
 	}
+	/** A job whose refusal is not recorded is told nothing else until it is: what was settled since reads the cut off it. */
 	function tell(telling: Telling): void {
-		if (listeners.size === 0 || !started) unheard.push(telling);
+		const refusal = unsaid.get(telling.agent);
+		if (refusal !== undefined && telling.onto !== "refused") refusal.later.push(telling);
+		else if (listeners.size === 0 || !started) unheard.push(telling);
 		else void deliver(telling).catch(onError);
 	}
 	/**
@@ -256,7 +286,8 @@ export function createHandoverAgentPort({
 	/**
 	 * Looks when the first grace period under way ends, and while rex does not answer about a job, `relookMs` after the
 	 * last look and not before that job's grace period ends: a job waiting either out needs no caller to leave undecided.
-	 * Called after every look, so a look with a caller puts the next one off.
+	 * Called after every look, so a look with a caller puts the next one off. A refusal whose telling failed is tried again
+	 * `relookMs` after that try at the latest, which no look puts off.
 	 */
 	function lookLater(): void {
 		clearTimeout(lookTimer);
@@ -266,9 +297,26 @@ export function createHandoverAgentPort({
 			if (job.why === "grace") return [graceEnds(job)];
 			return job.why === "rex" ? [Math.max(graceEnds(job), now() + relookMs)] : [];
 		});
+		for (const { due } of unsaid.values()) if (due !== undefined) at.push(due);
 		if (at.length === 0) return;
-		lookTimer = setTimeout(() => void look().catch(onError), Math.max(0, Math.min(...at) - now()));
+		lookTimer = setTimeout(
+			() => {
+				sayAgain();
+				void look().catch(onError);
+			},
+			Math.max(0, Math.min(...at) - now()),
+		);
 		lookTimer.unref();
+	}
+
+	/** Each refusal whose last try failed is tried once more, whatever the timer fired for; one that fails is due again. */
+	function sayAgain(): void {
+		for (const job of unsaid.values()) {
+			if (job.due === undefined) continue;
+			job.due = undefined;
+			tell(job.refusal);
+		}
+		lookLater();
 	}
 
 	// The names the startup's look gave back to `from`: dormant as those it found itself are, to the core's reconcile.
@@ -297,12 +345,13 @@ export function createHandoverAgentPort({
 		refusal,
 		reason,
 	});
-	const inHand = (agent: string) => moving.has(agent) || undecided.has(agent);
+	const inHand = (agent: string) => moving.has(agent) || undecided.has(agent) || unsaid.has(agent);
 	const stillMoving = (agent: string) => {
 		const job = undecided.get(agent);
-		return job === undefined
-			? `${agent} is being handed over`
-			: `${agent} is being handed over, and ${whyUndecided(job)}`;
+		if (job !== undefined) return `${agent} is being handed over, and ${whyUndecided(job)}`;
+		return unsaid.has(agent) && !moving.has(agent)
+			? `${agent}'s handover did not land, and how it ended is not recorded yet`
+			: `${agent} is being handed over`;
 	};
 	const backOnAcp = (error: Error, at: number): HandoverOutcome => ({
 		...refused(
@@ -384,7 +433,7 @@ export function createHandoverAgentPort({
 		await loading;
 		if (undecided.has(agent)) await look();
 		if (moved.has(agent)) return refused("not_acp", `${agent} is on rex already, in its window of the same name`);
-		if (undecided.has(agent)) return refused("cannot_resume", stillMoving(agent));
+		if (undecided.has(agent) || unsaid.has(agent)) return refused("cannot_resume", stillMoving(agent));
 		const held = await from.releasable(agent);
 		if ("refusal" in held) return refused(held.refusal, held.reason);
 		const unfit = await to.takeable(held).catch((error: Error) => error.message);
@@ -396,7 +445,12 @@ export function createHandoverAgentPort({
 			if (toKeep) {
 				await record?.(outcome).catch((error: Error) => {
 					onError(error);
-					if (!outcome.handedOver) return;
+					if (!outcome.handedOver) {
+						const refusal = { agent, onto: "refused", id: randomUUID(), outcome } as const;
+						unsaid.set(agent, { session: held, refusal, later: [] });
+						tell(refusal);
+						return;
+					}
 					unrecorded.set(agent, { said: [] });
 					tell({ agent, onto: "rex", sessionId: outcome.sessionId, answered: true });
 				});
@@ -454,18 +508,25 @@ export function createHandoverAgentPort({
 			await look();
 			// Taken before the sides are asked: a move that ends while they answer is in neither answer, and a job missing
 			// from a listing reads as gone.
-			const moves = [...moving.values(), ...undecided.values()];
+			const moves = [
+				...moving.values(),
+				...undecided.values(),
+				...[...unsaid.values()]
+					.map(({ session }) => session)
+					.filter(({ name }) => !moving.has(name) && !undecided.has(name)),
+			];
 			const [all, there] = await Promise.all([from.list(), moved.size === 0 ? [] : to.list()]);
-			// One whose turn is being cut is still in `from`'s answer.
-			const here = all.filter((agent) => !moving.has(agent.name));
+			// One whose turn is being cut is still in `from`'s answer, as is one whose refusal is not recorded.
+			const here = all.filter((agent) => !moving.has(agent.name) && !unsaid.has(agent.name));
 			// A status of a job whose landing is not recorded would read as the end of a turn on it as it was recorded before:
-			// one landed by a look until the handover bridge has answered, one landed by a handover until its caller has.
+			// one landed by a look until the handover bridge has answered, one landed by a handover until its caller has, and
+			// one whose refusal is not recorded until that is.
 			const onRex = there
 				.filter((agent) => moved.has(agent.name))
 				.map(({ status, seq, ...agent }) => {
 					const held = listeners.size > 0 ? unrecorded.get(agent.name) : undefined;
 					if (held !== undefined) held.listed = seq;
-					const withheld = held !== undefined || moving.has(agent.name);
+					const withheld = held !== undefined || moving.has(agent.name) || unsaid.has(agent.name);
 					return withheld || status === undefined ? agent : { ...agent, status, seq };
 				});
 			const named = new Set([...here, ...onRex].map((agent) => agent.name));
@@ -492,7 +553,7 @@ export function createHandoverAgentPort({
 				listener(event);
 			};
 			const offFrom = from.onStatus((event) => {
-				if (!moving.has(event.agent)) pass(event, !moved.has(event.agent));
+				if (!moving.has(event.agent) && !unsaid.has(event.agent)) pass(event, !moved.has(event.agent));
 			});
 			const offTo = to.onStatus((event) => {
 				if (!moved.has(event.agent) || moving.has(event.agent)) return;

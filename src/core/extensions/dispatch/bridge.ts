@@ -20,7 +20,7 @@ import { dispatchSignal, reblockSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
 import { askForJob } from "../ask/index.ts";
 import { recordFact } from "../memory/index.ts";
-import { commitCut, commitMove, Dispatches, JOB_DONE } from "./index.ts";
+import { commitCut, commitMove, commitRefusal, Dispatches, JOB_DONE } from "./index.ts";
 import { reclaimer } from "./reclaim.ts";
 
 export { JOB_DONE };
@@ -107,12 +107,12 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			const current = doc.jobs[index];
 			if (current === undefined || current.seq === event.seq) return;
 			// Decisions come from the current job, not the one read above: a respond tool may have added one since, and
-			// so may the reclaim, which a defer may have armed since, and the time of a return told since. A job that moved
-			// since is the window's: of what was read, only that a turn finished is still true of it, and its reply cannot be
-			// told from what a turn cut since left, so it says nothing.
+			// so may the reclaim, which a defer may have armed since, and the time of a return or the id of a refusal told
+			// since. A job that moved since is the window's: of what was read, only that a turn finished is still true of
+			// it, and its reply cannot be told from what a turn cut since left, so it says nothing.
 			const moved = current.sessionId !== job.sessionId;
 			const { launch: _held, handedOver: _handed, resultUnread: _unread, ...kept } = current;
-			const { decisions: _read, reclaim: _armed, toldBack: _told, ...fields } = next;
+			const { decisions: _read, reclaim: _armed, toldBack: _told, toldRefusal: _refused, ...fields } = next;
 			const outcome = moved ? "未知" : (next.outcome ?? "未知");
 			const written = moved ? { ...current, ...(action === "complete" ? { outcome } : {}) } : { ...kept, ...fields };
 			doc.jobs[index] = written;
@@ -202,6 +202,7 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
  * job whose window closed before its move was recorded takes the session too, with no claim of a window: one the
  * reconcile will report gone is told by that, and a done one, which it leaves alone, is told here. A commit that fails
  * fails the listener, so the agent side holds what that job's window says until a later commit, which its next status tries.
+ * A refusal `show_job` could not record is committed as it would have committed it.
  */
 export function handoverBridge(conversation: Conversation, settling: HandoverSettling, context: Context) {
 	async function apply(settled: Settled): Promise<void> {
@@ -212,6 +213,12 @@ export function handoverBridge(conversation: Conversation, settling: HandoverSet
 			if (job === undefined) return;
 			const { agent, card } = job;
 			const report = (content: string) => tx.appendEntry(conversation.id, noticeEntry("report", "outcome", content));
+			// Said for a `show_job` whose record failed, so it is that record as it would have landed, kept with its id.
+			if (settled.onto === "refused") {
+				if (job.toldRefusal === settled.id) return;
+				doc.jobs[index] = { ...job, toldRefusal: settled.id };
+				return commitRefusal(tx, conversation.id, { agent, card }, settled.outcome);
+			}
 			if (settled.onto === "acp") {
 				if (job.toldBack === settled.at) return;
 				const cut = cutOf(job.status);

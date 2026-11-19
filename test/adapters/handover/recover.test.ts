@@ -9,7 +9,7 @@ import {
 import { seqOf } from "../../../src/adapters/rex/agent-port.ts";
 import { RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
 import { type AgentStatusEvent, PromptRefused } from "../../../src/ports/agent.ts";
-import type { Settled } from "../../../src/ports/handover.ts";
+import { type Settled, TakeRefused } from "../../../src/ports/handover.ts";
 import { cleanUp, SESSION } from "../acp/fake.ts";
 import { type Block, fixture, HANGAR } from "../rex/fake.ts";
 import { AT_IDLE, alive, fakeClock, sides, sleep } from "./fake.ts";
@@ -774,6 +774,118 @@ test("the grace period of a restart counts from when the take failed, not from w
 	await expect(within.agents.prompt("card-a", "now")).rejects.toThrow("grace period, 5 s from now");
 });
 
+/**
+ * A soma whose card-a take asks for its window as late as it can, 18 s on `clock` past the mark (its release waiting out
+ * 3 × closeMs, its reads of the session more), and dies right after the request has gone out. `asked`: when it went.
+ */
+async function askedLate(clock: ReturnType<typeof fakeClock>) {
+	const first = await sides();
+	await first.ran();
+	let asked: number | undefined;
+	const { call } = first.hangar.client;
+	first.hangar.client.call = (async (method, payload, schema, options) => {
+		if (method !== "session.new_window") return call(method, payload, schema, options);
+		await options?.sending?.();
+		asked = clock.now();
+		return never();
+	}) as typeof call;
+	const { acp, onRex } = first;
+	const dying = createHandoverAgentPort({
+		from: {
+			...acp.port,
+			release: async (agent, mark) => {
+				const released = await acp.port.release(agent, mark);
+				clock.advance(9_000);
+				return released;
+			},
+		},
+		to: {
+			...onRex,
+			take: (...args) => {
+				clock.advance(9_000);
+				return onRex.take(...args);
+			},
+		},
+		onError: () => {},
+		now: clock.now,
+	});
+	void dying.handOver("card-a");
+	await until(() => asked !== undefined, "the window to be asked for");
+	await acp.end();
+	return { first, asked: asked as number };
+}
+
+test("a soma killed right after asking for the window, 18 s past the mark: the next one's grace period counts from the request", async () => {
+	const clock = fakeClock();
+	const { first, asked } = await askedLate(clock);
+	expect(asked - ((await first.entry()).handingOverAt as number)).toBe(18_000);
+	clock.advance(59_000);
+
+	const within = await restarted(first, { clock });
+
+	expect((await within.entry()).handingOver).toBe(true);
+	await expect(within.agents.prompt("card-a", "now")).rejects.toThrow("grace period, 1 s from now");
+	clock.advance(1_000);
+	expect(await within.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	expect((await within.entry()).handingOver).toBeUndefined();
+});
+
+test("a mark from before the request was recorded still counts from the mark", async () => {
+	const clock = fakeClock();
+	const { first } = await askedLate(clock);
+	const { windowAskedAt: _asked, ...old } = await first.entry();
+	await writeFile(first.acp.sessionsFile, `${JSON.stringify({ "card-a": old })}\n`);
+	clock.advance(40_000);
+
+	const within = await restarted(first, { clock });
+
+	await expect(within.agents.prompt("card-a", "now")).rejects.toThrow("grace period, 2 s from now");
+	clock.advance(2_000);
+	expect(await within.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	expect((await within.entry()).handingOver).toBeUndefined();
+});
+
+test("a request time an hour ahead of the clock counts as now: the job waits out one grace period, not 3660 s", async () => {
+	const clock = fakeClock();
+	const { first } = await askedLate(clock);
+	const ahead = { ...(await first.entry()), windowAskedAt: clock.now() + 3_600_000 };
+	await writeFile(first.acp.sessionsFile, `${JSON.stringify({ "card-a": ahead })}\n`);
+
+	const both = await restarted(first, { clock });
+
+	await expect(both.agents.prompt("card-a", "now")).rejects.toThrow("grace period, 60 s from now");
+	clock.advance(60_000);
+	expect(await both.agents.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
+	expect((await both.entry()).handingOver).toBeUndefined();
+});
+
+test("a request time that does not reach the file asks for no window: the job is back on ACP at once, saying why", async () => {
+	const both: Sides = await sides({
+		from: (port) => ({
+			...port,
+			release: async (agent, mark) => {
+				const released = await port.release(agent, mark);
+				await mkdir(`${both.acp.sessionsFile}.tmp`);
+				return released;
+			},
+		}),
+	});
+	await both.ran();
+
+	const outcome = await both.agents.handOver("card-a");
+
+	expect(outcome).toMatchObject({ handedOver: false, refusal: "cannot_resume" });
+	const { reason } = outcome as { reason: string };
+	expect(reason).toContain(`${both.acp.sessionsFile}.tmp`);
+	expect(reason).toContain("the job stays on ACP");
+	expect(both.windowsOpened()).toEqual([]);
+	await rmdir(`${both.acp.sessionsFile}.tmp`);
+	const from = both.acp.events.length;
+	await both.agents.prompt("card-a", "RECALL");
+	await both.acp.until("done", from);
+	expect(both.blocks).toEqual([]);
+});
+
 test("a window found at a restart inside the grace period puts the job on rex at once", async () => {
 	const clock = fakeClock();
 	const first = await died("after", { clock });
@@ -884,6 +996,62 @@ test("a grace period that ends while its handover is being recorded does not spi
 	// card-a's grace period ended 250 ms into the record, which a look does not settle: no look is due until it commits.
 	expect(looksAtB - before).toBe(0);
 	await until(() => given.includes("card-a"), "card-a to be looked at once its record committed");
+});
+
+test("a take that asked late, held while its handover is recorded, is looked at only once that commits, and from the request", async () => {
+	const session = { name: "card-a", card: "card-a", sessionId: "s-a", claudeSession: "c-a", cwd: "/w" };
+	let askedAt: number | undefined;
+	let reinstatedAt: number | undefined;
+	let looks = 0;
+	const from = {
+		released: async () => [],
+		handingOver: async () => [],
+		givenBack: async () => [],
+		dormant: async () => [],
+		releasable: async () => session,
+		// A turn cut, so `show_job` records how the handover ended.
+		cut: async () => ({}),
+		release: async () => session,
+		markedAt: async () => {},
+		windowAsked: async (_name: string, at: number) => {
+			askedAt = at;
+		},
+		reinstate: async () => {
+			reinstatedAt = Date.now();
+		},
+		list: async () => [],
+		onStatus: () => () => {},
+	} as unknown as HandoverAgentPortOptions["from"];
+	const to = {
+		hangar: HANGAR,
+		takeable: async () => undefined,
+		// Asks for the window 100 ms past the mark, and rex refuses it.
+		take: async (_session: unknown, _hangar: string, asking: () => Promise<void>) => {
+			await sleep(100);
+			await asking();
+			throw new TakeRefused("session.new_window: refused: no window for you");
+		},
+		// Rex stops answering as the take is refused, so the job is undecided, and answers every look after.
+		holds: async () => {
+			if (looks++ === 0) throw new Error("rex is away");
+			return "none";
+		},
+		list: async () => [],
+		onStatus: () => () => {},
+	} as unknown as HandoverAgentPortOptions["to"];
+	const agents = createHandoverAgentPort({ from, to, graceMs: 200, relookMs: 10, onError: () => {} });
+
+	let looksWhileRecorded: number | undefined;
+	await agents.handOver("card-a", async () => {
+		// Past the mark's grace period and before the request's, with the job held: a listing looks at nothing.
+		await until(() => askedAt !== undefined && Date.now() >= (askedAt as number) + 120, "the mark's grace period");
+		await agents.list();
+		looksWhileRecorded = looks;
+	});
+
+	expect(looksWhileRecorded).toBe(1);
+	await until(() => reinstatedAt !== undefined, "card-a to be given back");
+	expect((reinstatedAt as number) - (askedAt as number)).toBeGreaterThanOrEqual(200);
 });
 
 /** Everything the core could ask of an undecided card-a is held off, and nothing starts for it over ACP. */

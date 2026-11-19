@@ -139,6 +139,7 @@ export async function sides(
 				handingOver?: true;
 				hangar?: string;
 				handingOverAt?: number;
+				windowAskedAt?: number;
 				givenBack?: number;
 				model?: string;
 			},

@@ -118,7 +118,7 @@ const pressed: string[] = [];
 // The screen the first key was pressed on, read just before it: once it lands, the dialog is gone.
 let answered: string | undefined;
 const { call: callRex } = client;
-client.call = async (method, payload, schema) => {
+client.call = async (method, payload, schema, options) => {
 	const { event, session_id, block_id } = payload as {
 		event?: { type: string; payload: { key: string; action: string } };
 		session_id?: string;
@@ -132,7 +132,7 @@ client.call = async (method, payload, schema) => {
 		}
 		pressed.push(event.payload.key);
 	}
-	return callRex(method, payload, schema);
+	return callRex(method, payload, schema, options);
 };
 const created = await client.call("session.create", { label }, z.object({ session_id: z.string() }).passthrough());
 const hangar = created.session_id;

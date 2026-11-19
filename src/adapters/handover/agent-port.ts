@@ -120,8 +120,9 @@ export function createHandoverAgentPort({
 	/** What names a return of the agent, as `givenBack` says it at every startup: the one value a return is told by. */
 	const returnOf = async (agent: string) => (await from.givenBack()).find(({ name }) => name === agent)?.at ?? 0;
 	const hangarOf = ({ hangar }: HandingOver) => hangar ?? to.hangar;
-	// A mark that records no time is from before they did, and older than any grace period.
-	const graceEnds = ({ at }: HandingOver) => (at ?? 0) + graceMs;
+	// A mark that records no time is from before they did, and older than any grace period. A window asked for after the
+	// mark was written may open as late after the asking, so the later of the two counts.
+	const graceEnds = ({ at, asked }: HandingOver) => Math.max(at ?? 0, asked ?? 0) + graceMs;
 	const WHY: Record<Why, (job: HandingOver) => string> = {
 		rex: () => "rex does not answer to say which side it is on",
 		grace: (job) =>
@@ -330,7 +331,8 @@ export function createHandoverAgentPort({
 		for (const session of await from.handingOver()) {
 			// A time ahead of this clock, one set back since it was written, would hold the job for as long, or overflow a timer.
 			const at = session.at === undefined ? {} : { at: Math.min(session.at, now()) };
-			undecided.set(session.name, { ...session, ...at, why: "rex" });
+			const asked = session.asked === undefined ? {} : { asked: Math.min(session.asked, now()) };
+			undecided.set(session.name, { ...session, ...at, ...asked, why: "rex" });
 		}
 		await look();
 		for (const { name, at } of await from.givenBack()) tell({ agent: name, onto: "acp", at, startup: true });
@@ -417,11 +419,19 @@ export function createHandoverAgentPort({
 			await from.reinstate(agent);
 			return { ...backOnAcp(error as Error, await returnOf(agent)), ...cut };
 		}
+		// The release and the take's reads come between the mark and the window's request, so the request's time goes on
+		// disk before the request does: a soma killed past it counts a restart's grace period from then.
+		let asked: { asked?: number } = {};
+		const asking = async () => {
+			const at = now();
+			await from.windowAsked(agent, at);
+			asked = { asked: at };
+		};
 		// In the hangar the mark names, so the mark names where any window of this take is.
-		const taken = await to.take(held, mark.hangar).catch((error: Error) => error);
+		const taken = await to.take(held, mark.hangar, asking).catch((error: Error) => error);
 		const outcome =
 			taken instanceof Error
-				? await afterFailedTake(agent, { ...held, ...mark }, taken)
+				? await afterFailedTake(agent, { ...held, ...mark, ...asked }, taken)
 				: await landed(agent, held, taken);
 		return { ...outcome, ...cut };
 	}

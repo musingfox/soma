@@ -50,8 +50,8 @@ const die = (): never => {
 const client = createRexClient({ socketPath: process.env.SOMA_REX_SOCKET ?? defaultRexSocket(homedir()), onError });
 if (mode === "first" && scenario === "after") {
 	const { call } = client;
-	client.call = async (method, payload, schema) => {
-		const reply = await call(method, payload, schema);
+	client.call = async (method, payload, schema, options) => {
+		const reply = await call(method, payload, schema, options);
 		if (method === "session.new_window") die();
 		return reply;
 	};
@@ -59,7 +59,7 @@ if (mode === "first" && scenario === "after") {
 if (mode === "second" && scenario === "after") {
 	const { call } = client;
 	let pressed = false;
-	client.call = async (method, payload, schema) => {
+	client.call = async (method, payload, schema, options) => {
 		const { event, session_id, block_id } = payload as {
 			event?: { type: string; payload: { key: string; action: string } };
 			session_id?: string;
@@ -75,7 +75,7 @@ if (mode === "second" && scenario === "after") {
 			}
 			emit("key", { key: event.payload.key });
 		}
-		return call(method, payload, schema);
+		return call(method, payload, schema, options);
 	};
 }
 const bin = join(fileURLToPath(new URL("..", import.meta.url)), "bin");

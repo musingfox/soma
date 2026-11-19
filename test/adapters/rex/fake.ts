@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ZodType } from "zod";
-import { type RexClient, RexRpcError } from "../../../src/adapters/rex/client.ts";
+import { type CallOptions, type RexClient, RexRpcError } from "../../../src/adapters/rex/client.ts";
 import type { SessionEvent } from "../../../src/adapters/rex/schema.ts";
 
 export const HANGAR = "session:hangar";
@@ -165,7 +165,8 @@ export function rex(blocks: Block[], others: Session[] = [], clients: Client[] =
 	};
 	const originals = { ...replies };
 	const client: RexClient = {
-		async call<T>(method: string, payload: unknown, schema: ZodType<T>): Promise<T> {
+		async call<T>(method: string, payload: unknown, schema: ZodType<T>, options?: CallOptions): Promise<T> {
+			await options?.sending?.();
 			calls.push({ method, payload: payload as Record<string, unknown> });
 			const lost = notFound(method, (payload as { session_id?: unknown } | undefined)?.session_id);
 			if (lost !== undefined) throw lost;

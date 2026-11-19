@@ -150,6 +150,8 @@ type Session = {
 	readonly hangar?: string;
 	/** When the mark was written or the take failed, in milliseconds since the epoch. */
 	readonly handingOverAt?: number;
+	/** When the take of a handover in progress last asked for its window, written before it asked. */
+	readonly windowAskedAt?: number;
 	/** The time of the mark `reinstate` took off, written with its removal: what the human is owed a notice of, durably. */
 	readonly givenBack?: number;
 };
@@ -1023,7 +1025,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 				return { refusal: "not_at_rest", reason: `${agent} is ${state ?? "working"}: only a job at rest is released` };
 			}
 			const before = sessions.get(agent) as Session;
-			const { givenBack: _told, ...unmarked } = before;
+			const { givenBack: _told, windowAskedAt: _asked, ...unmarked } = before;
 			const session = { ...unmarked, handingOver: true as const, hangar, handingOverAt: at };
 			const asleep = dormant.get(agent);
 			const target = agents.get(agent);
@@ -1071,12 +1073,23 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			await record(agent, session);
 		},
 
+		/** Only once it is on disk is the window asked for: a restart counts its grace period from then at the soonest. */
+		async windowAsked(agent: string, at: number): Promise<void> {
+			await loading;
+			const found = sessions.get(agent);
+			if (!found?.handingOver) throw new Error(`${agent} has no handover in progress to ask a window for`);
+			const session = { ...found, windowAskedAt: at };
+			const file = options.sessionsFile;
+			if (file !== undefined) await write(file, agent, session);
+			sessions.set(agent, session);
+		},
+
 		/** The window exists, so the session is the other side's for good. */
 		async confirm(agent: string): Promise<void> {
 			await loading;
 			const found = sessions.get(agent);
 			if (!found?.handingOver) return;
-			const { handingOver: _over, hangar: _hangar, handingOverAt: _at, ...rest } = found;
+			const { handingOver: _over, hangar: _hangar, handingOverAt: _at, windowAskedAt: _asked, ...rest } = found;
 			const session = { ...rest, handedOver: true as const };
 			sessions.set(agent, session);
 			await record(agent, session);
@@ -1087,7 +1100,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			await loading;
 			const found = sessions.get(agent);
 			if (!found?.handingOver) return;
-			const { handingOver: _reinstated, hangar: _hangar, handingOverAt: at, ...rest } = found;
+			const { handingOver: _reinstated, hangar: _hangar, handingOverAt: at, windowAskedAt: _asked, ...rest } = found;
 			const session = { ...rest, givenBack: at ?? 0 };
 			sessions.set(agent, session);
 			dormant.set(agent, { name: agent, session });
@@ -1108,12 +1121,13 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			await loading;
 			return [...sessions].flatMap(([name, session]) => {
 				if (!session.handingOver) return [];
-				const { hangar, handingOverAt: at } = session;
+				const { hangar, handingOverAt: at, windowAskedAt: asked } = session;
 				return [
 					{
 						...heldOf(name, session),
 						...(hangar === undefined ? {} : { hangar }),
 						...(at === undefined ? {} : { at }),
+						...(asked === undefined ? {} : { asked }),
 					},
 				];
 			});

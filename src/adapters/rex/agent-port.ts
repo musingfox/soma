@@ -1055,7 +1055,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	 * A window named `name` whose one block is an interactive shell typing `launch`, so the block outlives claude
 	 * exiting, as a herdr pane does. The block's label keeps the session id, which nothing else in rex records. Returns
 	 * the block's id when rex names it. With `pinned`, it opens in that hangar only, and one rex says does not exist
-	 * fails it with session_not_found rather than make a hangar to open it in.
+	 * fails it with session_not_found rather than make a hangar to open it in. `beforeRequest` is awaited before each request.
 	 */
 	async function openWindow(
 		name: string,
@@ -1063,6 +1063,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		cwd: string,
 		launch: string,
 		pinned?: string,
+		beforeRequest?: () => Promise<void>,
 	): Promise<string | undefined> {
 		const open = (hangar: string) =>
 			client.call(
@@ -1074,6 +1075,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 					layout: { block: { flavor: SHELL_FLAVOR, label: session, options: { cwd, initial_input: launch } } },
 				},
 				NewWindowResultSchema,
+				beforeRequest === undefined ? {} : { sending: beforeRequest },
 			);
 		const { block_ids: blocks } = await (pinned === undefined ? onHangar(open) : open(pinned));
 		return blocks?.find((block) => block !== null) ?? undefined;
@@ -1523,17 +1525,26 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		 * nothing throws, so a claude slow to come up or a read that fails leaves the window and says `ready: false`. All
 		 * that is TakeRefused but a `session.new_window` rex did not answer with an error, which may be running still.
 		 * With `hangar`, the window opens in that hangar or nowhere, so a mark naming it names where the window is: rex
-		 * answering that it does not exist is TakeRefused, and no hangar is made for the window.
+		 * answering that it does not exist is TakeRefused, and no hangar is made for the window. `asking` goes right before
+		 * the window is asked for, once the connection is ready, and one that throws asks for nothing: TakeRefused.
 		 */
-		async take(session: HeldSession, hangar?: string) {
+		async take(session: HeldSession, hangar?: string, asking?: () => Promise<void>) {
 			const line = await takeLine(session).catch((error: Error) => {
 				throw new TakeRefused(error.message, { cause: error });
 			});
 			if ("refused" in line) throw new TakeRefused(line.refused);
 			const { name, claudeSession, cwd } = session;
-			const opened = await openWindow(name, claudeSession, cwd, line.launch, hangar).catch((error: Error) => {
-				throw error instanceof RexRpcError ? new TakeRefused(error.message, { cause: error }) : error;
-			});
+			const beforeRequest =
+				asking &&
+				(() =>
+					asking().catch((error: Error) => {
+						throw new TakeRefused(error.message, { cause: error });
+					}));
+			const opened = await openWindow(name, claudeSession, cwd, line.launch, hangar, beforeRequest).catch(
+				(error: Error) => {
+					throw error instanceof RexRpcError ? new TakeRefused(error.message, { cause: error }) : error;
+				},
+			);
 			return brought(name, async () => opened ?? only(await jobs(), name).blockId);
 		},
 

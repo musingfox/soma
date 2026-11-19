@@ -1158,6 +1158,50 @@ test("the mark's hangar and time come off with the mark, whichever way it ends, 
 	expect(left).not.toHaveProperty("at");
 });
 
+test("when the window was asked for is on disk once recorded, read with the mark, comes off with it, and needs a mark", async () => {
+	const acp = await harness();
+	await acp.start();
+	const from = acp.events.length;
+	await acp.until("idle");
+	await acp.port.prompt("card-a", "the word is KIWI");
+	await acp.until("done", from);
+	const entry = async () => JSON.parse(await readFile(acp.sessionsFile, "utf8"))["card-a"];
+	await expect(acp.port.windowAsked("card-a", 1_500)).rejects.toThrow("no handover in progress");
+	expect((await entry()).windowAskedAt).toBeUndefined();
+	await acp.port.release("card-a", MARK);
+
+	await acp.port.windowAsked("card-a", 1_500);
+	expect(await entry()).toMatchObject({ handingOverAt: MARK.at, windowAskedAt: 1_500 });
+	const after = await harness({ cwd: acp.cwd });
+	expect(await after.port.handingOver()).toMatchObject([{ at: MARK.at, asked: 1_500 }]);
+
+	await acp.port.reinstate("card-a");
+	expect((await entry()).windowAskedAt).toBeUndefined();
+	await acp.port.release("card-a", MARK);
+	await acp.port.windowAsked("card-a", 1_500);
+	await acp.port.confirm("card-a");
+	expect((await entry()).windowAskedAt).toBeUndefined();
+});
+
+test("a new mark starts with no request time, even over an entry that kept one", async () => {
+	const acp = await harness();
+	await acp.start();
+	const from = acp.events.length;
+	await acp.until("idle");
+	await acp.port.prompt("card-a", "the word is KIWI");
+	await acp.until("done", from);
+	await acp.end();
+	const entry = async () => JSON.parse(await readFile(acp.sessionsFile, "utf8"))["card-a"];
+	await writeFile(acp.sessionsFile, `${JSON.stringify({ "card-a": { ...(await entry()), windowAskedAt: 9_000 } })}\n`);
+	const after = await harness({ cwd: acp.cwd });
+
+	await after.port.release("card-a", MARK);
+
+	expect(await entry()).toMatchObject({ handingOver: true, handingOverAt: MARK.at });
+	expect((await entry()).windowAskedAt).toBeUndefined();
+	expect((await after.port.handingOver())[0]).not.toHaveProperty("asked");
+});
+
 test("confirm of an agent with no handover in progress does nothing", async () => {
 	const acp = await harness();
 	await acp.start();

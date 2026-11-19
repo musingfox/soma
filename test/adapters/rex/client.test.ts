@@ -151,6 +151,27 @@ test("an error response rejects with its code", async () => {
 	await expect(failed).rejects.toMatchObject({ code: "session_not_found", status: 404 });
 });
 
+test("a request's `sending` is awaited once the connection is open and before the request goes out; one that throws sends nothing", async () => {
+	const rex = fakeRex(() => ({ payload: {} }));
+	await rex.listening;
+	const client = createRexClient({ socketPath: rex.path });
+	closers.push(() => client.close(), rex.close);
+	const then: number[][] = [];
+
+	await client.call("server.version", {}, z.object({}), {
+		sending: async () => {
+			then.push([rex.hellos.length, rex.requests.length]);
+		},
+	});
+	const refused = client.call("server.status", {}, z.object({}), {
+		sending: () => Promise.reject(new Error("not recorded")),
+	});
+
+	await expect(refused).rejects.toThrow("not recorded");
+	expect(then).toEqual([[1, 0]]);
+	expect(rex.requests.map(({ method }) => method)).toEqual(["server.version"]);
+});
+
 test("a dropped connection is opened again while events are listened to, attached again, then announced", async () => {
 	const rex = fakeRex((request) => (request.method === "session.attach" ? { payload: view } : { payload: {} }));
 	await rex.listening;

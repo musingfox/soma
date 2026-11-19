@@ -49,8 +49,13 @@ export interface RexClientOptions {
 	readonly onError?: (error: Error) => void;
 }
 
+export interface CallOptions {
+	/** Awaited once the connection is ready, right before the request goes out; one that throws sends nothing. */
+	readonly sending?: () => Promise<void>;
+}
+
 export interface RexClient {
-	call<T>(method: string, payload: unknown, schema: ZodType<T>): Promise<T>;
+	call<T>(method: string, payload: unknown, schema: ZodType<T>, options?: CallOptions): Promise<T>;
 	/**
 	 * Attaches this and every later connection to the session, so its methods work and its events arrive, until rex says
 	 * the session does not exist.
@@ -259,8 +264,10 @@ export function createRexClient(options: RexClientOptions): RexClient {
 	};
 
 	return {
-		async call<T>(method: string, payload: unknown, schema: ZodType<T>): Promise<T> {
-			return schema.parse(await send(await ensure(), method, payload));
+		async call<T>(method: string, payload: unknown, schema: ZodType<T>, options?: CallOptions): Promise<T> {
+			const conn = await ensure();
+			await options?.sending?.();
+			return schema.parse(await send(conn, method, payload));
 		},
 
 		async attach(sessionId: string): Promise<void> {

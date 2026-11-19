@@ -1,7 +1,11 @@
 import { mkdir, readFile, rmdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
-import { createHandoverAgentPort, HANDOVER_GRACE_MS } from "../../../src/adapters/handover/agent-port.ts";
+import {
+	createHandoverAgentPort,
+	HANDOVER_GRACE_MS,
+	type HandoverAgentPortOptions,
+} from "../../../src/adapters/handover/agent-port.ts";
 import { seqOf } from "../../../src/adapters/rex/agent-port.ts";
 import { RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
 import { type AgentStatusEvent, PromptRefused } from "../../../src/ports/agent.ts";
@@ -822,6 +826,64 @@ test("a mark further ahead than a timer can count does not spin the grace timer:
 	expect(looked(both).length).toBeLessThanOrEqual(2 + (Date.now() - started) / 200);
 	clock.advance(200);
 	await until(async () => (await both.entry()).handingOver === undefined, "the look at the end of the grace period");
+});
+
+test("a grace period that ends while its handover is being recorded does not spin the timer for another undecided job", async () => {
+	const session = (name: string) => ({
+		name,
+		card: name,
+		sessionId: `s-${name}`,
+		claudeSession: `c-${name}`,
+		cwd: "/w",
+	});
+	let looksAtB = 0;
+	const given: string[] = [];
+	const from = {
+		released: async () => [],
+		// card-b was left mid-handover long ago, and rex does not answer about it: looked at again every `relookMs`.
+		handingOver: async () => [{ ...session("card-b"), hangar: HANGAR, at: 0 }],
+		givenBack: async () => [],
+		dormant: async () => [],
+		releasable: async () => session("card-a"),
+		// A turn cut, so `show_job` records how the handover ended.
+		cut: async () => ({}),
+		release: async () => session("card-a"),
+		markedAt: async () => {},
+		reinstate: async (name: string) => {
+			given.push(name);
+		},
+		list: async () => [],
+		onStatus: () => () => {},
+	} as unknown as HandoverAgentPortOptions["from"];
+	const to = {
+		hangar: HANGAR,
+		takeable: async () => undefined,
+		// A take that may still open a window: card-a is undecided, its grace period of 50 ms counting.
+		take: async () => {
+			throw new RexTransportError("no response within 10000 ms");
+		},
+		holds: async ({ name }: { name: string }) => {
+			if (name === "card-a") return "none";
+			looksAtB++;
+			throw new Error("rex is away");
+		},
+		list: async () => [],
+		onStatus: () => () => {},
+	} as unknown as HandoverAgentPortOptions["to"];
+	const agents = createHandoverAgentPort({ from, to, graceMs: 50, relookMs: 60_000, onError: () => {} });
+	await agents.list();
+	const before = looksAtB;
+
+	let recorded = false;
+	await agents.handOver("card-a", async () => {
+		await sleep(300);
+		recorded = true;
+	});
+	expect(recorded).toBe(true);
+
+	// card-a's grace period ended 250 ms into the record, which a look does not settle: no look is due until it commits.
+	expect(looksAtB - before).toBe(0);
+	await until(() => given.includes("card-a"), "card-a to be looked at once its record committed");
 });
 
 /** Everything the core could ask of an undecided card-a is held off, and nothing starts for it over ACP. */

@@ -23,6 +23,7 @@ import { reclaimer } from "../../../src/core/extensions/dispatch/reclaim.ts";
 import { openHarness } from "../../../src/core/harness.ts";
 import { NOTICE } from "../../../src/core/notice.ts";
 import type { AgentState } from "../../../src/ports/agent.ts";
+import type { AgentHandover } from "../../../src/ports/handover.ts";
 import { cleanUp } from "../acp/fake.ts";
 import { type Block, fixture, HANGAR } from "../rex/fake.ts";
 import { AT_IDLE, alive, fakeClock, sides, sleep } from "./fake.ts";
@@ -43,7 +44,12 @@ afterEach(async () => {
  * wake itself. `results` holds every tool result the model was handed.
  */
 async function core(
-	options: Parameters<typeof sides>[0] & { brief?: string; settledOn?: (root: Conversation) => Conversation } = {},
+	options: Parameters<typeof sides>[0] & {
+		brief?: string;
+		settledOn?: (root: Conversation) => Conversation;
+		/** The handover `show_job` is given, over the port's own. */
+		handover?: (agents: AgentHandover) => AgentHandover;
+	} = {},
 ) {
 	const both = await sides(options);
 	const results: unknown[] = [];
@@ -91,7 +97,7 @@ async function core(
 			dispatchExtension(
 				both.agents,
 				async (_repo, card) => `# ${card}\n\n${options.brief ?? "the word is KIWI"}`,
-				both.agents,
+				options.handover?.(both.agents) ?? both.agents,
 			),
 			defers.extension,
 		],
@@ -1668,6 +1674,54 @@ test("a deferral of another job is left alone by the move of this one", async ()
 	soma.off();
 });
 
+/** A `show_job` whose record of the handover waits for `open`: the window between the port's step and the core's commit. */
+function heldRecord() {
+	let open = () => {};
+	const opened = new Promise<void>((resolve) => {
+		open = resolve;
+	});
+	let reached = false;
+	const handover = (agents: AgentHandover): AgentHandover => ({
+		handOver: (agent, record) =>
+			agents.handOver(
+				agent,
+				record &&
+					(async (outcome) => {
+						reached = true;
+						await opened;
+						await record(outcome);
+					}),
+			),
+	});
+	return { handover, open, reached: () => reached };
+}
+
+test("a listing as the move is being recorded holds no status of the window, and a deferral armed then is cancelled by the move", async () => {
+	const held = heldRecord();
+	const soma = await core({ handover: held.handover });
+	await busy(soma, "SPIN");
+	const showing = soma.say("看 card-a");
+	await soma.until(held.reached, "the move's record");
+
+	const listed = (await soma.agents.list()).find((each) => each.name === "card-a");
+	expect(listed).toBeDefined();
+	expect(listed?.status).toBeUndefined();
+	expect(listed?.seq).toBeUndefined();
+	const id = await soma.defer("PT1S", "write the report");
+	expect((await soma.job())?.reclaim).toEqual({ phase: "due" });
+	held.open();
+	await showing;
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true, cut: {} });
+	expect((await soma.notices())[0]).toContain(cancelledDeferral);
+	expect(await soma.deferrals()).toEqual({});
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "cancelled" });
+	expect(soma.typed()).toEqual([]);
+	expect(soma.hangar.methods()).not.toContain("block.close");
+	expect((await soma.job())?.reclaim).toBeUndefined();
+	soma.off();
+});
+
 test("a deferral armed during the cut of a job killed with its window open: the next soma cancels it, tells it, and stops nothing", async () => {
 	const first = await core();
 	await busy(first, "SPIN");
@@ -2398,6 +2452,51 @@ test("a window that never opens, in a running soma: back on ACP at the next look
 	await sleep(50);
 	expect(counted(await next.notices(), backOnAcp)).toBe(1);
 	next.off();
+});
+
+test("a look while show_job records a cut that left the job undecided lands nothing until that commits: the cut is told once", async () => {
+	const held = heldRecord();
+	const soma = await core({ clock: fakeClock(), handover: held.handover });
+	await busy(soma, "SPIN");
+	const entry = await soma.entry();
+	failsWindow(soma, new RexTransportError("no response within 10000 ms"));
+	const showing = soma.say("看 card-a");
+	await soma.until(held.reached, "the cut's record");
+	lateWindow(soma, entry);
+
+	await soma.agents.list();
+	await sleep(100);
+
+	expect(await soma.notices()).toEqual([]);
+	expect((await soma.job())?.sessionId).not.toBe(entry.acpSessionId);
+	held.open();
+	await showing;
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: false, cut: {} });
+	await soma.agents.list();
+	await toldOnRexOnce(soma, entry.acpSessionId);
+	expect(counted(await soma.notices(), cutTurn)).toBe(1);
+	expect(await soma.notices()).toHaveLength(2);
+	soma.off();
+});
+
+test("a grace period that ends while show_job records the cut: the look it missed is made once that commits, the cut told once", async () => {
+	const held = heldRecord();
+	const soma = await core({ graceMs: 40, handover: held.handover });
+	await busy(soma, "SPIN");
+	const entry = await soma.entry();
+	failsWindow(soma, new RexTransportError("no response within 10000 ms"));
+	const showing = soma.say("看 card-a");
+	await soma.until(held.reached, "the cut's record");
+	lateWindow(soma, entry);
+
+	await sleep(100);
+
+	expect(await soma.notices()).toEqual([]);
+	held.open();
+	await showing;
+	await toldOnRexOnce(soma, entry.acpSessionId);
+	expect(counted(await soma.notices(), cutTurn)).toBe(1);
+	soma.off();
 });
 
 test("with no one asking, the end of the grace period tells the human where the job is: back on ACP", async () => {

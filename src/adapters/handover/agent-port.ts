@@ -237,10 +237,15 @@ export function createHandoverAgentPort({
 	}
 
 	let looking: Promise<unknown> | undefined;
-	/** One look at a time: a second caller waits for the one under way rather than settling the same job twice. */
+	/**
+	 * One look at a time: a second caller waits for the one under way rather than settling the same job twice. A job whose
+	 * handover's caller has not recorded how it ended is not looked at: settled before that record commits, it would be
+	 * told as it lands or returns, and then told again by the record. The handover's end schedules the look it missed.
+	 */
 	function look(): Promise<unknown> {
-		if (undecided.size === 0) return Promise.resolve();
-		looking ??= Promise.all([...undecided.values()].map(settle)).finally(() => {
+		const due = [...undecided.values()].filter(({ name }) => !moving.has(name));
+		if (due.length === 0) return Promise.resolve();
+		looking ??= Promise.all(due.map(settle)).finally(() => {
 			looking = undefined;
 			lookLater();
 		});
@@ -256,6 +261,8 @@ export function createHandoverAgentPort({
 	function lookLater(): void {
 		clearTimeout(lookTimer);
 		const at = [...undecided.values()].flatMap((job) => {
+			// No look settles it until its handover's end, which calls this again.
+			if (moving.has(job.name)) return [];
 			if (job.why === "grace") return [graceEnds(job)];
 			return job.why === "rex" ? [Math.max(graceEnds(job), now() + relookMs)] : [];
 		});
@@ -397,6 +404,7 @@ export function createHandoverAgentPort({
 			return outcome;
 		} finally {
 			moving.delete(agent);
+			if (undecided.has(agent)) lookLater();
 			await passOn(agent);
 		}
 	}
@@ -450,13 +458,15 @@ export function createHandoverAgentPort({
 			const [all, there] = await Promise.all([from.list(), moved.size === 0 ? [] : to.list()]);
 			// One whose turn is being cut is still in `from`'s answer.
 			const here = all.filter((agent) => !moving.has(agent.name));
-			// A status of a job whose landing is not recorded would read as the end of a turn on it as it was recorded before.
+			// A status of a job whose landing is not recorded would read as the end of a turn on it as it was recorded before:
+			// one landed by a look until the handover bridge has answered, one landed by a handover until its caller has.
 			const onRex = there
 				.filter((agent) => moved.has(agent.name))
 				.map(({ status, seq, ...agent }) => {
 					const held = listeners.size > 0 ? unrecorded.get(agent.name) : undefined;
 					if (held !== undefined) held.listed = seq;
-					return held !== undefined || status === undefined ? agent : { ...agent, status, seq };
+					const withheld = held !== undefined || moving.has(agent.name);
+					return withheld || status === undefined ? agent : { ...agent, status, seq };
 				});
 			const named = new Set([...here, ...onRex].map((agent) => agent.name));
 			return [

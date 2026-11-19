@@ -121,6 +121,8 @@ type Agent = {
 	turnOver?: () => void;
 	/** The last turn ended cancelled by a cut: what it wrote is no reply. */
 	cut: boolean;
+	/** The turn the process's exit cut short, with the prompt it waited on: what a handover's cut then says was cut. */
+	lost?: Cut;
 	exited: boolean;
 	stopped: boolean;
 	/** The tail of what the process wrote to stderr, for the error of an exit. */
@@ -391,6 +393,17 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			stderr: "",
 		};
 		holder.agent = agent;
+		// The connection closes as the process ends, before it withdraws the requests waiting, whichever of its output's
+		// end and its exit comes first: the turn it cuts short is taken here, with the prompt still on it.
+		connection.signal.addEventListener(
+			"abort",
+			() => {
+				if (!agent.turning) return;
+				const prompt = agent.asked[0]?.status.msg;
+				agent.lost = agent.cutting ?? (prompt === undefined ? {} : { prompt });
+			},
+			{ once: true },
+		);
 		child.stderr?.setEncoding("utf8");
 		child.stderr?.on("data", (data: string) => {
 			agent.stderr = (agent.stderr + data).slice(-STDERR_BYTES);
@@ -945,12 +958,14 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		 * Sends session/cancel and answers every permission request waiting `cancelled`, as the protocol has a client do,
 		 * then waits cutMs at most for the prompt's response. One the agent asks once cancelled is answered the same. A turn
 		 * that does not stop stays cancelled, reported `working`: a later cut waits for it again, and when it does stop it is
-		 * idle, and read as saying nothing. A process that exits has stopped its turn.
+		 * idle, and read as saying nothing. A process that exits has stopped its turn: what its exit cut short is the cut,
+		 * with no cancel, and the release that follows takes the agent off this side, so no later cut says it again.
 		 */
 		async cut(agent: string): Promise<Cut | Refused | undefined> {
 			await loading;
 			const target = agents.get(agent);
-			if (target === undefined || !target.turning || target.exited) return undefined;
+			if (target?.exited) return target.lost;
+			if (target === undefined || !target.turning) return undefined;
 			if (target.cutting === undefined) {
 				const prompt = target.asked[0]?.status.msg;
 				target.cutting = prompt === undefined ? {} : { prompt };
@@ -991,7 +1006,8 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		 * Records the handover in progress, so no restart lists the agent until a look at the other side says where it is,
 		 * then closes the session and ends the process, and returns only once the process is gone: the side that takes the
 		 * session must not write its transcript beside it. A dormant agent has none to end. Refuses, with nothing done, what
-		 * `releasable` would refuse now and an agent in a turn: the check and the taking of the agent off this side are one
+		 * `releasable` would refuse now and an agent in a turn, but for one whose process exited, which has stopped whatever
+		 * turn it ran and is released as a dormant one is: the check and the taking of the agent off this side are one
 		 * synchronous step, so no turn can begin between them. A mark that does not reach the file puts the agent back and
 		 * refuses too, since after a restart a prompt would wake it here beside the other side's claude, two writers on one
 		 * transcript.
@@ -1002,7 +1018,8 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			if ("refusal" in held) return held;
 			const running = agents.get(agent);
 			const state = running?.seen?.status.state;
-			if (running?.turning || state === "working" || state === "blocked") {
+			// A process that exited has stopped its turn, whatever it ran, and holds the transcript no more.
+			if (running !== undefined && !running.exited && (running.turning || state === "working" || state === "blocked")) {
 				return { refusal: "not_at_rest", reason: `${agent} is ${state ?? "working"}: only a job at rest is released` };
 			}
 			const before = sessions.get(agent) as Session;
@@ -1023,9 +1040,14 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 					target.stopped = false;
 					agents.set(agent, target);
 				} else dormant.set(agent, asleep ?? { name: agent, session: before });
+				// One whose process exited is dormant now, as after a restart: a prompt no longer finds it exited.
+				const where =
+					target?.exited === true
+						? "stays on ACP, dormant, since its process had exited: its next prompt starts it again in its session"
+						: "stays on ACP";
 				return {
 					refusal: "cannot_resume",
-					reason: `${agent} stays on ACP: its handover could not be recorded in ${file}: ${(error as Error).message}`,
+					reason: `${agent} ${where}: its handover could not be recorded in ${file}: ${(error as Error).message}`,
 				};
 			}
 			if (target === undefined) return held;

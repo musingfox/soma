@@ -1381,6 +1381,128 @@ test("a turn that ends by itself as the cancel goes out: refused, with nothing c
 	soma.off();
 });
 
+/** card-a has finished its brief, and its process then exited in the turn of `prompt`. */
+async function exitedIn(soma: Soma, prompt = "EXIT") {
+	await dispatched(soma);
+	const told = await soma.notices();
+	const turns = await soma.turns();
+	await soma.say(`回覆 card-a ${prompt}`);
+	await soma.until(async () => (await soma.job())?.status.state === "error", "the job error");
+	return { told, turns };
+}
+
+test("a job whose process exited mid-turn is handed over: its window resumes the session, the cut is told once, and nothing of it is recorded", async () => {
+	const soma = await core();
+	const { told, turns } = await exitedIn(soma);
+	const { acpSessionId } = await soma.entry();
+	await soma.say("回覆 card-a go on");
+	expect(soma.results.at(-1)).toEqual(expect.stringContaining("has exited: a prompt would go nowhere"));
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toEqual({
+		handedOver: true,
+		window: "card-a",
+		session: "hangar",
+		sessionId: acpSessionId,
+		ready: true,
+		cut: {},
+	});
+	const [window, ...more] = soma.windowsOpened();
+	expect(more).toEqual([]);
+	expect(JSON.stringify(window?.payload)).toContain(`claude --resume ${acpSessionId} --model 'claude-fake-1'`);
+	const notices = (await soma.notices()).slice(told.length);
+	expect(notices).toEqual([expect.stringContaining("its window is card-a in session hangar")]);
+	expect(notices[0]).toContain(cutTurn);
+	await sleep(50);
+	expect(await soma.turns()).toEqual(turns);
+	expect(await soma.job()).toMatchObject({ sessionId: acpSessionId, status: { state: "idle" } });
+
+	// Asked again, it is refused and no one is told again; a reply goes into the window.
+	await soma.say("看 card-a");
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: false, refusal: "not_acp" });
+	expect((await soma.notices()).slice(told.length)).toEqual(notices);
+	await soma.say("回覆 card-a go on");
+	expect(soma.results.at(-1)).toEqual({ sent: true });
+	expect(soma.typed()).toEqual(["go on"]);
+	soma.off();
+});
+
+test("a job whose process exited on a permission prompt is handed over, the prompt quoted once as cancelled", async () => {
+	const soma = await core();
+	const { told, turns } = await busy(soma, "ASKHANG", "blocked");
+	const [pid] = await soma.pids();
+	process.kill(pid as number, "SIGKILL");
+	await soma.until(async () => (await soma.job())?.status.state === "error", "the job error");
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true, cut: { prompt: expect.stringContaining(prompted) } });
+	const notices = (await soma.notices()).slice(told.length);
+	expect(notices).toEqual([expect.stringContaining("its window is card-a in session hangar")]);
+	expect(notices[0]).toContain(prompted);
+	expect(notices[0]).not.toContain("1. Yes");
+	expect(await soma.turns()).toEqual(turns);
+	soma.off();
+});
+
+test("a job whose process exited mid-turn and a window rex refuses: the turn is over, told once, and not told again", async () => {
+	const soma = await core();
+	const { told, turns } = await exitedIn(soma);
+	failsWindow(soma, new RexRpcError("session.new_window", "refused", "no window for you", 400));
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: false, refusal: "cannot_resume", cut: {} });
+	const notices = (await soma.notices()).slice(told.length);
+	expect(notices).toEqual([expect.stringContaining("no window for you")]);
+	expect(notices[0]).toContain(cutTurn);
+	expect(await soma.job()).toMatchObject({ status: { state: "done", msg: expect.any(String) }, outcome: "未知" });
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: true }]);
+
+	await soma.say("看 card-a");
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: false, refusal: "cannot_resume" });
+	expect(soma.results.at(-1)).not.toHaveProperty("cut");
+	expect(counted(await soma.notices(), cutTurn)).toBe(1);
+	expect((await soma.turns()).slice(turns.length)).toHaveLength(1);
+	soma.off();
+});
+
+test.each([
+	["mid-turn, its transcript holding no conversation", "UNWRITTEN", "has written no conversation yet"],
+	["at rest, with no transcript", "AUTH", "has no transcript"],
+] as const)(
+	"a job whose process exited %s is refused as before, with nothing cut or told",
+	async (_name, prompt, why) => {
+		const soma = await core({ brief: prompt, fake: { FAKE_ACP_MODEL: "fake-alias" } });
+		await soma.say("派 card-a");
+		const state = prompt === "AUTH" ? "blocked" : "working";
+		await soma.until(async () => (await soma.job())?.status.state === state, `the brief ${state}`);
+		if (prompt === "UNWRITTEN") {
+			const { acpSessionId, cwd } = await soma.entry();
+			const written = join(soma.acp.cwd, "..", "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${acpSessionId}.jsonl`);
+			await soma.until(async () => (await readFile(written, "utf8").catch(() => "")) !== "", "claude's first record");
+		}
+		const told = await soma.notices();
+		const [pid] = await soma.pids();
+		process.kill(pid as number, "SIGKILL");
+		await soma.until(async () => (await soma.job())?.status.state === "error", "the job error");
+
+		await soma.say("看 card-a");
+
+		expect(soma.results.at(-1)).toEqual({
+			handedOver: false,
+			refusal: "cannot_resume",
+			reason: expect.stringContaining(why),
+		});
+		expect(soma.windowsOpened()).toEqual([]);
+		expect((await soma.entry()).handingOver).toBeUndefined();
+		expect(await soma.notices()).toEqual(told);
+		expect((await soma.job())?.status.state).toBe("error");
+		soma.off();
+	},
+);
+
 test("a job blocked on a login is refused, with nothing cancelled and the human's question standing", async () => {
 	const soma = await core();
 	await busy(soma, "AUTH", "blocked");
@@ -1642,6 +1764,62 @@ test("a turn cut and a mark that will not write: the turn is over, told once wit
 	expect(await soma.notices()).toEqual(notices);
 	expect((await soma.turns()).slice(turns.length)).toHaveLength(1);
 	await rmdir(`${soma.acp.sessionsFile}.tmp`);
+	soma.off();
+});
+
+test("a job whose process exited mid-turn and a mark that will not write: told once, dormant on ACP, and a reply wakes it", async () => {
+	const soma = await core();
+	const { told, turns } = await exitedIn(soma);
+	const { acpSessionId } = await soma.entry();
+	await mkdir(`${soma.acp.sessionsFile}.tmp`);
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({
+		handedOver: false,
+		refusal: "cannot_resume",
+		reason: expect.stringContaining("dormant, since its process had exited: its next prompt starts it again"),
+		cut: {},
+	});
+	const notices = (await soma.notices()).slice(told.length);
+	expect(notices).toEqual([expect.stringContaining("could not be recorded")]);
+	expect(notices[0]).toContain(cutTurn);
+	expect(notices[0]).toContain("its next prompt starts it again in its session");
+	expect(soma.windowsOpened()).toEqual([]);
+	expect((await soma.turns()).slice(turns.length)).toMatchObject([{ outcome: "未知", notified: true }]);
+	await rmdir(`${soma.acp.sessionsFile}.tmp`);
+
+	await soma.say("回覆 card-a RECALL");
+	expect(soma.results.at(-1)).toEqual({ sent: true });
+	const loaded = join(soma.acp.cwd, "..", "projects", "loaded");
+	expect(await readFile(loaded, "utf8")).toContain(acpSessionId);
+	await soma.until(async () => (await soma.turns()).length === turns.length + 2, "the reply's turn");
+
+	// Handed over from there, nothing more was cut, and the exit's cut stays told once.
+	await soma.say("看 card-a");
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true });
+	expect(soma.results.at(-1)).not.toHaveProperty("cut");
+	expect(counted(await soma.notices(), cutTurn)).toBe(1);
+	soma.off();
+});
+
+test("a cut that does not stop, then an exit: the next show_job quotes the cancelled prompt, once", async () => {
+	const soma = await core({ cutMs: 50 });
+	const { told, turns } = await busy(soma, "ASKHANG", "blocked");
+	await soma.say("看 card-a");
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: false, refusal: "not_at_rest" });
+	await soma.until(async () => (await soma.job())?.status.state === "working", "the job no longer blocked");
+	const [pid] = await soma.pids();
+	process.kill(pid as number, "SIGKILL");
+	await soma.until(async () => (await soma.job())?.status.state === "error", "the job error");
+
+	await soma.say("看 card-a");
+
+	expect(soma.results.at(-1)).toMatchObject({ handedOver: true, cut: { prompt: expect.stringContaining(prompted) } });
+	const notices = (await soma.notices()).slice(told.length);
+	expect(notices).toEqual([expect.stringContaining("its window is card-a in session hangar")]);
+	expect(notices[0]).toContain(prompted);
+	expect(await soma.turns()).toEqual(turns);
 	soma.off();
 });
 

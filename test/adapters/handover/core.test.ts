@@ -8,7 +8,7 @@ import type { Conversation, Harness, TaskId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
 import type { AcpAgentPort } from "../../../src/adapters/acp/agent-port.ts";
 import { HANDOVER_GRACE_MS } from "../../../src/adapters/handover/agent-port.ts";
-import { type createRexAgentPort, seqOf } from "../../../src/adapters/rex/agent-port.ts";
+import { type createRexAgentPort, LEFT_SESSION, seqOf } from "../../../src/adapters/rex/agent-port.ts";
 import { RexRpcError, RexTransportError } from "../../../src/adapters/rex/client.ts";
 import { Deferrals, deferExtension } from "../../../src/core/extensions/defer/index.ts";
 import {
@@ -49,6 +49,8 @@ async function core(
 		settledOn?: (root: Conversation) => Conversation;
 		/** The handover `show_job` is given, over the port's own. */
 		handover?: (agents: AgentHandover) => AgentHandover;
+		/** Takes what the event bridge fails with, as main.ts logs it, instead of failing the test. */
+		bridgeErrors?: unknown[];
 	} = {},
 ) {
 	const both = await sides(options);
@@ -117,7 +119,8 @@ async function core(
 	await reconcileDispatches(root, both.agents, context, await both.agents.dormant());
 	reconciled();
 	const bridge = eventBridge(root, both.agents, context);
-	const offEvents = bridge.listen(quietOnceClosed);
+	const { bridgeErrors } = options;
+	const offEvents = bridge.listen(bridgeErrors ? (error) => bridgeErrors.push(error) : quietOnceClosed);
 	const off = () => {
 		offEvents();
 		offSettled();
@@ -318,6 +321,190 @@ test("a job that deferred after the handover is stopped and resumed the rex way,
 	expect(await soma.pids()).toEqual(pids);
 	expect(await readFile(join(soma.acp.cwd, "..", "projects", "loaded"), "utf8").catch(() => "")).toBe("");
 	expect(await soma.notices()).toHaveLength(1);
+	soma.off();
+});
+
+const CLEARED = "7b1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+
+test("a /clear in a moved job's window ends it error, with no notice and no turn, and its deferral types, closes and opens nothing", async () => {
+	const soma = await core();
+	await dispatched(soma);
+	await soma.say("看 card-a");
+	const entry = await soma.entry();
+	const notices = await soma.notices();
+	const turns = await soma.turns();
+
+	await soma.cleared(CLEARED);
+	// A turn after the /clear, its reply in the new session's transcript, and one more in the job's own for good measure.
+	await turn(soma, "結果：完成\nafter the clear");
+	soma.wrote({ ...entry, acpSessionId: CLEARED }, "結果：需要你\nafter the clear");
+	await soma.until(async () => (await soma.job())?.status.state === "error", "the job to end");
+	await sleep(200);
+
+	expect((await soma.job())?.status).toEqual({ state: "error", msg: LEFT_SESSION });
+	expect(await soma.turns()).toEqual(turns);
+	expect(await soma.notices()).toEqual(notices);
+
+	const id = await soma.defer("PT1S", "the instruction");
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "failed" });
+	expect(soma.typed()).toEqual([]);
+	expect(soma.hangar.methods()).not.toContain("block.close");
+	expect(soma.windowsOpened()).toHaveLength(1);
+	expect(soma.blocks).toHaveLength(1);
+	expect((await soma.job())?.status).toEqual({ state: "error", msg: LEFT_SESSION });
+	expect(await soma.turns()).toEqual(turns);
+	soma.off();
+});
+
+test("a restart with a moved job's window /clear-ed since reports it error again, telling nothing and starting nothing", async () => {
+	const first = await core();
+	await dispatched(first);
+	await first.say("看 card-a");
+	await first.until(async () => (await first.job())?.status.state === "idle", "the window's idle");
+	const notices = await first.notices();
+	const turns = await first.turns();
+
+	// Cleared while soma was down: the window reports nothing new, its record the one the job holds.
+	await first.cleared(CLEARED);
+	const soma = await again(first);
+	await sleep(200);
+
+	expect((await soma.job())?.status).toEqual({ state: "error", msg: LEFT_SESSION });
+	expect(await soma.agents.list()).toMatchObject([{ name: "card-a", status: { state: "error", msg: LEFT_SESSION } }]);
+	expect(await soma.notices()).toEqual(notices);
+	expect(await soma.turns()).toEqual(turns);
+	// This soma's rex has seen no call but its own.
+	expect(soma.typed()).toEqual([]);
+	expect(soma.hangar.methods()).not.toContain("block.close");
+	expect(soma.windowsOpened()).toEqual([]);
+	expect(soma.blocks).toHaveLength(1);
+	soma.off();
+});
+
+test("the idle a /clear reports before claude rewrites its pid file records no turn, and the job ends error after it", async () => {
+	// Measured on claude 2.1.329: /clear reports an idle, and its pid file names the new session some 30 ms later, by the
+	// time the core reads what that idle ended on.
+	let clearing = false;
+	let soma: Soma | undefined;
+	const logged: unknown[] = [];
+	soma = await core({
+		bridgeErrors: logged,
+		to: (port) => ({
+			...port,
+			readResult: async (agent: string) => {
+				if (clearing) await soma?.cleared(CLEARED);
+				return port.readResult(agent);
+			},
+		}),
+	});
+	await dispatched(soma);
+	await soma.say("看 card-a");
+	await soma.until(async () => (await soma?.job())?.status.state === "idle", "the window's idle");
+	const notices = await soma.notices();
+	const turns = await soma.turns();
+
+	clearing = true;
+	reports(soma, "idle");
+	await soma.until(async () => (await soma?.job())?.status.state === "error", "the job to end");
+
+	expect((await soma.job())?.status).toEqual({ state: "error", msg: LEFT_SESSION });
+	expect(await soma.turns()).toEqual(turns);
+	expect(await soma.notices()).toEqual(notices);
+	// The idle's read is what dropped it, which the soma logs once.
+	expect(logged).toEqual([new Error(`rex agent card-a: ${LEFT_SESSION}`)]);
+	soma.off();
+});
+
+/** A soma whose window's next idle is a /clear's, whose pid file claude rewrites once the core's read of that idle returned. */
+async function clearedAfterRead(options: Parameters<typeof core>[0] = {}) {
+	let clearing = false;
+	let soma: Soma | undefined;
+	soma = await core({
+		...options,
+		to: (port) => ({
+			...port,
+			readResult: async (agent: string) => {
+				const read = await port.readResult(agent);
+				if (clearing) await soma?.cleared(CLEARED);
+				return read;
+			},
+		}),
+	});
+	await dispatched(soma);
+	await soma.say("看 card-a");
+	await soma.until(async () => (await soma?.job())?.status.state === "idle", "the window's idle");
+	const clear = () => {
+		clearing = true;
+		return reports(soma, "idle");
+	};
+	return { soma, clear };
+}
+
+test("the idle a /clear reports, read before claude rewrites its pid file, is followed within a second by the job's error", async () => {
+	const logged: unknown[] = [];
+	const { soma, clear } = await clearedAfterRead({ bridgeErrors: logged });
+	const notices = await soma.notices();
+	const turns = await soma.turns();
+
+	const idle = clear();
+	await reached(soma, idle);
+	await soma.until(async () => (await soma.job())?.status.state === "error", "the job to end");
+
+	expect(await soma.job()).toMatchObject({ status: { state: "error", msg: LEFT_SESSION }, seq: idle + 0.5 });
+	expect(await soma.agents.list()).toMatchObject([{ name: "card-a", status: { state: "error", msg: LEFT_SESSION } }]);
+	expect(await soma.turns()).toEqual(turns);
+	expect(await soma.notices()).toEqual(notices);
+	expect(logged).toEqual([]);
+	soma.off();
+});
+
+test("while the core still holds a /clear-ed job idle, its deferral's reclaim closes nothing, and its prompt types nothing", async () => {
+	// The look at the pid file after the idle comes too late for this test, so the core holds the idle throughout.
+	const { soma, clear } = await clearedAfterRead({ clearMs: 60_000 });
+	const turns = await soma.turns();
+	const idle = clear();
+	await reached(soma, idle);
+	expect(await soma.agents.list()).toMatchObject([{ name: "card-a", status: { state: "error", msg: LEFT_SESSION } }]);
+
+	const id = await soma.defer("PT1S", "the instruction");
+	expect(await soma.outcome(id)).toEqual({ status: "completed", result: "failed" });
+
+	expect(await soma.job()).toMatchObject({ status: { state: "idle" }, seq: idle });
+	expect(soma.typed()).toEqual([]);
+	expect(soma.hangar.methods()).not.toContain("block.close");
+	expect(soma.windowsOpened()).toHaveLength(1);
+	expect(soma.blocks).toHaveLength(1);
+	expect(await soma.turns()).toEqual(turns);
+	soma.off();
+});
+
+test("a restart after a re-check went out above the window's record, /clear-ed with no record since, tells nothing", async () => {
+	const first = await core();
+	await dispatched(first);
+	await first.say("看 card-a");
+	await first.until(async () => (await first.job())?.status.state === "idle", "the window's idle");
+	const window = first.blocks.at(-1) as Block;
+	for (const state of ["working", "done", "idle"]) {
+		const record = stamped(state);
+		window.records = [record];
+		first.hangar.emit(first.hangar.status(window.block, record));
+		await sleep(5);
+	}
+	const idle = seqOf(window.records?.[0] as never) as number;
+	// Written past replyMs, so the read is cut short and the re-check reports the idle once more, above its record.
+	await sleep(180);
+	first.wrote(await first.entry(), "結果：完成\nlate reply");
+	await first.until(async () => (await first.job())?.seq === idle + 1, "the re-check");
+	const notices = await first.notices();
+	const turns = await first.turns();
+
+	await first.cleared(CLEARED);
+	const soma = await again(first);
+	await sleep(200);
+
+	expect(await soma.job()).toMatchObject({ status: { state: "error", msg: LEFT_SESSION }, seq: idle + 0.5 });
+	expect(await soma.notices()).toEqual(notices);
+	expect(await soma.turns()).toEqual(turns);
 	soma.off();
 });
 

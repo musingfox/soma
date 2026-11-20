@@ -5,7 +5,13 @@ import { join } from "node:path";
 import type { Tx } from "@earendil-works/pi-durable";
 import { afterAll, describe, expect, test } from "vitest";
 import type { ZodType } from "zod";
-import { createRexAgentPort, launchCommand, seqOf, stateOf } from "../../../src/adapters/rex/agent-port.ts";
+import {
+	createRexAgentPort,
+	LEFT_SESSION,
+	launchCommand,
+	seqOf,
+	stateOf,
+} from "../../../src/adapters/rex/agent-port.ts";
 import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
 import type { Job } from "../../../src/core/domain/dispatch.ts";
 import { type JobLedger, startJobIn } from "../../../src/core/extensions/dispatch/index.ts";
@@ -453,7 +459,9 @@ test("onStatus reports root records off the event stream, one per observation", 
 	fake.emit(fake.status("block:a", { state: "working", updated_at: AT }, "agent-1"));
 	fake.emit(fake.status("block:s", { state: "idle", updated_at: AT }));
 	fake.emit(fake.status("block:a", { state: "done", updated_at: "2026-10-27T01:02:04Z" }));
-	await settle();
+	// Each report reads claude's pid file first, which takes more than a tick.
+	await until(() => seen.length >= 2);
+	await sleep(20);
 
 	expect(seen).toEqual([
 		{ agent: "card-a", status: { state: "working" }, seq: AT_US },
@@ -480,7 +488,8 @@ test("onStatus re-reads each block's program_status once after a reconnect", asy
 
 	block.records = [{ state: "done", updated_at: AT }];
 	fake.reconnect();
-	await settle();
+	await until(() => seen.length >= 1);
+	await sleep(20);
 
 	expect(reads()).toBe(before + 1);
 	expect(seen).toEqual([{ agent: "card-a", status: { state: "done" }, seq: AT_US }]);
@@ -510,8 +519,8 @@ test("onStatus drops a report older than one a resync already emitted", async ()
 	await settle();
 	fake.emit(fake.status("block:a", { state: "working", updated_at: "2026-10-27T01:02:04Z" }));
 	release();
-	await settle();
-	await settle();
+	await until(() => seen.length >= 1);
+	await sleep(20);
 
 	expect(seen).toEqual([
 		{ agent: "card-a", status: { state: "idle" }, seq: Date.parse("2026-10-27T01:02:05Z") * 1000 },
@@ -833,6 +842,241 @@ test("readResult of a closed window reads the transcript its session left, and i
 	// As after a restart: this process never saw the window.
 	const fresh = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
 	expect(await fresh.readResult("card-k")).toBeUndefined();
+});
+
+describe("a job's window whose claude left the job's session, as a /clear does", () => {
+	const sessionsDir = mkdtempSync(join(tmpdir(), "soma-rex-sessions-"));
+	afterAll(() => rmSync(sessionsDir, { recursive: true, force: true }));
+	const OTHER = "7b1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+	let pid = 400;
+
+	/**
+	 * card-z idle at AT in the hangar, its transcript and the one of the session its claude went on to both written, and
+	 * its claude's pid file holding what `file` makes of the pid, or none when undefined.
+	 */
+	function cleared(file: ((pid: number) => string) | undefined, argv0 = "claude") {
+		const { cwd, path } = transcript([user("go"), reply("msg_1", "結果：完成")]);
+		writeFileSync(join(path, "..", `${OTHER}.jsonl`), line(user("again")) + line(reply("msg_2", "after the clear")));
+		const at = ++pid;
+		if (file !== undefined) writeFileSync(join(sessionsDir, `${at}.json`), file(at));
+		const block: Block = {
+			name: "card-z",
+			block: "block:z",
+			label: SESSION,
+			argv0,
+			cwd,
+			pid: at,
+			records: [{ state: "idle", updated_at: AT }],
+		};
+		const fake = rex([block]);
+		const port = createRexAgentPort({
+			processStart: unstarted,
+			client: fake.client,
+			sessionId: HANGAR,
+			projectsDir: projects,
+			sessionsDir,
+			confirmMs: 10,
+			replyMs: 50,
+			recheckMs: 50,
+		});
+		return { fake, port, block };
+	}
+	// As claude writes it, for the pid it is asked about unless `of` names another.
+	const left =
+		(sessionId: string, of?: number) =>
+		(pid: number): string =>
+			JSON.stringify({ pid: of ?? pid, sessionId, cwd: "/x", status: "idle" });
+	const LEFT = { state: "error", msg: LEFT_SESSION };
+	const typed = (fake: ReturnType<typeof rex>) =>
+		fake.methods().filter((method) => method === "block.event" || method.endsWith(".write"));
+
+	test("is listed and reported error, its result read from neither transcript, and a prompt types nothing", async () => {
+		const { fake, port, block } = cleared(left(OTHER));
+
+		expect(await port.list()).toEqual([{ name: "card-z", status: LEFT, seq: AT_US + 0.5, sessionId: SESSION }]);
+
+		const seen: AgentStatusEvent[] = [];
+		const off = port.onStatus((event) => seen.push(event));
+		await until(() => seen.length === 1);
+		const later = { state: "done", updated_at: "2026-10-27T01:02:04Z" };
+		block.records = [later];
+		fake.emit(fake.status("block:z", later));
+		await until(() => seen.length === 2);
+		expect(seen).toEqual([
+			{ agent: "card-z", status: LEFT, seq: AT_US + 0.5 },
+			{ agent: "card-z", status: LEFT, seq: (seqOf(later as never) as number) + 0.5 },
+		]);
+
+		await expect(port.readResult("card-z")).rejects.toThrow(LEFT_SESSION);
+		const prompted = port.prompt("card-z", "the deferred instruction");
+		await expect(prompted).rejects.toBeInstanceOf(PromptRefused);
+		await expect(prompted).rejects.toThrow(LEFT_SESSION);
+		expect(typed(fake)).toEqual([]);
+		expect(fake.methods()).not.toContain("block.close");
+		off();
+	});
+
+	test("a re-check due from before the /clear reports the error, not the record's end", async () => {
+		const { fake, port, block } = cleared(undefined);
+		const seen: AgentStatusEvent[] = [];
+		const off = port.onStatus((event) => seen.push(event));
+		await until(() => seen.length === 1);
+		const working = { state: "working", updated_at: new Date(Date.now() - 1_000).toISOString() };
+		fake.emit(fake.status("block:z", working));
+		// Ended after the transcript was last written, so the read waits out replyMs and asks for a re-check.
+		const done = { state: "done", updated_at: new Date(Date.now() + 60_000).toISOString() };
+		block.records = [done];
+		fake.emit(fake.status("block:z", done));
+		await until(() => seen.length === 3);
+		expect(await port.readResult("card-z")).toEqual({ id: "a-msg_1", text: "結果：完成" });
+
+		writeFileSync(join(sessionsDir, `${block.pid}.json`), left(OTHER)(block.pid as number));
+		await until(() => seen.length === 4);
+		expect(seen.at(-1)).toEqual({ agent: "card-z", status: LEFT, seq: (seqOf(done as never) as number) + 0.5 });
+		off();
+	});
+
+	test.each([
+		["a reconnect", "reconnect"],
+		["the same record sent again", "resent"],
+	] as const)(
+		"a /clear after a re-check went out above the record, with no record since, is reported above the re-check at %s",
+		async (_case, how) => {
+			const { fake, port, block } = cleared(undefined);
+			const seen: AgentStatusEvent[] = [];
+			const off = port.onStatus((event) => seen.push(event));
+			await until(() => seen.length === 1);
+			fake.emit(fake.status("block:z", { state: "working", updated_at: new Date(Date.now() - 1_000).toISOString() }));
+			const done = { state: "done", updated_at: new Date(Date.now() + 60_000).toISOString() };
+			block.records = [done];
+			fake.emit(fake.status("block:z", done));
+			await until(() => seen.length === 3);
+			expect(await port.readResult("card-z")).toEqual({ id: "a-msg_1", text: "結果：完成" });
+			const at = seqOf(done as never) as number;
+			await until(() => seen.length === 4);
+			expect(seen.at(-1)).toEqual({ agent: "card-z", status: { state: "done" }, seq: at + 1 });
+
+			writeFileSync(join(sessionsDir, `${block.pid}.json`), left(OTHER)(block.pid as number));
+			if (how === "reconnect") fake.reconnect();
+			if (how === "resent") fake.emit(fake.status("block:z", done));
+			await until(() => seen.length === 5);
+			expect(seen.at(-1)).toEqual({ agent: "card-z", status: LEFT, seq: at + 1.5 });
+			// Read afresh, as after a restart, it is the half above the record: no whole seq a re-check went out under.
+			expect(await port.list()).toEqual([{ name: "card-z", status: LEFT, seq: at + 0.5, sessionId: SESSION }]);
+			off();
+		},
+	);
+
+	test("an idle reported before claude rewrites its pid file, as a /clear's is, is followed within a second by the error", async () => {
+		const { fake, port, block } = cleared(undefined);
+		const seen: AgentStatusEvent[] = [];
+		const off = port.onStatus((event) => seen.push(event));
+		await until(() => seen.length === 1);
+		// Measured on claude 2.1.329: the /clear's record goes from done to idle, and the pid file names the new session
+		// some 30 ms after it arrives, by when the core may have read what that idle ended on off the job's transcript.
+		const idle = { state: "idle", updated_at: "2026-10-27T01:02:04Z" };
+		block.records = [idle];
+		fake.emit(fake.status("block:z", idle));
+		await until(() => seen.length === 2);
+		const at = seqOf(idle as never) as number;
+		expect(seen.at(-1)).toEqual({ agent: "card-z", status: { state: "idle" }, seq: at });
+		expect(await port.readResult("card-z")).toEqual({ id: "a-msg_1", text: "結果：完成" });
+
+		writeFileSync(join(sessionsDir, `${block.pid}.json`), left(OTHER)(block.pid as number));
+		const switched = Date.now();
+		await until(() => seen.length === 3);
+		expect(Date.now() - switched).toBeLessThan(1_000);
+		expect(seen.at(-1)).toEqual({ agent: "card-z", status: LEFT, seq: at + 0.5 });
+		off();
+	});
+
+	test("a window never /clear-ed has its pid file looked at once after an idle, and nothing more is reported", async () => {
+		const { fake, port, block } = cleared(undefined);
+		const seen: AgentStatusEvent[] = [];
+		const off = port.onStatus((event) => seen.push(event));
+		await until(() => seen.length === 1);
+		const processes = () => fake.methods().filter((method) => method.endsWith(".terminal.process")).length;
+		const idle = { state: "idle", updated_at: "2026-10-27T01:02:04Z" };
+		block.records = [idle];
+		fake.emit(fake.status("block:z", idle));
+		await until(() => seen.length === 2);
+		const before = processes();
+		await sleep(1_200);
+
+		expect(processes() - before).toBe(1);
+		expect(seen).toHaveLength(2);
+		off();
+	});
+
+	test.each([
+		["a reconnect", "reconnect"],
+		["the same record sent again", "resent"],
+	] as const)("the error is reported once: %s after it reports nothing more", async (_case, how) => {
+		const { fake, port, block } = cleared(left(OTHER));
+		const seen: AgentStatusEvent[] = [];
+		const off = port.onStatus((event) => seen.push(event));
+		await until(() => seen.length === 1);
+		expect(seen[0]).toEqual({ agent: "card-z", status: LEFT, seq: AT_US + 0.5 });
+		const reads = () => fake.methods().filter((method) => method.endsWith(".terminal.process")).length;
+		const before = reads();
+
+		if (how === "reconnect") fake.reconnect();
+		if (how === "resent") fake.emit(fake.status("block:z", block.records?.[0] as never));
+		await until(() => reads() > before);
+		await sleep(20);
+		expect(seen).toHaveLength(1);
+		off();
+	});
+
+	test("a claude seen to have left stays left while it runs, though its pid file is read torn later", async () => {
+		const { fake, port, block } = cleared(left(OTHER));
+		const seen: AgentStatusEvent[] = [];
+		const off = port.onStatus((event) => seen.push(event));
+		await until(() => seen.length === 1);
+		expect(seen[0]?.status).toEqual(LEFT);
+
+		// claude rewrites the file as its status changes; this read catches it half written.
+		writeFileSync(join(sessionsDir, `${block.pid}.json`), '{"pid": ');
+		const done = { state: "done", updated_at: "2026-10-27T01:02:04Z" };
+		block.records = [done];
+		fake.emit(fake.status("block:z", done));
+		await until(() => seen.length === 2);
+		await sleep(20);
+		expect(seen.at(-1)).toEqual({ agent: "card-z", status: LEFT, seq: (seqOf(done as never) as number) + 0.5 });
+		await expect(port.readResult("card-z")).rejects.toThrow(LEFT_SESSION);
+		await expect(port.prompt("card-z", "go")).rejects.toBeInstanceOf(PromptRefused);
+		expect(typed(fake)).toEqual([]);
+
+		// Another claude in the block is read afresh.
+		block.pid = (block.pid as number) + 1000;
+		expect(await port.list()).toEqual([
+			{ name: "card-z", status: { state: "done" }, seq: seqOf(done as never), sessionId: SESSION },
+		]);
+		off();
+	});
+
+	test.each([
+		["no pid file", undefined, "claude"],
+		["a pid file that is not JSON", () => "{ not json", "claude"],
+		["a pid file of another pid", left(OTHER, 1), "claude"],
+		["a pid file whose session is no session id", left("not-a-session"), "claude"],
+		["a pid file naming the job's own session", left(SESSION), "claude"],
+		["a pid file naming the job's own session in capitals", left(SESSION.toUpperCase()), "claude"],
+		["a foreground that is not claude", left(OTHER), "-fish"],
+	])("%s leaves the job read as before", async (_case, file, argv0) => {
+		const { fake, port } = cleared(file, argv0);
+		const claude = argv0 === "claude";
+
+		expect(await port.list()).toEqual([
+			claude
+				? { name: "card-z", status: { state: "idle" }, seq: AT_US, sessionId: SESSION }
+				: { name: "card-z", sessionId: SESSION },
+		]);
+		expect(await port.readResult("card-z")).toEqual({ id: "a-msg_1", text: "結果：完成" });
+		if (!claude) return;
+		await port.prompt("card-z", "go");
+		expect(typed(fake)).not.toEqual([]);
+	});
 });
 
 /**

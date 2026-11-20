@@ -94,6 +94,8 @@ export interface RexAgentPortOptions {
 	readonly replyMs?: number;
 	/** How long after a read that replyMs cut short the block's end is reported again, so the core reads it once more. */
 	readonly recheckMs?: number;
+	/** How long after a job's block reported an idle its claude's pid file is read again, for a `/clear` that idle was. */
+	readonly clearMs?: number;
 	/** How long after the watch failed to read a block, for a reason other than a lost hangar, it reads the block again. */
 	readonly retryMs?: number;
 	/** Pause between reads of a blocked screen that did not parse yet; claude may still be drawing it. */
@@ -138,6 +140,10 @@ const SOMA_SESSION_PREFIX = "soma-";
 
 /** The label of a hangar soma makes when the config sets none: prod's, under SOMA_SESSION_PREFIX. */
 export const HANGAR_LABEL = "soma-hangar";
+
+/** The msg of the error a job's window is reported in once its claude left the job's session (`leftSession`). */
+export const LEFT_SESSION =
+	"the claude in this job's window left the job's session, as a /clear does, so soma no longer follows that window";
 
 /** The hangar does not exist and rex made none in its place; the port logs it once for each hangar lost. */
 export class HangarUnmade extends Error {}
@@ -272,6 +278,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	const now = options.now ?? Date.now;
 	const replyMs = options.replyMs ?? 2_000;
 	const recheckMs = options.recheckMs ?? 10_000;
+	const clearMs = options.clearMs ?? 500;
 	const retryMs = options.retryMs ?? 5_000;
 	const redrawMs = options.redrawMs ?? 500;
 	const takeMs = options.takeMs ?? 30_000;
@@ -444,6 +451,34 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		if (pane === undefined) throw new Error(`rex hangar ${sessionId} has no window named ${agent}`);
 		return pane;
 	}
+
+	// By block, the pid of the claude seen to have left its job's session: it stays left while it runs, so a read of its
+	// pid file caught as claude rewrites it lets nothing of the window through.
+	const departed = new Map<string, number>();
+
+	/**
+	 * Whether the claude of `pid`, in job block `blockId` labelled with the job's session, names another session in its
+	 * pid file, as `/clear` makes it do (ARCHITECTURE.md "Session identity"), now or at an earlier read. A file that cannot
+	 * be read or does not check out says nothing.
+	 */
+	async function leftSession(blockId: string, pid: number, label: string): Promise<boolean> {
+		if (departed.get(blockId) === pid) return true;
+		const session = await readProcessSession(pid, options.sessionsDir);
+		if (session === undefined || session.sessionId.toLowerCase() === label.toLowerCase()) return false;
+		departed.set(blockId, pid);
+		return true;
+	}
+
+	/**
+	 * The error a job whose claude left its session is reported in, read with a record of `seq`, above `last`, the seq
+	 * the watch last reported for the block. Its seq is a half: every other observation's is whole (a record's, a
+	 * re-check's, a trust dialog's), so the error is never taken for one of them, by the watch or by a core that holds
+	 * one, after a restart too. It is the half above both, so the watch reports it, and drops only the same error again.
+	 */
+	const left = (seq: number, last = seq): Seen => ({
+		status: { state: "error", msg: LEFT_SESSION },
+		seq: Math.floor(Math.max(seq, last)) + 0.5,
+	});
 
 	async function isClaude(blockId: string): Promise<boolean> {
 		const { foreground } = await blockCall("process", blockId, ProcessResultSchema);
@@ -714,9 +749,10 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	/**
 	 * What the block shows while claude is in the foreground: the root record's status (subagents leave child records
 	 * with an id), or, while claude has reported none, its folder-trust dialog. `recorded` says a root record is there,
-	 * which ends the dialog check for the block: a dialog claude reports a record for is told by `statusOf`.
+	 * which ends the dialog check for the block: a dialog claude reports a record for is told by `statusOf`. A job's
+	 * block, by its `label`, whose claude left the job's session shows the error `left` gives above `last`.
 	 */
-	async function observe(blockId: string): Promise<{ seen?: Seen; recorded: boolean }> {
+	async function observe(blockId: string, label?: string, last?: number): Promise<{ seen?: Seen; recorded: boolean }> {
 		const [{ records }, { foreground }] = await Promise.all([
 			blockCall("program_status", blockId, ProgramStatusResultSchema),
 			blockCall("process", blockId, ProcessResultSchema),
@@ -730,7 +766,9 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 				? await trustDialog(blockId, foreground.pid, foreground.cwd)
 				: seq === undefined
 					? undefined
-					: { status: await statusOf(blockId, root, foreground.cwd), seq };
+					: label !== undefined && (await leftSession(blockId, foreground.pid, label))
+						? left(seq, last)
+						: { status: await statusOf(blockId, root, foreground.cwd), seq };
 		return seen === undefined ? { recorded } : { seen, recorded };
 	}
 
@@ -1205,6 +1243,8 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		// The hangar's other blocks in a window as `names` was read, a block split off a job's included, whose reports the
 		// watch drops without reading again.
 		let others = new Set<string>();
+		// The session id each job's block of `names` is labelled with.
+		let labels = new Map<string, string>();
 		let namesOf: string | undefined;
 		/** The names as last read, while they are the hangar's: a hangar made in place of theirs holds none of them. */
 		const cached = () => (namesOf === sessionId ? names : undefined);
@@ -1224,10 +1264,15 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		async function refresh(): Promise<Map<string, string | null>> {
 			const windows = await hangarWindows();
 			const fresh = new Map<string, string | null>();
+			const labelled = new Map<string, string>();
 			for (const [name, list] of jobsOf(panesOf(windows))) {
-				for (const pane of list) fresh.set(pane.blockId, list.length === 1 ? name : null);
+				for (const pane of list) {
+					fresh.set(pane.blockId, list.length === 1 ? name : null);
+					labelled.set(pane.blockId, pane.label);
+				}
 			}
 			names = fresh;
+			labels = labelled;
 			others = new Set(
 				windows.flatMap(blocksOf).flatMap(({ block_id: id }) => (id == null || fresh.has(id) ? [] : id)),
 			);
@@ -1276,7 +1321,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 
 		/** Reports what the block shows; a trust dialog seen again goes under a new seq, above the last one emitted. */
 		async function look(blockId: string, name: string | null): Promise<void> {
-			const { seen, recorded: has } = await observe(blockId);
+			const { seen, recorded: has } = await observe(blockId, labels.get(blockId), lastSeq.get(blockId));
 			if (has) recorded.add(blockId);
 			if (seen === undefined) return;
 			if (has) return report(blockId, name, seen.status, seen.seq);
@@ -1380,15 +1425,22 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			const known = fresh ? await refresh() : await namesWith(blockId);
 			const read =
 				last !== undefined && known.has(blockId)
-					? await Promise.all([blockCall("program_status", blockId, ProgramStatusResultSchema), isClaude(blockId)])
+					? await Promise.all([
+							blockCall("program_status", blockId, ProgramStatusResultSchema),
+							blockCall("process", blockId, ProcessResultSchema),
+						])
 					: undefined;
 			if (quiet.get(blockId) === token) quiet.delete(blockId);
 			if (last === undefined || read === undefined) return;
-			const [{ records }, claude] = read;
+			const [{ records }, { foreground }] = read;
 			const root = records.find(isRoot);
 			const status = root && stateOf(root);
-			if (!claude || status === undefined || status.state === "working" || status.state === "blocked") return;
-			report(blockId, known.get(blockId), status, last + 1);
+			if (foreground?.argv0 !== "claude" || status === undefined) return;
+			if (status.state === "working" || status.state === "blocked") return;
+			const label = labels.get(blockId);
+			const gone = label !== undefined && (await leftSession(blockId, foreground.pid, label));
+			const { status: shown, seq } = gone ? left(last) : { status, seq: last + 1 };
+			report(blockId, known.get(blockId), shown, seq);
 		}
 		recheck = (blockId) => {
 			clearTimeout(rechecks.get(blockId));
@@ -1400,6 +1452,38 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			}, recheckMs);
 			timer.unref();
 			rechecks.set(blockId, timer);
+		};
+
+		// By block, the timer of the look at its claude's pid file pending since the block reported an idle.
+		const clears = new Map<string, NodeJS.Timeout>();
+		/**
+		 * Reports the job's error, above the last seq emitted for the block, when its claude left the job's session since
+		 * the block's idle: claude reports the idle of a `/clear` before it rewrites its pid file, and the core's read of
+		 * that idle may have read the job's own transcript and asked for no re-check. Reports nothing otherwise, so a
+		 * window never `/clear`-ed costs one process read and one pid file read per idle.
+		 */
+		async function cleared(blockId: string): Promise<void> {
+			if (closed) return;
+			const known = await namesWith(blockId);
+			const label = labels.get(blockId);
+			const last = lastSeq.get(blockId);
+			if (!known.has(blockId) || label === undefined || last === undefined) return;
+			const { foreground } = await blockCall("process", blockId, ProcessResultSchema);
+			if (foreground?.argv0 !== "claude" || !(await leftSession(blockId, foreground.pid, label))) return;
+			const { status, seq } = left(last);
+			report(blockId, known.get(blockId), status, seq);
+		}
+		// The look, tried again while its reads fail.
+		const clearing = (blockId: string): Streak => ({ key: `cleared ${blockId}`, work: () => cleared(blockId) });
+		/** Looks at the block's pid file once clearMs after its idle; a newer idle puts the look off. */
+		const lookAfterIdle = (blockId: string) => {
+			clearTimeout(clears.get(blockId));
+			const timer = setTimeout(() => {
+				clears.delete(blockId);
+				enqueue(() => cleared(blockId), clearing(blockId));
+			}, clearMs);
+			timer.unref();
+			clears.set(blockId, timer);
 		};
 
 		// claude before 2.1.328 draws the trust dialog without reporting anything, so a block without a record is looked at
@@ -1440,7 +1524,13 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 				if (!known.has(blockId)) return;
 				const { foreground } = await blockCall("process", blockId, ProcessResultSchema);
 				if (foreground?.argv0 !== "claude") return;
-				report(blockId, known.get(blockId), await statusOf(blockId, record, foreground.cwd), seq);
+				const label = labels.get(blockId);
+				const { status, seq: seen } =
+					label !== undefined && (await leftSession(blockId, foreground.pid, label))
+						? left(seq, lastSeq.get(blockId))
+						: { status: await statusOf(blockId, record, foreground.cwd), seq };
+				report(blockId, known.get(blockId), status, seen);
+				if (label !== undefined && status.state === "idle") lookAfterIdle(blockId);
 			}, reading(blockId));
 		});
 		const offConnected = client.onConnected(resync);
@@ -1449,6 +1539,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		return () => {
 			closed = true;
 			for (const timer of rechecks.values()) clearTimeout(timer);
+			for (const timer of clears.values()) clearTimeout(timer);
 			for (const timer of failing.values()) clearTimeout(timer);
 			recheck = undefined;
 			clearInterval(trustCheck);
@@ -1585,17 +1676,22 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			return Promise.all(
 				[...byName.values()].map(async ([pane]) => {
 					const { name, blockId, label } = pane as JobPane;
-					const { seen } = await observe(blockId);
+					const { seen } = await observe(blockId, label);
 					return { name, ...(seen === undefined ? {} : seen), sessionId: label };
 				}),
 			);
 		},
 
+		/** Refuses, typing nothing, a job whose claude left its session: what is typed there no longer goes to the job. */
 		async prompt(agent: string, text: string): Promise<void> {
-			return promptOn(`rex agent ${agent}`, text, async () => ({
-				session: sessionId,
-				blockId: only(await jobs(), agent).blockId,
-			}));
+			return promptOn(`rex agent ${agent}`, text, async () => {
+				const { blockId, label } = only(await jobs(), agent);
+				const { foreground } = await blockCall("process", blockId, ProcessResultSchema);
+				if (foreground?.argv0 === "claude" && (await leftSession(blockId, foreground.pid, label))) {
+					throw new Error(`rex agent ${agent}: ${LEFT_SESSION}`);
+				}
+				return { session: sessionId, blockId };
+			});
 		},
 
 		onStatus(listener: (event: AgentStatusEvent) => void): () => void {
@@ -1621,7 +1717,11 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		 * saw (`track`), as at the startup reconcile, for a re-stamp of an end, or after a working the watch missed, it
 		 * is read at once, so a re-stamp reads the last record the core already holds. An agent with no window, as one
 		 * soma stopped, is read off the transcript of the session its window last showed this process, and is undefined
-		 * when this process never saw one, as after a restart.
+		 * when this process never saw one, as after a restart. A job whose claude left its session throws, read off neither
+		 * transcript, since nothing that window writes is the job's; undefined would record a turn. claude reports the idle
+		 * of its `/clear` before it rewrites its pid file, so that idle can reach the core as the job's: a read that sees the
+		 * switch throws, which drops it, and the re-check it asks for reports the job's error once more; a read before the
+		 * switch reads the job's own transcript, and the watch's look at the pid file clearMs after the idle reports it.
 		 */
 		async readResult(agent: string): Promise<AgentResult | undefined> {
 			const byName = await jobs();
@@ -1633,6 +1733,10 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			}
 			const { blockId, label } = only(byName, agent);
 			const { foreground, child } = await blockCall("process", blockId, ProcessResultSchema);
+			if (foreground?.argv0 === "claude" && (await leftSession(blockId, foreground.pid, label))) {
+				recheck?.(blockId);
+				throw new Error(`rex agent ${agent}: ${LEFT_SESSION}`);
+			}
 			const cwd = foreground?.cwd ?? child?.cwd;
 			if (cwd !== undefined) sessions.set(agent, { id: label, cwd });
 			// Taken after the watch's work queued so far, so a working queued behind the resync that reported this turn's end

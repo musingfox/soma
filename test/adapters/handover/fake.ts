@@ -45,6 +45,8 @@ export async function sides(
 		relistMs?: number;
 		/** How long a cut waits for a turn to stop. */
 		cutMs?: number;
+		/** How long after an idle the rex side looks at its claude's pid file again: the adapter's own by default. */
+		clearMs?: number;
 		/** Each side as the handover sees it, to hang or fail one of its calls. */
 		from?: (port: AcpAgentPort) => AcpAgentPort;
 		to?: (port: ReturnType<typeof createRexAgentPort>) => ReturnType<typeof createRexAgentPort>;
@@ -56,6 +58,7 @@ export async function sides(
 		...(options.cutMs === undefined ? {} : { cutMs: options.cutMs }),
 	});
 	const projects = join(acp.cwd, "..", "projects");
+	const sessionsDir = join(acp.cwd, "..", "sessions");
 	const blocks = options.blocks ?? [];
 	const hangar = rex(blocks, options.others ?? []);
 	let windows = 0;
@@ -88,6 +91,7 @@ export async function sides(
 		client: hangar.client,
 		sessionId: HANGAR,
 		projectsDir: projects,
+		sessionsDir,
 		processStart: async () => undefined,
 		env: { SOMA_SOCKET: "/run/soma.sock" },
 		path: "/opt/soma/bin",
@@ -98,6 +102,7 @@ export async function sides(
 		keyGapMs: 1,
 		settleMs: 0,
 		takeMs: options.takeMs ?? 200,
+		...(options.clearMs === undefined ? {} : { clearMs: options.clearMs }),
 		onError: () => {},
 	});
 	const said: string[] = [];
@@ -163,6 +168,12 @@ export async function sides(
 			const from = acp.events.length;
 			await agents.prompt(name, prompt);
 			await acp.until("done", from, name);
+		},
+		/** The claude of the hangar's last window is in `sessionId` from now on, as a /clear leaves its pid file. */
+		cleared: async (sessionId: string) => {
+			const pid = blocks.at(-1)?.pid ?? 9;
+			await mkdir(sessionsDir, { recursive: true });
+			await writeFile(join(sessionsDir, `${pid}.json`), JSON.stringify({ pid, sessionId, status: "idle" }));
 		},
 		/** Appends a user turn and its reply to the session's transcript, as the window's claude writes them. */
 		wrote: (session: { acpSessionId: string; cwd: string }, reply: string) => {

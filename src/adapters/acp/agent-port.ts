@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { constants } from "node:fs";
@@ -68,6 +68,8 @@ export interface AcpAgentPortOptions {
 	readonly startMs?: number;
 	/** How long stop waits for session/close before it ends the process anyway. */
 	readonly closeMs?: number;
+	/** The pgrep a release lists the agent process's children with; /usr/bin/pgrep unless set, as tests do. */
+	readonly pgrep?: string;
 	/** How long a cut waits for the turn to stop once cancelled. Set in tests; TURN_STOP_MS otherwise. */
 	readonly cutMs?: number;
 	/** How long readResult waits for claude to write the reply to a turn the agent reported over. */
@@ -233,6 +235,29 @@ function askedMsg(toolCall: ToolCallUpdate, options: readonly PermissionOption[]
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * The pids of a process's direct children, by `pgrep -P`, which matches on the parent alone and reads no command line;
+ * a pgrep that has not answered in `ms` is killed and fails.
+ */
+const childrenOf = (pgrep: string, pid: number, ms: number): Promise<number[]> =>
+	new Promise((resolve, reject) => {
+		execFile(pgrep, ["-P", String(pid)], { encoding: "utf8", timeout: ms, killSignal: "SIGKILL" }, (error, stdout) => {
+			if (error?.killed) reject(new Error(`${pgrep} gave no answer in ${ms} ms`));
+			// pgrep exits 1 when nothing matched.
+			else if (error && error.code !== 1) reject(error);
+			else resolve(stdout.split("\n").filter(Boolean).map(Number));
+		});
+	});
+
+const alive = (pid: number) => {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+
 /** The model a session/new reports: claude-agent-acp's alias, as `--model` takes it. */
 function reportedModel(options: readonly SessionConfigOption[] | null | undefined): string | undefined {
 	const option = options?.find(({ category }) => category === "model");
@@ -261,6 +286,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 	const git = options.git ?? runGit;
 	const startMs = options.startMs ?? 30_000;
 	const closeMs = options.closeMs ?? 3_000;
+	const pgrep = options.pgrep ?? "/usr/bin/pgrep";
 	const cutMs = options.cutMs ?? TURN_STOP_MS;
 	const replyMs = options.replyMs ?? 2_000;
 	const recheckMs = options.recheckMs ?? 10_000;
@@ -542,6 +568,37 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 				.catch((error: Error) => onError(new Error(`acp agent ${agent.name}: session/close: ${error.message}`)));
 		}
 		agent.child.kill();
+	}
+
+	/** The agent process's children now; none, with the failure logged, if they cannot be listed within closeMs. */
+	async function childrenNow(agent: Agent): Promise<readonly number[]> {
+		const pid = agent.child.pid;
+		if (agent.exited || pid === undefined) return [];
+		return childrenOf(pgrep, pid, closeMs).catch((error: Error) => {
+			onError(new Error(`acp agent ${agent.name}: listing its children: ${error.message}`));
+			return [];
+		});
+	}
+
+	/** Waits up to closeMs for the processes to exit, SIGKILLs those still alive, and waits up to closeMs more. */
+	async function outlived(pids: readonly number[]): Promise<void> {
+		const exited = async () => {
+			let over = false;
+			const timer = setTimeout(() => {
+				over = true;
+			}, closeMs);
+			while (!over && pids.some(alive)) await sleep(10);
+			clearTimeout(timer);
+		};
+		await exited();
+		for (const pid of pids.filter(alive)) {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// It exited since the look.
+			}
+		}
+		await exited();
 	}
 
 	const heldOf = (name: string, session: Session): HeldSession => ({
@@ -1007,12 +1064,14 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		/**
 		 * Records the handover in progress, so no restart lists the agent until a look at the other side says where it is,
 		 * then closes the session and ends the process, waiting for its exit up to `closeMs` after the SIGKILL: the side that
-		 * takes the session must not write its transcript beside it. A dormant agent has none to end. Refuses, with nothing done, what
-		 * `releasable` would refuse now and an agent in a turn, but for one whose process exited, which has stopped whatever
-		 * turn it ran and is released as a dormant one is: the check and the taking of the agent off this side are one
-		 * synchronous step, so no turn can begin between them. A mark that does not reach the file puts the agent back and
-		 * refuses too, since after a restart a prompt would wake it here beside the other side's claude, two writers on one
-		 * transcript.
+		 * takes the session must not write its transcript beside it. The process's children when the release began, the Claude
+		 * CLI among them, are waited for too, by pid, listed within `closeMs`: each still alive once the process is gone gets
+		 * up to `closeMs`, then a SIGKILL and up to `closeMs` more. A dormant agent, and one whose process exited, has none to
+		 * end, and nothing under it is waited for. Refuses, with nothing done, what `releasable` would refuse now and an agent
+		 * in a turn, but for one whose process exited, which has stopped whatever turn it ran and is released as a dormant one
+		 * is: the check and the taking of the agent off this side are one synchronous step, so no turn can begin between them.
+		 * A mark that does not reach the file puts the agent back and refuses too, since after a restart a prompt would wake
+		 * it here beside the other side's claude, two writers on one transcript.
 		 */
 		async release(agent: string, { hangar, at }: HandoverMark): Promise<HeldSession | Refused> {
 			await loading;
@@ -1054,6 +1113,8 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			}
 			if (target === undefined) return held;
 			clearTimeout(target.recheck);
+			// Taken while they are its children, the Claude CLI among them: claude-agent-acp exits without waiting for it.
+			const under = await childrenNow(target);
 			await close(target);
 			const exit = () => Promise.race([once(target.child, "exit"), sleep(closeMs)]);
 			if (!target.exited) await exit();
@@ -1061,6 +1122,7 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 				target.child.kill("SIGKILL");
 				await exit();
 			}
+			await outlived(under);
 			return held;
 		},
 

@@ -33,6 +33,8 @@
 // $FAKE_ACP_LOAD_MS delays session/load. $FAKE_ACP_IGNORE_TERM has the agent live through SIGTERM.
 // $FAKE_ACP_HELD, comma-separated among new, load and stop, holds session/new, session/load or a cancelled SPIN's end until
 // the file $FAKE_ACP_PROJECTS/release-<that> exists, so a test holds one as long as it needs, whatever the machine's load.
+// $FAKE_ACP_CLI has the agent spawn fake-cli.ts as its one child, as claude-agent-acp spawns the Claude CLI.
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -58,6 +60,10 @@ const transcriptOf = (sessionId: string, cwd: string) =>
 	join(projects, cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${sessionId}.jsonl`);
 if (process.env.FAKE_ACP_IGNORE_TERM) process.on("SIGTERM", () => {});
 if (process.env.FAKE_ACP_PIDS) appendFileSync(process.env.FAKE_ACP_PIDS, `${process.env.SOMA_AGENT} ${process.pid}\n`);
+// Not waited for at the agent's exit, as claude-agent-acp's shutdown does not wait for the CLI.
+if (process.env.FAKE_ACP_CLI) {
+	spawn(process.execPath, [join(import.meta.dirname, "fake-cli.ts")], { stdio: ["pipe", "ignore", "ignore"] });
+}
 
 /** Appends one record to the session's transcript, chained to the one before, as claude writes them. */
 function write(sessionId: string, type: "user" | "assistant", content: unknown): void {

@@ -3,7 +3,7 @@ import { mkdir, readFile, realpath, rm, rmdir, writeFile } from "node:fs/promise
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
 import { type AgentStatusEvent, NotImplemented, PromptRefused } from "../../../src/ports/agent.ts";
-import { cleanUp, git, harness, SESSION, sleep } from "./fake.ts";
+import { cleanUp, git, harness, repo, SESSION, sleep } from "./fake.ts";
 
 afterEach(cleanUp);
 
@@ -1052,6 +1052,103 @@ test("a process that lives through the end of its session and SIGTERM is killed 
 	} finally {
 		if (living()) process.kill(pid, "SIGKILL");
 	}
+});
+
+/** A harness whose agent runs a fake Claude CLI under it, and that CLI's pid once it is up. */
+async function withCli(fake: Record<string, string>) {
+	const acp = await harness({ fake });
+	await acp.start();
+	await acp.until("idle");
+	const from = acp.events.length;
+	await acp.port.prompt("card-a", "hello");
+	await acp.until("done", from);
+	const file = join(acp.cwd, "..", "projects", "cli");
+	let pid = Number.NaN;
+	for (const deadline = Date.now() + 5_000; Number.isNaN(pid) && Date.now() < deadline; await sleep(10)) {
+		pid = Number.parseInt(await readFile(file, "utf8").catch(() => ""), 10);
+	}
+	const living = () => {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	return { acp, living, kill: () => living() && process.kill(pid, "SIGKILL") };
+}
+
+test("release returns only once the CLI under the agent has exited, though the agent exits at SIGTERM without it", async () => {
+	const { acp, living, kill } = await withCli({ FAKE_ACP_CLI: "300" });
+	try {
+		expect(living()).toBe(true);
+		expect(await acp.port.release("card-a", MARK)).toMatchObject({ name: "card-a" });
+		expect(living()).toBe(false);
+		expect(acp.errors).toEqual([]);
+	} finally {
+		kill();
+	}
+});
+
+test("a CLI that outlives the agent is SIGKILLed closeMs after the agent is gone, within the release's bound", async () => {
+	// The harness's closeMs is 500.
+	const { acp, living, kill } = await withCli({ FAKE_ACP_CLI: "forever" });
+	try {
+		const begun = Date.now();
+		expect(await acp.port.release("card-a", MARK)).toMatchObject({ name: "card-a" });
+		const took = Date.now() - begun;
+		expect(living()).toBe(false);
+		expect(took).toBeGreaterThanOrEqual(500);
+		expect(took).toBeLessThan(2_000);
+	} finally {
+		kill();
+	}
+});
+
+/** A harness whose port lists children with a pgrep that runs `body`, idle after one turn, and its agent's pid. */
+async function withPgrep(body: string) {
+	const cwd = await repo();
+	const pgrep = join(cwd, "..", "pgrep");
+	await writeFile(pgrep, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+	const acp = await harness({ cwd, pgrep });
+	await acp.start();
+	await acp.until("idle");
+	const from = acp.events.length;
+	await acp.port.prompt("card-a", "hello");
+	await acp.until("done", from);
+	const line = (await readFile(join(cwd, "..", `pids-${acp.instance}`), "utf8")).trim();
+	return { acp, pid: Number(line.split(" ")[1]), calls: join(cwd, "..", "pgrep-calls") };
+}
+
+test("a pgrep that gives no answer is logged, waits for no child, and the release still returns within its bound", async () => {
+	// The harness's closeMs is 500.
+	const { acp, pid } = await withPgrep("exec sleep 10");
+	const begun = Date.now();
+	expect(await acp.port.release("card-a", MARK)).toMatchObject({ name: "card-a" });
+	const took = Date.now() - begun;
+	expect(took).toBeGreaterThanOrEqual(500);
+	expect(took).toBeLessThan(2_000);
+	expect(() => process.kill(pid, 0)).toThrow();
+	expect(acp.errors.map((error) => error.message)).toEqual([
+		expect.stringMatching(/^acp agent card-a: listing its children: .*pgrep gave no answer in 500 ms$/),
+	]);
+});
+
+test("a release of an agent with no children lists them once and logs nothing", async () => {
+	const { acp, pid, calls } = await withPgrep(`echo "$@" >> "$(dirname "$0")/pgrep-calls"; exec /usr/bin/pgrep "$@"`);
+	expect(await acp.port.release("card-a", MARK)).toMatchObject({ name: "card-a" });
+	expect(await readFile(calls, "utf8")).toBe(`-P ${pid}\n`);
+	expect(acp.errors).toEqual([]);
+});
+
+test("a release of an agent whose process had exited lists no children", async () => {
+	const { acp, pid, calls } = await withPgrep(`echo "$@" >> "$(dirname "$0")/pgrep-calls"; exec /usr/bin/pgrep "$@"`);
+	const from = acp.events.length;
+	process.kill(pid, "SIGKILL");
+	await acp.until("error", from);
+	expect(await acp.port.release("card-a", MARK)).toMatchObject({ name: "card-a" });
+	expect(await readFile(calls, "utf8").catch(() => "none")).toBe("none");
+	expect(acp.errors).toEqual([]);
 });
 
 test("a dormant agent waking for a prompt is not released, and the prompt goes on over ACP", async () => {

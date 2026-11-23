@@ -454,16 +454,15 @@ test("a getUpdates answer of an unexpected shape is reported once per attempt, a
 const OUTAGE_START = Date.UTC(2026, 10, 19, 0, 59);
 
 /**
- * The client on a clock the test moves, whose timers run when it passes them, with the outage alert a fake and the
+ * The client on a clock the test moves, whose timers run when it passes them, with the outage alert `alert` and the
  * zone Asia/Taipei; each failed poll is reported to `onError` and polled again after 10 ms.
  */
-async function outageWatch() {
+async function outageWatch(alert = vi.fn(async (_text: string) => {})) {
 	const human = new FakeHumanPort();
 	const { api, apiBase } = await bot();
 	let at = OUTAGE_START;
 	const timers = new Set<{ due: number; run: () => void }>();
 	const onError = vi.fn();
-	const alert = vi.fn(async (_text: string) => {});
 	const controller = new AbortController();
 	const running = runTelegram({
 		human,
@@ -505,7 +504,16 @@ async function outageWatch() {
 		api.deliver(text, CHAT);
 		await vi.waitFor(() => expect(human.inputs.map((input) => input.content)).toContain(text));
 	};
-	return { human, api, alert, advance, failures, succeeds };
+	// A poll the fake holds open, as Telegram holds a long poll while no update comes.
+	const held = async () => {
+		api.stalling.add("getUpdates");
+		await vi.waitFor(() => expect(api.holding).toBe(1));
+	};
+	const release = () => {
+		api.stalling.delete("getUpdates");
+		api.release();
+	};
+	return { human, api, alert, onError, advance, failures, succeeds, held, release };
 }
 
 test("polling that fails for 10 minutes alerts once, and not again while the outage lasts", async () => {
@@ -517,7 +525,7 @@ test("polling that fails for 10 minutes alerts once, and not again while the out
 	await failures(3);
 	expect(alert).not.toHaveBeenCalled();
 	advance(1);
-	expect(alert).toHaveBeenCalledOnce();
+	await vi.waitFor(() => expect(alert).toHaveBeenCalledOnce());
 	expect(alert).toHaveBeenCalledWith(
 		"Telegram 從 2026-11-19 08:59（Asia/Taipei）起一直連不上。soma 還在執行，會繼續重試，連上後會在 Telegram 告訴你斷了多久。",
 	);
@@ -548,8 +556,10 @@ test("the first poll that succeeds after an outage that alerted tells the chat i
 
 	await failures(1);
 	advance(10 * MIN);
-	expect(alert).toHaveBeenCalledOnce();
+	await vi.waitFor(() => expect(alert).toHaveBeenCalledOnce());
 	advance(3 * 60 * MIN + 48 * MIN);
+	// The second started on the moved clock, so the poll that succeeds does too.
+	await failures(2);
 	await succeeds("壞了嗎");
 	await succeeds("又一則");
 
@@ -569,6 +579,80 @@ test("an outage shorter than 10 minutes sends nothing on either channel when it 
 
 	expect(alert).not.toHaveBeenCalled();
 	expect(api.sent).toEqual([]);
+});
+
+test("a poll Telegram answers before the 10-minute mark and holds open past it ends the outage without an alert", async () => {
+	const { api, alert, onError, advance, failures, succeeds, held, release } = await outageWatch();
+	api.failing.add("getUpdates");
+
+	await failures(3);
+	advance(9 * MIN + 30_000);
+	await held();
+	api.failing.delete("getUpdates");
+	const failed = onError.mock.calls.length;
+	advance(30_000);
+	expect(alert).not.toHaveBeenCalled();
+	release();
+	await succeeds("在嗎");
+	advance(60 * MIN);
+
+	expect(onError).toHaveBeenCalledTimes(failed);
+	expect(alert).not.toHaveBeenCalled();
+	expect(api.sent).toEqual([]);
+});
+
+test("a poll open at the 10-minute mark that then fails alerts at its failure, and a poll that succeeds ends the outage when it was sent", async () => {
+	const { api, alert, advance, failures, succeeds, held, release } = await outageWatch();
+	api.failing.add("getUpdates");
+
+	await failures(3);
+	await held();
+	advance(10 * MIN);
+	expect(alert).not.toHaveBeenCalled();
+	release();
+	await vi.waitFor(() => expect(alert).toHaveBeenCalledOnce());
+	await held();
+	api.failing.delete("getUpdates");
+	advance(5 * MIN);
+	release();
+	await succeeds("好了");
+
+	// Telegram answered the held poll when it was sent, five minutes before it returned.
+	expect(api.sent.map((message) => message.text)).toEqual([
+		"[通知] Telegram 從 2026-11-19 08:59 到 2026-11-19 09:09（Asia/Taipei）連不上，共 10 分鐘。",
+	]);
+});
+
+test("a notification that fails is reported, and the polling goes on", async () => {
+	const refused = new Error("osascript: not allowed to send notifications");
+	const { api, onError, advance, failures, succeeds } = await outageWatch(
+		vi.fn(async (_text: string) => {
+			throw refused;
+		}),
+	);
+	api.failing.add("getUpdates");
+
+	await failures(1);
+	advance(10 * MIN);
+	await vi.waitFor(() => expect(onError).toHaveBeenCalledWith(refused));
+	await succeeds("還在嗎");
+});
+
+test("a getUpdates result that is not a list counts as a failed poll", async () => {
+	const { api, alert, onError, advance, failures } = await outageWatch();
+	api.answering.set(
+		"getUpdates",
+		Array.from({ length: 2_000 }, () => ({ ok: true, result: {} })),
+	);
+
+	await failures(3);
+	advance(10 * MIN);
+	await vi.waitFor(() => expect(alert).toHaveBeenCalledOnce());
+	expect(onError).toHaveBeenCalledWith(
+		expect.objectContaining({
+			message: "getUpdates: the result has an unexpected shape: (root): Expected array, received object",
+		}),
+	);
 });
 
 test("an update that does not parse is reported and skipped, the rest of its batch is handled, and it is not asked for again", async () => {

@@ -396,6 +396,11 @@ export class FakeBotApi {
 		for (const wake of this.#wake) wake();
 	}
 
+	/** How many calls `stalling` holds now. */
+	get holding(): number {
+		return this.#held.length;
+	}
+
 	/** Handles every call `stalling` holds, in the order they came. */
 	release(): void {
 		for (const handle of this.#held.splice(0)) handle();

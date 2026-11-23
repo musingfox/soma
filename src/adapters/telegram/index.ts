@@ -772,26 +772,38 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	};
 
 	// Telegram failed every poll of this bot for hours on 2026-11-19 and 2026-11-23 while soma ran, and a silent chat
-	// looked like a broken soma. An outage starts at the first failed poll; one that lasts `outageAlertMs` with no poll
-	// succeeding alerts once, on a timer, so a poll that hangs still counts, and the next poll that succeeds ends it.
+	// looked like a broken soma. An outage starts at the first failed poll and alerts once every poll has failed for
+	// `outageAlertMs`: a poll still open when that much time has passed decides, alerting when it fails, and a poll that
+	// succeeds ends the outage as of when it was sent, since a long poll Telegram holds open answered all along.
 	const timeZone = options.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
-	let outage: { since: number; alerted: boolean; cancel: () => void } | undefined;
+	let outage: { since: number; due: boolean; alerted: boolean; cancel: () => void } | undefined;
+	// When the poll in flight was sent.
+	let polling: number | undefined;
+	const raise = (current: NonNullable<typeof outage>) => {
+		current.alerted = true;
+		options.alert?.(outageAlertText(current.since, timeZone)).catch((error: unknown) => {
+			if (!signal.aborted) onError(error);
+		});
+	};
 	const pollFailed = () => {
-		if (outage !== undefined || options.alert === undefined || signal.aborted) return;
-		const { alert } = options;
-		const current = { since: now(), alerted: false, cancel: () => {} };
+		polling = undefined;
+		if (options.alert === undefined || signal.aborted) return;
+		if (outage !== undefined) {
+			if (outage.due && !outage.alerted) raise(outage);
+			return;
+		}
+		const current = { since: now(), due: false, alerted: false, cancel: () => {} };
 		current.cancel = setTimer(() => {
-			current.alerted = true;
-			alert(outageAlertText(current.since, timeZone)).catch((error: unknown) => {
-				if (!signal.aborted) onError(error);
-			});
+			current.due = true;
+			if (polling === undefined) raise(current);
 		}, options.outageAlertMs ?? OUTAGE_ALERT_MS);
 		outage = current;
 	};
-	const polled = () => {
+	const polled = (sent: number) => {
+		polling = undefined;
 		if (outage === undefined) return;
 		outage.cancel();
-		if (outage.alerted) send(outageEndText(outage.since, now(), timeZone));
+		if (outage.alerted) send(outageEndText(outage.since, sent, timeZone));
 		outage = undefined;
 	};
 
@@ -800,6 +812,8 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 	try {
 		while (!signal.aborted) {
 			try {
+				const sent = now();
+				polling = sent;
 				const batch = BatchSchema.safeParse(
 					await call("getUpdates", {
 						offset,
@@ -816,7 +830,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 					throw new Error(`getUpdates: the result has an unexpected shape: ${wrong(batch.error)}`);
 				}
 				// Before the batch, so the chat hears of the outage before the answers to what was sent during it.
-				polled();
+				polled(sent);
 				for (const each of batch.data) {
 					const { update_id } = each;
 					const update = UpdateSchema.safeParse(each);

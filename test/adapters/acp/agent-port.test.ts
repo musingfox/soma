@@ -1343,3 +1343,70 @@ test("a write of the final mark or of its removal that fails is logged, and leav
 	expect(await restarted.port.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
 	await rmdir(`${acp.sessionsFile}.tmp`);
 });
+
+const HANDED = "7e33597b-e33d-4c6d-a700-e21b2f54223e";
+
+/** A transcript the Claude Code CLI left of session HANDED in `cwd`: one prompt planting FIG, and its reply. */
+async function handedOver(acp: { cwd: string }, cwd: string) {
+	const directory = join(acp.cwd, "..", "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"));
+	await mkdir(directory, { recursive: true });
+	const records = [
+		{
+			type: "user",
+			uuid: "u-1",
+			parentUuid: null,
+			sessionId: HANDED,
+			cwd,
+			message: { role: "user", content: "the word is FIG" },
+		},
+		{
+			type: "assistant",
+			uuid: "a-1",
+			parentUuid: "u-1",
+			sessionId: HANDED,
+			cwd,
+			message: { id: "msg-a-1", role: "assistant", model: "claude-fake-1", content: [{ type: "text", text: "ok" }] },
+		},
+	];
+	await writeFile(join(directory, `${HANDED}.jsonl`), records.map((record) => `${JSON.stringify(record)}\n`).join(""));
+}
+
+const handoff = { name: "soma-repo-7e33", card: "soma-repo-7e33", sessionId: HANDED };
+
+test("resume with a cwd adopts a session it never started: session/load in the real path, and the entry written", async () => {
+	const acp = await harness();
+	// The repo is reached through a symlink on macOS, as a Bash's cwd may be.
+	const real = await realpath(acp.cwd);
+	await handedOver(acp, real);
+
+	await acp.port.resume({ ...handoff, cwd: acp.cwd });
+
+	expect(await readFile(join(acp.cwd, "..", "projects", "loaded"), "utf8")).toBe(`${HANDED} ${real}\n`);
+	expect((await recorded(acp))["soma-repo-7e33"]).toEqual({
+		card: "soma-repo-7e33",
+		sessionId: HANDED,
+		acpSessionId: HANDED,
+		cwd: real,
+	});
+	expect(await acp.port.list()).toEqual([
+		{ name: "soma-repo-7e33", sessionId: HANDED, status: { state: "idle" }, seq: expect.any(Number) },
+	]);
+	const from = acp.events.length;
+	await acp.port.prompt("soma-repo-7e33", "RECALL");
+	await acp.until("done", from, "soma-repo-7e33");
+	expect((await acp.port.readResult("soma-repo-7e33"))?.text).toBe("recall: the word is FIG");
+	expect((await spawned(acp)).map(([name]) => name)).toEqual(["soma-repo-7e33"]);
+});
+
+test("resume with a cwd and no transcript there throws NotImplemented, recording and starting nothing; without a cwd as today", async () => {
+	const acp = await harness();
+
+	await expect(acp.port.resume({ ...handoff, cwd: acp.cwd })).rejects.toThrow(NotImplemented);
+	await expect(acp.port.resume(handoff)).rejects.toThrow(NotImplemented);
+	await handedOver(acp, await realpath(acp.cwd));
+	await expect(acp.port.resume(handoff)).rejects.toThrow(NotImplemented);
+
+	await expect(readFile(acp.sessionsFile, "utf8")).rejects.toThrow(/ENOENT/);
+	expect(await spawned(acp)).toEqual([]);
+	expect(await acp.port.list()).toEqual([]);
+});

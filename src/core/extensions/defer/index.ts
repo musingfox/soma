@@ -8,8 +8,8 @@ import {
 	type Tx,
 } from "@earendil-works/pi-durable";
 import { type AgentPort, NotImplemented, PromptRefused } from "../../../ports/agent.ts";
-import type { DeferReply, DeferRequest } from "../../../ports/defer.ts";
-import { type Deferred, deferAt, deferNotice, deferredPrompt } from "../../domain/defer.ts";
+import type { DeferReply, DeferRequest, HandoffRequest } from "../../../ports/defer.ts";
+import { type Deferred, deferAt, deferNotice, handoffName, handoffRefusal, promptOf } from "../../domain/defer.ts";
 import type { Job, Reclaim } from "../../domain/dispatch.ts";
 import { noticeEntry } from "../../notice.ts";
 import { Dispatches } from "../dispatch/index.ts";
@@ -147,6 +147,11 @@ export interface DeferOptions {
 	 * the reconcile has under way for one a crash cut short, nor the other way round.
 	 */
 	readonly reclaim?: (agent: string) => Promise<void>;
+	/**
+	 * The git repo root a hand-off's directory is in, which names its job, or undefined outside any repo; main.ts gives
+	 * the file system's. Unset, every directory is taken as outside any repo.
+	 */
+	readonly repoRoot?: (cwd: string) => Promise<string | undefined>;
 }
 
 /**
@@ -160,7 +165,9 @@ export interface DeferOptions {
  * hand, is started again in its session (`resume`, past the hangar cap) under the `resuming` checkpoint, and prompted
  * once it is listed at rest, as a dispatched agent's launch prompt waits for its first idle; one soma was stopping
  * takes the gone path, since the listing cannot tell a stop that never went out, and so does one on an agent side
- * whose `resume` throws NotImplemented.
+ * whose `resume` throws NotImplemented. A Claude Code session soma did not dispatch hands itself over the same way: at
+ * fire time it becomes a job, resumed in the directory it sent and prompted with the launch rules before the
+ * instruction.
  */
 export function deferExtension(
 	agents: Pick<AgentPort, "list" | "prompt" | "resume" | "stop">,
@@ -170,6 +177,7 @@ export function deferExtension(
 	const tries = options.tries ?? 20;
 	const readyMs = options.readyMs ?? 120_000;
 	const pollMs = options.pollMs ?? 1_000;
+	const repoRoot = options.repoRoot ?? (async () => undefined);
 
 	const listing = async (agent: string) => (await agents.list()).find((each) => each.name === agent);
 
@@ -232,7 +240,7 @@ export function deferExtension(
 			if (held) return retry(busy());
 			if (!sending) return;
 			try {
-				await agents.prompt(item.agent, deferredPrompt(id, item));
+				await agents.prompt(item.agent, promptOf(id, item));
 			} catch (error) {
 				// Tried again only when the adapter refused before it typed, as rex does for a busy agent: any other
 				// failure may come after the text reached the agent, and the prompt goes out at most once.
@@ -253,6 +261,26 @@ export function deferExtension(
 				const index = doc.jobs.findIndex((each) => each.agent === item.agent);
 				const current = doc.jobs[index];
 				const phase = current?.reclaim?.phase;
+				// A hand-off's session becomes soma's job here, as soma resumes it. Its `before` is `stopped`: a deferral that
+				// ends without the agent leaves a job no reconcile takes for one that vanished.
+				if (current === undefined && item.session !== undefined) {
+					doc.jobs.push({
+						card: item.agent,
+						agent: item.agent,
+						sessionId: item.session,
+						...(item.cwd !== undefined && { repo: item.cwd }),
+						status: { state: "idle" },
+						createdAt: new Date(runtime.now()).toISOString(),
+						decisions: [],
+						handoff: true,
+						reclaim: { phase: "resuming" },
+					});
+					items[id] = { ...own, resuming: true, before: { phase: "stopped" } };
+					return {
+						status: "running",
+						checkpoint: { phase: "resuming", tries: tried, session: item.session, until: runtime.now() + readyMs },
+					};
+				}
 				if (current === undefined) return ending(tx, "gone", deferNotice.gone(id, item));
 				if (phase === "stopping") return ending(tx, "gone", deferNotice.stopping(id, item));
 				if (phase === "resuming" || phase === "sending") {
@@ -320,11 +348,18 @@ export function deferExtension(
 					}
 					if (!listed) {
 						try {
-							await agents.resume({ name: task.input.agent, card: task.input.card, sessionId: session });
+							const { cwd } = task.input;
+							await agents.resume({
+								name: task.input.agent,
+								card: task.input.card,
+								sessionId: session,
+								...(cwd !== undefined && { cwd }),
+							});
 							started = true;
 						} catch (error) {
 							// A side that cannot start an agent again ends this as it did before it could.
-							if (error instanceof NotImplemented) return end("gone", deferNotice.gone(id, task.input), true);
+							if (error instanceof NotImplemented)
+								return end("gone", deferNotice.gone(id, task.input, errorText(error)), true);
 							// A window of the name made since, by the human or by this start before it failed, is the agent; one
 							// a listing that fails cannot rule out is looked for by `ready`.
 							const after = await listing(task.input.agent).then(
@@ -400,6 +435,7 @@ export function deferExtension(
 	 * no longer live is released first, so the new one is not held back by it for good.
 	 */
 	async function defer(conversation: Conversation, request: DeferRequest, context: Context): Promise<DeferReply> {
+		if ("session" in request) return handoff(conversation, request, context);
 		const setAt = Date.now();
 		let at: number;
 		try {
@@ -456,6 +492,48 @@ export function deferExtension(
 		// next restart's reconcile.
 		if (agent !== undefined) await reclaimer(conversation, agents, context)(agent).catch(() => {});
 		return reply;
+	}
+
+	/**
+	 * Accepts a hand-off from a Claude Code session soma did not dispatch: one commit creates the deferral and its item,
+	 * named for the job the session becomes when it falls due (`handoffName`), and nothing else happens until then: no
+	 * job, no listing, no reclaim, no stop. A session that already has a hand-off job, or a waiting hand-off, gets that
+	 * name again; any other name a job or a waiting deferral holds is another session's.
+	 */
+	async function handoff(conversation: Conversation, request: HandoffRequest, context: Context): Promise<DeferReply> {
+		const setAt = Date.now();
+		let at: number;
+		try {
+			at = deferAt(request.at, setAt);
+		} catch (error) {
+			return { accepted: false, reason: (error as Error).message };
+		}
+		const instruction = request.instruction.trim();
+		if (instruction === "") return { accepted: false, reason: "the instruction is empty" };
+		const { session, cwd } = request;
+		const refusal = handoffRefusal(session, cwd);
+		if (refusal !== undefined) return { accepted: false, reason: refusal };
+		// A directory that cannot be read is named as one outside any repo: the name only has to be the job's own.
+		const root = (await repoRoot(cwd).catch(() => undefined)) ?? cwd;
+		return conversation.commit(async (tx) => {
+			const { jobs } = await tx.doc(Dispatches, conversation.id);
+			const deferrals = await tx.doc(Deferrals, conversation.id);
+			const waiting = Object.values(deferrals.items);
+			const agent =
+				jobs.find((each) => each.handoff === true && each.sessionId === session)?.agent ??
+				waiting.find((each) => each.session === session)?.agent ??
+				handoffName(
+					root,
+					session,
+					(name) =>
+						jobs.some((each) => each.agent === name || each.card === name) ||
+						waiting.some((each) => each.agent === name),
+				);
+			const item: Deferred = { agent, card: agent, instruction, at, setAt, session, cwd };
+			const id = await tx.createTask(Deferral, item, { ownership: { kind: "conversation" }, background: true });
+			deferrals.items[String(id)] = item;
+			return { accepted: true, id: String(id), at: new Date(at).toISOString() } as const;
+		}, context);
 	}
 
 	/** Moves the job of `card` from `due` back to `stopped`; a job in any other phase by now is left to whoever changed it. */

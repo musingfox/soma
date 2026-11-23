@@ -1,3 +1,4 @@
+import { composeHandoffPrompt } from "./launch-prompt.ts";
 import { resolveAt } from "./schedule.ts";
 
 // A date-time without an offset would be read in whichever zone soma runs in, not the one the agent meant.
@@ -23,6 +24,10 @@ export type Deferred = {
 	readonly at: number;
 	// When the agent asked, so the prompt can tell it which of its own requests this is.
 	readonly setAt: number;
+	// A hand-off's: the Claude Code session that asked, soma did not dispatch it, and the directory it ran in. `agent`
+	// and `card` are then both the name of the job it becomes (`handoffName`).
+	readonly session?: string;
+	readonly cwd?: string;
 };
 
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -32,7 +37,49 @@ export function deferredPrompt(id: string, { instruction, setAt }: Deferred): st
 	return `[soma deferred instruction ${id}] You asked soma with \`soma defer\` at ${iso(setAt)} to send you this instruction now: ${instruction}`;
 }
 
-const named = (id: string, { agent, card }: Deferred) => `Deferred instruction ${id} for agent ${agent} (card ${card})`;
+/**
+ * What a deferral gives its agent: a hand-off's session runs unattended as soma's job from this prompt on, so it is
+ * given the launch rules first, which also make its reply open with the result line the bridge reads.
+ */
+export function promptOf(id: string, item: Deferred): string {
+	const sentence = deferredPrompt(id, item);
+	return item.session === undefined ? sentence : composeHandoffPrompt(sentence);
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Why a hand-off's session or directory cannot be taken, in words for the session; undefined when both can. */
+export function handoffRefusal(session: string, cwd: string): string | undefined {
+	if (!UUID.test(session)) return `the session "${session}" (CLAUDE_CODE_SESSION_ID) is not a UUID`;
+	if (!cwd.startsWith("/")) return `the directory "${cwd}" is not an absolute path`;
+	return undefined;
+}
+
+/**
+ * The job name of a hand-off, decided 2026-11-23: `soma-<repo>-<hex>`, `<repo>` the base name of `root`, the session's
+ * repo root or its directory outside any repo, in lower case with every run of other characters one `-` and none at
+ * either end, `session` when nothing is left; `<hex>` the session id's first 4 hex digits, one more at a time while
+ * `taken` says the name is another session's.
+ */
+export function handoffName(root: string, session: string, taken: (name: string) => boolean): string {
+	const base = root.split("/").filter(Boolean).at(-1) ?? "";
+	const repo =
+		base
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/^-|-$/g, "") || "session";
+	const hex = session.replace(/-/g, "").toLowerCase();
+	for (let digits = 4; digits < hex.length; digits++) {
+		const name = `soma-${repo}-${hex.slice(0, digits)}`;
+		if (!taken(name)) return name;
+	}
+	return `soma-${repo}-${hex}`;
+}
+
+const named = (id: string, { agent, card, session, cwd }: Deferred) =>
+	session === undefined
+		? `Deferred instruction ${id} for agent ${agent} (card ${card})`
+		: `Deferred instruction ${id} for agent ${agent} (Claude Code session ${session} in ${cwd})`;
 
 /** What the notice of a move says of a deferral its job armed as it moved: only the human can still send it. */
 export const deferCancelled = ({ at, instruction }: Deferred) =>
@@ -44,8 +91,11 @@ export const reclaimFailedNotice = (agent: string, card: string, error: string) 
 
 /** The one notice for a deferral that ended unsent, or perhaps unsent. */
 export const deferNotice = {
-	gone: (id: string, item: Deferred) =>
-		`${named(id, item)} was not sent: the agent was no longer listed when it fell due at ${iso(item.at)}. The instruction was: ${item.instruction}`,
+	// `error` is the agent side's, for a hand-off whose session it cannot resume, as one with no transcript there.
+	gone: (id: string, item: Deferred, error?: string) =>
+		item.session !== undefined && error !== undefined
+			? `${named(id, item)} was not sent: when it fell due at ${iso(item.at)}, soma could not resume the session: ${error}. The instruction was: ${item.instruction}`
+			: `${named(id, item)} was not sent: the agent was no longer listed when it fell due at ${iso(item.at)}. The instruction was: ${item.instruction}`,
 	// The agent was gone at `at`, and starting it again in its session failed.
 	unresumed: (id: string, item: Deferred, error: string) =>
 		`${named(id, item)} was not sent: the agent was gone when it fell due at ${iso(item.at)}, and soma could not start it again: ${error}. The instruction was: ${item.instruction}`,

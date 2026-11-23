@@ -1,9 +1,14 @@
 // `soma defer --at <when> "<instruction>"`: run from the shell of an agent soma dispatched, it asks soma to send the
 // instruction back to this agent at <when>. bin/soma runs it; the agent's identity and soma's socket come from the
-// SOMA_AGENT and SOMA_SOCKET soma put in the agent's environment when it started it.
+// SOMA_AGENT and SOMA_SOCKET soma put in the agent's environment when it started it. Run in any other Claude Code
+// session, it hands that session to soma, which resumes it at <when> in this directory and gives it the instruction:
+// the session is CLAUDE_CODE_SESSION_ID, and soma is found on SOMA_SOCKET or else the socket of the config `soma
+// dispatch` would load.
 import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { DeferUnreachable, requestDefer } from "./adapters/defer-socket/index.ts";
+import { configPath, loadConfig } from "./config.ts";
 import { deferAt } from "./core/domain/defer.ts";
 import type { DeferReply, DeferRequest } from "./ports/defer.ts";
 
@@ -40,6 +45,7 @@ export async function runDefer(
 	env: Env,
 	io: Io,
 	send: (path: string, request: DeferRequest) => Promise<DeferReply> = requestDefer,
+	{ cwd = process.cwd(), home = homedir() }: { cwd?: string; home?: string } = {},
 ): Promise<number> {
 	const parsed = parseDeferArgs(args);
 	if ("error" in parsed) {
@@ -53,16 +59,31 @@ export async function runDefer(
 		return 2;
 	}
 	const agent = env.SOMA_AGENT?.trim();
-	const socket = env.SOMA_SOCKET?.trim();
-	if (!agent || !socket) {
+	const session = env.CLAUDE_CODE_SESSION_ID?.trim();
+	let socket = env.SOMA_SOCKET?.trim();
+	if (!agent && !session) {
 		io.err(
-			`soma defer: ${agent ? "SOMA_SOCKET" : "SOMA_AGENT"} is not set: soma defer works only in the shell of an agent soma dispatched`,
+			"soma defer: neither SOMA_AGENT nor CLAUDE_CODE_SESSION_ID is set: soma defer works only in a Claude Code session or in the shell of an agent soma dispatched",
 		);
 		return 1;
 	}
+	if (agent && !socket) {
+		io.err("soma defer: SOMA_SOCKET is not set: soma defer works only in the shell of an agent soma dispatched");
+		return 1;
+	}
+	if (!socket) {
+		try {
+			socket = loadConfig(configPath(env, home), env, home, io.err).deferSocket;
+		} catch (error) {
+			io.err(`soma defer: ${(error as Error).message}; nothing was deferred`);
+			return 1;
+		}
+	}
+	// A dispatched agent's shell carries both, and SOMA_AGENT names its job.
+	const request: DeferRequest = agent ? { agent, ...parsed } : { session: session as string, cwd, ...parsed };
 	let reply: DeferReply;
 	try {
-		reply = await send(socket, { agent, ...parsed });
+		reply = await send(socket, request);
 	} catch (error) {
 		const message = (error as Error).message;
 		if (error instanceof DeferUnreachable) {
@@ -80,7 +101,9 @@ export async function runDefer(
 		return 1;
 	}
 	io.out(
-		`soma defer: accepted as ${reply.id}; soma will send this instruction to agent ${agent} as a new prompt at ${reply.at}. You can end your turn now.`,
+		agent
+			? `soma defer: accepted as ${reply.id}; soma will send this instruction to agent ${agent} as a new prompt at ${reply.at}. You can end your turn now.`
+			: `soma defer: accepted as ${reply.id}; at ${reply.at} soma resumes session ${session} in ${cwd} and gives it this instruction as a new prompt. This session may be closed now.`,
 	);
 	return 0;
 }

@@ -1,6 +1,6 @@
 import { lstatSync, mkdirSync, unlinkSync } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { z } from "zod";
 import type { DeferReply, DeferRequest } from "../../ports/defer.ts";
 import { type DispatchReply, type DispatchRequest, refusedForAgent } from "../../ports/dispatch.ts";
@@ -8,8 +8,18 @@ import { type DispatchReply, type DispatchRequest, refusedForAgent } from "../..
 // One request per connection: a JSON line from the CLI, a JSON line back, then the server ends the connection. A
 // request with `kind: "dispatch"` is `soma dispatch`'s; any other is `soma defer`'s, whose CLI, in the shell of an agent
 // an older release started, sends no kind. A dispatch request carries the caller's SOMA_AGENT when it had one, and the
-// CLI of an older release sends none.
+// CLI of an older release sends none. A defer names the agent soma dispatched, or, from a Claude Code session soma did
+// not dispatch, the session and its directory: a request with either of those two keys is read as that one's.
 const RequestSchema = z.object({ agent: z.string().min(1), at: z.string(), instruction: z.string() }).strict();
+const HandoffSchema = z
+	.object({
+		session: z.string().uuid(),
+		cwd: z.string().refine(isAbsolute, "not an absolute path"),
+		at: z.string(),
+		instruction: z.string(),
+	})
+	.strict();
+const handingOff = (json: unknown) => typeof json === "object" && json !== null && ("session" in json || "cwd" in json);
 const DispatchRequestSchema = z
 	.object({
 		kind: z.literal("dispatch"),
@@ -147,7 +157,7 @@ export async function serveDefer(options: {
 				});
 				return;
 			}
-			const request = RequestSchema.safeParse(json);
+			const request = (handingOff(json) ? HandoffSchema : RequestSchema).safeParse(json);
 			if (!request.success) {
 				return reply({ accepted: false, reason: `the request is malformed at ${fields(request.error)}` });
 			}

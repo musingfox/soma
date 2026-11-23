@@ -47,6 +47,9 @@ export type Job = {
 	readonly launch?: string;
 	// The human's request, for a job whose agent writes it as a card; `card` then names the job, not a card.
 	readonly ticket?: string;
+	// A Claude Code session soma did not dispatch, which handed itself over with `soma defer` and was resumed as this
+	// job; `card` then names the job, as for a ticket.
+	readonly handoff?: true;
 	// Read off the result line of the agent's last finished turn.
 	readonly outcome?: Outcome | "未知";
 	// The id of the transcript's last record when a finished turn was last recorded; the same record observed again is

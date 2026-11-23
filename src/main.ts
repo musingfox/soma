@@ -8,6 +8,7 @@ import { serveDefer } from "./adapters/defer-socket/index.ts";
 import { jobsFile } from "./adapters/jobs/jobs-file.ts";
 import { createCard, readCard } from "./adapters/obsidian/card.ts";
 import { repoUnder } from "./adapters/repos/folder.ts";
+import { repoRootOf } from "./adapters/repos/root.ts";
 import {
 	runTelegram,
 	ABILITIES as TELEGRAM_ABILITIES,
@@ -85,6 +86,7 @@ const ready = new Promise<void>((resolve) => {
 });
 const defers = deferExtension(agents, {
 	reclaim: (agent) => ready.then(() => reclaimer(root, agents, context)(agent)),
+	repoRoot: repoRootOf,
 });
 const reflections = reflection({
 	repo: config.repo,

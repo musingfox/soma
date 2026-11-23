@@ -160,6 +160,19 @@ type Session = {
 
 const givenUp = (session?: Session) => session?.handedOver === true || session?.handingOver === true;
 
+const withoutStop = ({ stopped: _resumed, ...session }: Session): Session => session;
+
+/**
+ * The entry of a session this port never started, in the real path of the directory it ran in: claude names the
+ * transcript's directory after that path, which session/load must give.
+ */
+async function adopted({ name, card, sessionId, cwd }: ResumeRequest): Promise<Session> {
+	const real = await realpath(cwd as string).catch(() => {
+		throw new Error(`the directory ${cwd} of session ${sessionId}, which agent ${name} would adopt, is gone`);
+	});
+	return { card, sessionId, acpSessionId: sessionId, cwd: real };
+}
+
 /**
  * An agent soma did not stop, found in the sessions file as the port was made: listed, with no process and no status,
  * until a prompt wakes it in its session.
@@ -831,7 +844,9 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		 * could send a brief it still holds or record a turn. Refuses a name already listed, or a resume already under way.
 		 * An agent with no session of this id recorded, or no transcript of it, cannot be resumed: claude refuses to load
 		 * such a session, so NotImplemented ends the deferral `gone`. One whose worktree is gone or whose session does not
-		 * load throws what happened, and stays stopped.
+		 * load throws what happened, and stays stopped. Given a `cwd` and holding no entry of the name, it adopts the
+		 * session, one a Claude Code session handed over with `soma defer`: claude-agent-acp loads a session the CLI made as
+		 * one of its own, so its id is the ACP session id, and the entry is written once it has loaded.
 		 */
 		async resume(request: ResumeRequest): Promise<void> {
 			await loading;
@@ -840,12 +855,13 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 				throw new Error(`acp already lists an agent named ${name}`);
 			}
 			const found = sessions.get(name);
-			if (found === undefined || found.sessionId !== sessionId || givenUp(found)) {
+			const adopting = found === undefined && request.cwd !== undefined;
+			if (!adopting && (found === undefined || found.sessionId !== sessionId || givenUp(found))) {
 				throw new NotImplemented(`acp holds no session ${sessionId} of agent ${name} to start again`);
 			}
-			const { stopped: _resumed, ...session } = found;
 			resuming.add(name);
 			try {
+				const session = found === undefined ? await adopted(request) : withoutStop(found);
 				if ((await transcriptOf(session)) === undefined) {
 					throw new NotImplemented(
 						`ACP session ${session.acpSessionId} of agent ${name} has no transcript, so it never ran a prompt`,

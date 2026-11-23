@@ -30,6 +30,9 @@ export interface ResumeRequest {
 	readonly card: string;
 	// The one its StartRequest carried, as the dispatch list holds it.
 	readonly sessionId: string;
+	// Given for a session the agent side never started, one handed over with `soma defer`: the directory it ran in,
+	// where the agent side adopts it.
+	readonly cwd?: string;
 }
 
 export interface AgentListing {

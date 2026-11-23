@@ -18,18 +18,23 @@ export const TOUCHED_MS = 10 * 60_000;
 
 /**
  * Whether a finished turn goes to the human at once instead of waiting for the next report: someone has to act on
- * 需要你 and 失敗, and a 完成 is awaited by a human who touched the job within TOUCHED_MS, or who asked for the ticket
- * the job writes: its reply names the card.
+ * 需要你 and 失敗, and a 完成 is awaited by a human who touched the job within TOUCHED_MS, who asked for the ticket
+ * the job writes (its reply names the card), or who handed the job's session over to soma to go on with later.
  */
 export function urgent(
 	outcome: Outcome | "未知",
-	{ decisions, ticket }: { readonly decisions: readonly Decision[]; readonly ticket?: string },
+	{
+		decisions,
+		ticket,
+		handoff,
+	}: { readonly decisions: readonly Decision[]; readonly ticket?: string; readonly handoff?: true },
 	now: number,
 ): boolean {
 	if (outcome === "需要你" || outcome === "失敗") return true;
 	return (
 		outcome === "完成" &&
 		(ticket !== undefined ||
+			handoff === true ||
 			decisions.some(
 				(decision) =>
 					(decision.action === "replied" || (decision.action === "answered" && decision.reason === HUMAN_CHOSEN)) &&

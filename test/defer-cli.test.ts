@@ -1,4 +1,7 @@
-import { expect, test } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, expect, test } from "vitest";
 import { DeferUnreachable } from "../src/adapters/defer-socket/index.ts";
 import { parseDeferArgs, runDefer } from "../src/defer-cli.ts";
 import type { DeferReply, DeferRequest } from "../src/ports/defer.ts";
@@ -70,7 +73,9 @@ test("outside a dispatched agent's shell, or with soma down, nothing is deferred
 	const bare = await cli(["--at", "PT2M", "x"], {});
 	expect([bare.status, bare.err, bare.sent]).toEqual([
 		1,
-		["soma defer: SOMA_AGENT is not set: soma defer works only in the shell of an agent soma dispatched"],
+		[
+			"soma defer: neither SOMA_AGENT nor CLAUDE_CODE_SESSION_ID is set: soma defer works only in a Claude Code session or in the shell of an agent soma dispatched",
+		],
 		[],
 	]);
 
@@ -79,4 +84,83 @@ test("outside a dispatched agent's shell, or with soma down, nothing is deferred
 		1,
 		["soma defer: soma is not answering on /run/soma.sock (connect ENOENT /run/soma.sock); nothing was deferred"],
 	]);
+});
+
+const dir = mkdtempSync(join(tmpdir(), "soma-defer-cli-"));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
+const config = join(dir, "dev.json");
+writeFileSync(config, JSON.stringify({ db: "/data/dev.sqlite" }));
+const SESSION = "7e33597b-e33d-4c6d-a700-e21b2f54223e";
+const SESSION_ENV = { CLAUDE_CODE_SESSION_ID: SESSION, SOMA_CONFIG: config };
+
+/** As `cli`, run in `cwd` and recording the socket each request went to. */
+async function handoff(env: Record<string, string>, cwd = "/Users/me/workspace/soma/src") {
+	const out: string[] = [];
+	const err: string[] = [];
+	const sent: { path: string; request: DeferRequest }[] = [];
+	const status = await runDefer(
+		["--at", "PT2M", "run the tests"],
+		env,
+		{ out: (line) => out.push(line), err: (line) => err.push(line) },
+		async (path, request) => {
+			sent.push({ path, request });
+			return { accepted: true, id: "9", at: "2026-11-04T10:02:00.000Z" };
+		},
+		{ cwd, home: "/Users/me" },
+	);
+	return { status, out, err, sent };
+}
+
+test("in a Claude Code session soma did not dispatch, the session and its directory go to the config's socket", async () => {
+	const run = await handoff(SESSION_ENV);
+
+	expect(run).toEqual({
+		status: 0,
+		out: [
+			`soma defer: accepted as 9; at 2026-11-04T10:02:00.000Z soma resumes session ${SESSION} in /Users/me/workspace/soma/src and gives it this instruction as a new prompt. This session may be closed now.`,
+		],
+		err: [],
+		sent: [
+			{
+				path: "/data/dev.sqlite.defer.sock",
+				request: { session: SESSION, cwd: "/Users/me/workspace/soma/src", at: "PT2M", instruction: "run the tests" },
+			},
+		],
+	});
+});
+
+test("a hand-off goes to SOMA_SOCKET when it is set, whatever the config names", async () => {
+	const run = await handoff({ ...SESSION_ENV, SOMA_SOCKET: "/tmp/soma-other.sock" });
+
+	expect(run.status).toBe(0);
+	expect(run.sent).toEqual([
+		{
+			path: "/tmp/soma-other.sock",
+			request: { session: SESSION, cwd: "/Users/me/workspace/soma/src", at: "PT2M", instruction: "run the tests" },
+		},
+	]);
+});
+
+test("a dispatched agent's shell sends today's request, though its claude sets CLAUDE_CODE_SESSION_ID too", async () => {
+	const run = await handoff({ ...AGENT_ENV, CLAUDE_CODE_SESSION_ID: SESSION, SOMA_CONFIG: config });
+
+	expect(run.sent).toEqual([
+		{ path: "/run/soma.sock", request: { agent: "card-a", at: "PT2M", instruction: "run the tests" } },
+	]);
+	expect(run.out).toEqual([
+		"soma defer: accepted as 9; soma will send this instruction to agent card-a as a new prompt at 2026-11-04T10:02:00.000Z. You can end your turn now.",
+	]);
+});
+
+test("with neither SOMA_AGENT nor CLAUDE_CODE_SESSION_ID, or a config that cannot be read, nothing is sent", async () => {
+	const bare = await handoff({ SOMA_SOCKET: "/run/soma.sock", SOMA_CONFIG: config });
+	expect([bare.status, bare.sent, bare.out]).toEqual([1, [], []]);
+	expect(bare.err).toEqual([
+		"soma defer: neither SOMA_AGENT nor CLAUDE_CODE_SESSION_ID is set: soma defer works only in a Claude Code session or in the shell of an agent soma dispatched",
+	]);
+
+	writeFileSync(join(dir, "broken.json"), "{");
+	const broken = await handoff({ CLAUDE_CODE_SESSION_ID: SESSION, SOMA_CONFIG: join(dir, "broken.json") });
+	expect([broken.status, broken.sent, broken.out]).toEqual([1, [], []]);
+	expect(broken.err.at(-1)).toMatch(/^soma defer: .*; nothing was deferred$/);
 });

@@ -1095,3 +1095,23 @@ test("noHandover says why, doing nothing", async () => {
 		reason: "this soma runs its jobs on rex",
 	});
 });
+
+test("a resume of a session the ACP side never started goes to the ACP side with its cwd", async () => {
+	const asked: unknown[] = [];
+	const both = await sides({
+		from: (port) => ({
+			...port,
+			resume: (request) => {
+				asked.push(request);
+				return port.resume(request);
+			},
+		}),
+	});
+	const request = { name: "soma-repo-7e33", card: "soma-repo-7e33", sessionId: SESSION, cwd: both.acp.cwd };
+
+	// The fake CLI left no transcript of it, so the ACP side cannot adopt it.
+	await expect(both.agents.resume(request)).rejects.toThrow(/has no transcript/);
+
+	expect(asked).toEqual([request]);
+	expect(both.windowsOpened()).toEqual([]);
+});

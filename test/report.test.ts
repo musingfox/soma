@@ -105,3 +105,12 @@ test("a summary gets each 卡片： line of what it covers that it lacks, once, 
 	expect(withCardLines("", covered.slice(0, 2))).toBe("卡片：soma-a\n卡片：soma-b");
 	expect(withCardLines("摘要", covered.slice(3))).toBe("摘要");
 });
+
+test("a hand-off job's 完成 is told at once, untouched; its reply with no result line waits for the digest", () => {
+	const now = Date.parse("2026-11-23T10:00:00Z");
+	const job = { decisions: [], handoff: true as const };
+
+	expect(urgent("完成", job, now)).toBe(true);
+	expect(urgent("未知", job, now)).toBe(false);
+	expect(urgent("完成", { decisions: [] }, now)).toBe(false);
+});

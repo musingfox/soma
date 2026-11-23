@@ -395,3 +395,41 @@ test("soma defer calls the outcome unknown once the request went out, and says n
 	expect(down.status).toBe(1);
 	expect(down.err).toEqual([expect.stringMatching(/^soma defer: soma is not answering on .*; nothing was deferred$/)]);
 });
+
+const SESSION = "7e33597b-e33d-4c6d-a700-e21b2f54223e";
+
+test("a hand-off from a Claude Code session reaches defer as it was sent, and an agent's defer still does", async () => {
+	const { path, seen, server } = await serving();
+	const handoff = { session: SESSION, cwd: "/Users/me/workspace/soma", at: "PT2M", instruction: "run the tests" };
+
+	expect(await requestDefer(path, handoff)).toEqual({ accepted: true, id: "1", at: "x" });
+	expect(await requestDefer(path, { agent: "card-a", at: "PT2M", instruction: "x" })).toMatchObject({ accepted: true });
+
+	expect(seen).toEqual([handoff, { agent: "card-a", at: "PT2M", instruction: "x" }]);
+	await server.close();
+});
+
+test("a hand-off mixing in an agent, with a session that is no UUID or a relative cwd, is refused without reaching defer", async () => {
+	const { path, seen, server } = await serving();
+	const handoff = { session: SESSION, cwd: "/Users/me/workspace/soma", at: "PT2M", instruction: "x" };
+	const refused = async (request: object) => JSON.parse(await raw(path, `${JSON.stringify(request)}\n`));
+
+	expect(await refused({ ...handoff, agent: "card-a" })).toEqual({
+		accepted: false,
+		reason: "the request is malformed at (top level)",
+	});
+	expect(await refused({ agent: "card-a", cwd: "/w", at: "PT2M", instruction: "x" })).toEqual({
+		accepted: false,
+		reason: "the request is malformed at session, (top level)",
+	});
+	expect(await refused({ ...handoff, session: "card-a" })).toEqual({
+		accepted: false,
+		reason: "the request is malformed at session",
+	});
+	expect(await refused({ ...handoff, cwd: "workspace/soma" })).toEqual({
+		accepted: false,
+		reason: "the request is malformed at cwd",
+	});
+	expect(seen).toEqual([]);
+	await server.close();
+});

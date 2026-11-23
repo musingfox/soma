@@ -15,6 +15,14 @@ export function composeLaunchPrompt(cardContent: string): string {
 	return `${LAUNCH_RULES}\n以下是任務卡：\n\n${cardContent}`;
 }
 
+/**
+ * The first prompt soma gives a session handed over with `soma defer`: it now runs unattended as soma's job, so it
+ * gets the rules a dispatched agent's brief opens with, and then `instruction`.
+ */
+export function composeHandoffPrompt(instruction: string): string {
+	return `${LAUNCH_RULES}\n${instruction}`;
+}
+
 /** The line of a ticket agent's final reply, after the result line, that names the card it wrote. */
 export const TICKET_CARD_LINE = "卡片：";
 

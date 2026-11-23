@@ -9,7 +9,15 @@ import {
 } from "@earendil-works/pi-durable";
 import { type AgentPort, NotImplemented, PromptRefused } from "../../../ports/agent.ts";
 import type { DeferReply, DeferRequest, HandoffRequest } from "../../../ports/defer.ts";
-import { type Deferred, deferAt, deferNotice, handoffName, handoffRefusal, promptOf } from "../../domain/defer.ts";
+import {
+	type Deferred,
+	deferAt,
+	deferNotice,
+	handoffName,
+	handoffRefusal,
+	heldSession,
+	promptOf,
+} from "../../domain/defer.ts";
 import type { Job, Reclaim } from "../../domain/dispatch.ts";
 import { noticeEntry } from "../../notice.ts";
 import { Dispatches } from "../dispatch/index.ts";
@@ -71,6 +79,13 @@ async function release(tx: Tx, conversation: Conversation["id"], id: string, age
 	doc.jobs[index] = { ...current, reclaim: { phase: "due" } };
 	return true;
 }
+
+/**
+ * The job other than its own that holds a hand-off's session, as one soma dispatched in it, or none: a hand-off job a
+ * session owns under its own name is the only job that may hold it beside the hand-off.
+ */
+const holderOf = (jobs: readonly Job[], session: string, own?: string) =>
+	jobs.find((job) => job.sessionId === session && !(job.handoff === true && (own === undefined || job.agent === own)));
 
 /** `job` with `before`, the reclaim it had before a deferral held it `resuming`, absent when it had none. */
 function unheld(job: Job, before: Reclaim | undefined): Job {
@@ -224,6 +239,10 @@ export function deferExtension(
 				const phase = current?.reclaim?.phase;
 				// A reclaim that committed `stopping` since the listing wins, and nothing is sent.
 				if (phase === "stopping") return ending(tx, "gone", deferNotice.stopping(id, item));
+				// Its own resume checked this already, in the commit that held the job.
+				const holder =
+					item.session === undefined || own.resuming ? undefined : holderOf(doc.jobs, item.session, item.agent);
+				if (holder !== undefined) return ending(tx, "unresumed", deferNotice.taken(id, item, holder.card));
 				if (phase === "resuming" && !own.resuming) {
 					held = true;
 					return undefined;
@@ -261,6 +280,9 @@ export function deferExtension(
 				const index = doc.jobs.findIndex((each) => each.agent === item.agent);
 				const current = doc.jobs[index];
 				const phase = current?.reclaim?.phase;
+				// Accept refused a session a job held then; one may have come to hold it since, as a handover's move does.
+				const holder = item.session === undefined ? undefined : holderOf(doc.jobs, item.session, item.agent);
+				if (holder !== undefined) return ending(tx, "unresumed", deferNotice.taken(id, item, holder.card));
 				// A hand-off's session becomes soma's job here, as soma resumes it. Its `before` is `stopped`: a deferral that
 				// ends without the agent leaves a job no reconcile takes for one that vanished.
 				if (current === undefined && item.session !== undefined) {
@@ -498,7 +520,8 @@ export function deferExtension(
 	 * Accepts a hand-off from a Claude Code session soma did not dispatch: one commit creates the deferral and its item,
 	 * named for the job the session becomes when it falls due (`handoffName`), and nothing else happens until then: no
 	 * job, no listing, no reclaim, no stop. A session that already has a hand-off job, or a waiting hand-off, gets that
-	 * name again; any other name a job or a waiting deferral holds is another session's.
+	 * name again; any other name a job or a waiting deferral holds is another session's. A session any other job holds,
+	 * as one soma dispatched that the human resumed by hand, is refused: never two writers on one transcript.
 	 */
 	async function handoff(conversation: Conversation, request: HandoffRequest, context: Context): Promise<DeferReply> {
 		const setAt = Date.now();
@@ -515,8 +538,10 @@ export function deferExtension(
 		if (refusal !== undefined) return { accepted: false, reason: refusal };
 		// A directory that cannot be read is named as one outside any repo: the name only has to be the job's own.
 		const root = (await repoRoot(cwd).catch(() => undefined)) ?? cwd;
-		return conversation.commit(async (tx) => {
+		return conversation.commit(async (tx): Promise<DeferReply> => {
 			const { jobs } = await tx.doc(Dispatches, conversation.id);
+			const holder = holderOf(jobs, session);
+			if (holder !== undefined) return { accepted: false, reason: heldSession(session, holder.card) };
 			const deferrals = await tx.doc(Deferrals, conversation.id);
 			const waiting = Object.values(deferrals.items);
 			const agent =
@@ -532,7 +557,7 @@ export function deferExtension(
 			const item: Deferred = { agent, card: agent, instruction, at, setAt, session, cwd };
 			const id = await tx.createTask(Deferral, item, { ownership: { kind: "conversation" }, background: true });
 			deferrals.items[String(id)] = item;
-			return { accepted: true, id: String(id), at: new Date(at).toISOString() } as const;
+			return { accepted: true, id: String(id), at: new Date(at).toISOString() };
 		}, context);
 	}
 

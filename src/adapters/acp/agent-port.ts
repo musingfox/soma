@@ -859,6 +859,14 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 			if (!adopting && (found === undefined || found.sessionId !== sessionId || givenUp(found))) {
 				throw new NotImplemented(`acp holds no session ${sessionId} of agent ${name} to start again`);
 			}
+			// Another name's entry for the same claude session, under its ACP id or soma's, would be a second claude-agent-acp
+			// on one transcript, whatever that entry's state.
+			const holder = adopting
+				? [...sessions].find(([, held]) => held.acpSessionId === sessionId || held.sessionId === sessionId)?.[0]
+				: undefined;
+			if (holder !== undefined) {
+				throw new Error(`acp agent ${holder} already holds session ${sessionId}, so ${name} does not adopt it`);
+			}
 			resuming.add(name);
 			try {
 				const session = found === undefined ? await adopted(request) : withoutStop(found);

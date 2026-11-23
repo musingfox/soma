@@ -1410,3 +1410,23 @@ test("resume with a cwd and no transcript there throws NotImplemented, recording
 	expect(await spawned(acp)).toEqual([]);
 	expect(await acp.port.list()).toEqual([]);
 });
+
+test("resume with a cwd adopts no session another entry holds, under its ACP id or soma's, and starts nothing", async () => {
+	const acp = await harness();
+	await acp.start();
+	await acp.until("idle");
+	const from = acp.events.length;
+	await acp.port.prompt("card-a", "the word is KIWI");
+	await acp.until("done", from);
+	const { acpSessionId } = (await recorded(acp))["card-a"] ?? { acpSessionId: "" };
+	const before = await readFile(acp.sessionsFile, "utf8");
+
+	for (const sessionId of [acpSessionId, SESSION]) {
+		await expect(acp.port.resume({ ...handoff, sessionId, cwd: acp.cwd })).rejects.toThrow(
+			`acp agent card-a already holds session ${sessionId}, so soma-repo-7e33 does not adopt it`,
+		);
+	}
+	expect(await readFile(acp.sessionsFile, "utf8")).toBe(before);
+	expect((await spawned(acp)).map(([name]) => name)).toEqual(["card-a"]);
+	expect((await acp.port.list()).map(({ name }) => name)).toEqual(["card-a"]);
+});

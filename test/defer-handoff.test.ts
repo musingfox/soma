@@ -299,3 +299,103 @@ test("a rerun that finds a hand-off's prompt in flight ends unsure, naming the s
 		),
 	]);
 });
+
+test("a hand-off of a session another job of soma's holds is refused naming that job, and records nothing", async () => {
+	const { db, repo } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const dispatched: Job = {
+		card: "card-a",
+		agent: "card-a",
+		sessionId: SESSION,
+		status: { state: "done" },
+		decisions: [],
+	};
+	await soma.root.commit(async (tx) => {
+		(await tx.doc(Dispatches, soma.root.id)).jobs.push(dispatched);
+	}, context);
+
+	expect(await soma.handoff(repo)).toEqual({
+		accepted: false,
+		reason: `session ${SESSION} is already the session of soma's job card-a, which soma resumes and prompts itself: it takes no hand-off of it, since two claudes would then write one transcript`,
+	});
+	expect(await soma.items()).toEqual({});
+	expect(await soma.jobs()).toEqual([dispatched]);
+});
+
+test("a hand-off whose session another job came to hold before it fell due is not resumed, and one notice names both", async () => {
+	const { db, repo } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const deferral = id(await soma.handoff(repo, SESSION, "PT1S"));
+	const dispatched: Job = {
+		card: "card-a",
+		agent: "card-a",
+		sessionId: SESSION,
+		status: { state: "done" },
+		decisions: [],
+	};
+	await soma.root.commit(async (tx) => {
+		(await tx.doc(Dispatches, soma.root.id)).jobs.push(dispatched);
+	}, context);
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "unresumed" });
+	expect([agents.resumed, agents.prompts]).toEqual([[], []]);
+	expect(await soma.jobs()).toEqual([dispatched]);
+	expect(await soma.notices()).toEqual([
+		expect.stringMatching(
+			new RegExp(
+				`^Deferred instruction ${deferral} for agent soma-my-repo-7e33 \\(Claude Code session ${SESSION} in ${repo}\\) was not sent: .*already that of soma's job card-a, so soma did not resume it a second time`,
+			),
+		),
+	]);
+});
+
+test("a hand-off whose session another job holds is not prompted where its own job is listed already", async () => {
+	const { db, repo } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const deferral = id(await soma.handoff(repo, SESSION, "PT1S"));
+	const own: Job = {
+		card: "soma-my-repo-7e33",
+		agent: "soma-my-repo-7e33",
+		sessionId: SESSION,
+		status: { state: "done" },
+		decisions: [],
+		handoff: true,
+	};
+	const { handoff: _own, ...rest } = own;
+	const dispatched: Job = { ...rest, card: "card-a", agent: "card-a" };
+	await soma.root.commit(async (tx) => {
+		(await tx.doc(Dispatches, soma.root.id)).jobs.push(own, dispatched);
+	}, context);
+	agents.emit("soma-my-repo-7e33", { state: "done" });
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "unresumed" });
+	expect(agents.prompts).toEqual([]);
+	expect(await soma.notices()).toEqual([expect.stringMatching(/already that of soma's job card-a/)]);
+});
+
+test("a second hand-off of a session whose own job is listed goes to that job's agent once", async () => {
+	const { db, repo } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const own: Job = {
+		card: "soma-my-repo-7e33",
+		agent: "soma-my-repo-7e33",
+		sessionId: SESSION,
+		status: { state: "done" },
+		decisions: [],
+		handoff: true,
+	};
+	await soma.root.commit(async (tx) => {
+		(await tx.doc(Dispatches, soma.root.id)).jobs.push(own);
+	}, context);
+	agents.emit("soma-my-repo-7e33", { state: "done" });
+
+	const deferral = id(await soma.handoff(repo, SESSION, "PT1S"));
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "sent" });
+	expect(agents.resumed).toEqual([]);
+	expect(agents.prompts).toEqual([{ agent: "soma-my-repo-7e33", text: expect.stringMatching(/tell me the word$/) }]);
+});

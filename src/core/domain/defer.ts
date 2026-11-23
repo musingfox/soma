@@ -55,6 +55,10 @@ export function handoffRefusal(session: string, cwd: string): string | undefined
 	return undefined;
 }
 
+/** Why a hand-off of `session` is refused while soma's job `card` holds that session: never two writers on one transcript. */
+export const heldSession = (session: string, card: string) =>
+	`session ${session} is already the session of soma's job ${card}, which soma resumes and prompts itself: it takes no hand-off of it, since two claudes would then write one transcript`;
+
 /**
  * The job name of a hand-off, decided 2026-11-23: `soma-<repo>-<hex>`, `<repo>` the base name of `root`, the session's
  * repo root or its directory outside any repo, in lower case with every run of other characters one `-` and none at
@@ -96,6 +100,10 @@ export const deferNotice = {
 		item.session !== undefined && error !== undefined
 			? `${named(id, item)} was not sent: when it fell due at ${iso(item.at)}, soma could not resume the session: ${error}. The instruction was: ${item.instruction}`
 			: `${named(id, item)} was not sent: the agent was no longer listed when it fell due at ${iso(item.at)}. The instruction was: ${item.instruction}`,
+	// A hand-off whose session another job of soma's holds, which it is not resumed beside: never two writers on one
+	// transcript.
+	taken: (id: string, item: Deferred, card: string) =>
+		`${named(id, item)} was not sent: when it fell due at ${iso(item.at)}, its session was already that of soma's job ${card}, so soma did not resume it a second time: two claudes would then write one transcript. The instruction was: ${item.instruction}`,
 	// The agent was gone at `at`, and starting it again in its session failed.
 	unresumed: (id: string, item: Deferred, error: string) =>
 		`${named(id, item)} was not sent: the agent was gone when it fell due at ${iso(item.at)}, and soma could not start it again: ${error}. The instruction was: ${item.instruction}`,

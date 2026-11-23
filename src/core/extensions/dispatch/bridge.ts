@@ -90,7 +90,11 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 				? {
 						agent: job.agent,
 						card: job.card,
-						...(event.status.fingerprint === undefined ? {} : { fingerprint: event.status.fingerprint }),
+						...(event.status.fingerprint === undefined
+							? event.status.msg === undefined
+								? {}
+								: { msg: event.status.msg }
+							: { fingerprint: event.status.fingerprint }),
 						at: new Date().toISOString(),
 					}
 				: undefined;

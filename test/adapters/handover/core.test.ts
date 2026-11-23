@@ -141,7 +141,7 @@ async function core(
 		notices: async () =>
 			(await entries(NOTICE))
 				.map((entry) => (entry.data as { content: string }).content)
-				.filter((content) => !content.includes("soma's model did not answer")),
+				.filter((content) => !content.includes("soma 的模型沒有決定")),
 		turns: async () => (await entries(JOB_DONE)).map((entry) => entry.data as { outcome: string; notified: boolean }),
 		say: async (content: string) => {
 			const submission = await root.submit({ type: "input", content, requestId: `t:${said++}` }, context);

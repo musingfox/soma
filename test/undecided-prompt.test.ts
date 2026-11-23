@@ -135,7 +135,7 @@ test("a wake the model's round answers with text only reaches the human as one q
 		{
 			kind: "question",
 			class: "action",
-			content: expect.stringContaining("agent card-a (card card-a)"),
+			content: expect.stringContaining("agent card-a（卡片 card-a）卡在提示上"),
 			choices: { card: "card-a", fingerprint: "f00d", options },
 		},
 	]);
@@ -158,6 +158,94 @@ test("a prompt whose screen gave no options is still handed over, as a question 
 		{ kind: "question", class: "action", content: expect.stringContaining("Which branch?") },
 	]);
 	expect((await soma.job())?.decisions).toMatchObject([{ kind: "question", action: "escalated" }]);
+});
+
+test("a wake round that fails is handed over too, as a question offering the prompt's options", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await core(await database(), agents, () =>
+		fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid_request_error: the request was refused" }),
+	);
+
+	agents.emit("card-a", prompt);
+	await soma.settle();
+
+	const settled = await soma.root.commit(
+		async (tx) => (await tx.submissionByRequest(soma.root.id, `agent:card-a:${(await soma.job())?.seq}`))?.status,
+		context,
+	);
+	expect(settled).toBe("unanswered");
+	expect(await soma.notices()).toEqual([
+		{
+			kind: "question",
+			class: "action",
+			content: expect.stringContaining(prompt.msg),
+			choices: { card: "card-a", fingerprint: "f00d", options },
+		},
+	]);
+	expect((await soma.job())?.decisions).toMatchObject([{ action: "escalated", reason: LEFT_UNDECIDED }]);
+});
+
+test("a wake round the human stopped is handed over too, while the job still waits on the prompt", async () => {
+	const agents = new FakeAgentPort();
+	let asked = () => {};
+	const requested = new Promise<void>((resolve) => {
+		asked = resolve;
+	});
+	const soma = await core(await database(), agents, (_wake, signal) => {
+		asked();
+		return new Promise<AssistantMessage>((resolve) =>
+			signal?.addEventListener("abort", () =>
+				resolve(fauxAssistantMessage("", { stopReason: "aborted", errorMessage: "Request was aborted" })),
+			),
+		);
+	});
+
+	agents.emit("card-a", prompt);
+	await soma.handledAll();
+	await requested;
+	await soma.root.abort(context);
+	await soma.settle();
+
+	const settled = await soma.root.commit(
+		async (tx) => (await tx.submissionByRequest(soma.root.id, `agent:card-a:${(await soma.job())?.seq}`))?.status,
+		context,
+	);
+	expect(settled).toBe("unanswered");
+	expect(await soma.notices()).toEqual([
+		expect.objectContaining({ kind: "question", choices: { card: "card-a", fingerprint: "f00d", options } }),
+	]);
+	expect((await soma.job())?.decisions).toMatchObject([{ action: "escalated", reason: LEFT_UNDECIDED }]);
+});
+
+test("a prompt with no fingerprint that gave way to another during the round is left to that one's round", async () => {
+	const agents = new FakeAgentPort();
+	let soma: Awaited<ReturnType<typeof core>> | undefined;
+	let first = true;
+	soma = await core(await database(), agents, async ({ card }) => {
+		if (first) {
+			first = false;
+			// Answered in the agent's own pane, which then stops at another prompt with no options either.
+			agents.emit("card-a", { state: "working" });
+			agents.emit("card-a", { state: "blocked", kind: "question", msg: "Which file?" });
+			await soma?.handledAll();
+			return fauxAssistantMessage("你要選哪一個？");
+		}
+		return fauxAssistantMessage(
+			[fauxToolCall("escalate", { card, question: "要改哪個檔案？", reason: "畫面讀不出選項" })],
+			{
+				stopReason: "toolUse",
+			},
+		);
+	});
+
+	agents.emit("card-a", { state: "blocked", kind: "question", msg: "Which branch?" });
+	await soma.settle();
+
+	expect(await soma.wakes()).toHaveLength(2);
+	expect(await soma.notices()).toEqual([
+		{ kind: "question", class: "action", content: "agent card-a（卡片 card-a）：要改哪個檔案？" },
+	]);
+	expect((await soma.job())?.decisions).toMatchObject([{ action: "escalated", reason: "畫面讀不出選項" }]);
 });
 
 test("a round that answers the prompt with respond writes no notice", async () => {

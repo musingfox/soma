@@ -211,7 +211,7 @@ test("three answers of one kind and a block again lead to a memory revision citi
 		expect.objectContaining({ id: 1, by: "model", text: expect.stringContaining("轉給人") }),
 	]);
 	expect(soma.notices).toEqual([
-		expect.stringContaining("soma's model did not answer"),
+		expect.stringContaining("soma 的模型沒有決定"),
 		expect.stringContaining("soma 修改了長期記憶 #1"),
 		expect.stringMatching(/^soma 開了一張改程式碼的卡 fix-reblock：.*已派進 fleet（agent fix-reblock）/),
 		"觀察：…\n證據 id：…\n改動：…",
@@ -261,7 +261,7 @@ test("the same problem the next day wakes no model and tells the human once that
 
 	// Each block again is one the model left alone, which soma hands to the human: #3 the first day, #5 the next.
 	expect(soma.notices.slice(handled)).toEqual([
-		expect.stringContaining("soma's model did not answer"),
+		expect.stringContaining("soma 的模型沒有決定"),
 		"卡片 card-a 的問題處理過之後又出現新的訊號，處理可能沒有奏效。" +
 			`先前的處理：長期記憶 #1 在 ${new Date((await soma.history())[0]?.at ?? 0).toISOString()} 的修改、卡片 fix-reblock。` +
 			"新訊號的證據：decision:card-a#4。soma 不會自動再修訂或開卡，請你看看。",
@@ -273,7 +273,7 @@ test("the same problem the next day wakes no model and tells the human once that
 
 	// The day after: the same handling has been reported already, so nothing is said again.
 	await nextDay("f005");
-	expect(soma.notices.slice(handled + 2)).toEqual([expect.stringContaining("soma's model did not answer")]);
+	expect(soma.notices.slice(handled + 2)).toEqual([expect.stringContaining("soma 的模型沒有決定")]);
 	expect(await soma.reflections()).toHaveLength(1);
 });
 

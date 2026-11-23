@@ -92,18 +92,20 @@ export function awaitsAnswer(job: Job | undefined, { turn, at }: Pick<JobQuestio
 
 /**
  * A blocked prompt the event bridge handed the model: the job's agent, its card, the prompt's fingerprint when the
- * screen gave one, and when it was handed over.
+ * screen gave one, else its `msg`, which then tells it from another prompt as `observe` does, and when it was handed over.
  */
 export type Wake = {
 	readonly agent: string;
 	readonly card: string;
 	readonly fingerprint?: string;
+	readonly msg?: string;
 	readonly at: string;
 };
 
 /**
  * Whether the prompt `wake` handed the model still waits with no decision on it once the model's round is over: the job
- * is still blocked on a prompt of the same fingerprint, and nothing was answered or escalated for it since the wake.
+ * is still blocked on a prompt of the same fingerprint, or of the same `msg` when neither has one, and nothing was
+ * answered or escalated for it since the wake.
  */
 export function leftUndecided(
 	job: Job | undefined,
@@ -111,6 +113,7 @@ export function leftUndecided(
 ): job is Job & { readonly status: Extract<AgentState, { state: "blocked" }> } {
 	if (job === undefined || job.status.state !== "blocked" || job.status.kind === "auth") return false;
 	if (job.status.fingerprint !== wake.fingerprint) return false;
+	if (wake.fingerprint === undefined && job.status.msg !== wake.msg) return false;
 	return !job.decisions.some((decision) => decision.at >= wake.at);
 }
 

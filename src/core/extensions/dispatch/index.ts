@@ -188,8 +188,7 @@ function promptChoices({ card, status }: Job): Choices | undefined {
 }
 
 /** The reason of the decision soma records for a prompt the model's round left undecided. */
-export const LEFT_UNDECIDED =
-	"the model's round ended with neither respond nor escalate, so soma handed it to the human";
+export const LEFT_UNDECIDED = "模型這一輪沒有用 respond 代答，也沒有用 escalate 轉給人，soma 轉給人";
 
 /**
  * In the commit that sees the wake's round over: a prompt the round left undecided goes to the human as the question
@@ -207,9 +206,7 @@ async function escalateUndecided(tx: Tx, conversationId: Conversation["id"], wak
 		decisions: [...current.decisions, decide(current, { action: "escalated", reason: LEFT_UNDECIDED })],
 	};
 	const screen = current.status.msg ? `\n${clip(current.status.msg)}` : "";
-	const content =
-		`agent ${current.agent} (card ${current.card}) is waiting at a prompt (kind=${current.status.kind}) that ` +
-		`soma's model did not answer: it is yours to decide.${screen}`;
+	const content = `agent ${current.agent}（卡片 ${current.card}）卡在提示上，kind=${current.status.kind}，soma 的模型沒有決定，要你決定。${screen}`;
 	await tx.appendEntry(conversationId, noticeEntry("question", "action", content, promptChoices(current)));
 }
 
@@ -238,8 +235,9 @@ function nextRound(runtime: UndecidedRuntime, watch: DocumentWatch<LiveState> | 
 /**
  * Created by the event bridge with each wake, in the commit of its seq, so a resent event or a restart makes none twice.
  * It waits for the wake's input to be answered: a run's inputs settle in the commit that ends it, by which time every call
- * the model made in that round has committed its decision. Only a round that answered: one that failed or was stopped
- * is told to the human as such. Background, so no idle wait and no stop of the conversation waits for it.
+ * the model made in that round has committed its decision. A round that failed or was stopped is looked at too: its
+ * failure, if told at all, offers no buttons and decides nothing. Background, so no idle wait and no stop of the
+ * conversation waits for it.
  */
 export const UndecidedPrompt = defineTask<Undecided, { phase: "wait" }, null>({
 	name: "soma.dispatch.undecided",
@@ -260,7 +258,7 @@ export const UndecidedPrompt = defineTask<Undecided, { phase: "wait" }, null>({
 						const record = await tx.submissionByRequest(runtime.conversationId, requestId);
 						if (record !== undefined && record.status !== "done" && record.status !== "unanswered") return undefined;
 						over = true;
-						if (record?.status === "done") await escalateUndecided(tx, runtime.conversationId, wake);
+						if (record !== undefined) await escalateUndecided(tx, runtime.conversationId, wake);
 						return { status: "terminal", outcome: { status: "completed", result: null } };
 					}, context);
 					if (over) return;

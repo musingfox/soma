@@ -26,6 +26,7 @@ import {
 	type Step,
 	window,
 } from "../../domain/inspect.ts";
+import { homeOfCall } from "../../home.ts";
 import { JOB_DONE } from "../dispatch/bridge.ts";
 import { Dispatches } from "../dispatch/index.ts";
 import { Stops } from "../stop/index.ts";
@@ -141,9 +142,10 @@ export function inspectExtension(storage: Pick<Storage, "scanSubmissions">) {
 			}
 			const limit = args.limit ?? INSPECT_DEFAULT_LIMIT;
 			if (args.what === "decisions" || args.what === "jobs") {
-				const jobs = (await api.snapshot(Dispatches, api.conversationId, context))?.jobs ?? [];
+				const home = await homeOfCall(api, context);
+				const jobs = (await api.snapshot(Dispatches, home, context))?.jobs ?? [];
 				if (args.what === "decisions") return json(window(decisionRows(jobs, range), limit));
-				const evidence = await api.commit((tx) => jobEvidence(tx, api.conversationId), context);
+				const evidence = await api.commit((tx) => jobEvidence(tx, home), context);
 				return json(window(jobRows(jobs, evidence), limit));
 			}
 			if (args.what === "failures") {

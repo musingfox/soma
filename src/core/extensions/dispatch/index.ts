@@ -17,6 +17,7 @@ import { deferCancelled } from "../../domain/defer.ts";
 import { type Decision, type Job, jobQuestions } from "../../domain/dispatch.ts";
 import { composeLaunchPrompt, composeTicketPrompt } from "../../domain/launch-prompt.ts";
 import { cutInWindow, cutSentence, HANDOVER_CUT, turning } from "../../domain/reconcile.ts";
+import { homeOf, homeOfCall } from "../../home.ts";
 import { FORWARDED, noticeEntry } from "../../notice.ts";
 import { Questions } from "../ask/index.ts";
 import { Deferrals } from "../defer/deferrals.ts";
@@ -24,7 +25,7 @@ import { Deferrals } from "../defer/deferrals.ts";
 /** Entry kind of a turn the bridge recorded as finished; it carries no model message. */
 export const JOB_DONE = "soma.dispatch.done";
 
-/** Every job dispatched from this conversation; one per card. */
+/** Every job dispatched from this conversation and the ones it is home of; one per card. */
 export const Dispatches = defineDoc<{ jobs: Job[] }>({
 	kind: "soma.dispatch.jobs",
 	version: 1,
@@ -150,7 +151,7 @@ async function startOne(
 	return { job, existing: false, started: listed === undefined };
 }
 
-/** `startJobIn` under a tool call, which memoizes the session id under the call. */
+/** `startJobIn` under a tool call, which memoizes the session id under the call and records the job on its home. */
 export async function startJob(
 	agents: AgentPort,
 	readCard: (repo: string, card: string) => Promise<string>,
@@ -159,7 +160,7 @@ export async function startJob(
 	context: Context,
 ): Promise<Job> {
 	const ledger: JobLedger = {
-		conversationId: api.conversationId,
+		conversationId: await homeOfCall(api, context),
 		commit: (change) => api.commit(change, context),
 		sessionId: () => api.memo("sessionId", randomUUID(), context),
 	};
@@ -371,10 +372,10 @@ export function dispatchExtension(
 		replay: "safe",
 		execute: async (_args, api, context) =>
 			text(
-				await api.commit(
-					async (tx) => JSON.parse(JSON.stringify((await tx.doc(Dispatches, api.conversationId)).jobs)) as Job[],
-					context,
-				),
+				await api.commit(async (tx) => {
+					const { jobs } = await tx.doc(Dispatches, await homeOf(tx, api.conversationId));
+					return JSON.parse(JSON.stringify(jobs)) as Job[];
+				}, context),
 			),
 	});
 
@@ -409,7 +410,8 @@ export function dispatchExtension(
 					await agents.respondForeign(foreign, answer).catch((error: Error) => ({ sent: false, error: error.message })),
 				);
 			}
-			const outcome = await answerJob(agents, (change) => api.commit(change, context), api.conversationId, {
+			const home = await homeOfCall(api, context);
+			const outcome = await answerJob(agents, (change) => api.commit(change, context), home, {
 				card: card as string,
 				answer,
 				reason,
@@ -431,7 +433,8 @@ export function dispatchExtension(
 		replay: "unsafe",
 		execute: async (args, api, context) => {
 			const escalated = await api.commit(async (tx) => {
-				const doc = await tx.doc(Dispatches, api.conversationId);
+				const home = await homeOf(tx, api.conversationId);
+				const doc = await tx.doc(Dispatches, home);
 				const index = doc.jobs.findIndex((each) => each.card === args.card);
 				const current = doc.jobs[index];
 				if (current === undefined) return false;
@@ -446,7 +449,7 @@ export function dispatchExtension(
 						? { card: current.card, fingerprint: status.fingerprint, options: status.options ?? [] }
 						: undefined;
 				await tx.appendEntry(
-					api.conversationId,
+					home,
 					noticeEntry(
 						"question",
 						"action",
@@ -473,9 +476,10 @@ export function dispatchExtension(
 		// Not replayed: a crash mid-call reports it interrupted rather than sending the answer a second time.
 		replay: "unsafe",
 		execute: async (args, api, context) => {
+			const home = await homeOfCall(api, context);
 			// Copied out as JSON: a doc is a live proxy only valid inside its commit.
 			const job = await api.commit(async (tx) => {
-				const found = (await tx.doc(Dispatches, api.conversationId)).jobs.find((each) => each.card === args.card);
+				const found = (await tx.doc(Dispatches, home)).jobs.find((each) => each.card === args.card);
 				return found && (JSON.parse(JSON.stringify(found)) as Job);
 			}, context);
 			if (job === undefined) return text({ sent: false, error: `no job for card ${args.card}` });
@@ -488,7 +492,7 @@ export function dispatchExtension(
 				reason: args.reason,
 			};
 			await api.commit(async (tx) => {
-				const doc = await tx.doc(Dispatches, api.conversationId);
+				const doc = await tx.doc(Dispatches, home);
 				const index = doc.jobs.findIndex((each) => each.card === args.card);
 				const current = doc.jobs[index];
 				if (current !== undefined) doc.jobs[index] = { ...current, decisions: [...current.decisions, decision] };
@@ -558,10 +562,10 @@ export function dispatchExtension(
 			}
 			try {
 				if (foreign !== undefined) return text(tailOf(await agents.readForeignScreen(foreign), lines));
-				const agent = await api.commit(
-					async (tx) => (await tx.doc(Dispatches, api.conversationId)).jobs.find((each) => each.card === card)?.agent,
-					context,
-				);
+				const agent = await api.commit(async (tx) => {
+					const { jobs } = await tx.doc(Dispatches, await homeOf(tx, api.conversationId));
+					return jobs.find((each) => each.card === card)?.agent;
+				}, context);
 				if (agent === undefined) return text({ error: `no job for card ${card}` });
 				return text(tailOf(await agents.readScreen(agent), lines));
 			} catch (error) {
@@ -617,9 +621,10 @@ export function dispatchExtension(
 		replay: "unsafe",
 		execute: async ({ card: name }, api, context) => {
 			const refuse = (refusal: HandoverRefusal, reason: string) => text({ handedOver: false, refusal, reason });
+			const home = await homeOfCall(api, context);
 			// Copied out as JSON: a doc is a live proxy only valid inside its commit.
 			const job = await api.commit(async (tx) => {
-				const found = (await tx.doc(Dispatches, api.conversationId)).jobs.find((each) => each.card === name);
+				const found = (await tx.doc(Dispatches, home)).jobs.find((each) => each.card === name);
 				return found && (JSON.parse(JSON.stringify(found)) as Job);
 			}, context);
 			if (job === undefined) return refuse("unknown", `no job for card ${name}`);
@@ -636,14 +641,11 @@ export function dispatchExtension(
 						(outcome.cut === undefined ? "" : cutInWindow(outcome.cut)) +
 						(outcome.ready ? "" : " claude has not reported itself up in the window yet, so look at the window.");
 					const lastRecord = last === undefined ? {} : { lastRecord: last.id };
-					await api.commit(
-						(tx) => commitMove(tx, api.conversationId, job, { ...outcome, ...lastRecord }, after),
-						context,
-					);
+					await api.commit((tx) => commitMove(tx, home, job, { ...outcome, ...lastRecord }, after), context);
 					return;
 				}
 				if (outcome.cut === undefined && outcome.back === undefined) return;
-				await api.commit((tx) => commitRefusal(tx, api.conversationId, job, outcome), context);
+				await api.commit((tx) => commitRefusal(tx, home, job, outcome), context);
 			};
 			let moved: HandoverOutcome;
 			try {

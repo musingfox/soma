@@ -22,6 +22,7 @@ import {
 	renderRecurrence,
 	triage,
 } from "../../domain/reflection.ts";
+import { homeOfCall } from "../../home.ts";
 import { noticeEntry } from "../../notice.ts";
 import { Dispatches, startJob } from "../dispatch/index.ts";
 import { Curated, Facts } from "../memory/index.ts";
@@ -226,8 +227,9 @@ export function reflection({ repo, createCard, readCard, agents }: ReflectionOpt
 		execute: async (args, api, context) => {
 			const refused = refuseCard(args.evidence);
 			if (refused !== undefined) return answer(refused);
+			const home = await homeOfCall(api, context);
 			const find = async (tx: Tx) => {
-				const found = (await tx.doc(Reflections, api.conversationId)).cards.find((card) => card.callId === api.callId);
+				const found = (await tx.doc(Reflections, home)).cards.find((card) => card.callId === api.callId);
 				return found && (JSON.parse(JSON.stringify(found)) as OpenedCard);
 			};
 			let opened = await api.commit(find, context);
@@ -248,7 +250,7 @@ export function reflection({ repo, createCard, readCard, agents }: ReflectionOpt
 				};
 				const card = opened;
 				await api.commit(async (tx) => {
-					(await tx.doc(Reflections, api.conversationId)).cards.push(card);
+					(await tx.doc(Reflections, home)).cards.push(card);
 				}, context);
 			}
 			let dispatch = "started";
@@ -260,10 +262,10 @@ export function reflection({ repo, createCard, readCard, agents }: ReflectionOpt
 			const done: OpenedCard = { ...opened, dispatch };
 			const { notice, result } = outcome(done);
 			await api.commit(async (tx) => {
-				const { cards } = await tx.doc(Reflections, api.conversationId);
+				const { cards } = await tx.doc(Reflections, home);
 				const index = cards.findIndex((card) => card.callId === api.callId);
 				cards[index] = done;
-				await tx.appendEntry(api.conversationId, noticeEntry("report", "ambient", notice));
+				await tx.appendEntry(home, noticeEntry("report", "ambient", notice));
 			}, context);
 			return answer(result);
 		},

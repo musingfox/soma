@@ -12,6 +12,7 @@ import type { Choice } from "../../../ports/agent.ts";
 import type { SaidChoices } from "../../../ports/human.ts";
 import type { JobQuestion } from "../../domain/dispatch.ts";
 import { MAX_OPTIONS, MIN_OPTIONS, OPTION_MAX_CHARS, optionsRefusal } from "../../domain/options.ts";
+import { homeOf } from "../../home.ts";
 import { noticeEntry } from "../../notice.ts";
 import { inputKinds } from "../interfaces/index.ts";
 
@@ -112,13 +113,11 @@ export function askExtension({ storage, interfaces }: AskOptions) {
 				options: args.options.map((label, index) => ({ id: String(index + 1), label: label.trim() })),
 			};
 			await api.commit(async (tx) => {
-				const doc = await tx.doc(Questions, api.conversationId);
+				const home = await homeOf(tx, api.conversationId);
+				const doc = await tx.doc(Questions, home);
 				if (doc.questions[question] !== undefined) return;
 				doc.questions[question] = { options: choices.options };
-				await tx.appendEntry(
-					api.conversationId,
-					noticeEntry("question", "action", args.question, choices, undefined, replyTo),
-				);
+				await tx.appendEntry(home, noticeEntry("question", "action", args.question, choices, undefined, replyTo));
 			}, context);
 			return text({ asked: true, note: `The question has been sent to the human as its own message: ${END_TURN}` });
 		},

@@ -29,6 +29,7 @@ import {
 	type StoredLine,
 } from "../../domain/memory.ts";
 import { deniedSignal } from "../../domain/signal.ts";
+import { homeOf } from "../../home.ts";
 import { noticeEntry } from "../../notice.ts";
 
 const RECALL_LIMIT = 20;
@@ -123,13 +124,14 @@ async function applyChange(
 	conversationId: ConversationId,
 	change: (lines: readonly StoredLine[], history: readonly Revision[]) => Changed,
 ): Promise<string> {
+	const home = await homeOf(tx, conversationId);
 	const curated = await tx.doc(Curated);
 	const changed = change(curated.lines, curated.history);
 	if (!changed.ok) return changed.reason;
 	curated.lines = changed.lines;
 	curated.history.push(changed.revision);
 	const notice = renderRevision(changed.revision);
-	await tx.appendEntry(conversationId, noticeEntry("report", "ambient", notice));
+	await tx.appendEntry(home, noticeEntry("report", "ambient", notice));
 	return `${notice}已通知使用者。`;
 }
 

@@ -437,6 +437,12 @@ export const releasedSession = (card: string) =>
 	"gave the Claude Code session back to the human, so nothing runs to take a reply. To give it more work, hand off " +
 	"from that session again (soma defer in it), or dispatch a new job.";
 
+/** What `reply` returns for a hand-off job soma stopped with a deferral of its agent pending, the first due at `at`. */
+export const awaitsDeferral = (card: string, at: number) =>
+	`Not sent: soma stopped the agent of hand-off job ${card} while a deferred instruction of it is pending, so nothing ` +
+	`runs to take a reply now, and this one is not delivered. At ${new Date(at).toISOString()} soma resumes the job's ` +
+	"session and gives it the deferred instruction; a reply can go to it once it is running again.";
+
 /** A soma given no handover has no rex hangar to hand over to. */
 const NO_HANGAR: AgentHandover = {
 	handOver: async () => ({
@@ -605,14 +611,21 @@ export function dispatchExtension(
 		execute: async (args, api, context) => {
 			const home = await homeOfCall(api, context);
 			// Copied out as JSON: a doc is a live proxy only valid inside its commit.
-			const job = await api.commit(async (tx) => {
+			const { job, due } = await api.commit(async (tx) => {
 				const found = (await tx.doc(Dispatches, home)).jobs.find((each) => each.card === args.card);
-				return found && (JSON.parse(JSON.stringify(found)) as Job);
+				const { items } = await tx.doc(Deferrals, home);
+				const pending = Object.values(items).filter((item) => item.agent === found?.agent);
+				const due = pending.length === 0 ? undefined : Math.min(...pending.map((item) => item.at));
+				return { job: found && (JSON.parse(JSON.stringify(found)) as Job), due };
 			}, context);
 			if (job === undefined) return text({ sent: false, error: `no job for card ${args.card}` });
-			// No process is left to take it, and the session is the human's again: only a new hand-off or dispatch reaches it.
+			// No process is left to take it: a deferral pending resumes it in its session when it falls due, and without one
+			// the session is the human's again, which only a new hand-off or dispatch reaches.
 			if (job.handoff === true && job.reclaim?.phase === "stopped") {
-				return text({ sent: false, refused: releasedSession(job.card) });
+				return text({
+					sent: false,
+					refused: due === undefined ? releasedSession(job.card) : awaitsDeferral(job.card, due),
+				});
 			}
 			await agents.prompt(job.agent, args.text);
 			const decision: Decision = {

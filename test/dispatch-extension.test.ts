@@ -4,8 +4,14 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
+import { Deferrals } from "../src/core/extensions/defer/deferrals.ts";
 import { eventBridge, JOB_DONE, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
-import { Dispatches, dispatchExtension, releasedSession } from "../src/core/extensions/dispatch/index.ts";
+import {
+	awaitsDeferral,
+	Dispatches,
+	dispatchExtension,
+	releasedSession,
+} from "../src/core/extensions/dispatch/index.ts";
 
 const context = BACKGROUND_CONTEXT;
 const open: Harness[] = [];
@@ -386,6 +392,38 @@ test("reply to a hand-off job soma stopped after its last turn is refused, sendi
 
 	expect(result).toEqual({ sent: false, refused: releasedSession("soma-repo-7e33") });
 	expect(releasedSession("x")).toMatch(/session was released after its last turn.*hand off.*dispatch a new job/);
+	expect(agents.prompts).toEqual([]);
+	expect(await jobs()).toEqual([stopped]);
+});
+
+test("reply to a hand-off job soma stopped with a deferral of it pending says the deferral resumes it, and sends nothing", async () => {
+	const { agents, root, call, jobs } = await setup();
+	const stopped = {
+		card: "soma-repo-7e33",
+		agent: "soma-repo-7e33",
+		sessionId: "7e33597b-e33d-4c6d-a700-e21b2f54223e",
+		status: { state: "done" as const },
+		outcome: "完成" as const,
+		decisions: [],
+		handoff: true as const,
+		reclaim: { phase: "stopped" as const },
+	};
+	const at = Date.parse("2026-11-25T09:00:00Z");
+	const pending = { agent: stopped.agent, card: stopped.card, instruction: "go on", setAt: at - 60_000 };
+	await root.commit(async (tx) => {
+		(await tx.doc(Dispatches, root.id)).jobs.push(stopped);
+		const { items } = await tx.doc(Deferrals, root.id);
+		items["41"] = { ...pending, at: at + 60_000 };
+		items["42"] = { ...pending, at };
+		items["43"] = { ...pending, agent: "card-b", card: "card-b", at: at - 120_000 };
+	}, context);
+
+	const result = await call("reply", { card: "soma-repo-7e33", text: "go on", reason: "人要它繼續" }, "r1");
+
+	expect(result).toEqual({ sent: false, refused: awaitsDeferral("soma-repo-7e33", at) });
+	expect(awaitsDeferral("x", at)).toMatch(
+		/deferred instruction of it is pending.*not delivered\. At 2026-11-25T09:00:00\.000Z soma resumes the job's session and gives it the deferred instruction/,
+	);
 	expect(agents.prompts).toEqual([]);
 	expect(await jobs()).toEqual([stopped]);
 });

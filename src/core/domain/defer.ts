@@ -1,3 +1,4 @@
+import type { Job } from "./dispatch.ts";
 import { composeHandoffPrompt } from "./launch-prompt.ts";
 import { resolveAt } from "./schedule.ts";
 
@@ -90,6 +91,18 @@ const named = (id: string, { agent, card, session, cwd }: Deferred) =>
 /** What the notice of a move says of a deferral its job armed as it moved: only the human can still send it. */
 export const deferCancelled = ({ at, instruction }: Deferred) =>
 	` A deferred instruction it set as it moved was cancelled, since the stop it arms would have closed this window: it was due at ${iso(at)}: ${instruction}. Send it in the window yourself if it still matters.`;
+
+/**
+ * Whether a hand-off job with nothing deferred for it is at rest, so its session goes back to the human (ARCHITECTURE.md
+ * "Hand-off from a session soma did not dispatch"): no reclaim, and its last turn ended 完成 or 失敗, or it is idle with
+ * no turn recorded. A 需要你 one waits for its reply.
+ */
+export function givesSessionBack(job: Job): boolean {
+	if (job.handoff !== true || job.reclaim !== undefined) return false;
+	const { state } = job.status;
+	if (state !== "idle" && state !== "done") return false;
+	return job.outcome === "完成" || job.outcome === "失敗" || (job.outcome === undefined && state === "idle");
+}
 
 /** The one notice for an agent soma could not stop once it deferred: it stays open, and its deferrals still go to it. */
 export const reclaimFailedNotice = (agent: string, card: string, error: string) =>

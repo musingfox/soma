@@ -13,6 +13,7 @@ import type { Job } from "../src/core/domain/dispatch.ts";
 import { type DeferOptions, Deferrals, deferExtension } from "../src/core/extensions/defer/index.ts";
 import { eventBridge, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
+import { reclaimer } from "../src/core/extensions/dispatch/reclaim.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { NOTICE } from "../src/core/notice.ts";
 import {
@@ -57,7 +58,15 @@ async function core(db: string, agents: Agents, options: DeferOptions = {}) {
 	faux.setResponses(Array.from({ length: 20 }, () => fauxAssistantMessage("好。")));
 	const models = createModels();
 	models.setProvider(faux.provider);
-	const defers = deferExtension(agents, { pollMs: 10, readyMs: 2_000, repoRoot: repoRootOf, ...options });
+	// The host's reclaimer, as main.ts gives it, once the root conversation is open.
+	let reclaim: (agent: string) => Promise<void> = async () => {};
+	const defers = deferExtension(agents, {
+		pollMs: 10,
+		readyMs: 2_000,
+		repoRoot: repoRootOf,
+		reclaim: (agent) => reclaim(agent),
+		...options,
+	});
 	const harness = await openHarness(
 		db,
 		[dispatchExtension(agents as AgentPort, async () => ""), defers.extension],
@@ -66,6 +75,7 @@ async function core(db: string, agents: Agents, options: DeferOptions = {}) {
 	);
 	open.push(harness);
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+	reclaim = reclaimer(root, agents as AgentPort, context);
 	harness.resume();
 	const bridge = eventBridge(root, agents as AgentPort, context);
 	const handled: Promise<void>[] = [];
@@ -349,6 +359,286 @@ test("a hand-off job with a deferral of its agent pending is left to that deferr
 	await soma.settle();
 	expect(agents.stopped).toEqual([name]);
 	expect((await soma.jobs())[0]).toMatchObject({ reclaim: { phase: "stopped" } });
+});
+
+/** Refuses every prompt once `refuse` is set, as rex does for a busy agent: nothing is typed. */
+class Refusing extends FakeAgentPort {
+	refuse = false;
+	override async prompt(agent: string, text: string): Promise<void> {
+		if (this.refuse) throw new PromptRefused(`agent ${agent} is busy`);
+		return super.prompt(agent, text);
+	}
+}
+
+/** Waits for `ok`, as for a stop that goes out unawaited once a deferral ended. */
+async function until(ok: () => boolean | Promise<boolean>, what: string) {
+	for (const deadline = Date.now() + 5_000; !(await ok()); await new Promise((resolve) => setTimeout(resolve, 10))) {
+		if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+	}
+}
+
+/** What a stop that would go out unawaited has had time to do. */
+const quiet = () => new Promise((resolve) => setTimeout(resolve, 100));
+
+test("a hand-off job at rest after 完成 whose pending hand-off ends unsent is stopped once", async () => {
+	const { db, src } = await tree();
+	const agents = new Refusing();
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	expect(agents.stopped).toEqual([]);
+
+	agents.refuse = true;
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "failed" });
+	await until(() => agents.stopped.length > 0, "the stop");
+	await quiet();
+	expect(agents.stopped).toEqual([name]);
+	expect((await soma.jobs())[0]).toMatchObject({ outcome: "完成", reclaim: { phase: "stopped" } });
+	expect(await soma.items()).toEqual({});
+	expect(await soma.notices()).toEqual([
+		expect.stringContaining("這一輪結束了"),
+		expect.stringMatching(new RegExp(`^Deferred instruction ${later} .* was not sent`)),
+	]);
+});
+
+test("a hand-off whose first prompt is refused leaves its job idle with no turn, and it is stopped", async () => {
+	const { db, src } = await tree();
+	const agents = new Refusing();
+	agents.refuse = true;
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+
+	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "failed" });
+	await until(() => agents.stopped.length > 0, "the stop");
+	expect(agents.stopped).toEqual(["soma-my-repo-7e33"]);
+	const [job] = await soma.jobs();
+	expect(job).toMatchObject({ handoff: true, status: { state: "idle" }, reclaim: { phase: "stopped" } });
+	expect(job?.outcome).toBeUndefined();
+});
+
+test("a hand-off job whose last turn asked 需要你 is not stopped when its pending hand-off ends unsent", async () => {
+	const { db, src } = await tree();
+	const agents = new Refusing();
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.finish(name, "結果：需要你\nWhich branch?");
+	await soma.settle();
+
+	agents.refuse = true;
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "failed" });
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("a hand-off job in a window is not stopped when its pending hand-off ends unsent", async () => {
+	const { db, src } = await tree();
+	const agents = new Refusing();
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.windows.add(name);
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+
+	agents.refuse = true;
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "failed" });
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("a hand-off that ends unsent while another of its agent is pending stops nothing", async () => {
+	const { db, src } = await tree();
+	const agents = new Refusing();
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+	const name = await fired(soma, src);
+	const first = id(await soma.handoff(src, SESSION, "PT1S"));
+	const second = id(await soma.handoff(src, SESSION, "PT1H"));
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+
+	agents.refuse = true;
+	expect(await soma.outcome(first)).toEqual({ status: "completed", result: "failed" });
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect(Object.keys(await soma.items())).toEqual([second]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("an agent side with no windowless look stops no hand-off job, at a turn's end or a deferral's unsent end", async () => {
+	const { db, src } = await tree();
+	const agents = new Refusing();
+	// rex, herdr and tty alone: every agent is in a window.
+	Object.defineProperty(agents, "windowless", { value: undefined });
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+	const name = await fired(soma, src);
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.refuse = true;
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "failed" });
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("a windowless look that fails stops no hand-off job, at a turn's end or a deferral's unsent end", async () => {
+	const { db, src } = await tree();
+	const agents = new Refusing();
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+	const name = await fired(soma, src);
+	agents.windowless = async () => {
+		throw new Error("the agent side cannot tell");
+	};
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]).toMatchObject({ outcome: "完成" });
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.refuse = true;
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "failed" });
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("a hand-off job listed at work when its pending hand-off ends unsent is not armed to be stopped", async () => {
+	const { db, src } = await tree();
+	// The listing is read fresh: the agent took a prompt since the turn the job last recorded.
+	const agents = new (class extends Refusing {
+		busy = false;
+		override async list() {
+			const listed = await super.list();
+			return this.busy ? listed.map((each) => ({ ...each, status: { state: "working" as const } })) : listed;
+		}
+	})();
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+
+	agents.busy = true;
+	agents.refuse = true;
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "failed" });
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("a hand-off job given its pending instruction is not stopped, though its listing has not caught up with the prompt", async () => {
+	const { db, src } = await tree();
+	// As a side whose status of the prompt comes later than the prompt: still listed at rest.
+	const agents = new (class extends FakeAgentPort {
+		lagging = false;
+		override async prompt(agent: string, text: string): Promise<void> {
+			if (!this.lagging) return super.prompt(agent, text);
+			this.prompts.push({ agent, text });
+		}
+	})();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+
+	agents.lagging = true;
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "sent" });
+	await quiet();
+	expect(agents.prompts).toHaveLength(2);
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("a hand-off job at rest whose pending hand-off is aborted is stopped", async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1H"));
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	expect(agents.stopped).toEqual([]);
+
+	await soma.harness.abortTask(Number(later) as TaskId, context);
+	expect(await soma.outcome(later)).toEqual({ status: "aborted" });
+	await until(() => agents.stopped.length > 0, "the stop");
+	expect(agents.stopped).toEqual([name]);
+	expect(await soma.items()).toEqual({});
+});
+
+test("a rerun that ends a hand-off's prompt unsure stops its job when it is listed at rest with no window", {
+	timeout: 20_000,
+}, async () => {
+	const { db, src } = await tree();
+	let listed: AgentListing[] = [];
+	const stopped: string[] = [];
+	let sent: () => void = () => {};
+	let cut: (error: Error) => void = () => {};
+	const reached = new Promise<void>((resolve) => {
+		sent = resolve;
+	});
+	// As the hanging prompt of the rerun test above, over a side with no window that lists the agent at rest.
+	const hanging: Agents & Pick<AgentPort, "windowless"> = {
+		list: async () => listed,
+		resume: async ({ name }) => {
+			listed = [{ name, status: { state: "idle" }, seq: 1 }];
+		},
+		stop: async (agent) => {
+			stopped.push(agent);
+			listed = [];
+		},
+		onStatus: () => () => {},
+		readResult: async () => undefined,
+		windowless: async () => true,
+		prompt: () => {
+			sent();
+			return new Promise((_resolve, reject) => {
+				cut = reject;
+			});
+		},
+	};
+	const first = await core(db, hanging);
+	const deferral = id(await first.handoff(src, SESSION, "PT1S"));
+	await reached;
+	const closed = first.harness.close(context);
+	cut(new Error("soma went down"));
+	await closed;
+	open.splice(open.indexOf(first.harness), 1);
+
+	const second = await core(db, hanging);
+	expect(await second.outcome(deferral)).toEqual({ status: "completed", result: "unsure" });
+	await until(() => stopped.length > 0, "the stop");
+	expect(stopped).toEqual(["soma-my-repo-7e33"]);
+	expect((await second.jobs())[0]).toMatchObject({ handoff: true, reclaim: { phase: "stopped" } });
+});
+
+test("a hand-off job whose stop is under way as its turn ends 完成 is not armed again, and not stopped a second time", async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+	// As a deferral that fell due while its job was `stopping` left it, taking its own item off.
+	await soma.root.commit(async (tx) => {
+		const doc = await tx.doc(Dispatches, soma.root.id);
+		doc.jobs = doc.jobs.map((each) => ({ ...each, reclaim: { phase: "stopping" } }));
+	}, context);
+
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]).toMatchObject({ outcome: "完成", reclaim: { phase: "stopping" } });
 });
 
 test("a hand-off job stopped after its 完成 takes a later hand-off of its session, resumed as after a reclaim", async () => {

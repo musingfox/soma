@@ -15,6 +15,7 @@ import {
 	deferAt,
 	deferNotice,
 	deferredPrompt,
+	givesSessionBack,
 	handoffName,
 	handoffRefusal,
 	heldSession,
@@ -168,6 +169,22 @@ async function settle(
 	return false;
 }
 
+/**
+ * Arms the reclaim of `agent`'s hand-off job when a deferral that ended unsent leaves it at rest with none of the agent's
+ * pending (`givesSessionBack`): no turn's end follows to arm it, as the event bridge does for one that ends. True when
+ * this armed it.
+ */
+async function giveBack(tx: Tx, conversation: Conversation["id"], agent: string): Promise<boolean> {
+	const { items } = await tx.doc(Deferrals, conversation);
+	if (Object.values(items).some((item) => item.agent === agent)) return false;
+	const doc = await tx.doc(Dispatches, conversation);
+	const index = doc.jobs.findIndex((job) => job.agent === agent);
+	const current = doc.jobs[index];
+	if (current === undefined || !givesSessionBack(current)) return false;
+	doc.jobs[index] = { ...current, reclaim: { phase: "due" } };
+	return true;
+}
+
 export interface DeferOptions {
 	/** How long after a prompt that failed, say to a busy agent, it is tried again. */
 	readonly retryMs?: number;
@@ -211,8 +228,9 @@ export interface DeferOptions {
  * instruction.
  */
 export function deferExtension(
-	// Without the foreign calls, no hand-off's session is ever found open in a pane soma can type into.
-	agents: Pick<AgentPort, "list" | "prompt" | "resume" | "stop"> &
+	// Without the foreign calls, no hand-off's session is ever found open in a pane soma can type into; without
+	// `windowless`, every agent is in a window, and no deferral that ends unsent stops one.
+	agents: Pick<AgentPort, "list" | "prompt" | "resume" | "stop" | "windowless"> &
 		Partial<Pick<AgentPort, "findForeignSession" | "promptForeign">>,
 	options: DeferOptions = {},
 ) {
@@ -225,6 +243,20 @@ export function deferExtension(
 
 	const listing = async (agent: string) => (await agents.list()).find((each) => each.name === agent);
 
+	/**
+	 * Whether `agent` runs with no window and is listed at rest, looked at before a deferral of it ends unsent: only then
+	 * may that ending arm its stop (`giveBack`). A look that fails is doubt, and the agent keeps running.
+	 */
+	const restsUnseen = async (agent: string): Promise<boolean> => {
+		try {
+			if (!((await agents.windowless?.(agent)) ?? false)) return false;
+			const state = (await listing(agent))?.status?.state;
+			return state === "idle" || state === "done";
+		} catch {
+			return false;
+		}
+	};
+
 	/** A deferral whose job's move took it off the pending ones ends so when it wakes, doing nothing and telling nothing. */
 	const cancelled = {
 		status: "terminal" as const,
@@ -233,13 +265,22 @@ export function deferExtension(
 
 	/** What every phase of deferral `id` does to end, to try again later, and to send its prompt, `tried` times tried. */
 	function steps(id: string, item: Deferred, tried: number, runtime: Runtime, context: Context) {
-		const ending = async (tx: Tx, outcome: DeferOutcome, notice?: string, gone = false) => {
+		// Set by an ending that armed the job's stop, which goes out once that ending has committed.
+		let armed = false;
+		const ending = async (tx: Tx, outcome: DeferOutcome, notice?: string, gone = false, rests = false) => {
 			await settle(tx, runtime.conversationId, id, item.agent, gone);
+			armed = rests && (await giveBack(tx, runtime.conversationId, item.agent));
 			if (notice !== undefined) await tx.appendEntry(runtime.conversationId, noticeEntry("report", "outcome", notice));
 			return { status: "terminal" as const, outcome: { status: "completed" as const, result: outcome } };
 		};
-		const end = (outcome: DeferOutcome, notice?: string, gone = false) =>
-			runtime.commit((tx) => ending(tx, outcome, notice, gone), context);
+		// A hand-off's agent this leaves at rest with nothing deferred is stopped, as its turn's end would have stopped it.
+		// Not awaited: the task has ended, and a stop that hangs must not hold it.
+		const end = async (outcome: DeferOutcome, notice?: string, gone = false) => {
+			const rests = outcome !== "sent" && (await restsUnseen(item.agent));
+			const ended = await runtime.commit((tx) => ending(tx, outcome, notice, gone, rests), context);
+			if (armed) void options.reclaim?.(item.agent).catch(() => {});
+			return ended;
+		};
 		// A hand-off that found its session open elsewhere held nothing for it, so its ending touches no job: one an
 		// earlier resume left stays as it was, its reclaim included, which `settle` would disarm.
 		// So does one typed into a pane of the human's.
@@ -531,8 +572,10 @@ export function deferExtension(
 			sending: async (task, runtime, context) => {
 				const id = String(task.id);
 				let due = false;
+				const rests = await restsUnseen(task.input.agent);
 				await runtime.commit(async (tx) => {
 					due = await settle(tx, runtime.conversationId, id, task.input.agent);
+					due ||= rests && (await giveBack(tx, runtime.conversationId, task.input.agent));
 					await tx.appendEntry(
 						runtime.conversationId,
 						noticeEntry("report", "outcome", deferNotice.unsure(id, task.input)),
@@ -545,10 +588,14 @@ export function deferExtension(
 			},
 		},
 		abort: async (task, runtime, context) => {
+			const rests = await restsUnseen(task.input.agent);
+			let armed = false;
 			await runtime.commit(async (tx) => {
 				await settle(tx, runtime.conversationId, String(task.id), task.input.agent);
+				armed = rests && (await giveBack(tx, runtime.conversationId, task.input.agent));
 				return { status: "terminal", outcome: { status: "aborted" } };
 			}, context);
+			if (armed) void options.reclaim?.(task.input.agent).catch(() => {});
 		},
 	});
 

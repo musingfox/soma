@@ -908,6 +908,20 @@ test("a handover whose mark does not reach the file is refused with why: the job
 	await both.agents.prompt("card-a", "still here");
 });
 
+test("a job is windowless while it runs over ACP, and neither while its turn is cut to move it nor once it is in its window", async () => {
+	const both = await sides({ fake: { FAKE_ACP_HELD: "stop" } });
+	await inTurn(both, "SPIN");
+	expect(await both.agents.windowless?.("card-a")).toBe(true);
+
+	const moving = both.agents.handOver("card-a");
+	while ((await both.cancelled()) === "") await sleep(5);
+	expect(await both.agents.windowless?.("card-a")).toBe(false);
+
+	await both.release("stop");
+	expect(await moving).toMatchObject({ handedOver: true });
+	expect(await both.agents.windowless?.("card-a")).toBe(false);
+});
+
 test("while a job moves it is listed with no status and takes no prompt, and a second handover waits and is refused", async () => {
 	const both = await sides();
 	await both.ran();

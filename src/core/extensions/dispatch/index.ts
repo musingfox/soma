@@ -9,6 +9,7 @@ import {
 	defineTool,
 	LiveDoc,
 	type LiveState,
+	type SubmissionRecord,
 	section,
 	type TaskRuntime,
 	type ToolExecutionApi,
@@ -24,9 +25,10 @@ import { composeLaunchPrompt, composeTicketPrompt } from "../../domain/launch-pr
 import { cutInWindow, cutSentence, HANDOVER_CUT, turning } from "../../domain/reconcile.ts";
 import { clip } from "../../domain/report.ts";
 import { homeOf, homeOfCall } from "../../home.ts";
-import { FORWARDED, noticeEntry } from "../../notice.ts";
+import { FORWARDED, failureContent, failureReason, noticeEntry } from "../../notice.ts";
 import { Questions } from "../ask/index.ts";
 import { Deferrals } from "../defer/deferrals.ts";
+import { Stops } from "../stop/index.ts";
 
 /** Entry kind of a turn the bridge recorded as finished; it carries no model message. */
 export const JOB_DONE = "soma.dispatch.done";
@@ -194,20 +196,41 @@ export const LEFT_UNDECIDED = "模型這一輪沒有用 respond 代答，也沒�
  * In the commit that sees the wake's round over: a prompt the round left undecided goes to the human as the question
  * `escalate` writes, stating the prompt as the bridge read it, since the model's own words may be no question at all.
  * Read with the job, so a prompt answered or moved past since is left alone; the decision recorded with the notice makes
- * any later look at the same prompt find it decided.
+ * any later look at the same prompt find it decided. `failure` is why the round failed, which no HumanPort pushes for a
+ * wake: the question says it, so the human gets one message, and a round that leaves no question is told as one failed.
  */
-async function escalateUndecided(tx: Tx, conversationId: Conversation["id"], wake: Wake): Promise<void> {
+async function escalateUndecided(
+	tx: Tx,
+	conversationId: Conversation["id"],
+	{ requestId, wake }: Undecided,
+	failure?: string,
+): Promise<void> {
 	const doc = await tx.doc(Dispatches, conversationId);
 	const index = doc.jobs.findIndex((each) => each.agent === wake.agent);
 	const current = doc.jobs[index];
-	if (!leftUndecided(current, wake)) return;
+	if (!leftUndecided(current, wake)) {
+		if (failure !== undefined)
+			await tx.appendEntry(conversationId, noticeEntry("report", "outcome", failureContent(requestId, failure)));
+		return;
+	}
 	doc.jobs[index] = {
 		...current,
 		decisions: [...current.decisions, decide(current, { action: "escalated", reason: LEFT_UNDECIDED })],
 	};
 	const screen = current.status.msg ? `\n${clip(current.status.msg)}` : "";
-	const content = `agent ${current.agent}（卡片 ${current.card}）卡在提示上，kind=${current.status.kind}，soma 的模型沒有決定，要你決定。${screen}`;
+	const model = failure === undefined ? "soma 的模型沒有決定" : `soma 的模型這一輪失敗（${failure}），沒有決定`;
+	const content = `agent ${current.agent}（卡片 ${current.card}）卡在提示上，kind=${current.status.kind}，${model}，要你決定。${screen}`;
 	await tx.appendEntry(conversationId, noticeEntry("question", "action", content, promptChoices(current)));
+}
+
+/** Why the wake's round failed, or undefined when it answered or the human stopped it (`HumanPort.stop`). */
+async function failureOf(tx: Tx, conversationId: Conversation["id"], record: SubmissionRecord) {
+	if (record.status !== "unanswered") return undefined;
+	if (record.reason === "aborted") {
+		const { stops } = await tx.doc(Stops, conversationId);
+		if (stops.some((stop) => stop.inputs.includes(record.id))) return undefined;
+	}
+	return failureReason(record.reason, record.detail);
 }
 
 type Undecided = { requestId: string; wake: Wake };
@@ -235,9 +258,9 @@ function nextRound(runtime: UndecidedRuntime, watch: DocumentWatch<LiveState> | 
 /**
  * Created by the event bridge with each wake, in the commit of its seq, so a resent event or a restart makes none twice.
  * It waits for the wake's input to be answered: a run's inputs settle in the commit that ends it, by which time every call
- * the model made in that round has committed its decision. A round that failed or was stopped is looked at too: its
- * failure, if told at all, offers no buttons and decides nothing. Background, so no idle wait and no stop of the
- * conversation waits for it.
+ * the model made in that round has committed its decision. A round that failed or was stopped is looked at too, and a
+ * failed one's failure is told here, in the same commit, since the HumanPort does not push it. Background, so no idle
+ * wait and no stop of the conversation waits for it.
  */
 export const UndecidedPrompt = defineTask<Undecided, { phase: "wait" }, null>({
 	name: "soma.dispatch.undecided",
@@ -245,7 +268,7 @@ export const UndecidedPrompt = defineTask<Undecided, { phase: "wait" }, null>({
 	initial: () => ({ phase: "wait" }),
 	phases: {
 		wait: async (task, runtime, context) => {
-			const { requestId, wake } = task.input;
+			const { requestId } = task.input;
 			// Watched before the first look, so a round that ends between the look and the wait is not missed.
 			const watch = await runtime.watchDoc(LiveDoc, runtime.conversationId, context);
 			const changed = nextRound(runtime, watch);
@@ -258,7 +281,10 @@ export const UndecidedPrompt = defineTask<Undecided, { phase: "wait" }, null>({
 						const record = await tx.submissionByRequest(runtime.conversationId, requestId);
 						if (record !== undefined && record.status !== "done" && record.status !== "unanswered") return undefined;
 						over = true;
-						if (record !== undefined) await escalateUndecided(tx, runtime.conversationId, wake);
+						if (record !== undefined) {
+							const failure = await failureOf(tx, runtime.conversationId, record);
+							await escalateUndecided(tx, runtime.conversationId, task.input, failure);
+						}
 						return { status: "terminal", outcome: { status: "completed", result: null } };
 					}, context);
 					if (over) return;

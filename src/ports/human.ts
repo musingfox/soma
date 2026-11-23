@@ -50,11 +50,13 @@ export type SaidOutcome =
 	| { readonly said: false; readonly refusal: "no_question" | "unknown_option" | "not_waiting" };
 
 /**
- * requestId prefixes of rounds the core starts itself (schedule, the event bridge for a job, the foreign bridge for a
- * foreign agent) whose failure no client owns, so every client pushes it. A digest round is not among them: on failure
- * the digest task writes a notice with the reason.
+ * requestId prefixes of rounds the core starts itself (schedule, the foreign bridge for a foreign agent) whose failure
+ * no client owns, so every client pushes it. A digest round is not among them: on failure the digest task writes a
+ * notice with the reason. Nor is the event bridge's wake for a blocked job (`agent:`): the task that looks at the
+ * prompt once that round is over tells its failure, in the question it hands the prompt over with when the job still
+ * waits on it, so the human gets one message.
  */
-export const PUSHED_FAILURES = ["schedule:", "agent:", "foreign:"] as const;
+export const PUSHED_FAILURES = ["schedule:", "foreign:"] as const;
 
 /** requestId prefixes of rounds the core starts itself whose answer no client asked for, so it is pushed. */
 export const PUSHED_ANSWERS = ["schedule:"] as const;

@@ -33,3 +33,21 @@ export function noticeEntry(
 	if (replyTo !== undefined && replyTo.length > 0) data.replyTo = [...replyTo];
 	return { kind: NOTICE, data };
 }
+
+// Durable spec 8.3: the reasons an input settles unanswered with; model_error and faulted carry the error text.
+const REASONS: Record<string, string> = {
+	model_error: "模型出錯",
+	no_model: "找不到模型",
+	aborted: "這一輪被中止",
+	faulted: "內部錯誤",
+};
+
+/** Why a round settled unanswered, in words a human can read. */
+export const failureReason = (reason: string, detail: unknown) => {
+	const head = REASONS[reason] ?? reason;
+	const text = typeof detail === "string" ? detail : detail === undefined ? "" : JSON.stringify(detail);
+	return text === "" ? head : `${head}：${text}`;
+};
+
+/** What the human is told of a round the core started that failed. */
+export const failureContent = (requestId: string, reason: string) => `${requestId} 那一輪失敗：${reason}`;

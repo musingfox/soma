@@ -50,15 +50,7 @@ import { answerJob, Dispatches } from "./extensions/dispatch/index.ts";
 import { recordFact } from "./extensions/memory/index.ts";
 import { Stops, settleStops } from "./extensions/stop/index.ts";
 import { forgetHolding, Holds, holding, type Push, summaries, textOf } from "./hold.ts";
-import { isForwarded, NOTICE, noticeEntry } from "./notice.ts";
-
-// Durable spec 8.3: the reasons an input settles unanswered with; model_error and faulted carry the error text.
-const REASONS: Record<string, string> = {
-	model_error: "模型出錯",
-	no_model: "找不到模型",
-	aborted: "這一輪被中止",
-	faulted: "內部錯誤",
-};
+import { failureContent, failureReason, isForwarded, NOTICE, noticeEntry } from "./notice.ts";
 
 /**
  * The class a notice entry names. One that names none is a fault in the code that wrote it: it is logged and pushed as
@@ -74,12 +66,6 @@ function classOf(data: { class?: unknown; content?: unknown }): MessageClass {
 /** Escalations kept before pushes had classes: only questions and pushed failures were kept. */
 const pendingClass = (pending: PendingPush): MessageClass =>
 	pending.class ?? (pending.kind === "question" ? "action" : "outcome");
-
-const failureReason = (reason: string, detail: unknown) => {
-	const head = REASONS[reason] ?? reason;
-	const text = typeof detail === "string" ? detail : detail === undefined ? "" : JSON.stringify(detail);
-	return text === "" ? head : `${head}：${text}`;
-};
 
 /** When the human last typed on each interface, and the pushes waiting to be pushed to the default interface too. */
 export const Pushes = defineDoc<{ presence: Presence; pending: PendingPush[] }>({
@@ -166,7 +152,6 @@ const replying = (pushed: Delivered, replyTo: readonly string[], rang: ReadonlyS
 const repliedTo = (entries: readonly EntryRecord[]): Set<string> =>
 	new Set(entries.flatMap((entry) => (entry.kind === NOTICE ? ((entry.data as NoticeData).replyTo ?? []) : [])));
 
-const failureContent = (requestId: string, reason: string) => `${requestId} 那一輪失敗：${reason}`;
 const pushedFailure = (requestId: string, reason: string): Push => ({
 	kind: "report",
 	class: "outcome",

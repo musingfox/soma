@@ -206,7 +206,7 @@ describe("holding", () => {
 		await first.human.close();
 		// A round the core started fails while nothing handles it.
 		const round = await root.submit(
-			{ type: "input", content: "wake", entry: { kind: "test" }, requestId: "agent:a:1" },
+			{ type: "input", content: "wake", entry: { kind: "test" }, requestId: "foreign:a:1" },
 			context,
 		);
 		expect((await round.wait(context)).status).toBe("unanswered");
@@ -222,7 +222,7 @@ describe("holding", () => {
 				at: 100 * MIN,
 				kind: "report",
 				class: "outcome",
-				content: expect.stringMatching(/^agent:a:1 那一輪失敗：模型出錯：401 invalid x-api-key/),
+				content: expect.stringMatching(/^foreign:a:1 那一輪失敗：模型出錯：401 invalid x-api-key/),
 				to: [TELEGRAM],
 			},
 		]);

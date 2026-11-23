@@ -6,14 +6,16 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { Harness } from "@earendil-works/pi-durable";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { HUMAN_CHOSEN } from "../src/core/domain/dispatch.ts";
 import { AGENT_BLOCKED, eventBridge, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { answerJob, Dispatches, dispatchExtension, LEFT_UNDECIDED } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
+import { openHumanPort } from "../src/core/human-port.ts";
 import { NOTICE } from "../src/core/notice.ts";
 import type { AgentState } from "../src/ports/agent.ts";
+import type { SomaEvent } from "../src/ports/human.ts";
 
 const context = BACKGROUND_CONTEXT;
 const open: Harness[] = [];
@@ -49,8 +51,16 @@ const prompt = {
 	options,
 } as const satisfies AgentState;
 
-/** One core process over `db` with one job, card-a, recorded working; the faux model answers a wake by `plan`. */
-async function core(db: string, agents: FakeAgentPort, plan: Plan = textOnly) {
+/**
+ * One core process over `db` with one job, card-a, recorded working; the faux model answers a wake by `plan`, and any
+ * other input by `other`.
+ */
+async function core(
+	db: string,
+	agents: FakeAgentPort,
+	plan: Plan = textOnly,
+	other: () => AssistantMessage = () => fauxAssistantMessage("好。"),
+) {
 	const faux = fauxProvider();
 	faux.setResponses(
 		Array.from(
@@ -61,7 +71,7 @@ async function core(db: string, agents: FakeAgentPort, plan: Plan = textOnly) {
 					if (last?.role === "toolResult") return fauxAssistantMessage("好。");
 					const said = JSON.stringify(last?.content ?? "");
 					const wake = /卡片 ([a-z0-9-]+)）卡住了(?:.*?fingerprint=([0-9a-z]+))?/.exec(said);
-					if (wake === null) return fauxAssistantMessage("好。");
+					if (wake === null) return other();
 					return plan({ card: wake[1] ?? "", fingerprint: wake[2] ?? "" }, streaming?.signal);
 				},
 		),
@@ -183,6 +193,122 @@ test("a wake round that fails is handed over too, as a question offering the pro
 		},
 	]);
 	expect((await soma.job())?.decisions).toMatchObject([{ action: "escalated", reason: LEFT_UNDECIDED }]);
+});
+
+const refused = () =>
+	fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid_request_error: the request was refused" });
+
+/** What the HumanPort over `soma` emits; `pushed` keeps what reaches the human: notices, and pushed answers or failures. */
+async function listening(soma: Awaited<ReturnType<typeof core>>, agents: FakeAgentPort) {
+	const human = await openHumanPort(soma.harness, soma.root, agents, context);
+	const seen: SomaEvent[] = [];
+	human.subscribe((event) => seen.push(event));
+	return {
+		seen,
+		close: () => human.close(),
+		pushed: () =>
+			seen.filter(
+				(event) =>
+					event.type === "notice" ||
+					((event.type === "failure" || event.type === "answer") && event.class !== undefined),
+			),
+	};
+}
+
+test("a failed wake round on a job still blocked reaches the human as one message, the question saying the round failed", async () => {
+	const agents = new FakeAgentPort();
+	const soma = await core(await database(), agents, refused, refused);
+	const human = await listening(soma, agents);
+
+	agents.emit("card-a", prompt);
+	await soma.settle();
+	await vi.waitFor(() => expect(human.seen.some((event) => event.type === "notice")).toBe(true));
+	// A round of another kind that fails is still pushed on its own.
+	await soma.root.submit({ type: "input", content: "fire", requestId: "schedule:r1:1" }, context);
+	await soma.root.waitForIdle(context);
+	await vi.waitFor(() => expect(human.pushed()).toHaveLength(2));
+	await human.close();
+
+	expect(human.pushed()).toEqual([
+		{
+			type: "notice",
+			kind: "question",
+			class: "action",
+			content: expect.stringContaining(
+				"soma 的模型這一輪失敗（模型出錯：invalid_request_error: the request was refused），沒有決定，要你決定。",
+			),
+			choices: { card: "card-a", fingerprint: "f00d", options },
+		},
+		{ type: "failure", requestId: "schedule:r1:1", reason: expect.stringContaining("模型出錯"), class: "outcome" },
+	]);
+	expect(human.seen).toContainEqual({
+		type: "failure",
+		requestId: `agent:card-a:${(await soma.job())?.seq}`,
+		reason: expect.any(String),
+	});
+});
+
+test("a failed wake round on a job that moved past the prompt is told once, as the failed round", async () => {
+	const agents = new FakeAgentPort();
+	let soma: Awaited<ReturnType<typeof core>> | undefined;
+	soma = await core(await database(), agents, async () => {
+		agents.emit("card-a", { state: "working" });
+		await soma?.handledAll();
+		return refused();
+	});
+	const human = await listening(soma, agents);
+
+	agents.emit("card-a", prompt);
+	await soma.settle();
+	await vi.waitFor(() => expect(human.pushed()).toHaveLength(1));
+	await human.close();
+
+	expect(human.pushed()).toEqual([
+		{
+			type: "notice",
+			kind: "report",
+			class: "outcome",
+			content: expect.stringMatching(/^agent:card-a:\d+ 那一輪失敗：模型出錯：invalid_request_error/),
+		},
+	]);
+	expect((await soma.job())?.decisions).toEqual([]);
+});
+
+test("a wake round the human stopped with HumanPort.stop is handed over as undecided, not as failed", async () => {
+	const agents = new FakeAgentPort();
+	let asked = () => {};
+	const requested = new Promise<void>((resolve) => {
+		asked = resolve;
+	});
+	const soma = await core(await database(), agents, (_wake, signal) => {
+		asked();
+		return new Promise<AssistantMessage>((resolve) =>
+			signal?.addEventListener("abort", () =>
+				resolve(fauxAssistantMessage("", { stopReason: "aborted", errorMessage: "Request was aborted" })),
+			),
+		);
+	});
+	const human = await openHumanPort(soma.harness, soma.root, agents, context);
+	const seen: SomaEvent[] = [];
+	human.subscribe((event) => seen.push(event));
+
+	agents.emit("card-a", prompt);
+	await soma.handledAll();
+	await requested;
+	const requestId = `agent:card-a:${(await soma.job())?.seq}`;
+	expect(await human.stop(requestId)).toBe(true);
+	await soma.settle();
+	await vi.waitFor(() => expect(seen.some((event) => event.type === "notice")).toBe(true));
+	await human.close();
+
+	expect(seen).toContainEqual({ type: "stopped", requestId });
+	expect(seen.filter((event) => event.type === "notice" || event.type === "failure")).toEqual([
+		expect.objectContaining({
+			type: "notice",
+			kind: "question",
+			content: expect.stringContaining("soma 的模型沒有決定"),
+		}),
+	]);
 });
 
 test("a wake round the human stopped is handed over too, while the job still waits on the prompt", async () => {

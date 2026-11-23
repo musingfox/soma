@@ -81,11 +81,27 @@ async function release(tx: Tx, conversation: Conversation["id"], id: string, age
 }
 
 /**
- * The job other than its own that holds a hand-off's session, as one soma dispatched in it, or none: a hand-off job a
- * session owns under its own name is the only job that may hold it beside the hand-off.
+ * The job other than its own that holds a hand-off's session, as one soma dispatched in it, or none. A hand-off job of
+ * the session is its own: accept gives every hand-off of a session the name of the hand-off job it has.
  */
-const holderOf = (jobs: readonly Job[], session: string, own?: string) =>
-	jobs.find((job) => job.sessionId === session && !(job.handoff === true && (own === undefined || job.agent === own)));
+const holderOf = (jobs: readonly Job[], session: string) =>
+	jobs.find((job) => job.sessionId === session && job.handoff !== true);
+
+/**
+ * The job a hand-off's session becomes, held as `reclaim` says. Recorded only once its agent is there, so a resume that
+ * fails leaves no job behind.
+ */
+const handoffJob = (item: Deferred, session: string, at: number, reclaim: Reclaim): Job => ({
+	card: item.agent,
+	agent: item.agent,
+	sessionId: session,
+	...(item.cwd !== undefined && { repo: item.cwd }),
+	status: { state: "idle" },
+	createdAt: new Date(at).toISOString(),
+	decisions: [],
+	handoff: true,
+	reclaim,
+});
 
 /** `job` with `before`, the reclaim it had before a deferral held it `resuming`, absent when it had none. */
 function unheld(job: Job, before: Reclaim | undefined): Job {
@@ -240,8 +256,7 @@ export function deferExtension(
 				// A reclaim that committed `stopping` since the listing wins, and nothing is sent.
 				if (phase === "stopping") return ending(tx, "gone", deferNotice.stopping(id, item));
 				// Its own resume checked this already, in the commit that held the job.
-				const holder =
-					item.session === undefined || own.resuming ? undefined : holderOf(doc.jobs, item.session, item.agent);
+				const holder = item.session === undefined || own.resuming ? undefined : holderOf(doc.jobs, item.session);
 				if (holder !== undefined) return ending(tx, "unresumed", deferNotice.taken(id, item, holder.card));
 				if (phase === "resuming" && !own.resuming) {
 					held = true;
@@ -250,6 +265,10 @@ export function deferExtension(
 				// A stopped one listed again was reopened by the human: it is the agent, and the bridge sees it from now on.
 				if (current !== undefined && (phase === "due" || phase === "stopped" || phase === "resuming")) {
 					doc.jobs[index] = { ...current, reclaim: { phase: "sending" } };
+				}
+				// A hand-off's agent listed with no job yet, as one whose resume threw but is there: it is the job from now on.
+				if (current === undefined && item.session !== undefined) {
+					doc.jobs.push(handoffJob(item, item.session, runtime.now(), { phase: "sending" }));
 				}
 				const { resuming: _started, before: _held, ...rest } = own;
 				items[id] = { ...rest, sending: true };
@@ -281,23 +300,20 @@ export function deferExtension(
 				const current = doc.jobs[index];
 				const phase = current?.reclaim?.phase;
 				// Accept refused a session a job held then; one may have come to hold it since, as a handover's move does.
-				const holder = item.session === undefined ? undefined : holderOf(doc.jobs, item.session, item.agent);
+				const holder = item.session === undefined ? undefined : holderOf(doc.jobs, item.session);
 				if (holder !== undefined) return ending(tx, "unresumed", deferNotice.taken(id, item, holder.card));
-				// A hand-off's session becomes soma's job here, as soma resumes it. Its `before` is `stopped`: a deferral that
-				// ends without the agent leaves a job no reconcile takes for one that vanished.
+				// A hand-off's session has no job until its resume returns (`ready`'s commit records it): the item holds the
+				// name meanwhile, which another live hand-off of the session waits on, as on a job held `resuming`.
 				if (current === undefined && item.session !== undefined) {
-					doc.jobs.push({
-						card: item.agent,
-						agent: item.agent,
-						sessionId: item.session,
-						...(item.cwd !== undefined && { repo: item.cwd }),
-						status: { state: "idle" },
-						createdAt: new Date(runtime.now()).toISOString(),
-						decisions: [],
-						handoff: true,
-						reclaim: { phase: "resuming" },
-					});
-					items[id] = { ...own, resuming: true, before: { phase: "stopped" } };
+					for (const [other, each] of Object.entries(items)) {
+						if (other === id || each.agent !== item.agent || each.resuming !== true) continue;
+						const status = (await tx.task(Number(other) as TaskId))?.state.status;
+						if (status !== undefined && status !== "completing" && status !== "terminal") {
+							held = true;
+							return undefined;
+						}
+					}
+					items[id] = { ...own, resuming: true };
 					return {
 						status: "running",
 						checkpoint: { phase: "resuming", tries: tried, session: item.session, until: runtime.now() + readyMs },
@@ -359,8 +375,8 @@ export function deferExtension(
 				const unresumed = (error: unknown) =>
 					end("unresumed", deferNotice.unresumed(id, task.input, errorText(error)), true);
 				let started = false;
+				let listed: boolean | undefined;
 				for (;;) {
-					let listed: boolean;
 					try {
 						listed = (await listing(task.input.agent)) !== undefined;
 					} catch {
@@ -394,13 +410,26 @@ export function deferExtension(
 					break;
 				}
 				// Timed from the start, so a start a crash cut short long ago still gets the whole wait.
-				return runtime.commit(
-					() => ({
-						status: "running",
-						checkpoint: { phase: "ready", tries: tried, until: runtime.now() + readyMs, started },
-					}),
-					context,
-				);
+				const ready = {
+					status: "running" as const,
+					checkpoint: { phase: "ready" as const, tries: tried, until: runtime.now() + readyMs, started },
+				};
+				const item = task.input;
+				// A hand-off's session becomes soma's job once its resume returned, or once a rerun finds its agent listed,
+				// as after a crash between the two: then this commit, never a second resume, records it. Its `before` is
+				// `stopped`, so a deferral that ends without the agent leaves a job no reconcile takes for one that vanished.
+				if (item.session === undefined || !(started || listed === true)) return runtime.commit(() => ready, context);
+				return runtime.commit(async (tx) => {
+					const { items } = await tx.doc(Deferrals, runtime.conversationId);
+					const own = items[id];
+					if (own === undefined) return cancelled;
+					const doc = await tx.doc(Dispatches, runtime.conversationId);
+					if (!doc.jobs.some((each) => each.agent === item.agent)) {
+						doc.jobs.push(handoffJob(item, session, runtime.now(), { phase: "resuming" }));
+						items[id] = { ...own, before: { phase: "stopped" } };
+					}
+					return ready;
+				}, context);
 			},
 			// The agent's window is up: it is prompted once it is listed idle or done, which is when claude takes a prompt.
 			// Only a listing that answers decides, past `until` too: one that fails is no sign of the agent either way. Listings

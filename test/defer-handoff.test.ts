@@ -179,14 +179,22 @@ test("at fire time the session becomes a job, is resumed in its directory, gets 
 	const soma = await core(db, agents);
 	let held: Job | undefined;
 	const resume = agents.resume.bind(agents);
+	let before: Job[] | undefined;
 	agents.resume = async (request) => {
-		held = (await soma.jobs())[0];
+		before = await soma.jobs();
 		await resume(request);
+	};
+	const prompt = agents.prompt.bind(agents);
+	agents.prompt = async (agent, text) => {
+		held = (await soma.jobs())[0];
+		await prompt(agent, text);
 	};
 
 	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
 
 	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "sent" });
+	// Recorded once the resume returned, and held `sending` by the prompt's commit.
+	expect(before).toEqual([]);
 	expect(held).toEqual({
 		card: "soma-my-repo-7e33",
 		agent: "soma-my-repo-7e33",
@@ -196,7 +204,7 @@ test("at fire time the session becomes a job, is resumed in its directory, gets 
 		createdAt: expect.any(String),
 		decisions: [],
 		handoff: true,
-		reclaim: { phase: "resuming" },
+		reclaim: { phase: "sending" },
 	});
 	expect(agents.resumed).toEqual([
 		{ name: "soma-my-repo-7e33", card: "soma-my-repo-7e33", sessionId: SESSION, cwd: src },
@@ -224,7 +232,7 @@ test("at fire time the session becomes a job, is resumed in its directory, gets 
 	]);
 });
 
-test("a session the agent side cannot resume ends gone with one notice naming it, its job stopped, and a reconcile tells nothing more", async () => {
+test("a session the agent side cannot resume ends gone with one notice naming it, no job, and a reconcile tells nothing more", async () => {
 	const { db, src } = await tree();
 	class NoTranscript extends FakeAgentPort {
 		override async resume(request: ResumeRequest): Promise<void> {
@@ -244,11 +252,11 @@ test("a session the agent side cannot resume ends gone with one notice naming it
 	expect(await soma.notices()).toEqual([
 		`Deferred instruction ${deferral} for agent soma-my-repo-7e33 (Claude Code session ${SESSION} in ${src}) was not sent: when it fell due at ${at}, soma could not resume the session: ACP session ${SESSION} has no transcript, so it never ran a prompt. The instruction was: tell me the word`,
 	]);
-	expect((await soma.jobs())[0]).toMatchObject({ agent: "soma-my-repo-7e33", reclaim: { phase: "stopped" } });
+	expect(await soma.jobs()).toEqual([]);
 
 	await reconcileDispatches(soma.root, agents, context);
 	expect(await soma.notices()).toHaveLength(1);
-	expect((await soma.jobs())[0]).toMatchObject({ status: { state: "idle" }, reclaim: { phase: "stopped" } });
+	expect(await soma.jobs()).toEqual([]);
 });
 
 test("a rerun that finds a hand-off's prompt in flight ends unsure, naming the session, and prompts nothing", {
@@ -398,4 +406,131 @@ test("a second hand-off of a session whose own job is listed goes to that job's 
 	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "sent" });
 	expect(agents.resumed).toEqual([]);
 	expect(agents.prompts).toEqual([{ agent: "soma-my-repo-7e33", text: expect.stringMatching(/tell me the word$/) }]);
+});
+
+test("a hand-off of the ACP id of a dispatched job, which accept cannot tell, is refused by the agent side and leaves no job", async () => {
+	const { db, repo } = await tree();
+	// On ACP a dispatched job holds soma's own session id, and claude's transcript is named after the ACP one.
+	const dispatched: Job = {
+		card: "card-a",
+		agent: "card-a",
+		sessionId: "s-card-a",
+		status: { state: "done" },
+		decisions: [],
+	};
+	class Held extends FakeAgentPort {
+		override async resume(request: ResumeRequest): Promise<void> {
+			this.resumed.push(request);
+			throw new Error(
+				`acp agent card-a already holds session ${request.sessionId}, so ${request.name} does not adopt it`,
+			);
+		}
+	}
+	const agents = new Held();
+	const soma = await core(db, agents);
+	await soma.root.commit(async (tx) => {
+		(await tx.doc(Dispatches, soma.root.id)).jobs.push(dispatched);
+	}, context);
+
+	const deferral = id(await soma.handoff(repo, SESSION, "PT1S"));
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "unresumed" });
+	expect(agents.resumed).toHaveLength(1);
+	expect(agents.prompts).toEqual([]);
+	expect(await soma.jobs()).toEqual([dispatched]);
+	expect(await soma.notices()).toEqual([
+		expect.stringMatching(
+			new RegExp(
+				`^Deferred instruction ${deferral} for agent soma-my-repo-7e33 \\(Claude Code session ${SESSION} in ${repo}\\) was not sent: .*soma could not start it again: acp agent card-a already holds session ${SESSION}`,
+			),
+		),
+	]);
+	await reconcileDispatches(soma.root, agents, context);
+	expect(await soma.notices()).toHaveLength(1);
+});
+
+test("a crash once the resume returned records the job at the rerun, which resumes nothing again", {
+	timeout: 20_000,
+}, async () => {
+	const { db, src } = await tree();
+	let listed: AgentListing[] = [];
+	let resumes = 0;
+	let resumed: () => void = () => {};
+	const reached = new Promise<void>((resolve) => {
+		resumed = resolve;
+	});
+	let hold = true;
+	// The first resume returns only as the core closes, so its run cannot commit what follows: a crash just after it.
+	const agents: Agents = {
+		list: async () => listed,
+		resume: async ({ name }) => {
+			resumes++;
+			// At work, so it is never prompted: only the rerun's own commit can record its job.
+			listed = [{ name, status: { state: "working" }, seq: 1 }];
+			resumed();
+			while (hold) await new Promise((resolve) => setTimeout(resolve, 10));
+		},
+		stop: async () => {},
+		onStatus: () => () => {},
+		readResult: async () => undefined,
+		prompt: async () => {},
+	};
+	const first = await core(db, agents);
+	const deferral = id(await first.handoff(src, SESSION, "PT1S"));
+	await reached;
+	expect(await first.jobs()).toEqual([]);
+	const closed = first.harness.close(context);
+	hold = false;
+	await closed;
+	open.splice(open.indexOf(first.harness), 1);
+
+	const second = await core(db, agents);
+
+	expect(await second.outcome(deferral)).toEqual({ status: "completed", result: "failed" });
+	expect(resumes).toBe(1);
+	expect(await second.jobs()).toMatchObject([{ agent: "soma-my-repo-7e33", sessionId: SESSION, handoff: true }]);
+});
+
+test("two hand-offs of one session falling due together resume it once, the second waiting for the first", {
+	timeout: 20_000,
+}, async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const resume = agents.resume.bind(agents);
+	agents.resume = async (request) => {
+		// Slow enough that both deferrals are past their listing before the first agent is listed.
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		await resume(request);
+	};
+	const soma = await core(db, agents, { retryMs: 50 });
+
+	const first = id(await soma.handoff(src, SESSION, "PT1S"));
+	const second = id(await soma.handoff(src, SESSION, "PT1S"));
+
+	expect(await soma.outcome(first)).toEqual({ status: "completed", result: "sent" });
+	expect(await soma.outcome(second)).toEqual({ status: "completed", result: "sent" });
+	expect(agents.resumed).toHaveLength(1);
+	expect(agents.prompts.map(({ agent }) => agent)).toEqual(["soma-my-repo-7e33", "soma-my-repo-7e33"]);
+	expect((await soma.jobs()).map(({ agent }) => agent)).toEqual(["soma-my-repo-7e33"]);
+});
+
+test("a hand-off whose resume threw but whose agent is listed after it becomes the job as it is prompted", async () => {
+	const { db, src } = await tree();
+	class Late extends FakeAgentPort {
+		override async resume(request: ResumeRequest): Promise<void> {
+			await super.resume(request);
+			throw new Error("the answer to session/load was lost");
+		}
+	}
+	const agents = new Late();
+	const soma = await core(db, agents);
+
+	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "sent" });
+	expect(agents.prompts).toHaveLength(1);
+	const [job, ...more] = await soma.jobs();
+	expect(more).toEqual([]);
+	expect(job).toMatchObject({ agent: "soma-my-repo-7e33", sessionId: SESSION, handoff: true });
+	expect(job?.reclaim).toBeUndefined();
 });

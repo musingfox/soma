@@ -72,6 +72,18 @@ const reasonOf = (record: Extract<SubmissionRecord, { status: "unanswered" }>) =
 
 const text = (value: string) => ({ output: [{ type: "text" as const, text: value }] });
 
+/**
+ * The root's tools a fire does without: the schedule tools, so a rule cannot make, list or end rules, and `ask`, as no
+ * one answers a fire's question.
+ */
+export const FIRE_REMOVED: readonly string[] = [
+	"schedule",
+	"schedule_list",
+	"schedule_cancel",
+	"schedule_recurring",
+	"ask",
+];
+
 export interface RecurringOptions {
 	/** The slot after `after`, in epoch ms; tests set a short one. */
 	nextFire?: (cron: string, after: number) => number;
@@ -81,9 +93,10 @@ export interface RecurringOptions {
 
 /**
  * Recurring rules (ARCHITECTURE.md "Recurring schedule"). Each fire runs the instruction in a fresh conversation the
- * rule's task owns, with no extension and no tool, as the dream runs; its answer is told to the human as a notice and
- * written into the root's context, in the commit that moves the rule to its next slot, unless it is only `NO_REPLY`.
- * The root's model is not woken.
+ * rule's task owns, with the root's model, extensions, sections and tools but `FIRE_REMOVED`; a tool there that acts on
+ * the root's documents, such as `dispatch`, reaches them by the home rule (`home.ts`). Its answer is told to the human
+ * as a notice and written into the root's context, in the commit that moves the rule to its next slot, unless it is
+ * only `NO_REPLY`. The root's model is not woken.
  */
 export function recurring({ nextFire = cronNextFire, lateMs = 60_000 }: RecurringOptions = {}) {
 	const Recurring = defineTask<Rule, Checkpoint, null>({
@@ -109,8 +122,12 @@ export function recurring({ nextFire = cronNextFire, lateMs = 60_000 }: Recurrin
 					}
 					await runtime.commit(async (tx, current) => {
 						const created = await tx.createConversation({ ownership: { kind: "task", taskId: current.id } });
-						// It starts as a copy of the root's agent, its model included; it gets none of its extensions or tools.
-						await configure(tx, created.id, { extensions: [], tools: [] });
+						// It starts as a copy of the root's agent: its model, extensions, sections and tools, less these. They are
+						// stored by name, so the registry's own registrations name them.
+						const removed = runtime.registry
+							.tools()
+							.flatMap(({ tool }) => (FIRE_REMOVED.includes(tool.name) ? [tool] : []));
+						await configure(tx, created.id, { tools: { remove: removed } });
 						pinned = { ...checkpoint, slot: checkpoint.next, conversationId: created.id };
 						return { status: "running", checkpoint: pinned };
 					}, context);

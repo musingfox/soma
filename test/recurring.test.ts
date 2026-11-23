@@ -7,7 +7,9 @@ import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/provid
 import { type Extension, type Harness, InboxDoc, type TaskId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test, vi } from "vitest";
 import { run } from "../smoke/driver.ts";
+import { composeTicketPrompt } from "../src/core/domain/launch-prompt.ts";
 import { askExtension } from "../src/core/extensions/ask/index.ts";
+import { Dispatches } from "../src/core/extensions/dispatch/index.ts";
 import { inspectExtension } from "../src/core/extensions/inspect/index.ts";
 import { interfaces } from "../src/core/extensions/interfaces/index.ts";
 import { memory } from "../src/core/extensions/memory/index.ts";
@@ -15,7 +17,7 @@ import { schedule } from "../src/core/extensions/schedule/index.ts";
 import { RESULT, recurring } from "../src/core/extensions/schedule/recurring.ts";
 import { tools } from "../src/core/extensions/tools/index.ts";
 import { openHarness, openStorage } from "../src/core/harness.ts";
-import { type Core, context, openCore, textOf } from "./recurring-core.ts";
+import { type Core, context, openCore, type Request, textOf } from "./recurring-core.ts";
 import { steppedModel } from "./stepped-model.ts";
 
 const cleanup: (() => Promise<unknown>)[] = [];
@@ -41,6 +43,26 @@ const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const CRON = "*/2 * * * *";
 const every = (ms: number) => (_cron: string, after: number) => after + ms;
 const idOf = (result: string) => /Scheduled (\d+): /.exec(result)?.[1] ?? "";
+// One fire, then none for an hour.
+const once = () => {
+	let slots = 0;
+	return (_cron: string, after: number) => after + (++slots === 1 ? 300 : 3_600_000);
+};
+
+/** The tools and sections a request states, its system messages replayed in order. */
+function offered(request: Request | undefined) {
+	const tools = new Set<string>();
+	const sections: Record<string, string> = {};
+	for (const message of request?.context.messages ?? []) {
+		if (message.role !== "system") continue;
+		for (const tool of message.toolsAdded ?? []) tools.add(tool.name);
+		for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+		for (const [key, value] of Object.entries(message.sections ?? {}))
+			if (value === null) delete sections[key];
+			else sections[key] = value;
+	}
+	return { tools: [...tools].sort(), sections };
+}
 
 test("a rule the model creates fires in a new conversation each time, told as an outcome, and wakes no root round", {
 	timeout: 15_000,
@@ -69,12 +91,8 @@ test("a rule the model creates fires in a new conversation each time, told as an
 		const fireLine = `[soma] schedule ${id} (${CRON}) fired in conversation ${conversation?.id}`;
 		expect(fired.mock.calls.map((call) => call.join(" "))).toContain(fireLine);
 	}
-	// The fire's request carries the input alone: no tool, no section, nothing of the root's transcript.
+	// The fire's request carries its input and nothing of the root's transcript.
 	const fire = soma.requests.find((request) => request.fire);
-	const system = (request: typeof fire) =>
-		JSON.stringify(request?.context.messages.filter((message) => message.role === "system") ?? []);
-	expect(system(soma.requests.find((request) => !request.fire))).toContain('"name":"schedule_recurring"');
-	expect(system(fire)).not.toMatch(/"toolsAdded"|"sections"/);
 	expect(fire?.context.messages.filter((message) => message.role !== "system")).toHaveLength(1);
 	expect(textOf(fire?.context.messages.at(-1)?.content)).toMatch(
 		new RegExp(
@@ -391,4 +409,60 @@ test("a fire killed after its answer is stored and before the notice tells it on
 	expect(done.owned).toEqual([
 		{ id: done.pinned.conversationId, requests: [`recurring:${done.taskId}:${done.pinned.slot}`] },
 	]);
+});
+
+test("a fire is offered the root's tools but the schedule tools and ask, under the root's sections", {
+	timeout: 15_000,
+}, async () => {
+	const soma = await core({ nextFire: once() });
+	await soma.say(`每 ${CRON} 做 報時`);
+	await vi.waitFor(() => expect(soma.notices()).toHaveLength(1), { timeout: 5_000 });
+	const root = offered(soma.requests.find((request) => !request.fire));
+	const fire = offered(soma.requests.find((request) => request.fire));
+	const removed = ["ask", "schedule", "schedule_cancel", "schedule_list", "schedule_recurring"];
+	expect(root.tools).toEqual(expect.arrayContaining([...removed, "dispatch", "jobs"]));
+	expect(fire.tools).toEqual(root.tools.filter((name) => !removed.includes(name)));
+	expect(fire.tools).not.toContain("ask");
+	expect(Object.keys(fire.sections)).not.toEqual([]);
+	expect(fire.sections).toEqual(root.sections);
+});
+
+test("a fire that calls dispatch with a ticket starts a job on the root's list, briefed by the bridge", {
+	timeout: 15_000,
+}, async () => {
+	const soma = await core({ nextFire: once() });
+	const ticket = "請開一張票：每週整理一次 inbox";
+	const args = { card: "ticket-weekly-inbox", repo: "/soma", ticket };
+	const id = idOf(await soma.say(`每 ${CRON} 做 call dispatch ${JSON.stringify(args)}`));
+	await vi.waitFor(() => expect(soma.notices()).toHaveLength(1), { timeout: 5_000 });
+
+	expect(soma.agents.started).toMatchObject([{ name: "ticket-weekly-inbox", cwd: "/soma" }]);
+	expect(await soma.jobs()).toMatchObject([{ card: "ticket-weekly-inbox", ticket }]);
+	const [owned] = await soma.owned(Number(id) as TaskId);
+	expect(await soma.harness.snapshot(Dispatches, owned?.id ?? (0 as never), context)).toBeUndefined();
+	// The agent side reports the new agent idle once it is up, after the job is recorded.
+	soma.agents.emit("ticket-weekly-inbox", { state: "idle" });
+	await soma.settle();
+	expect(soma.agents.prompts).toEqual([{ agent: "ticket-weekly-inbox", text: composeTicketPrompt(ticket) }]);
+
+	const [notice] = soma.notices();
+	const head = `[schedule ${id} · ${CRON}]\nfire 1: `;
+	expect(notice?.content.startsWith(head)).toBe(true);
+	expect(JSON.parse(notice?.content.slice(head.length) ?? "")).toMatchObject({ card: "ticket-weekly-inbox", ticket });
+});
+
+test("a fire that calls schedule_recurring gets an error result and makes no rule", { timeout: 15_000 }, async () => {
+	const soma = await core({ nextFire: once() });
+	const args = { cron: "* * * * *", instruction: "再排一條" };
+	const id = idOf(await soma.say(`每 ${CRON} 做 call schedule_recurring ${JSON.stringify(args)}`));
+	await vi.waitFor(() => expect(soma.notices()).toHaveLength(1), { timeout: 5_000 });
+
+	expect(Object.keys(await soma.rules())).toEqual([id]);
+	const [owned] = await soma.owned(Number(id) as TaskId);
+	const conversation = await soma.harness.conversation(owned?.id ?? (0 as never), context);
+	const { items } = (await conversation?.entries({ order: "ascending" }, 100, undefined, context)) ?? { items: [] };
+	const results = items.flatMap((entry) => (entry.model ?? []).filter((message) => message.role === "toolResult"));
+	expect(results).toMatchObject([{ toolName: "schedule_recurring", isError: true }]);
+	expect(textOf(results[0]?.content)).toContain("Tool schedule_recurring is not available");
+	expect(soma.notices()[0]?.content).toContain("Tool schedule_recurring is not available");
 });

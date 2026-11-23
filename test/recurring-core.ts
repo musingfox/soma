@@ -4,8 +4,11 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { AssistantMessage, TranscriptContext } from "@earendil-works/pi-ai";
 import { createModels, type Models } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { ConversationId, Harness, ModelRef, TaskId } from "@earendil-works/pi-durable";
+import type { ConversationId, Harness, JsonObject, ModelRef, TaskId } from "@earendil-works/pi-durable";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
+import { askExtension } from "../src/core/extensions/ask/index.ts";
+import { eventBridge } from "../src/core/extensions/dispatch/bridge.ts";
+import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { memory } from "../src/core/extensions/memory/index.ts";
 import { schedule } from "../src/core/extensions/schedule/index.ts";
 import { RESULT, type RecurringOptions, Rules, recurring } from "../src/core/extensions/schedule/recurring.ts";
@@ -32,7 +35,8 @@ export type Answer = (instruction: string, fire: number) => string | AssistantMe
  * human it calls `schedule_recurring` on 「每 <cron> 做 <instruction>」, `schedule` on 「提醒我 <words>」, `schedule_list`
  * on 「列出排程」 and `schedule_cancel` on 「取消排程 <id>」, and says 「好。」 otherwise. A fire's input is answered
  * `fire <n>: <instruction>`, `n` counting the fires this process answered, or what `answer` gives, and fails while
- * `failing` says so.
+ * `failing` says so; an instruction `call <tool> <json args>` is a call of the tool, and its result is answered
+ * `fire <n>: <result>`.
  */
 export function fauxModels(options: { failing?: () => boolean; answer?: Answer } = {}) {
 	const requests: Request[] = [];
@@ -42,18 +46,22 @@ export function fauxModels(options: { failing?: () => boolean; answer?: Answer }
 		Array.from({ length: 200 }, () => (request: TranscriptContext) => {
 			const last = request.messages.findLast((message) => message.role !== "system");
 			const said = textOf(last?.content ?? "");
-			const fire = last?.role === "user" && FIRE.test(said);
+			const input = FIRE.exec(textOf(request.messages.findLast((message) => message.role === "user")?.content ?? ""));
+			const fire = input !== null;
 			requests.push({ fire, context: request });
+			const call = (name: string, args: JsonObject) =>
+				fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
 			if (fire) {
 				if (options.failing?.() === true) throw new Error("401 invalid x-api-key");
-				const instruction = FIRE.exec(said)?.[3] ?? "";
+				if (last?.role === "toolResult") return fauxAssistantMessage(`fire ${++fires}: ${said}`);
+				const instruction = input[3] ?? "";
+				const tool = /^call (\S+) (.*)$/s.exec(instruction);
+				if (tool?.[1] !== undefined && tool[2] !== undefined) return call(tool[1], JSON.parse(tool[2]));
 				const fire = ++fires;
 				const answer = options.answer?.(instruction, fire) ?? `fire ${fire}: ${instruction}`;
 				return typeof answer === "string" ? fauxAssistantMessage(answer) : answer;
 			}
 			if (last?.role === "toolResult") return fauxAssistantMessage(`好。${said}`);
-			const call = (name: string, args: Record<string, string>) =>
-				fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
 			const rule = /每 (.+?) 做 (.+)$/s.exec(said);
 			if (rule?.[1] !== undefined && rule[2] !== undefined)
 				return call("schedule_recurring", { cron: rule[1], instruction: rule[2] });
@@ -88,19 +96,30 @@ export async function openCore(options: CoreOptions) {
 	});
 	const { models, model } = options.models ?? faux;
 	const storage = await openStorage(options.db);
+	const agents = new FakeAgentPort();
 	const recurringOptions: RecurringOptions = {
 		...(options.nextFire && { nextFire: options.nextFire }),
 		...(options.lateMs !== undefined && { lateMs: options.lateMs }),
 	};
 	const harness: Harness = await openHarness(
 		storage,
-		[memory, schedule((id, c) => harness.abortTask(id, c)), recurring(recurringOptions)],
+		// In main.ts's order, with the tools a fire is to keep or lose beside the schedule's.
+		[
+			memory,
+			schedule((id, c) => harness.abortTask(id, c)),
+			dispatchExtension(agents, async (_repo, card) => `# ${card}`),
+			askExtension({ storage, interfaces: ["chat.terminal"] }),
+			recurring(recurringOptions),
+		],
 		context,
 		{ models },
 	);
 	const root = await harness.root(context, { agent: { model } });
-	const human = await openHumanPort(harness, root, new FakeAgentPort(), context);
+	const human = await openHumanPort(harness, root, agents, context);
 	if (options.resume !== false) harness.resume();
+	const bridge = eventBridge(root, agents, context);
+	const handled: Promise<void>[] = [];
+	agents.onStatus((event) => handled.push(bridge.handle(event)));
 	const events: SomaEvent[] = [];
 	human.subscribe((event) => events.push(event));
 	const notices = () =>
@@ -113,6 +132,15 @@ export async function openCore(options: CoreOptions) {
 		root,
 		human,
 		storage,
+		agents,
+		/** Until every agent event so far has been handled by the bridge. */
+		async settle() {
+			for (let seen = -1; seen !== handled.length; ) {
+				seen = handled.length;
+				await Promise.all(handled);
+			}
+		},
+		jobs: async () => (await harness.snapshot(Dispatches, root.id, context))?.jobs ?? [],
 		events,
 		notices,
 		requests: faux.requests,

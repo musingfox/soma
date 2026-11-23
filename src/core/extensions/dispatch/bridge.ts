@@ -19,6 +19,7 @@ import { clip, resultNotice, urgent } from "../../domain/report.ts";
 import { dispatchSignal, reblockSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
 import { askForJob } from "../ask/index.ts";
+import { Deferrals } from "../defer/deferrals.ts";
 import { recordFact } from "../memory/index.ts";
 import { commitCut, commitMove, commitRefusal, Dispatches, JOB_DONE, UndecidedPrompt } from "./index.ts";
 import { reclaimer } from "./reclaim.ts";
@@ -60,8 +61,9 @@ function wakeContent(job: Job, status: Extract<AgentState, { state: "blocked" }>
  * decision, so the model never sees it to answer. The input's requestId carries the observation's
  * seq, so a resent event, from a repeated snapshot or a restarted core, is admitted once. A turn is
  * recorded once per last transcript record: the same record under a new seq is the same turn.
- * An idle or done agent with a deferral pending is stopped after its turn is recorded (`reclaimer`), and a job soma
- * stopped takes no more statuses: what its closed window reports is no news.
+ * An idle or done agent with a deferral pending is stopped after its turn is recorded (`reclaimer`), and so is a
+ * hand-off's whose turn ended 完成 or 失敗 with none pending; a job soma stopped takes no more statuses: what its closed
+ * window reports is no news.
  */
 export function eventBridge(conversation: Conversation, agents: AgentPort, context: Context) {
 	// One event at a time: each reads the job, acts, then commits what it saw.
@@ -196,6 +198,16 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 				});
 				const signal = dispatchSignal(next, outcome, event.seq, done.id, Date.now());
 				if (signal !== undefined) await recordFact(tx, signal);
+				// A hand-off's session is the human's: once its turn is over with nothing deferred, its process is stopped
+				// as a reclaim stops one at rest, so a `claude --resume` by hand is no second writer. A 需要你 turn waits
+				// for its reply, and a job a deferral holds keeps the reclaim that deferral gave it.
+				const over = outcome === "完成" || outcome === "失敗";
+				if (current.handoff === true && over && written.reclaim === undefined) {
+					const { items } = await tx.doc(Deferrals, conversation.id);
+					if (!Object.values(items).some((item) => item.agent === current.agent)) {
+						doc.jobs[index] = { ...written, reclaim: { phase: "due" } };
+					}
+				}
 			}
 		}, context);
 		if (event.status.state === "idle" || event.status.state === "done") await reclaim(job.agent);

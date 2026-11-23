@@ -242,6 +242,131 @@ test("at fire time the session becomes a job, is resumed in its directory, gets 
 	]);
 });
 
+/** A hand-off of `src` fired and prompted, its job at work on the instruction with no reclaim. */
+async function fired(soma: Awaited<ReturnType<typeof core>>, src: string) {
+	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "sent" });
+	await soma.settle();
+	expect((await soma.jobs())[0]).toMatchObject({ handoff: true, status: { state: "working" } });
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+	return "soma-my-repo-7e33";
+}
+
+test("a hand-off job whose turn ends 完成 with nothing deferred is stopped once, and its 完成 is told as before", async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+
+	agents.finish(name, "結果：完成\nKUMQUAT");
+	await soma.settle();
+	expect(agents.stopped).toEqual([name]);
+	expect((await soma.jobs())[0]).toMatchObject({ outcome: "完成", reclaim: { phase: "stopped" } });
+	expect(await soma.notices()).toEqual([`agent ${name}（卡片 ${name}）這一輪結束了：\n結果：完成\nKUMQUAT`]);
+
+	// The closed process's last reports: no second stop.
+	agents.emit(name, { state: "done" });
+	agents.emit(name, { state: "idle" });
+	await soma.settle();
+	expect(agents.stopped).toEqual([name]);
+});
+
+test("a hand-off job ending 失敗 is stopped as well; one ending 需要你 keeps running for the reply", async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+
+	agents.finish(name, "結果：需要你\nWhich branch?");
+	await soma.settle();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+
+	await agents.prompt(name, "main");
+	agents.finish(name, "結果：失敗\nno such branch");
+	await soma.settle();
+	expect(agents.stopped).toEqual([name]);
+});
+
+test("a job soma dispatched whose turn ends 完成 with nothing deferred is not stopped", async () => {
+	const { db } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const dispatched: Job = {
+		card: "card-a",
+		agent: "card-a",
+		sessionId: SESSION,
+		status: { state: "idle" },
+		decisions: [],
+	};
+	await soma.root.commit(async (tx) => {
+		(await tx.doc(Dispatches, soma.root.id)).jobs.push(dispatched);
+	}, context);
+
+	agents.emit("card-a", { state: "working" });
+	agents.finish("card-a", "結果：完成");
+	await soma.settle();
+	expect((await soma.jobs())[0]).toMatchObject({ outcome: "完成" });
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+	expect(agents.stopped).toEqual([]);
+});
+
+test("a hand-off job with a deferral of its agent pending is left to that deferral's reclaim, and not stopped twice", async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+
+	// The session hands off again mid-turn, as its own skill does: nothing is armed until that falls due.
+	const later = id(await soma.handoff(src, SESSION, "PT1H"));
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+	expect(Object.keys(await soma.items())).toEqual([later]);
+
+	// A deferral on the dispatched path arms the reclaim, which stops it at its next rest, once.
+	await agents.prompt(name, "go on");
+	id(await soma.dispatched(name, "PT2H"));
+	expect((await soma.jobs())[0]).toMatchObject({ reclaim: { phase: "due" } });
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	agents.emit(name, { state: "idle" });
+	await soma.settle();
+	expect(agents.stopped).toEqual([name]);
+	expect((await soma.jobs())[0]).toMatchObject({ reclaim: { phase: "stopped" } });
+});
+
+test("a hand-off job stopped after its 完成 takes a later hand-off of its session, resumed as after a reclaim", async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	expect(agents.stopped).toEqual([name]);
+
+	const again = id(await soma.handoff(src, SESSION, "PT1S"));
+	expect((await soma.items())[again]).toMatchObject({ agent: name });
+	expect(await soma.outcome(again)).toEqual({ status: "completed", result: "sent" });
+	await soma.settle();
+	expect(agents.resumed).toEqual([
+		{ name, card: name, sessionId: SESSION, cwd: src },
+		{ name, card: name, sessionId: SESSION, cwd: src },
+	]);
+	expect(agents.prompts.map((each) => each.text)).toEqual([
+		expect.stringContaining("tell me the word"),
+		expect.stringContaining(`[soma deferred instruction ${again}]`),
+	]);
+	expect(await soma.jobs()).toHaveLength(1);
+	expect((await soma.jobs())[0]).toMatchObject({ handoff: true, status: { state: "working" } });
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	expect(agents.stopped).toEqual([name, name]);
+});
+
 test("a session the agent side cannot resume ends gone with one notice naming it, no job, and a reconcile tells nothing more", async () => {
 	const { db, src } = await tree();
 	class NoTranscript extends FakeAgentPort {

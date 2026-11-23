@@ -685,3 +685,33 @@ test("a deferral of an agent soma dispatched, or of a hand-off whose agent is li
 	expect(agents.resumed).toEqual([{ name: "card-a", card: "card-a", sessionId: "s-card-a" }]);
 	expect(looks).toBe(0);
 });
+
+test.each([{ phase: "failed", error: "rex: block.close timed out" }, { phase: "due" }, { phase: "sending" }] as const)(
+	"a hand-off of an open session leaves the job an earlier resume gave it, reclaim $phase, byte for byte",
+	async (reclaim) => {
+		const { db, repo } = await tree();
+		const agents = new FakeAgentPort();
+		const soma = await core(db, agents, { liveSession: async () => ({ pid: 4242 }) });
+		const own: Job = {
+			card: "soma-my-repo-7e33",
+			agent: "soma-my-repo-7e33",
+			sessionId: SESSION,
+			status: { state: "done" },
+			decisions: [],
+			handoff: true,
+			reclaim,
+		};
+		await soma.root.commit(async (tx) => {
+			(await tx.doc(Dispatches, soma.root.id)).jobs.push(own);
+		}, context);
+		const before = JSON.stringify(await soma.jobs());
+
+		const deferral = id(await soma.handoff(repo, SESSION, "PT1S"));
+
+		expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "open" });
+		expect(JSON.stringify(await soma.jobs())).toBe(before);
+		expect(agents.resumed).toEqual([]);
+		expect(await soma.items()).toEqual({});
+		expect(await soma.notices()).toEqual([expect.stringMatching(/was still open in a claude soma did not start/)]);
+	},
+);

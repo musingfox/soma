@@ -237,6 +237,15 @@ export function deferExtension(
 		};
 		const end = (outcome: DeferOutcome, notice?: string, gone = false) =>
 			runtime.commit((tx) => ending(tx, outcome, notice, gone), context);
+		// A hand-off that found its session open elsewhere held nothing for it, so its ending touches no job: one an
+		// earlier resume left stays as it was, its reclaim included, which `settle` would disarm.
+		const left = (notice: string) =>
+			runtime.commit(async (tx) => {
+				const { items } = await tx.doc(Deferrals, runtime.conversationId);
+				delete items[id];
+				await tx.appendEntry(runtime.conversationId, noticeEntry("report", "outcome", notice));
+				return { status: "terminal" as const, outcome: { status: "completed" as const, result: "open" as const } };
+			}, context);
 		const retry = (error: unknown) => {
 			const message = errorText(error);
 			const count = tried + 1;
@@ -347,7 +356,7 @@ export function deferExtension(
 			if (held) await retry(busy());
 		}
 
-		return { end, retry, send, resume };
+		return { end, left, retry, send, resume };
 	}
 
 	const Deferral = defineTask<Deferred, Checkpoint, DeferOutcome>({
@@ -359,7 +368,7 @@ export function deferExtension(
 				const checkpoint = task.state.checkpoint;
 				if (runtime.now() < checkpoint.at) return runtime.sleepUntil(checkpoint.at, checkpoint, context);
 				const id = String(task.id);
-				const { end, retry, send, resume } = steps(id, task.input, checkpoint.tries, runtime, context);
+				const { end, left, retry, send, resume } = steps(id, task.input, checkpoint.tries, runtime, context);
 				const pending = await runtime.snapshot(Deferrals, runtime.conversationId, context);
 				if (pending?.items[id] === undefined) return runtime.commit(() => cancelled, context);
 				const job = (await runtime.snapshot(Dispatches, runtime.conversationId, context))?.jobs.find(
@@ -383,7 +392,7 @@ export function deferExtension(
 					} catch (error) {
 						return retry(error);
 					}
-					if (open !== undefined) return end("open", deferNotice.open(id, task.input, open.pid, open.cwd));
+					if (open !== undefined) return left(deferNotice.open(id, task.input, open.pid, open.cwd));
 				}
 				// Gone, as soma stopped it or the human closed its window: it is started again in its session first.
 				return listed ? send() : resume();

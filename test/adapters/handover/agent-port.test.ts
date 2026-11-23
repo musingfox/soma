@@ -1115,3 +1115,19 @@ test("a resume of a session the ACP side never started goes to the ACP side with
 	expect(asked).toEqual([request]);
 	expect(both.windowsOpened()).toEqual([]);
 });
+
+test("the session a foreign pane is in is looked for on the rex side", async () => {
+	const asked: string[] = [];
+	const both = await sides({
+		to: (port) => ({
+			...port,
+			findForeignSession: async (sessionId) => {
+				asked.push(sessionId);
+				return "block:pane";
+			},
+		}),
+	});
+
+	expect(await both.agents.findForeignSession(SESSION)).toBe("block:pane");
+	expect(asked).toEqual([SESSION]);
+});

@@ -14,3 +14,19 @@ export const readProcessStart: ProcessStart = (pid) =>
 			resolve(Number.isNaN(at) ? undefined : at);
 		});
 	});
+
+/** The pids of a process's direct children; none once it is gone or pgrep cannot say. */
+export type ProcessChildren = (pid: number) => Promise<readonly number[]>;
+
+// `pgrep -P` matches on the parent alone and reads no command line; one that has not answered in 3 s is killed.
+export const readProcessChildren: ProcessChildren = (pid) =>
+	new Promise((resolve) => {
+		execFile(
+			"/usr/bin/pgrep",
+			["-P", String(pid)],
+			{ encoding: "utf8", timeout: 3_000, killSignal: "SIGKILL" },
+			(error, stdout) => {
+				resolve(error ? [] : stdout.split("\n").filter(Boolean).map(Number));
+			},
+		);
+	});

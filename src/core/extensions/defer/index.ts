@@ -14,6 +14,7 @@ import {
 	type Deferred,
 	deferAt,
 	deferNotice,
+	deferredPrompt,
 	handoffName,
 	handoffRefusal,
 	heldSession,
@@ -210,7 +211,9 @@ export interface DeferOptions {
  * instruction.
  */
 export function deferExtension(
-	agents: Pick<AgentPort, "list" | "prompt" | "resume" | "stop">,
+	// Without the foreign calls, no hand-off's session is ever found open in a pane soma can type into.
+	agents: Pick<AgentPort, "list" | "prompt" | "resume" | "stop"> &
+		Partial<Pick<AgentPort, "findForeignSession" | "promptForeign">>,
 	options: DeferOptions = {},
 ) {
 	const retryMs = options.retryMs ?? 30_000;
@@ -239,12 +242,14 @@ export function deferExtension(
 			runtime.commit((tx) => ending(tx, outcome, notice, gone), context);
 		// A hand-off that found its session open elsewhere held nothing for it, so its ending touches no job: one an
 		// earlier resume left stays as it was, its reclaim included, which `settle` would disarm.
-		const left = (notice: string) =>
+		// So does one typed into a pane of the human's.
+		const left = (outcome: DeferOutcome, notice?: string) =>
 			runtime.commit(async (tx) => {
 				const { items } = await tx.doc(Deferrals, runtime.conversationId);
 				delete items[id];
-				await tx.appendEntry(runtime.conversationId, noticeEntry("report", "outcome", notice));
-				return { status: "terminal" as const, outcome: { status: "completed" as const, result: "open" as const } };
+				if (notice !== undefined)
+					await tx.appendEntry(runtime.conversationId, noticeEntry("report", "outcome", notice));
+				return { status: "terminal" as const, outcome: { status: "completed" as const, result: outcome } };
 			}, context);
 		const retry = (error: unknown) => {
 			const message = errorText(error);
@@ -356,7 +361,34 @@ export function deferExtension(
 			if (held) await retry(busy());
 		}
 
-		return { end, left, retry, send, resume };
+		/**
+		 * Types a hand-off's instruction into `pane`, the foreign agent whose claude is in its session, at most once: the
+		 * commit before marks it `sending`, so a rerun that finds that tells the human instead. The pane's claude reads the
+		 * sentence as the human's next prompt, so it gets no unattended rules, and nothing is resumed or recorded as a job.
+		 */
+		async function typeIn(pane: string): Promise<void> {
+			let sending = false;
+			await runtime.commit(async (tx) => {
+				const { items } = await tx.doc(Deferrals, runtime.conversationId);
+				const own = items[id];
+				if (own === undefined) return cancelled;
+				items[id] = { ...own, sending: true };
+				sending = true;
+				return { status: "running", checkpoint: { phase: "sending", tries: tried } };
+			}, context);
+			if (!sending) return;
+			try {
+				if (agents.promptForeign === undefined) throw new PromptRefused("this agent side types into no foreign pane");
+				await agents.promptForeign(pane, deferredPrompt(id, item));
+			} catch (error) {
+				// Nothing was typed, as into a pane at work or closed since the look: looked for again from the start.
+				if (error instanceof PromptRefused) return retry(error);
+				return left("unsure", deferNotice.unsure(id, item, errorText(error)));
+			}
+			await left("sent");
+		}
+
+		return { end, left, retry, send, resume, typeIn };
 	}
 
 	const Deferral = defineTask<Deferred, Checkpoint, DeferOutcome>({
@@ -368,7 +400,7 @@ export function deferExtension(
 				const checkpoint = task.state.checkpoint;
 				if (runtime.now() < checkpoint.at) return runtime.sleepUntil(checkpoint.at, checkpoint, context);
 				const id = String(task.id);
-				const { end, left, retry, send, resume } = steps(id, task.input, checkpoint.tries, runtime, context);
+				const { end, left, retry, send, resume, typeIn } = steps(id, task.input, checkpoint.tries, runtime, context);
 				const pending = await runtime.snapshot(Deferrals, runtime.conversationId, context);
 				if (pending?.items[id] === undefined) return runtime.commit(() => cancelled, context);
 				const job = (await runtime.snapshot(Dispatches, runtime.conversationId, context))?.jobs.find(
@@ -385,6 +417,17 @@ export function deferExtension(
 				// A hand-off's session is resumed only when no claude has it open, which is looked for before anything is held
 				// for the resume: never two writers on one transcript. A look that fails is doubt, never "closed".
 				const { session } = task.input;
+				// Open in a pane of the agent side, it is typed into there instead. Looked for first: that pane's claude has a
+				// pid file too, which the look below would take for a session soma cannot reach.
+				if (!listed && session !== undefined && agents.findForeignSession !== undefined) {
+					let pane: string | undefined;
+					try {
+						pane = await agents.findForeignSession(session);
+					} catch (error) {
+						return retry(error);
+					}
+					if (pane !== undefined) return typeIn(pane);
+				}
 				if (!listed && session !== undefined) {
 					let open: Awaited<ReturnType<LiveSession>>;
 					try {
@@ -392,7 +435,7 @@ export function deferExtension(
 					} catch (error) {
 						return retry(error);
 					}
-					if (open !== undefined) return left(deferNotice.open(id, task.input, open.pid, open.cwd));
+					if (open !== undefined) return left("open", deferNotice.open(id, task.input, open.pid, open.cwd));
 				}
 				// Gone, as soma stopped it or the human closed its window: it is started again in its session first.
 				return listed ? send() : resume();

@@ -103,7 +103,7 @@ export async function runDefer(
 	io.out(
 		agent
 			? `soma defer: accepted as ${reply.id}; soma will send this instruction to agent ${agent} as a new prompt at ${reply.at}. You can end your turn now.`
-			: `soma defer: accepted as ${reply.id}; at ${reply.at} soma resumes session ${session} in ${cwd} and gives it this instruction as a new prompt. This session may be closed now.`,
+			: `soma defer: accepted as ${reply.id}; at ${reply.at} soma types this instruction into session ${session}'s window as a new prompt if it is still open in rex, and otherwise resumes the session in ${cwd} and gives it the instruction as a new prompt. This session may be closed now.`,
 	);
 	return 0;
 }

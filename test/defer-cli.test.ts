@@ -117,7 +117,7 @@ test("in a Claude Code session soma did not dispatch, the session and its direct
 	expect(run).toEqual({
 		status: 0,
 		out: [
-			`soma defer: accepted as 9; at 2026-11-04T10:02:00.000Z soma resumes session ${SESSION} in /Users/me/workspace/soma/src and gives it this instruction as a new prompt. This session may be closed now.`,
+			`soma defer: accepted as 9; at 2026-11-04T10:02:00.000Z soma types this instruction into session ${SESSION}'s window as a new prompt if it is still open in rex, and otherwise resumes the session in /Users/me/workspace/soma/src and gives it the instruction as a new prompt. This session may be closed now.`,
 		],
 		err: [],
 		sent: [

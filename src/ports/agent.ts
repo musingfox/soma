@@ -159,4 +159,7 @@ export interface AgentPort {
 	// typed. Throws PromptRefused when it typed nothing, as for a working or blocked one or an id that names no foreign
 	// agent now.
 	promptForeign(id: string, text: string): Promise<void>;
+	// The id of the foreign agent whose claude is in Claude Code session `sessionId` now, as `promptForeign` takes it;
+	// undefined when none is. Throws when the agent side cannot look, which is doubt, never "none".
+	findForeignSession(sessionId: string): Promise<string | undefined>;
 }

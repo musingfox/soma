@@ -36,6 +36,7 @@ const agents: AgentPort = {
 	onForeignStatus: () => () => {},
 	respondForeign: async () => ({ sent: false, refusal: "not_blocked" }),
 	promptForeign: async () => {},
+	findForeignSession: async () => undefined,
 };
 
 const faux = fauxProvider();

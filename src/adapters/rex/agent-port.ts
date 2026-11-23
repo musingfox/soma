@@ -37,7 +37,7 @@ import {
 import { type HeldSession, type Holding, type SessionTaker, type Taken, TakeRefused } from "../../ports/handover.ts";
 import { type RexClient, RexRpcError } from "./client.ts";
 import type { HangarMemory } from "./hangar-file.ts";
-import { type ProcessStart, readProcessStart } from "./process-start.ts";
+import { type ProcessChildren, type ProcessStart, readProcessChildren, readProcessStart } from "./process-start.ts";
 import {
 	AttachAllResultSchema,
 	BlobReadResultSchema,
@@ -90,6 +90,11 @@ export interface RexAgentPortOptions {
 	/** How long claude may be in the foreground without a record before its screen is read for the trust dialog. */
 	readonly trustMs?: number;
 	readonly processStart?: ProcessStart;
+	/**
+	 * The children of a pane's foreground claude, whose pid file one of them may write: on Claude Code 2.1.330 some
+	 * interactive claudes run as a parent whose one child is the claude that writes `~/.claude/sessions/<pid>.json`.
+	 */
+	readonly processChildren?: ProcessChildren;
 	/** How long readResult waits for claude to write the reply to a turn it reported over. */
 	readonly replyMs?: number;
 	/** How long after a read that replyMs cut short the block's end is reported again, so the core reads it once more. */
@@ -275,6 +280,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	const settleMs = options.settleMs ?? 500;
 	const trustMs = options.trustMs ?? 3_000;
 	const processStart = options.processStart ?? readProcessStart;
+	const processChildren = options.processChildren ?? readProcessChildren;
 	const now = options.now ?? Date.now;
 	const replyMs = options.replyMs ?? 2_000;
 	const recheckMs = options.recheckMs ?? 10_000;
@@ -1822,6 +1828,21 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			if (session === undefined) return undefined;
 			const path = await resolveTranscriptPath(session.sessionId, session.cwd ?? found.agent.cwd, options.projectsDir);
 			return path === undefined ? undefined : readLastRecord(path);
+		},
+
+		/**
+		 * The foreign agent whose claude names `sessionId` in its per-process session file now: the file of the pane's
+		 * foreground claude, or of a direct child of it, where that child is the claude that writes it. A pane whose file
+		 * cannot be read is not matched. A listing that fails throws.
+		 */
+		async findForeignSession(sessionId: string): Promise<string | undefined> {
+			const names = async (pid: number) =>
+				(await readProcessSession(pid, options.sessionsDir))?.sessionId.toLowerCase() === sessionId.toLowerCase();
+			for (const { agent, pid } of await foreign()) {
+				if (await names(pid)) return agent.id;
+				for (const child of await processChildren(pid)) if (await names(child)) return agent.id;
+			}
+			return undefined;
 		},
 
 		/** As readScreen, on the foreign agent's block in its own session, once the listing found it running claude. */

@@ -203,5 +203,6 @@ export function createHerdrAgentPort(options: HerdrAgentPortOptions): AgentPort 
 		onForeignStatus: () => () => {},
 		respondForeign: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: herdr lists none`)),
 		promptForeign: (id: string) => Promise.reject(new PromptRefused(`no foreign agent ${id}: herdr lists none`)),
+		findForeignSession: async () => undefined,
 	};
 }

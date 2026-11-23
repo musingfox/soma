@@ -129,6 +129,17 @@ export class FakeAgentPort implements AgentPort {
 		found.agent = { ...found.agent, status: { state: "working" } };
 	}
 
+	/** The foreign agents' Claude Code sessions, by session id, as a test sets them; and an error to throw instead. */
+	readonly foreignSessions = new Map<string, string>();
+	foreignSessionError: Error | undefined;
+	readonly foreignSessionLooks: string[] = [];
+
+	async findForeignSession(sessionId: string): Promise<string | undefined> {
+		this.foreignSessionLooks.push(sessionId);
+		if (this.foreignSessionError !== undefined) throw this.foreignSessionError;
+		return this.foreignSessions.get(sessionId);
+	}
+
 	onForeignStatus(listener: (event: ForeignStatusEvent) => void): () => void {
 		this.#foreignListeners.add(listener);
 		return () => this.#foreignListeners.delete(listener);

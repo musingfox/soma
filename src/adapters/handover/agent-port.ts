@@ -609,5 +609,6 @@ export function createHandoverAgentPort({
 		readForeignScreen: (id) => to.readForeignScreen(id),
 		respondForeign: (id, answer) => to.respondForeign(id, answer),
 		promptForeign: (id, text) => to.promptForeign(id, text),
+		findForeignSession: (sessionId) => to.findForeignSession(sessionId),
 	};
 }

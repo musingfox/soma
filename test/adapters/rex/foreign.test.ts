@@ -60,6 +60,7 @@ const home: Session = {
 function port(fake: ReturnType<typeof rex>, foreignMs = 60_000) {
 	return createRexAgentPort({
 		processStart: unstarted,
+		processChildren: async () => [],
 		client: fake.client,
 		sessionId: HANGAR,
 		projectsDir: projects,
@@ -763,4 +764,71 @@ test("a pane whose presence cannot be read counts as not looked at, and is pushe
 			method,
 		).toEqual([false]);
 	}
+});
+
+const HANDED = "7e33597b-e33d-4c6d-a700-e21b2f54223e";
+const desk: Session = {
+	id: "session:desk",
+	label: "desk",
+	blocks: [
+		{ name: "one", block: "block:d1", argv0: "claude", pid: 201, records: [{ state: "idle", updated_at: AT }] },
+		{ name: "two", block: "block:d2", argv0: "claude", pid: 202, records: [{ state: "done", updated_at: AT }] },
+		{ name: "three", block: "block:d3", argv0: "claude", pid: 203, records: [{ state: "idle", updated_at: AT }] },
+	],
+};
+
+test("findForeignSession names the foreign pane whose claude is in the session now, off its pid file", async () => {
+	writeFileSync(join(sessionsDir, "201.json"), JSON.stringify({ pid: 201, sessionId: OTHER }));
+	writeFileSync(join(sessionsDir, "202.json"), JSON.stringify({ pid: 202, sessionId: HANDED.toUpperCase() }));
+	// 203 has no pid file.
+	const finder = port(rex([], [desk]));
+
+	expect(await finder.findForeignSession(HANDED)).toBe("block:d2");
+	expect(await finder.findForeignSession(OTHER)).toBe("block:d1");
+	expect(await finder.findForeignSession("0e9d6c1f-4a3b-4a52-9c85-2f6d3f6f2f10")).toBeUndefined();
+});
+
+test("findForeignSession matches no pane whose pid file names another session or is missing, nor soma's own job", async () => {
+	writeFileSync(join(sessionsDir, "201.json"), JSON.stringify({ pid: 201, sessionId: OTHER }));
+	writeFileSync(join(sessionsDir, "202.json"), JSON.stringify({ pid: 999, sessionId: HANDED }));
+	writeFileSync(join(sessionsDir, "301.json"), JSON.stringify({ pid: 301, sessionId: HANDED }));
+	// soma's own job runs that session in the hangar: it is no foreign agent.
+	const finder = port(rex([{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude", pid: 301 }], [desk]));
+
+	expect(await finder.findForeignSession(HANDED)).toBeUndefined();
+});
+
+test("findForeignSession throws when rex cannot be listed", async () => {
+	const fake = rex([], [desk]);
+	fake.replace("session.attach_all", () => {
+		throw new Error("rex is away");
+	});
+
+	await expect(port(fake).findForeignSession(HANDED)).rejects.toThrow("rex is away");
+});
+
+test("findForeignSession reads the pid file of a pane's claude written by its one child, and of no other process", async () => {
+	const pane: Session = {
+		id: "session:split",
+		label: "split",
+		blocks: [
+			{ name: "one", block: "block:s1", argv0: "claude", pid: 401, records: [{ state: "idle", updated_at: AT }] },
+			{ name: "two", block: "block:s2", argv0: "claude", pid: 403, records: [{ state: "idle", updated_at: AT }] },
+		],
+	};
+	// 401 writes no file of its own; its child 402 is the claude that does. 403's child is not.
+	writeFileSync(join(sessionsDir, "402.json"), JSON.stringify({ pid: 402, sessionId: HANDED }));
+	writeFileSync(join(sessionsDir, "405.json"), JSON.stringify({ pid: 405, sessionId: OTHER }));
+	const children: Record<number, number[]> = { 401: [402], 403: [404] };
+	const finder = createRexAgentPort({
+		processStart: unstarted,
+		processChildren: async (pid) => children[pid] ?? [],
+		client: rex([], [pane]).client,
+		sessionId: HANGAR,
+		projectsDir: projects,
+		sessionsDir,
+	});
+
+	expect(await finder.findForeignSession(HANDED)).toBe("block:s1");
+	expect(await finder.findForeignSession(OTHER)).toBeUndefined();
 });

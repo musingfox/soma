@@ -14,7 +14,13 @@ import { eventBridge, reconcileDispatches } from "../src/core/extensions/dispatc
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { NOTICE } from "../src/core/notice.ts";
-import { type AgentListing, type AgentPort, NotImplemented, type ResumeRequest } from "../src/ports/agent.ts";
+import {
+	type AgentListing,
+	type AgentPort,
+	NotImplemented,
+	PromptRefused,
+	type ResumeRequest,
+} from "../src/ports/agent.ts";
 
 const context = BACKGROUND_CONTEXT;
 const SESSION = "7e33597b-e33d-4c6d-a700-e21b2f54223e";
@@ -715,3 +721,170 @@ test.each([{ phase: "failed", error: "rex: block.close timed out" }, { phase: "d
 		expect(await soma.notices()).toEqual([expect.stringMatching(/was still open in a claude soma did not start/)]);
 	},
 );
+
+const PANE = { id: "block:pane", session: "desk", label: "claude" };
+
+/** A fake agent side on which SESSION is open in a foreign pane of rex, at rest. */
+function openInPane() {
+	const agents = new FakeAgentPort();
+	agents.emitForeign(PANE, { state: "idle" }, 1);
+	agents.foreignSessions.set(SESSION, PANE.id);
+	return agents;
+}
+
+test("a hand-off whose session is open in a rex pane is typed into it once, with no job, resume or rules", async () => {
+	const { db, src } = await tree();
+	const agents = openInPane();
+	// The pane's claude has a pid file too: the look for the pane comes first, so this never ends it.
+	const soma = await core(db, agents, { liveSession: async () => ({ pid: 4242 }) });
+
+	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "sent" });
+	expect(agents.foreignSessionLooks).toEqual([SESSION]);
+	expect(agents.foreignPrompts).toEqual([
+		{
+			id: PANE.id,
+			text: expect.stringMatching(new RegExp(`^\\[soma deferred instruction ${deferral}\\] .*: tell me the word$`)),
+		},
+	]);
+	expect([agents.resumed, agents.prompts]).toEqual([[], []]);
+	expect(await soma.jobs()).toEqual([]);
+	expect(await soma.items()).toEqual({});
+	expect(await soma.notices()).toEqual([]);
+});
+
+test("a pane that refuses the instruction twice and is then closed is looked for again each time, and the session resumed as today", {
+	timeout: 20_000,
+}, async () => {
+	const { db, src } = await tree();
+	const agents = openInPane();
+	let refusals = 0;
+	agents.promptForeign = async (paneId) => {
+		refusals++;
+		// Closed after the second refusal: its claude, and the session's pid file, are gone.
+		if (refusals === 2) agents.foreignSessions.delete(SESSION);
+		throw new PromptRefused(`rex foreign agent ${paneId} is working: a prompt goes only to idle or done`);
+	};
+	const soma = await core(db, agents, { retryMs: 20 });
+
+	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "sent" });
+	expect(refusals).toBe(2);
+	expect(agents.foreignSessionLooks).toEqual([SESSION, SESSION, SESSION]);
+	expect(agents.resumed).toEqual([
+		{ name: "soma-my-repo-7e33", card: "soma-my-repo-7e33", sessionId: SESSION, cwd: src },
+	]);
+	expect(agents.prompts).toEqual([
+		{ agent: "soma-my-repo-7e33", text: expect.stringMatching(/^你正在被無人值守地派工/) },
+	]);
+	expect(await soma.notices()).toEqual([]);
+});
+
+test("a pane that keeps refusing ends the hand-off failed after its tries, and nothing is resumed", {
+	timeout: 20_000,
+}, async () => {
+	const { db, src } = await tree();
+	const agents = openInPane();
+	agents.emitForeign(PANE, { state: "working" }, 2);
+	const soma = await core(db, agents, { retryMs: 20, tries: 3 });
+
+	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "failed" });
+	expect([agents.foreignPrompts, agents.resumed, agents.prompts]).toEqual([[], [], []]);
+	expect(await soma.notices()).toEqual([
+		expect.stringMatching(/was not sent after 3 tries: foreign agent block:pane is working/),
+	]);
+});
+
+test("a look for the pane that keeps failing ends the hand-off failed after its tries and never resumes", {
+	timeout: 20_000,
+}, async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	agents.foreignSessionError = new Error("rex is away");
+	let looks = 0;
+	const soma = await core(db, agents, {
+		retryMs: 20,
+		tries: 3,
+		liveSession: async () => {
+			looks++;
+			return undefined;
+		},
+	});
+
+	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "failed" });
+	expect(agents.foreignSessionLooks).toHaveLength(3);
+	expect([looks, agents.resumed, agents.prompts]).toEqual([0, [], []]);
+	expect(await soma.jobs()).toEqual([]);
+	expect(await soma.notices()).toEqual([expect.stringMatching(/was not sent after 3 tries: rex is away/)]);
+});
+
+test("typing that fails once it may have begun ends unsure, with one notice, and is not tried again", async () => {
+	const { db, src } = await tree();
+	const agents = openInPane();
+	let typed = 0;
+	agents.promptForeign = async () => {
+		typed++;
+		throw new Error("rex: connection reset");
+	};
+	const soma = await core(db, agents, { retryMs: 20 });
+
+	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "unsure" });
+	expect(typed).toBe(1);
+	expect(agents.resumed).toEqual([]);
+	expect(await soma.items()).toEqual({});
+	expect(await soma.notices()).toEqual([
+		expect.stringMatching(
+			/may not have reached the agent: sending it failed after it may have begun \(rex: connection reset\)/,
+		),
+	]);
+});
+
+test("a rerun that finds the typing in flight ends unsure and types nothing more", { timeout: 20_000 }, async () => {
+	const { db, src } = await tree();
+	const typed: string[] = [];
+	let reached: () => void = () => {};
+	const reaching = new Promise<void>((resolve) => {
+		reached = resolve;
+	});
+	let cut: (error: Error) => void = () => {};
+	// Stands in for soma dying mid-paste: the typing settles only as the core closes, and then fails.
+	const agents: Agents & Pick<AgentPort, "findForeignSession" | "promptForeign"> = {
+		list: async () => [],
+		resume: async () => {},
+		stop: async () => {},
+		onStatus: () => () => {},
+		readResult: async () => undefined,
+		prompt: async () => {},
+		findForeignSession: async () => PANE.id,
+		promptForeign: (_pane, text) => {
+			typed.push(text);
+			reached();
+			return new Promise((_resolve, reject) => {
+				cut = reject;
+			});
+		},
+	};
+	const first = await core(db, agents);
+	const deferral = id(await first.handoff(src, SESSION, "PT1S"));
+	await reaching;
+	const closed = first.harness.close(context);
+	cut(new Error("soma went down"));
+	await closed;
+	open.splice(open.indexOf(first.harness), 1);
+
+	const second = await core(db, agents);
+
+	expect(await second.outcome(deferral)).toEqual({ status: "completed", result: "unsure" });
+	expect(typed).toHaveLength(1);
+	expect(await second.notices()).toEqual([
+		expect.stringMatching(/may not have reached the agent: soma stopped while sending it/),
+	]);
+});

@@ -439,5 +439,6 @@ export function createTtyAgentPort(options: TtyAgentPortOptions): AgentPort {
 		onForeignStatus: () => () => {},
 		respondForeign: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: tty runs none`)),
 		promptForeign: (id: string) => Promise.reject(new PromptRefused(`no foreign agent ${id}: tty runs none`)),
+		findForeignSession: async () => undefined,
 	};
 }

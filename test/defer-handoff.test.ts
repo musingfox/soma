@@ -8,6 +8,7 @@ import type { Harness, TaskId } from "@earendil-works/pi-durable";
 import { afterEach, expect, test, vi } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { repoRootOf } from "../src/adapters/repos/root.ts";
+import { createRexAgentPort } from "../src/adapters/rex/agent-port.ts";
 import type { Job } from "../src/core/domain/dispatch.ts";
 import { type DeferOptions, Deferrals, deferExtension } from "../src/core/extensions/defer/index.ts";
 import { eventBridge, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
@@ -21,6 +22,7 @@ import {
 	PromptRefused,
 	type ResumeRequest,
 } from "../src/ports/agent.ts";
+import { AT, HANGAR, type Session as RexSession, rex } from "./adapters/rex/fake.ts";
 
 const context = BACKGROUND_CONTEXT;
 const SESSION = "7e33597b-e33d-4c6d-a700-e21b2f54223e";
@@ -886,5 +888,36 @@ test("a rerun that finds the typing in flight ends unsure and types nothing more
 	expect(typed).toHaveLength(1);
 	expect(await second.notices()).toEqual([
 		expect.stringMatching(/may not have reached the agent: soma stopped while sending it/),
+	]);
+});
+
+test("a pane whose claude's pid file is under a child that cannot be listed is not typed into: the look for a live claude ends it", async () => {
+	const { db, src } = await tree();
+	const sessionsDir = join(src, "..", "sessions");
+	await mkdir(sessionsDir);
+	// The pane's foreground claude, 601, has no pid file; the child that wrote one cannot be listed.
+	const pane: RexSession = {
+		id: "session:desk",
+		label: "desk",
+		blocks: [
+			{ name: "one", block: "block:p1", argv0: "claude", pid: 601, records: [{ state: "idle", updated_at: AT }] },
+		],
+	};
+	const fake = rex([], [pane]);
+	const agents = createRexAgentPort({
+		processStart: async () => undefined,
+		processChildren: async () => [],
+		client: fake.client,
+		sessionId: HANGAR,
+		sessionsDir,
+	});
+	const soma = await core(db, agents, { liveSession: async () => ({ pid: 602, cwd: src }) });
+
+	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "open" });
+	expect(fake.methods().filter((method) => method === "block.event")).toEqual([]);
+	expect(await soma.notices()).toEqual([
+		expect.stringMatching(/was still open in a claude soma did not start \(pid 602/),
 	]);
 });

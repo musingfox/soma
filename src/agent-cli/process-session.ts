@@ -14,6 +14,9 @@ const ProcessSessionSchema = z
 		pid: z.number(),
 		sessionId: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i),
 		cwd: z.string().optional(),
+		// When the process started, as `ps -o lstart=` prints it in UTC: what tells a live claude's file from one a dead
+		// claude left under a pid since reused.
+		procStart: z.string().optional(),
 	})
 	.passthrough();
 
@@ -24,7 +27,7 @@ const ProcessSessionSchema = z
 export async function readProcessSession(
 	pid: number,
 	sessionsDir = defaultSessionsDir(),
-): Promise<{ readonly sessionId: string; readonly cwd?: string } | undefined> {
+): Promise<{ readonly sessionId: string; readonly cwd?: string; readonly procStart?: string } | undefined> {
 	let text: string;
 	try {
 		text = await readFile(join(sessionsDir, `${pid}.json`), "utf8");
@@ -38,8 +41,8 @@ export async function readProcessSession(
 		return undefined;
 	}
 	if (!parsed.success || parsed.data.pid !== pid) return undefined;
-	const { sessionId, cwd } = parsed.data;
-	return cwd === undefined ? { sessionId } : { sessionId, cwd };
+	const { sessionId, cwd, procStart } = parsed.data;
+	return { sessionId, ...(cwd === undefined ? {} : { cwd }), ...(procStart === undefined ? {} : { procStart }) };
 }
 
 /** Whether signal 0 reaches `pid`: it is alive, though perhaps another user's, which EPERM says. */

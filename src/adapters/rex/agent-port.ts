@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { copyFile, stat } from "node:fs/promises";
+import { access, copyFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ZodType, z } from "zod";
 import { readPerfCoresViaSysctl, resolveHangarCapWithSource } from "../../agent-cli/hangar-cap.ts";
@@ -9,7 +9,7 @@ import {
 	isTrustDialog,
 	readBlockedScreen,
 } from "../../agent-cli/permission/blocked-screen.ts";
-import { readProcessSession } from "../../agent-cli/process-session.ts";
+import { defaultSessionsDir, readProcessSession } from "../../agent-cli/process-session.ts";
 import {
 	awaitingReply,
 	readLastRecord,
@@ -1832,14 +1832,29 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 
 		/**
 		 * The foreign agent whose claude names `sessionId` in its per-process session file now: the file of the pane's
-		 * foreground claude, or of a direct child of it, where that child is the claude that writes it. A pane whose file
-		 * cannot be read is not matched. A listing that fails throws.
+		 * foreground claude, or, only where that claude has none, of a direct child of it, the claude that writes it then. A
+		 * file counts only when its `procStart` is the start of the process of its pid now, so one a dead claude left under
+		 * a pid since reused, as by a shell or an MCP server, does not. A pane whose file cannot be read is not matched. A
+		 * listing that fails throws.
 		 */
 		async findForeignSession(sessionId: string): Promise<string | undefined> {
-			const names = async (pid: number) =>
-				(await readProcessSession(pid, options.sessionsDir))?.sessionId.toLowerCase() === sessionId.toLowerCase();
+			const dir = options.sessionsDir ?? defaultSessionsDir();
+			// A file with no `procStart`, or one that does not parse, reads as NaN, which is no process's start.
+			const names = async (pid: number) => {
+				const session = await readProcessSession(pid, dir);
+				if (session?.sessionId.toLowerCase() !== sessionId.toLowerCase()) return false;
+				return Date.parse(`${session.procStart} UTC`) === (await processStart(pid));
+			};
+			const hasFile = (pid: number) =>
+				access(join(dir, `${pid}.json`)).then(
+					() => true,
+					() => false,
+				);
 			for (const { agent, pid } of await foreign()) {
-				if (await names(pid)) return agent.id;
+				if (await hasFile(pid)) {
+					if (await names(pid)) return agent.id;
+					continue;
+				}
 				for (const child of await processChildren(pid)) if (await names(child)) return agent.id;
 			}
 			return undefined;

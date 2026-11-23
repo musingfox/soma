@@ -26,6 +26,9 @@ const [mode, db, card, repo] = process.argv.slice(2);
 if (db === undefined) throw new Error("usage: rex-defer-child.ts dispatch <db> <card> <repo> | reopen <db>");
 const hangar = process.env.SOMA_REX_SESSION_ID;
 if (hangar === undefined) throw new Error("SOMA_REX_SESSION_ID names the smoke's rex session");
+const label = process.env.SOMA_REX_LABEL;
+// Unset, a hangar the port makes in place of the smoke's, once the smoke destroys it, would take prod's label.
+if (label === undefined) throw new Error("SOMA_REX_LABEL labels a hangar made in place of the smoke's rex session");
 const emit = (record: object) => console.log(JSON.stringify(record));
 const socket = `${db}.defer.sock`;
 
@@ -34,6 +37,7 @@ const client = createRexClient({ socketPath: process.env.SOMA_REX_SOCKET ?? defa
 const agents = createRexAgentPort({
 	client,
 	sessionId: hangar,
+	label,
 	env: { SOMA_SOCKET: socket, SOMA_NODE: process.execPath },
 	path: join(dirname(dirname(fileURLToPath(import.meta.url))), "bin"),
 });

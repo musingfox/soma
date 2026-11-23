@@ -71,7 +71,7 @@ try {
 	const job = await window(card, randomUUID(), `echo FIRST-${tag}\n`);
 	await window("human", "human", "claude\n");
 	const jobBlock = job.block_ids?.[0] ?? "";
-	const agents = createRexAgentPort({ client, sessionId: hangar });
+	const agents = createRexAgentPort({ client, sessionId: hangar, label: `soma-smoke-${tag}` });
 
 	const first = await until(
 		() => agents.readScreen(card),

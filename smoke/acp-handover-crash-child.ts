@@ -38,6 +38,9 @@ const [mode, scenario, dir, hangar, card, repo, word] = process.argv.slice(2);
 if (dir === undefined || hangar === undefined || card === undefined || repo === undefined || word === undefined) {
 	throw new Error("usage: acp-handover-crash-child.ts first|second before|after <dir> <hangar> <card> <repo> <word>");
 }
+const label = process.env.SOMA_REX_LABEL;
+// Unset, a hangar the port makes in place of the smoke's, once the smoke destroys it, would take prod's label.
+if (label === undefined) throw new Error("SOMA_REX_LABEL labels a hangar made in place of the smoke's rex session");
 const emit = (step: string, value: object) => console.log(JSON.stringify({ step, ...value }));
 const onError = (error: Error) => console.error(`[soma] ${error.message}`);
 
@@ -101,6 +104,7 @@ const acp = createAcpAgentPort({
 const rex = createRexAgentPort({
 	client,
 	sessionId: hangar,
+	label,
 	onError,
 	env,
 	path: bin,

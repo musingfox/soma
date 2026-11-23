@@ -58,7 +58,10 @@ type Line = { step: string } & Record<string, unknown>;
 
 /** A soma of the smoke's, with every JSON line it printed so far; its stderr goes to the smoke's. */
 function soma(args: string[]) {
-	const child = spawn(process.execPath, [CHILD, ...args], { stdio: ["pipe", "pipe", "inherit"] });
+	const child = spawn(process.execPath, [CHILD, ...args], {
+		env: { ...process.env, SOMA_REX_LABEL: label },
+		stdio: ["pipe", "pipe", "inherit"],
+	});
 	const lines: Line[] = [];
 	createInterface({ input: child.stdout as NodeJS.ReadableStream }).on("line", (line) => {
 		try {

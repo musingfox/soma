@@ -173,7 +173,7 @@ try {
 	};
 	// Read as the handover goes: what the cut found and how long it took, and that no mark stood until it was over.
 	const order: unknown[] = [];
-	const rex = createRexAgentPort({ client, sessionId: hangar, onError, env, path: bin, takeMs: 60_000 });
+	const rex = createRexAgentPort({ client, sessionId: hangar, label, onError, env, path: bin, takeMs: 60_000 });
 	const agents = createHandoverAgentPort({
 		from: {
 			...acp,

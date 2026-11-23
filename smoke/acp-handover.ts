@@ -194,6 +194,7 @@ try {
 	const rex = createRexAgentPort({
 		client,
 		sessionId: hangar,
+		label,
 		onError,
 		env,
 		path: bin,

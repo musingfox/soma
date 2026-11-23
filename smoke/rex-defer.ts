@@ -61,7 +61,12 @@ const created = await client.call(
 	z.object({ session_id: z.string() }).passthrough(),
 );
 const hangar = created.session_id;
-const env = { ...process.env, SOMA_REX_SESSION_ID: hangar, SOMA_REX_SOCKET: socketPath };
+const env = {
+	...process.env,
+	SOMA_REX_SESSION_ID: hangar,
+	SOMA_REX_LABEL: `soma-smoke-${tag}`,
+	SOMA_REX_SOCKET: socketPath,
+};
 const block = (method: string, blockId: string, args = {}) => ({ session_id: hangar, block_id: blockId, args, method });
 const children: Child[] = [];
 

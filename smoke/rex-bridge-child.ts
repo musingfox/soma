@@ -33,6 +33,9 @@ const [mode, db, card, repo] = process.argv.slice(2);
 if (mode !== "run" || db === undefined) throw new Error("usage: rex-bridge-child.ts run <db> [<card> <repo>]");
 const hangar = process.env.SOMA_REX_SESSION_ID;
 if (hangar === undefined) throw new Error("SOMA_REX_SESSION_ID names the smoke's rex session");
+const label = process.env.SOMA_REX_LABEL;
+// Unset, a hangar the port makes in place of the smoke's, once the smoke destroys it, would take prod's label.
+if (label === undefined) throw new Error("SOMA_REX_LABEL labels a hangar made in place of the smoke's rex session");
 const config = process.env.CLAUDE_CONFIG_DIR;
 if (config === undefined) throw new Error("CLAUDE_CONFIG_DIR must be set");
 const trustPath = process.env.SOMA_SMOKE_TRUST_PATH;
@@ -42,6 +45,7 @@ const client = createRexClient({ socketPath: process.env.SOMA_REX_SOCKET ?? defa
 const agents = createRexAgentPort({
 	client,
 	sessionId: hangar,
+	label,
 	onError: (error) => emit({ event: "rex_error", error: error.message }),
 	// A pane sees only what the launch command types, not this process's environment.
 	env: {

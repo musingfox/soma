@@ -131,6 +131,7 @@ try {
 		...process.env,
 		CLAUDE_CONFIG_DIR: config,
 		SOMA_REX_SESSION_ID: hangar,
+		SOMA_REX_LABEL: `soma-smoke-${tag}`,
 		SOMA_REX_SOCKET: socketPath,
 		SOMA_SMOKE_TRUST_PATH: worktree,
 	};

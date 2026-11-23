@@ -21,10 +21,13 @@ const [mode, db, card, repo] = process.argv.slice(2);
 if (db === undefined) throw new Error("usage: rex-dispatch-child.ts dispatch <db> <card> <repo> | reopen <db>");
 const hangar = process.env.SOMA_REX_SESSION_ID;
 if (hangar === undefined) throw new Error("SOMA_REX_SESSION_ID names the smoke's rex session");
+const label = process.env.SOMA_REX_LABEL;
+// Unset, a hangar the port makes in place of the smoke's, once the smoke destroys it, would take prod's label.
+if (label === undefined) throw new Error("SOMA_REX_LABEL labels a hangar made in place of the smoke's rex session");
 const emit = (record: object) => console.log(JSON.stringify(record));
 
 const client = createRexClient({ socketPath: process.env.SOMA_REX_SOCKET ?? defaultRexSocket(homedir()) });
-const rex = createRexAgentPort({ client, sessionId: hangar });
+const rex = createRexAgentPort({ client, sessionId: hangar, label });
 const agents: AgentPort =
 	process.env.SOMA_SMOKE_HANG_AFTER_START === "1"
 		? {

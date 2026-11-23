@@ -1,7 +1,7 @@
 import type { Context } from "@earendil-works/chord/context";
 import type { Conversation } from "@earendil-works/pi-durable";
 import type { AgentListing, AgentPort } from "../../../ports/agent.ts";
-import { reclaimFailedNotice } from "../../domain/defer.ts";
+import { givesSessionBack, reclaimFailedNotice } from "../../domain/defer.ts";
 import type { Job, Reclaim } from "../../domain/dispatch.ts";
 import { noticeEntry } from "../../notice.ts";
 import { Deferrals } from "../defer/deferrals.ts";
@@ -106,5 +106,57 @@ export function reclaimer(conversation: Conversation, agents: Pick<AgentPort, "l
 			}
 		}
 		await move(agent, "stopping", { phase: "stopped" });
+	};
+}
+
+/**
+ * The level check that gives a hand-off's session back (ARCHITECTURE.md "Hand-off from a session soma did not dispatch"):
+ * stops `agent`'s hand-off job when it is at rest by its record (`givesSessionBack`, so with no reclaim: one stopping,
+ * stopped, failed or held by a deferral is left as it is), runs with no window, has no deferral of its agent pending in
+ * any phase, and is listed at rest with a status, so a process is there. Asked whenever any of that may have changed,
+ * not on one transition, so no order of a turn's end and a deferral's can leave the claude running: the bridge asks at
+ * each status it records, the startup reconcile for every hand-off job, and a deferral that ends sent once it has
+ * committed. The stop goes through `reclaimer`, whose compare-and-set stops it once. A look that fails is doubt, and the
+ * job keeps running.
+ */
+export function releaser(
+	conversation: Conversation,
+	agents: Pick<AgentPort, "list" | "stop" | "windowless">,
+	context: Context,
+) {
+	const reclaim = reclaimer(conversation, agents, context);
+	return async function release(agent: string): Promise<void> {
+		const job = await conversation.commit(async (tx) => {
+			const found = (await tx.doc(Dispatches, conversation.id)).jobs.find((each) => each.agent === agent);
+			return found && (JSON.parse(JSON.stringify(found)) as Job);
+		}, context);
+		if (job === undefined || !givesSessionBack(job)) return;
+		if (!((await agents.windowless?.(agent).catch(() => false)) ?? false)) return;
+		const armed = await conversation.commit(async (tx) => {
+			const doc = await tx.doc(Dispatches, conversation.id);
+			const index = doc.jobs.findIndex((each) => each.agent === agent);
+			const current = doc.jobs[index];
+			if (current === undefined || !givesSessionBack(current)) return false;
+			const { items } = await tx.doc(Deferrals, conversation.id);
+			if (Object.values(items).some((item) => item.agent === agent)) return false;
+			doc.jobs[index] = { ...current, reclaim: { phase: "due" } };
+			return true;
+		}, context);
+		if (!armed) return;
+		// The reclaim lists the agent and stops it only when it is listed at rest: so one with no process, listed with no
+		// status as ACP lists one dormant since a restart, or at work, as just prompted, is not stopped.
+		await reclaim(agent);
+		// An arm the reclaim did not act on is taken back: left `due`, it would stop the agent at its next rest whatever
+		// that turn asks, a 需要你 one included. The next look arms again.
+		await conversation.commit(async (tx) => {
+			const doc = await tx.doc(Dispatches, conversation.id);
+			const index = doc.jobs.findIndex((each) => each.agent === agent);
+			const current = doc.jobs[index];
+			if (current?.reclaim?.phase !== "due") return;
+			const { items } = await tx.doc(Deferrals, conversation.id);
+			if (Object.values(items).some((item) => item.agent === agent)) return;
+			const { reclaim: _unarmed, ...rest } = current;
+			doc.jobs[index] = rest;
+		}, context);
 	};
 }

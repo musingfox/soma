@@ -428,6 +428,28 @@ test("reply to a hand-off job soma stopped with a deferral of it pending says th
 	expect(await jobs()).toEqual([stopped]);
 });
 
+test("reply to a dispatched job its reclaim stopped is sent as to any job, given neither hand-off refusal", async () => {
+	const { agents, root, call, jobs } = await setup();
+	const stopped = {
+		card: "card-a",
+		agent: "card-a",
+		sessionId: "7e33597b-e33d-4c6d-a700-e21b2f54223e",
+		status: { state: "done" as const },
+		outcome: "需要你" as const,
+		decisions: [],
+		reclaim: { phase: "stopped" as const },
+	};
+	await root.commit(async (tx) => {
+		(await tx.doc(Dispatches, root.id)).jobs.push(stopped);
+	}, context);
+
+	const result = await call("reply", { card: "card-a", text: "hi", reason: "人回答了" }, "r1");
+
+	expect(result).toEqual({ sent: true });
+	expect(agents.prompts).toEqual([{ agent: "card-a", text: "hi" }]);
+	expect((await jobs())[0]?.decisions).toMatchObject([{ action: "replied", text: "hi" }]);
+});
+
 test("reply to a card with no job sends nothing and says why", async () => {
 	const { agents, call, jobs } = await setup();
 

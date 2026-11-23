@@ -201,6 +201,11 @@ export interface DeferOptions {
 	 */
 	readonly reclaim?: (agent: string) => Promise<void>;
 	/**
+	 * The level check that stops a hand-off job at rest with nothing deferred, as `releaser` does; called once a deferral
+	 * ended sent. The host runs it only after its reconcile, as `reclaim`.
+	 */
+	readonly release?: (agent: string) => Promise<void>;
+	/**
 	 * The git repo root a hand-off's directory is in, which names its job, or undefined outside any repo; main.ts gives
 	 * the file system's. Unset, every directory is taken as outside any repo.
 	 */
@@ -274,11 +279,13 @@ export function deferExtension(
 			return { status: "terminal" as const, outcome: { status: "completed" as const, result: outcome } };
 		};
 		// A hand-off's agent this leaves at rest with nothing deferred is stopped, as its turn's end would have stopped it.
-		// Not awaited: the task has ended, and a stop that hangs must not hold it.
+		// Not awaited: the task has ended, and a stop that hangs must not hold it. A sent one takes away the deferral that
+		// held back the bridge's look at a turn recorded meanwhile, after which no status may come: it is looked at again.
 		const end = async (outcome: DeferOutcome, notice?: string, gone = false) => {
 			const rests = outcome !== "sent" && (await restsUnseen(item.agent));
 			const ended = await runtime.commit((tx) => ending(tx, outcome, notice, gone, rests), context);
 			if (armed) void options.reclaim?.(item.agent).catch(() => {});
+			if (outcome === "sent") void options.release?.(item.agent).catch(() => {});
 			return ended;
 		};
 		// A hand-off that found its session open elsewhere held nothing for it, so its ending touches no job: one an

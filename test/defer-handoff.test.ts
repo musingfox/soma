@@ -13,7 +13,7 @@ import type { Job } from "../src/core/domain/dispatch.ts";
 import { type DeferOptions, Deferrals, deferExtension } from "../src/core/extensions/defer/index.ts";
 import { eventBridge, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
 import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
-import { reclaimer } from "../src/core/extensions/dispatch/reclaim.ts";
+import { reclaimer, releaser } from "../src/core/extensions/dispatch/reclaim.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { NOTICE } from "../src/core/notice.ts";
 import {
@@ -60,11 +60,13 @@ async function core(db: string, agents: Agents, options: DeferOptions = {}) {
 	models.setProvider(faux.provider);
 	// The host's reclaimer, as main.ts gives it, once the root conversation is open.
 	let reclaim: (agent: string) => Promise<void> = async () => {};
+	let release: (agent: string) => Promise<void> = async () => {};
 	const defers = deferExtension(agents, {
 		pollMs: 10,
 		readyMs: 2_000,
 		repoRoot: repoRootOf,
 		reclaim: (agent) => reclaim(agent),
+		release: (agent) => release(agent),
 		...options,
 	});
 	const harness = await openHarness(
@@ -76,6 +78,7 @@ async function core(db: string, agents: Agents, options: DeferOptions = {}) {
 	open.push(harness);
 	const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	reclaim = reclaimer(root, agents as AgentPort, context);
+	release = releaser(root, agents as AgentPort, context);
 	harness.resume();
 	const bridge = eventBridge(root, agents as AgentPort, context);
 	const handled: Promise<void>[] = [];
@@ -537,9 +540,10 @@ test("a hand-off job listed at work when its pending hand-off ends unsent is not
 	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
 });
 
-test("a hand-off job given its pending instruction is not stopped, though its listing has not caught up with the prompt", async () => {
+test("a hand-off job whose listing has not caught up with its pending instruction's prompt is taken at its word, and stopped once", async () => {
 	const { db, src } = await tree();
-	// As a side whose status of the prompt comes later than the prompt: still listed at rest.
+	// As a side whose status of the prompt comes later than the prompt: still listed at rest. ACP, the side a windowless
+	// job runs on, reports the prompt's working before its prompt returns; the level check believes the listing.
 	const agents = new (class extends FakeAgentPort {
 		lagging = false;
 		override async prompt(agent: string, text: string): Promise<void> {
@@ -552,13 +556,265 @@ test("a hand-off job given its pending instruction is not stopped, though its li
 	const later = id(await soma.handoff(src, SESSION, "PT1S"));
 	agents.finish(name, "結果：完成");
 	await soma.settle();
+	expect(agents.stopped).toEqual([]);
 
 	agents.lagging = true;
 	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "sent" });
+	await until(() => agents.stopped.length > 0, "the stop");
 	await quiet();
 	expect(agents.prompts).toHaveLength(2);
+	expect(agents.stopped).toEqual([name]);
+});
+
+/** Ends each prompt's turn with `reply`, and has the bridge record it, before the prompt returns, once `early` is set. */
+class Early extends FakeAgentPort {
+	early = false;
+	reply = "結果：完成\nKUMQUAT";
+	recorded: Job | undefined;
+	settle: () => Promise<void> = async () => {};
+	jobs: () => Promise<Job[]> = async () => [];
+	override async prompt(agent: string, text: string): Promise<void> {
+		await super.prompt(agent, text);
+		if (!this.early) return;
+		this.finish(agent, this.reply);
+		await this.settle();
+		this.recorded = (await this.jobs())[0];
+	}
+}
+
+async function early(windowed = false, reply = "結果：完成\nKUMQUAT") {
+	const { db, src } = await tree();
+	const agents = new Early();
+	agents.reply = reply;
+	const soma = await core(db, agents);
+	agents.settle = soma.settle;
+	agents.jobs = soma.jobs;
+	agents.early = true;
+	if (windowed) agents.windows.add("soma-my-repo-7e33");
+	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "sent" });
+	// The turn was recorded while the prompt still held the job, so the bridge's look then left it running.
+	expect(agents.recorded).toMatchObject({ outcome: /^結果：(\S+)/.exec(reply)?.[1], reclaim: { phase: "sending" } });
+	return { agents, soma, name: "soma-my-repo-7e33" };
+}
+
+test("a hand-off job whose prompt's turn is recorded 完成 before its sent ending commits ends stopped once", async () => {
+	const { agents, soma, name } = await early();
+
+	await until(() => agents.stopped.length > 0, "the stop");
+	await quiet();
+	expect(agents.stopped).toEqual([name]);
+	expect((await soma.jobs())[0]).toMatchObject({ outcome: "完成", reclaim: { phase: "stopped" } });
+	expect(await soma.items()).toEqual({});
+	expect(await soma.notices()).toEqual([`agent ${name}（卡片 ${name}）這一輪結束了：\n結果：完成\nKUMQUAT`]);
+
+	// The closed process's last reports: no second stop.
+	agents.emit(name, { state: "idle" });
+	await soma.settle();
+	await quiet();
+	expect(agents.stopped).toEqual([name]);
+});
+
+test("a hand-off job whose sent ending commits before its prompt's turn is recorded still ends stopped once, at that turn", async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	await quiet();
+	expect(agents.stopped).toEqual([name]);
+	expect((await soma.jobs())[0]).toMatchObject({ outcome: "完成", reclaim: { phase: "stopped" } });
+});
+
+/** As ACP lists a dormant agent while `dormant`: no status and no seq. The prompt wakes it, and its turn ends early. */
+class Dormant extends FakeAgentPort {
+	dormant = false;
+	early = false;
+	settle: () => Promise<void> = async () => {};
+	override async list(): Promise<readonly AgentListing[]> {
+		const all = await super.list();
+		return this.dormant
+			? all.map(({ name, sessionId }) => ({ name, ...(sessionId === undefined ? {} : { sessionId }) }))
+			: all;
+	}
+	override async prompt(agent: string, text: string): Promise<void> {
+		const woke = this.dormant;
+		this.dormant = false;
+		await super.prompt(agent, text);
+		if (!woke || !this.early) return;
+		this.finish(agent, "結果：完成\nSECOND");
+		await this.settle();
+	}
+}
+
+test("a dormant hand-off job whose deferral's turn is recorded 完成 before its sent ending ends stopped once", async () => {
+	const { db, src } = await tree();
+	const agents = new Dormant();
+	const soma = await core(db, agents);
+	agents.settle = soma.settle;
+	const name = await fired(soma, src);
+	agents.finish(name, "結果：需要你\nWhich branch?");
+	await soma.settle();
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.dormant = true;
+	agents.early = true;
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "sent" });
+	await until(() => agents.stopped.length > 0, "the stop");
+	await quiet();
+	expect((await soma.jobs())[0]).toMatchObject({ outcome: "完成", reclaim: { phase: "stopped" } });
+	expect(agents.stopped).toEqual([name]);
+});
+
+test("a hand-off job at rest whose agent is listed with no process is not stopped by a startup reconcile", async () => {
+	const { db, src } = await tree();
+	const agents = new Dormant();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+	agents.windows.add(name);
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	agents.windows.delete(name);
+	agents.dormant = true;
+
+	await reconcileDispatches(soma.root, agents, context);
+	await quiet();
 	expect(agents.stopped).toEqual([]);
 	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+/**
+ * Ends the job's running turn just before the next prompt goes out, once `late` is set, so the bridge records that turn
+ * only after the deferral's sending commit; `emitsWorking` reports the prompt's own turn, else the listing lags it.
+ */
+class LateTurn extends FakeAgentPort {
+	late: (() => Promise<void>) | undefined;
+	emitsWorking = false;
+	override async prompt(agent: string, text: string): Promise<void> {
+		const late = this.late;
+		this.late = undefined;
+		if (late === undefined) return super.prompt(agent, text);
+		await late();
+		if (this.emitsWorking) return super.prompt(agent, text);
+		this.prompts.push({ agent, text });
+	}
+}
+
+async function lateTurn(emitsWorking: boolean) {
+	const { db, src } = await tree();
+	const agents = new LateTurn();
+	agents.emitsWorking = emitsWorking;
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.late = async () => {
+		agents.finish(name, "結果：完成\nFIRST");
+		await soma.settle();
+	};
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "sent" });
+	await quiet();
+	expect(agents.prompts).toHaveLength(2);
+	return { agents, soma, name };
+}
+
+test("a turn that ended before the prompt, recorded after the sending commit, with the listing lagging the prompt, ends stopped once", async () => {
+	const { agents, soma, name } = await lateTurn(false);
+
+	await until(() => agents.stopped.length > 0, "the stop");
+	await quiet();
+	expect(agents.stopped).toEqual([name]);
+	expect((await soma.jobs())[0]).toMatchObject({ reclaim: { phase: "stopped" } });
+});
+
+test("a turn recorded late before the sent ending stops nothing while the prompt's turn runs, which then ends stopped once", async () => {
+	const { agents, soma, name } = await lateTurn(true);
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+
+	agents.finish(name, "結果：完成\nSECOND");
+	await soma.settle();
+	await quiet();
+	expect(agents.stopped).toEqual([name]);
+});
+
+test("a hand-off job whose prompt's turn ends 需要你, after a turn recorded late, is never stopped by the check", async () => {
+	const { agents, soma, name } = await lateTurn(true);
+
+	agents.finish(name, "結果：需要你\nWhich branch?");
+	await soma.settle();
+	agents.emit(name, { state: "idle" });
+	await soma.settle();
+	await reconcileDispatches(soma.root, agents, context);
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]).toMatchObject({ outcome: "需要你" });
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("a hand-off job whose prompt's turn is recorded 需要你 before its sent ending is never stopped by the check", async () => {
+	const { agents, soma, name } = await early(false, "結果：需要你\nWhich branch?");
+
+	agents.emit(name, { state: "idle" });
+	await soma.settle();
+	await reconcileDispatches(soma.root, agents, context);
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("a hand-off job in a window is never stopped by the check: after its sent ending, at a status or at a restart", async () => {
+	const { agents, soma, name } = await early(true);
+
+	agents.emit(name, { state: "idle" });
+	await soma.settle();
+	await reconcileDispatches(soma.root, agents, context);
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("a hand-off job at rest with a deferral of its agent pending is never stopped by the check", async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1H"));
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+
+	agents.emit(name, { state: "idle" });
+	agents.emit(name, { state: "done" });
+	await soma.settle();
+	await reconcileDispatches(soma.root, agents, context);
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+	expect(Object.keys(await soma.items())).toEqual([later]);
+});
+
+test("a startup reconcile stops a hand-off job a soma left at rest and running, once", async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+	// Recorded at rest while the look saw a window; a soma that stopped then left it running with no status to come.
+	agents.windows.add(name);
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	agents.windows.delete(name);
+	expect(agents.stopped).toEqual([]);
+
+	await reconcileDispatches(soma.root, agents, context);
+	await reconcileDispatches(soma.root, agents, context);
+	await quiet();
+	expect(agents.stopped).toEqual([name]);
+	expect((await soma.jobs())[0]).toMatchObject({ outcome: "完成", reclaim: { phase: "stopped" } });
 });
 
 test("a hand-off job at rest whose pending hand-off is aborted is stopped", async () => {

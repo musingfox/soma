@@ -32,7 +32,7 @@ import { DIGEST_PERIOD_MS, digest } from "./core/extensions/digest/index.ts";
 import { eventBridge, handoverBridge, reconcileDispatches } from "./core/extensions/dispatch/bridge.ts";
 import { foreignBridge } from "./core/extensions/dispatch/foreign.ts";
 import { hostDispatcher } from "./core/extensions/dispatch/host.ts";
-import { reclaimer } from "./core/extensions/dispatch/reclaim.ts";
+import { reclaimer, releaser } from "./core/extensions/dispatch/reclaim.ts";
 import { keepJobsFile } from "./core/extensions/dispatch/sidecar.ts";
 import { inspectExtension } from "./core/extensions/inspect/index.ts";
 import { interfaces } from "./core/extensions/interfaces/index.ts";
@@ -89,6 +89,7 @@ const ready = new Promise<void>((resolve) => {
 });
 const defers = deferExtension(agents, {
 	reclaim: (agent) => ready.then(() => reclaimer(root, agents, context)(agent)),
+	release: (agent) => ready.then(() => releaser(root, agents, context)(agent)),
 	repoRoot: repoRootOf,
 	liveSession: liveSession(),
 });

@@ -19,10 +19,9 @@ import { clip, resultNotice, urgent } from "../../domain/report.ts";
 import { dispatchSignal, reblockSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
 import { askForJob } from "../ask/index.ts";
-import { Deferrals } from "../defer/deferrals.ts";
 import { recordFact } from "../memory/index.ts";
 import { commitCut, commitMove, commitRefusal, Dispatches, JOB_DONE, UndecidedPrompt } from "./index.ts";
-import { reclaimer } from "./reclaim.ts";
+import { reclaimer, releaser } from "./reclaim.ts";
 
 export { JOB_DONE };
 
@@ -61,14 +60,15 @@ function wakeContent(job: Job, status: Extract<AgentState, { state: "blocked" }>
  * decision, so the model never sees it to answer. The input's requestId carries the observation's
  * seq, so a resent event, from a repeated snapshot or a restarted core, is admitted once. A turn is
  * recorded once per last transcript record: the same record under a new seq is the same turn.
- * An idle or done agent with a deferral pending is stopped after its turn is recorded (`reclaimer`), and so is a
- * hand-off's whose turn ended 完成 or 失敗 with none pending and which runs with no window; a job soma stopped takes no
- * more statuses: what its closed window reports is no news.
+ * An idle or done agent with a deferral pending is stopped after its turn is recorded (`reclaimer`), and a hand-off's
+ * job is looked at after each status recorded (`releaser`), which stops it at rest with none pending and no window; a
+ * job soma stopped takes no more statuses: what its closed window reports is no news.
  */
 export function eventBridge(conversation: Conversation, agents: AgentPort, context: Context) {
 	// One event at a time: each reads the job, acts, then commits what it saw.
 	let queue = Promise.resolve();
 	const reclaim = reclaimer(conversation, agents, context);
+	const release = releaser(conversation, agents, context);
 
 	async function apply(event: AgentStatusEvent): Promise<void> {
 		// A doc is a live proxy only valid inside its commit, so the job is copied out as the JSON it is stored as.
@@ -116,18 +116,12 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			);
 		}
 		if (action === "launch" && job.launch !== undefined) await agents.prompt(job.agent, job.launch);
-		// A window is where the human works with a job, so only a hand-off running without one gives its session back.
-		// A look that fails is doubt, and the job keeps running.
-		const windowless =
-			action === "complete" &&
-			job.handoff === true &&
-			((await agents.windowless?.(job.agent).catch(() => false)) ?? false);
 
-		await conversation.commit(async (tx) => {
+		const recorded = await conversation.commit(async (tx) => {
 			const doc = await tx.doc(Dispatches, conversation.id);
 			const index = doc.jobs.findIndex((candidate) => candidate.agent === event.agent);
 			const current = doc.jobs[index];
-			if (current === undefined || current.seq === event.seq) return;
+			if (current === undefined || current.seq === event.seq) return false;
 			// Decisions come from the current job, not the one read above: a respond tool may have added one since, and
 			// so may the reclaim, which a defer may have armed since, and the time of a return or the id of a refusal told
 			// since. A job that moved since is the window's: of what was read, only that a turn finished is still true of
@@ -204,19 +198,14 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 				});
 				const signal = dispatchSignal(next, outcome, event.seq, done.id, Date.now());
 				if (signal !== undefined) await recordFact(tx, signal);
-				// A hand-off's session is the human's: once its turn is over with nothing deferred, its process is stopped
-				// as a reclaim stops one at rest, so a `claude --resume` by hand is no second writer. A 需要你 turn waits
-				// for its reply, and a job a deferral holds keeps the reclaim that deferral gave it.
-				const over = outcome === "完成" || outcome === "失敗";
-				if (windowless && over && written.reclaim === undefined) {
-					const { items } = await tx.doc(Deferrals, conversation.id);
-					if (!Object.values(items).some((item) => item.agent === current.agent)) {
-						doc.jobs[index] = { ...written, reclaim: { phase: "due" } };
-					}
-				}
 			}
+			return true;
 		}, context);
 		if (event.status.state === "idle" || event.status.state === "done") await reclaim(job.agent);
+		// A hand-off's session is the human's once its job is at rest with nothing deferred: its process is stopped as a
+		// reclaim stops one at rest, so a `claude --resume` by hand is no second writer. Looked at on every status
+		// recorded, so a turn recorded while a deferral still held the job is stopped at the next look.
+		if (recorded && job.handoff === true) await release(job.agent);
 	}
 
 	function handle(event: AgentStatusEvent): Promise<void> {
@@ -309,6 +298,7 @@ export function handoverBridge(conversation: Conversation, settling: HandoverSet
  * finished in the gap is recorded and a block that was already handed to the model is not handed
  * over again. A job left `stopping` by the last process is settled, and one `due` whose agent is at
  * rest is stopped, so a reclaim a crash cut short neither leaves its window open nor reads as a vanished agent.
+ * Last, every hand-off job is looked at as the bridge looks at one (`releaser`), so one left at rest and running is stopped.
  * `dormant` names the agents the agent side lists with no process, since they ended with soma, and no status, so their
  * jobs keep the last one soma recorded. A job among them that was in a turn lost it: the turn is recorded over, once,
  * as one with no outcome. The human is told once of those that were not done or failed, with which had a turn cut.
@@ -329,7 +319,7 @@ export async function reconcileDispatches(
 	for (const { name, status, seq } of listed) {
 		if (status !== undefined && seq !== undefined) await bridge.handle({ agent: name, status, seq });
 	}
-	const armed = await conversation.commit(async (tx) => {
+	const { armed, handoffs } = await conversation.commit(async (tx) => {
 		const doc = await tx.doc(Dispatches, conversation.id);
 		const before = doc.jobs.map((job) => job.status.state);
 		const reconciled = reconcile(doc.jobs, listed);
@@ -367,10 +357,17 @@ export async function reconcileDispatches(
 				noticeEntry("report", cut.length > 0 ? "action" : "ambient", dormantNotice(asleep, cut)),
 			);
 		}
-		return doc.jobs
-			.filter((job) => job.reclaim?.phase === "due" || job.reclaim?.phase === "stopping")
-			.map((job) => job.agent);
+		return {
+			armed: doc.jobs
+				.filter((job) => job.reclaim?.phase === "due" || job.reclaim?.phase === "stopping")
+				.map((job) => job.agent),
+			handoffs: doc.jobs.filter((job) => job.handoff === true).map((job) => job.agent),
+		};
 	}, context);
 	const reclaim = reclaimer(conversation, agents, context);
 	for (const agent of armed) await reclaim(agent, true);
+	// A hand-off job a soma left at rest and running, as one that stopped between recording a turn and the next look, or
+	// whose look saw a deferral that then ended, is given back now: no status of it may come again.
+	const release = releaser(conversation, agents, context);
+	for (const agent of handoffs) await release(agent);
 }

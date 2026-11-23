@@ -78,7 +78,8 @@ test("a rule the model creates fires in a new conversation each time, told as an
 	expect(fire?.context.messages.filter((message) => message.role !== "system")).toHaveLength(1);
 	expect(textOf(fire?.context.messages.at(-1)?.content)).toMatch(
 		new RegExp(
-			`^Scheduled run of rule ${id} \\(\\*/2 \\* \\* \\* \\*\\) for \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d\\.\\n\\n說現在幾點$`,
+			`^Scheduled run of rule ${id} \\(\\*/2 \\* \\* \\* \\*\\) for \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d\\.\\n` +
+				"Nobody is in this conversation: your final answer is sent to the human as a notice, and an answer of exactly NO_REPLY sends nothing.\\n\\n說現在幾點$",
 		),
 	);
 
@@ -162,6 +163,68 @@ test("a fire whose model call fails is told as unfinished, with the reason, and 
 	// The failure enters the root's context as the answer does.
 	const [result] = await soma.results();
 	expect(textOf(result?.model?.[0]?.content)).toContain(`> ${failed?.content}`);
+});
+
+test("a fire answered only NO_REPLY, bare or padded, tells nothing on the root or the HumanPort, and the rule fires again", {
+	timeout: 15_000,
+}, async () => {
+	const fired = vi.spyOn(console, "error");
+	const silences = ["NO_REPLY", "  NO_REPLY  ", "\nNO_REPLY\n", " \n NO_REPLY \n "];
+	const soma = await core({ nextFire: every(300), answer: (_instruction, fire) => silences[fire - 1] });
+	const id = idOf(await soma.say(`每 ${CRON} 做 有事才說`));
+	const before = (await soma.entries()).length;
+	const events = soma.events.length;
+
+	await vi.waitFor(() => expect(soma.notices()).toHaveLength(1), { timeout: 5_000 });
+	expect(soma.notices()).toEqual([{ class: "outcome", content: `[schedule ${id} · ${CRON}]\nfire 5: 有事才說` }]);
+	// Only the fifth fire's notice and result, and its answer's event, are new.
+	const added = (await soma.entries()).slice(before);
+	expect(added.map((entry) => entry.kind)).toEqual([RESULT, "notice"]);
+	expect(soma.events.slice(events)).toEqual([expect.objectContaining({ type: "notice", class: "outcome" })]);
+	const owned = await soma.owned(Number(id) as TaskId);
+	expect(owned.length).toBeGreaterThanOrEqual(5);
+	const lines = fired.mock.calls.map((call) => call.join(" "));
+	for (const conversation of owned.slice(0, 4))
+		expect(lines).toContain(`[soma] schedule ${id} (${CRON}) fired in conversation ${conversation.id}, silent`);
+	expect(lines).toContain(`[soma] schedule ${id} (${CRON}) fired in conversation ${owned[4]?.id}`);
+});
+
+test("an answer with NO_REPLY among other words is told as written", { timeout: 15_000 }, async () => {
+	const answers = ["NO_REPLY, except that the disk is 95% full.", "NO_REPLY.", "no_reply"];
+	const soma = await core({ nextFire: every(300), answer: (_instruction, fire) => answers[fire - 1] });
+	const id = idOf(await soma.say(`每 ${CRON} 做 看磁碟`));
+	await vi.waitFor(() => expect(soma.notices().length).toBeGreaterThanOrEqual(3), { timeout: 5_000 });
+	expect(soma.notices().slice(0, 3)).toEqual(
+		answers.map((answer) => ({ class: "outcome", content: `[schedule ${id} · ${CRON}]\n${answer}` })),
+	);
+	await vi.waitFor(async () => expect((await soma.results()).length).toBeGreaterThanOrEqual(3));
+	expect(textOf((await soma.results())[0]?.model?.[0]?.content)).toContain(`> ${answers[0]}`);
+});
+
+test("an empty answer, and a model that wrote NO_REPLY before it failed, are told as unfinished outcomes", {
+	timeout: 15_000,
+}, async () => {
+	const answers = [
+		"",
+		"  \n ",
+		fauxAssistantMessage("NO_REPLY", { stopReason: "error", errorMessage: "401 invalid x-api-key" }),
+		"NO_REPLY",
+	];
+	const soma = await core({ nextFire: every(300), answer: (_instruction, fire) => answers[fire - 1] });
+	const id = idOf(await soma.say(`每 ${CRON} 做 報時`));
+	await vi.waitFor(() => expect(soma.notices().length).toBeGreaterThanOrEqual(3), { timeout: 5_000 });
+	const head = `[schedule ${id} · ${CRON}] did not finish: `;
+	const [empty, blank, failed] = soma.notices();
+	expect(empty).toEqual({ class: "outcome", content: `${head}the answer had no text. The instruction was: 報時` });
+	expect(blank).toEqual(empty);
+	expect(failed?.class).toBe("outcome");
+	expect(failed?.content).toMatch(
+		/^\[schedule \d+ · [^\]]+\] did not finish: .*401 invalid x-api-key.*\. The instruction was: 報時$/,
+	);
+	await vi.waitFor(async () => expect((await soma.results()).length).toBeGreaterThanOrEqual(3));
+	const results = (await soma.results()).slice(0, 3).map((entry) => textOf(entry.model?.[0]?.content));
+	for (const [index, notice] of [empty, blank, failed].entries())
+		expect(results[index]).toContain(`> ${notice?.content}`);
 });
 
 test("a root that ran under the old extension list gets schedule_recurring added alone, and nothing removed", async () => {

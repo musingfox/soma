@@ -117,9 +117,22 @@ export function localMinute(ms: number): string {
 	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-/** What a rule's fire submits in its own conversation: one fixed line naming the rule and the slot, then the instruction. */
+/** The whole answer, trimmed, by which a fire tells nothing. */
+export const NO_REPLY = "NO_REPLY";
+
+/** Only the exact token is silence, so an answer that mentions it among other words is still told whole. */
+export const isSilent = (answer: string) => answer.trim() === NO_REPLY;
+
+/**
+ * What a rule's fire submits in its own conversation: one fixed line naming the rule and the slot, one fixed line on
+ * where the answer goes, then the instruction. The model is alone there, so it is told nobody will answer it.
+ */
 export function fireInput(id: number, cron: string, slot: number, instruction: string): string {
-	return `Scheduled run of rule ${id} (${cron}) for ${localMinute(slot)}.\n\n${instruction}`;
+	return (
+		`Scheduled run of rule ${id} (${cron}) for ${localMinute(slot)}.\n` +
+		`Nobody is in this conversation: your final answer is sent to the human as a notice, and an answer of exactly ${NO_REPLY} sends nothing.\n\n` +
+		instruction
+	);
 }
 
 /**

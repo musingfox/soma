@@ -10,7 +10,7 @@ import {
 	type SubmissionRecord,
 } from "@earendil-works/pi-durable";
 import { obj, str } from "@earendil-works/pi-schema";
-import { nextFire as cronNextFire, fireInput, fireResult } from "../../domain/schedule.ts";
+import { nextFire as cronNextFire, fireInput, fireResult, isSilent } from "../../domain/schedule.ts";
 import { noticeEntry } from "../../notice.ts";
 
 export type Rule = { cron: string; instruction: string; callId: string; next: number };
@@ -82,7 +82,8 @@ export interface RecurringOptions {
 /**
  * Recurring rules (ARCHITECTURE.md "Recurring schedule"). Each fire runs the instruction in a fresh conversation the
  * rule's task owns, with no extension and no tool, as the dream runs; its answer is told to the human as a notice and
- * written into the root's context, in the commit that moves the rule to its next slot. The root's model is not woken.
+ * written into the root's context, in the commit that moves the rule to its next slot, unless it is only `NO_REPLY`.
+ * The root's model is not woken.
  */
 export function recurring({ nextFire = cronNextFire, lateMs = 60_000 }: RecurringOptions = {}) {
 	const Recurring = defineTask<Rule, Checkpoint, null>({
@@ -141,21 +142,27 @@ export function recurring({ nextFire = cronNextFire, lateMs = 60_000 }: Recurrin
 						: settled?.status === "unanswered"
 							? reasonOf(settled as Extract<SubmissionRecord, { status: "unanswered" }>)
 							: "its conversation was not found";
+				// A failure is told whatever the model wrote before it, so only a finished answer can be silent.
+				const silent = failure === undefined && isSilent(answer);
 				const told = toldText(task.id, cron, failure === undefined ? { answer } : { failure, instruction });
 				const root = await runtime.conversation(runtime.conversationId, context);
 				await runtime.commit(async (tx, current) => {
 					const now = runtime.now();
-					// First in the commit, as an admission must be. Idle, the root gets the entry now; busy, at its next
-					// boundary: either way no round starts for it, and the model has it at its next request.
-					await root?.submit(tx, { type: "write", entry: resultEntry(task.id, cron, slot, told, now) });
-					await tx.appendEntry(current.conversationId, noticeEntry("report", "outcome", told));
+					if (!silent) {
+						// First in the commit, as an admission must be. Idle, the root gets the entry now; busy, at its next
+						// boundary: either way no round starts for it, and the model has it at its next request.
+						await root?.submit(tx, { type: "write", entry: resultEntry(task.id, cron, slot, told, now) });
+						await tx.appendEntry(current.conversationId, noticeEntry("report", "outcome", told));
+					}
 					// A slot that passed while the fire ran is skipped.
 					const next = nextFire(cron, now);
 					const rule = (await tx.doc(Rules, current.conversationId)).items[task.id];
 					if (rule !== undefined) rule.next = next;
 					return { status: "running", checkpoint: { phase: "wait", next } };
 				}, context);
-				console.error(`[soma] schedule ${task.id} (${cron}) fired in conversation ${conversationId}`);
+				console.error(
+					`[soma] schedule ${task.id} (${cron}) fired in conversation ${conversationId}${silent ? ", silent" : ""}`,
+				);
 			},
 		},
 		abort: async (task, runtime, context) => {

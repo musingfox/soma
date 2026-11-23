@@ -1,7 +1,7 @@
 // A real core with the recurring schedule over the faux provider, for test/recurring.test.ts and the crash child
 // test/recurring-child.ts.
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { TranscriptContext } from "@earendil-works/pi-ai";
+import type { AssistantMessage, TranscriptContext } from "@earendil-works/pi-ai";
 import { createModels, type Models } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ConversationId, Harness, ModelRef, TaskId } from "@earendil-works/pi-durable";
@@ -15,7 +15,7 @@ import type { SomaEvent } from "../src/ports/human.ts";
 
 export const context = BACKGROUND_CONTEXT;
 /** The fixed first line of a fire's input, by which the faux model tells a fire from the human. */
-export const FIRE = /^Scheduled run of rule (\d+) \(([^)]*)\) for [^\n]*\.\n\n(.*)$/s;
+export const FIRE = /^Scheduled run of rule (\d+) \(([^)]*)\) for [^\n]*\.\n[^\n]*\n\n(.*)$/s;
 
 export const textOf = (content: unknown) =>
 	typeof content === "string"
@@ -24,13 +24,17 @@ export const textOf = (content: unknown) =>
 
 export type Request = { fire: boolean; context: TranscriptContext };
 
+/** A fire's answer as text or a whole message, or undefined for the default one. */
+export type Answer = (instruction: string, fire: number) => string | AssistantMessage | undefined;
+
 /**
  * The model, in the root and in every fire's conversation alike, as each starts as a copy of the root's agent. For the
  * human it calls `schedule_recurring` on 「每 <cron> 做 <instruction>」, `schedule` on 「提醒我 <words>」, `schedule_list`
  * on 「列出排程」 and `schedule_cancel` on 「取消排程 <id>」, and says 「好。」 otherwise. A fire's input is answered
- * `fire <n>: <instruction>`, `n` counting the fires this process answered, and fails while `failing` says so.
+ * `fire <n>: <instruction>`, `n` counting the fires this process answered, or what `answer` gives, and fails while
+ * `failing` says so.
  */
-export function fauxModels(options: { failing?: () => boolean } = {}) {
+export function fauxModels(options: { failing?: () => boolean; answer?: Answer } = {}) {
 	const requests: Request[] = [];
 	let fires = 0;
 	const faux = fauxProvider();
@@ -42,7 +46,10 @@ export function fauxModels(options: { failing?: () => boolean } = {}) {
 			requests.push({ fire, context: request });
 			if (fire) {
 				if (options.failing?.() === true) throw new Error("401 invalid x-api-key");
-				return fauxAssistantMessage(`fire ${++fires}: ${FIRE.exec(said)?.[3]}`);
+				const instruction = FIRE.exec(said)?.[3] ?? "";
+				const fire = ++fires;
+				const answer = options.answer?.(instruction, fire) ?? `fire ${fire}: ${instruction}`;
+				return typeof answer === "string" ? fauxAssistantMessage(answer) : answer;
 			}
 			if (last?.role === "toolResult") return fauxAssistantMessage(`好。${said}`);
 			const call = (name: string, args: Record<string, string>) =>
@@ -69,12 +76,16 @@ export interface CoreOptions extends RecurringOptions {
 	db: string;
 	models?: { models: Models; model: ModelRef };
 	failing?: () => boolean;
+	answer?: Answer;
 	/** False leaves the tasks to resume when the caller says. */
 	resume?: boolean;
 }
 
 export async function openCore(options: CoreOptions) {
-	const faux = fauxModels({ ...(options.failing && { failing: options.failing }) });
+	const faux = fauxModels({
+		...(options.failing && { failing: options.failing }),
+		...(options.answer && { answer: options.answer }),
+	});
 	const { models, model } = options.models ?? faux;
 	const storage = await openStorage(options.db);
 	const recurringOptions: RecurringOptions = {

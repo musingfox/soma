@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { nextFire, parseCron, resolveAt } from "../src/core/domain/schedule.ts";
+import { isSilent, nextFire, parseCron, resolveAt } from "../src/core/domain/schedule.ts";
 
 const now = Date.parse("2026-10-18T10:00:00Z");
 
@@ -82,4 +82,18 @@ test("a cron that matches no minute in five years is rejected", () => {
 	expect(() => nextFire("0 0 31 4 *", at(2026, 11, 23))).toThrow(RangeError);
 	// A leap day is within five years of any time.
 	expect(nextFire("0 0 29 2 *", at(2026, 11, 23))).toBe(at(2028, 2, 29));
+});
+
+test("only NO_REPLY alone, trimmed, is silence", () => {
+	for (const answer of ["NO_REPLY", "  NO_REPLY\n", "\n\tNO_REPLY \r\n"]) expect(isSilent(answer)).toBe(true);
+	for (const answer of [
+		"",
+		" ",
+		"NO_REPLY.",
+		"no_reply",
+		"NO_REPLYING",
+		"NO_REPLY NO_REPLY",
+		"NO_REPLY, but disk full",
+	])
+		expect(isSilent(answer)).toBe(false);
 });

@@ -311,6 +311,20 @@ test("a job soma dispatched whose turn ends 完成 with nothing deferred is not 
 	expect(agents.stopped).toEqual([]);
 });
 
+test("a hand-off job in a window the human works in whose turn ends 完成 with nothing deferred is not stopped", async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+
+	agents.windows.add(name);
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]).toMatchObject({ outcome: "完成" });
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
 test("a hand-off job with a deferral of its agent pending is left to that deferral's reclaim, and not stopped twice", async () => {
 	const { db, src } = await tree();
 	const agents = new FakeAgentPort();

@@ -1227,5 +1227,6 @@ export function createAcpAgentPort(options: AcpAgentPortOptions): AcpAgentPort {
 		respondForeign: (id: string) => Promise.reject(new Error(`no foreign agent ${id}: acp runs none`)),
 		promptForeign: (id: string) => Promise.reject(new PromptRefused(`no foreign agent ${id}: acp runs none`)),
 		findForeignSession: async () => undefined,
+		windowless: async () => true,
 	};
 }

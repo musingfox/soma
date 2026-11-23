@@ -610,5 +610,11 @@ export function createHandoverAgentPort({
 		respondForeign: (id, answer) => to.respondForeign(id, answer),
 		promptForeign: (id, text) => to.promptForeign(id, text),
 		findForeignSession: (sessionId) => to.findForeignSession(sessionId),
+
+		async windowless(agent) {
+			await loading;
+			if (moved.has(agent) || inHand(agent)) return false;
+			return (await from.windowless?.(agent)) ?? false;
+		},
 	};
 }

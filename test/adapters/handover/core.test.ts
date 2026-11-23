@@ -172,6 +172,12 @@ async function core(
 				const doc = await tx.doc(Dispatches, root.id);
 				doc.jobs = doc.jobs.map((each) => ({ ...each, outcome }));
 			}, context),
+		/** The job is a session handed off with `soma defer`, as one a hand-off's fire recorded. */
+		handedOff: () =>
+			root.commit(async (tx) => {
+				const doc = await tx.doc(Dispatches, root.id);
+				doc.jobs = doc.jobs.map((each) => ({ ...each, handoff: true as const }));
+			}, context),
 		/** The job's status becomes `idle`, as after a cancelled turn: one a reconcile would report gone if it is not listed. */
 		rest: () =>
 			root.commit(async (tx) => {
@@ -280,6 +286,34 @@ test("after the handover screen reads the pane, and a reply goes into the pane a
 	expect((await soma.turns()).at(-1)).toMatchObject({ outcome: "完成" });
 	expect(await soma.pids()).toHaveLength(1);
 	soma.off();
+});
+
+test("a hand-off job over ACP whose turn ends 完成 with nothing deferred is stopped", async () => {
+	const soma = await core();
+	await dispatched(soma);
+	await soma.handedOff();
+	// The fake agent's ASK turn ends 結果：完成 once its permission prompt is answered.
+	await soma.say("回覆 card-a ASK");
+	await soma.until(async () => (await soma.job())?.status.state === "blocked", "the prompt");
+	await soma.say(`選 card-a ${(await blockedOn(soma)).fingerprint}`);
+	await soma.until(async () => (await soma.job())?.reclaim?.phase === "stopped", "the hand-off job stopped");
+	expect(await soma.job()).toMatchObject({ outcome: "完成" });
+	soma.off();
+});
+
+test("a hand-off job handed over to a window whose turn ends 完成 with nothing deferred is not stopped", async () => {
+	const shown = await core();
+	await dispatched(shown);
+	await shown.handedOff();
+	await shown.say("看 card-a");
+	await turn(shown, "結果：完成\nKIWI");
+	await shown.until(async () => (await shown.job())?.outcome === "完成", "the window's turn");
+	await sleep(100);
+	expect(await shown.job()).toMatchObject({ handoff: true, status: { state: "done" } });
+	expect((await shown.job())?.reclaim).toBeUndefined();
+	expect(shown.hangar.methods()).not.toContain("block.close");
+	expect(shown.blocks).toHaveLength(1);
+	shown.off();
 });
 
 test("a window that reports its first idle and settles records no turn, and sends no brief again", async () => {

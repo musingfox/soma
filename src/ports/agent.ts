@@ -162,4 +162,7 @@ export interface AgentPort {
 	// The id of the foreign agent whose claude is in Claude Code session `sessionId` now, as `promptForeign` takes it;
 	// undefined when none is. Throws when the agent side cannot look, which is doubt, never "none".
 	findForeignSession(sessionId: string): Promise<string | undefined>;
+	// Whether the agent runs with no window the human works with it in, as a process over ACP: false for one handed over
+	// to a window or being moved. Absent where every agent has a window.
+	windowless?(agent: string): Promise<boolean>;
 }

@@ -140,6 +140,13 @@ export class FakeAgentPort implements AgentPort {
 		return this.foreignSessions.get(sessionId);
 	}
 
+	/** Agents a test has put in a window the human works in, as one handed over to rex; every other runs windowless. */
+	readonly windows = new Set<string>();
+
+	async windowless(agent: string): Promise<boolean> {
+		return !this.windows.has(agent);
+	}
+
 	onForeignStatus(listener: (event: ForeignStatusEvent) => void): () => void {
 		this.#foreignListeners.add(listener);
 		return () => this.#foreignListeners.delete(listener);

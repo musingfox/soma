@@ -62,8 +62,8 @@ function wakeContent(job: Job, status: Extract<AgentState, { state: "blocked" }>
  * seq, so a resent event, from a repeated snapshot or a restarted core, is admitted once. A turn is
  * recorded once per last transcript record: the same record under a new seq is the same turn.
  * An idle or done agent with a deferral pending is stopped after its turn is recorded (`reclaimer`), and so is a
- * hand-off's whose turn ended 完成 or 失敗 with none pending; a job soma stopped takes no more statuses: what its closed
- * window reports is no news.
+ * hand-off's whose turn ended 完成 or 失敗 with none pending and which runs with no window; a job soma stopped takes no
+ * more statuses: what its closed window reports is no news.
  */
 export function eventBridge(conversation: Conversation, agents: AgentPort, context: Context) {
 	// One event at a time: each reads the job, acts, then commits what it saw.
@@ -116,6 +116,12 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			);
 		}
 		if (action === "launch" && job.launch !== undefined) await agents.prompt(job.agent, job.launch);
+		// A window is where the human works with a job, so only a hand-off running without one gives its session back.
+		// A look that fails is doubt, and the job keeps running.
+		const windowless =
+			action === "complete" &&
+			job.handoff === true &&
+			((await agents.windowless?.(job.agent).catch(() => false)) ?? false);
 
 		await conversation.commit(async (tx) => {
 			const doc = await tx.doc(Dispatches, conversation.id);
@@ -202,7 +208,7 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 				// as a reclaim stops one at rest, so a `claude --resume` by hand is no second writer. A 需要你 turn waits
 				// for its reply, and a job a deferral holds keeps the reclaim that deferral gave it.
 				const over = outcome === "完成" || outcome === "失敗";
-				if (current.handoff === true && over && written.reclaim === undefined) {
+				if (windowless && over && written.reclaim === undefined) {
 					const { items } = await tx.doc(Deferrals, conversation.id);
 					if (!Object.values(items).some((item) => item.agent === current.agent)) {
 						doc.jobs[index] = { ...written, reclaim: { phase: "due" } };

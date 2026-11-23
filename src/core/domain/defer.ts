@@ -28,6 +28,8 @@ export type Deferred = {
 	// and `card` are then both the name of the job it becomes (`handoffName`).
 	readonly session?: string;
 	readonly cwd?: string;
+	// A hand-off through the drop directory: the request file's name, by which the same request read again is known.
+	readonly request?: string;
 };
 
 const iso = (ms: number) => new Date(ms).toISOString();

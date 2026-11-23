@@ -4,6 +4,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import type { Harness } from "@earendil-works/pi-durable";
+import { serveDrop } from "./adapters/defer-drop/index.ts";
 import { serveDefer } from "./adapters/defer-socket/index.ts";
 import { jobsFile } from "./adapters/jobs/jobs-file.ts";
 import { createCard, readCard } from "./adapters/obsidian/card.ts";
@@ -216,6 +217,15 @@ const deferServer = await serveDefer({
 	console.error("[soma] soma defer not served:", error);
 	return undefined;
 });
+// The other way in for a hand-off, which needs nothing of soma's on the session's side; served as the socket is, and a
+// directory that cannot be served leaves soma running without it.
+const dropServer = await serveDrop({
+	dir: config.handoffDir,
+	defer: (request) => defers.defer(root, request, context),
+}).catch((error: unknown) => {
+	console.error("[soma] drop directory not served:", error);
+	return undefined;
+});
 
 const { telegram } = config;
 const stopTelegram = new AbortController();
@@ -246,7 +256,7 @@ const shutdown = () => {
 	unlistenSettled?.();
 	unlistenForeign();
 	stopTelegram.abort();
-	void Promise.all([telegramDone, webPage?.close(), deferServer?.close()])
+	void Promise.all([telegramDone, webPage?.close(), deferServer?.close(), dropServer?.close()])
 		.then(() => human.close())
 		.then(() => harness.close(context))
 		.then(() => Promise.all(mcpClients.map(({ client }) => client.close())))

@@ -433,3 +433,20 @@ test("a hand-off mixing in an agent, with a session that is no UUID or a relativ
 	expect(seen).toEqual([]);
 	await server.close();
 });
+
+test("a hand-off carrying the drop directory's request or setAt is refused without reaching defer", async () => {
+	const { path, seen, server } = await serving();
+	const handoff = { session: SESSION, cwd: "/Users/me/workspace/soma", at: "PT2M", instruction: "x" };
+	const refused = async (request: object) => JSON.parse(await raw(path, `${JSON.stringify(request)}\n`));
+
+	expect(await refused({ ...handoff, request: "r-1" })).toEqual({
+		accepted: false,
+		reason: "the request is malformed at (top level)",
+	});
+	expect(await refused({ ...handoff, setAt: 1 })).toEqual({
+		accepted: false,
+		reason: "the request is malformed at (top level)",
+	});
+	expect(seen).toEqual([]);
+	await server.close();
+});

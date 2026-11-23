@@ -581,10 +581,13 @@ export function deferExtension(
 	 * named for the job the session becomes when it falls due (`handoffName`), and nothing else happens until then: no
 	 * job, no listing, no reclaim, no stop. A session that already has a hand-off job, or a waiting hand-off, gets that
 	 * name again; any other name a job or a waiting deferral holds is another session's. A session any other job holds,
-	 * as one soma dispatched that the human resumed by hand, is refused: never two writers on one transcript.
+	 * as one soma dispatched that the human resumed by hand, is refused: never two writers on one transcript. A request
+	 * the drop directory read again, as after a crash or a reply it could not write, carries the `request` of a waiting
+	 * deferral and gets that one's reply with nothing created. One read late, as while soma was down, counts from its own
+	 * `setAt` and is refused once that time has passed, since its session expected it then.
 	 */
 	async function handoff(conversation: Conversation, request: HandoffRequest, context: Context): Promise<DeferReply> {
-		const setAt = Date.now();
+		const setAt = request.setAt ?? Date.now();
 		let at: number;
 		try {
 			at = deferAt(request.at, setAt);
@@ -599,10 +602,20 @@ export function deferExtension(
 		// A directory that cannot be read is named as one outside any repo: the name only has to be the job's own.
 		const root = (await repoRoot(cwd).catch(() => undefined)) ?? cwd;
 		return conversation.commit(async (tx): Promise<DeferReply> => {
+			const deferrals = await tx.doc(Deferrals, conversation.id);
+			if (request.request !== undefined) {
+				const made = Object.entries(deferrals.items).find(([, each]) => each.request === request.request);
+				if (made !== undefined) return { accepted: true, id: made[0], at: new Date(made[1].at).toISOString() };
+			}
+			if (request.setAt !== undefined && at <= Date.now()) {
+				return {
+					accepted: false,
+					reason: `its time, ${new Date(at).toISOString()}, had passed when soma read the request`,
+				};
+			}
 			const { jobs } = await tx.doc(Dispatches, conversation.id);
 			const holder = holderOf(jobs, session);
 			if (holder !== undefined) return { accepted: false, reason: heldSession(session, holder.card) };
-			const deferrals = await tx.doc(Deferrals, conversation.id);
 			const waiting = Object.values(deferrals.items);
 			const agent =
 				jobs.find((each) => each.handoff === true && each.sessionId === session)?.agent ??
@@ -614,7 +627,16 @@ export function deferExtension(
 						jobs.some((each) => each.agent === name || each.card === name) ||
 						waiting.some((each) => each.agent === name),
 				);
-			const item: Deferred = { agent, card: agent, instruction, at, setAt, session, cwd };
+			const item: Deferred = {
+				agent,
+				card: agent,
+				instruction,
+				at,
+				setAt,
+				session,
+				cwd,
+				...(request.request === undefined ? {} : { request: request.request }),
+			};
 			const id = await tx.createTask(Deferral, item, { ownership: { kind: "conversation" }, background: true });
 			deferrals.items[String(id)] = item;
 			return { accepted: true, id: String(id), at: new Date(at).toISOString() };

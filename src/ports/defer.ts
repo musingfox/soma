@@ -17,6 +17,16 @@ export interface HandoffRequest {
 	readonly cwd: string;
 	readonly at: string;
 	readonly instruction: string;
+	/**
+	 * The drop directory's alone: the name of the request file, so a request read again after a crash or a reply that
+	 * could not be written gets the deferral it made the first time instead of a second one.
+	 */
+	readonly request?: string;
+	/**
+	 * The drop directory's alone: when the session asked, in epoch ms (the file's modification time), since soma may read
+	 * the file long after, as when it was down. A duration in `at` counts from it.
+	 */
+	readonly setAt?: number;
 }
 
 export type DeferRequest = AgentDeferRequest | HandoffRequest;

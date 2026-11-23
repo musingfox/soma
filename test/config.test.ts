@@ -61,6 +61,14 @@ const fields = [
 		values: ["/env.sock", "/file.sock", "/data/soma.sqlite.defer.sock"],
 	},
 	{
+		name: "handoffDir",
+		env: ["SOMA_HANDOFF_DIR", "/env.handoff"],
+		file: { handoffDir: "/file.handoff" },
+		base: { env: { SOMA_DB: "/data/soma.sqlite" } },
+		read: (c) => c.handoffDir,
+		values: ["/env.handoff", "/file.handoff", "/data/soma.sqlite.handoff"],
+	},
+	{
 		name: "model",
 		env: ["SOMA_MODEL", "env-model"],
 		file: { model: "file-model" },

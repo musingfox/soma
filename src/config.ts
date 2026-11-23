@@ -97,6 +97,7 @@ const FileConfig = z
 		mcpConfig: z.string().min(1),
 		db: z.string().min(1),
 		deferSocket: z.string().min(1),
+		handoffDir: z.string().min(1),
 		model: z.string().min(1),
 		language: z.string().refine((tag) => canonicalLanguage(tag) !== undefined, "Expected a BCP 47 language tag"),
 		hangarCap: z.number().int().positive(),
@@ -152,6 +153,8 @@ export interface Config {
 	readonly db: string;
 	/** The unix socket `soma defer` reaches soma on; absolute, since agents run it from their own directories. */
 	readonly deferSocket: string;
+	/** The drop directory a Claude Code session hands soma timed work through; absolute, as the defer socket is. */
+	readonly handoffDir: string;
 	readonly model: string;
 	/** The BCP 47 tag of the language soma answers the human in. */
 	readonly language: string;
@@ -325,6 +328,8 @@ export function resolveConfig(file: FileConfig | undefined, env: Env, home: stri
 		db,
 		// Next to the db by default: one soma per db (acquireDbLock), so prod and a dev instance never share a socket.
 		deferSocket: resolve(fromEnv("SOMA_DEFER_SOCKET") ?? file?.deferSocket ?? `${db}.defer.sock`),
+		// Next to the db for the same reason: prod and a dev instance never take each other's requests.
+		handoffDir: resolve(fromEnv("SOMA_HANDOFF_DIR") ?? file?.handoffDir ?? `${db}.handoff`),
 		model: fromEnv("SOMA_MODEL") ?? file?.model ?? "claude-opus-5-5",
 		language:
 			parseEnv("SOMA_LANGUAGE", canonicalLanguage, "a BCP 47 language tag") ??

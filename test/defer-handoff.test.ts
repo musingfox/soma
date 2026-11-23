@@ -624,6 +624,138 @@ test("a rerun that ends a hand-off's prompt unsure stops its job when it is list
 	expect((await second.jobs())[0]).toMatchObject({ handoff: true, reclaim: { phase: "stopped" } });
 });
 
+/** Sets fields of every job, as a status or a reclaim recorded since would have left them. */
+const recorded = (soma: Awaited<ReturnType<typeof core>>, change: (job: Job) => Job) =>
+	soma.root.commit(async (tx) => {
+		const doc = await tx.doc(Dispatches, soma.root.id);
+		doc.jobs = doc.jobs.map(change);
+	}, context);
+
+test("a dispatched job whose deferral ends unsent is not stopped by that ending, only once at accept as before", async () => {
+	const { db } = await tree();
+	const agents = new Refusing();
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+	const dispatched: Job = {
+		card: "card-a",
+		agent: "card-a",
+		sessionId: SESSION,
+		status: { state: "idle" },
+		decisions: [],
+	};
+	await soma.root.commit(async (tx) => {
+		(await tx.doc(Dispatches, soma.root.id)).jobs.push(dispatched);
+	}, context);
+	agents.emit("card-a", { state: "working" });
+	agents.finish("card-a", "結果：完成");
+	await soma.settle();
+
+	agents.refuse = true;
+	const later = id(await soma.dispatched("card-a", "PT1S"));
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "failed" });
+	await quiet();
+	await soma.settle();
+	expect(agents.stopped).toEqual(["card-a"]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("a hand-off job at rest after 失敗 whose pending hand-off ends unsent is stopped", async () => {
+	const { db, src } = await tree();
+	const agents = new Refusing();
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.finish(name, "結果：失敗");
+	await soma.settle();
+	expect(agents.stopped).toEqual([]);
+
+	agents.refuse = true;
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "failed" });
+	await until(() => agents.stopped.length > 0, "the stop");
+	expect(agents.stopped).toEqual([name]);
+});
+
+test("a hand-off job whose stop is under way as its pending hand-off ends gone keeps that stop, and is stopped by none other", async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents);
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	// A reclaim committed `stopping` and its stop is in flight: the agent is still listed at rest.
+	await recorded(soma, (job) => ({ ...job, reclaim: { phase: "stopping" } }));
+
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "gone" });
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]).toMatchObject({ reclaim: { phase: "stopping" } });
+});
+
+test("a hand-off job recorded blocked, though listed at rest, is not armed when its pending hand-off ends unsent", async () => {
+	const { db, src } = await tree();
+	const agents = new Refusing();
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	// The bridge has recorded a permission prompt the listing has not caught up with.
+	await recorded(soma, (job) => ({
+		...job,
+		status: { state: "blocked", kind: "permission", msg: "approve Bash: ls" },
+	}));
+
+	agents.refuse = true;
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "failed" });
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("a hand-off job recorded at rest but listed blocked is not armed when its pending hand-off ends unsent", async () => {
+	const { db, src } = await tree();
+	// The listing is read fresh: the agent stopped on a permission prompt the bridge has not recorded yet.
+	const agents = new (class extends Refusing {
+		blocked = false;
+		override async list() {
+			const listed = await super.list();
+			const status = { state: "blocked" as const, kind: "permission" as const, msg: "approve Bash: ls" };
+			return this.blocked ? listed.map((each) => ({ ...each, status })) : listed;
+		}
+	})();
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+
+	agents.blocked = true;
+	agents.refuse = true;
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "failed" });
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+});
+
+test("a hand-off job recorded done with no turn read is not armed when its pending hand-off ends unsent", async () => {
+	const { db, src } = await tree();
+	const agents = new Refusing();
+	const soma = await core(db, agents, { tries: 1, retryMs: 10 });
+	const name = await fired(soma, src);
+	const later = id(await soma.handoff(src, SESSION, "PT1S"));
+	agents.finish(name, "結果：完成");
+	await soma.settle();
+	// Only an idle job with no turn counts: a done one has a turn whose outcome was never read.
+	await recorded(soma, ({ outcome: _unread, ...job }) => ({ ...job, status: { state: "done" } }));
+
+	agents.refuse = true;
+	expect(await soma.outcome(later)).toEqual({ status: "completed", result: "failed" });
+	await quiet();
+	expect(agents.stopped).toEqual([]);
+	expect((await soma.jobs())[0]?.reclaim).toBeUndefined();
+	expect((await soma.jobs())[0]?.outcome).toBeUndefined();
+});
+
 test("a hand-off job whose stop is under way as its turn ends 完成 is not armed again, and not stopped a second time", async () => {
 	const { db, src } = await tree();
 	const agents = new FakeAgentPort();

@@ -5,7 +5,7 @@ import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durab
 import { afterEach, expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { eventBridge, JOB_DONE, reconcileDispatches } from "../src/core/extensions/dispatch/bridge.ts";
-import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
+import { Dispatches, dispatchExtension, releasedSession } from "../src/core/extensions/dispatch/index.ts";
 
 const context = BACKGROUND_CONTEXT;
 const open: Harness[] = [];
@@ -364,6 +364,30 @@ test("reply sends the human's answer to the agent that asked, and its next resul
 		(entry) => entry.kind === JOB_DONE,
 	);
 	expect(done.map((entry) => (entry.data as { outcome: string }).outcome)).toEqual(["需要你", "完成"]);
+});
+
+test("reply to a hand-off job soma stopped after its last turn is refused, sending nothing and recording nothing", async () => {
+	const { agents, root, call, jobs } = await setup();
+	const stopped = {
+		card: "soma-repo-7e33",
+		agent: "soma-repo-7e33",
+		sessionId: "7e33597b-e33d-4c6d-a700-e21b2f54223e",
+		status: { state: "done" as const },
+		outcome: "完成" as const,
+		decisions: [],
+		handoff: true as const,
+		reclaim: { phase: "stopped" as const },
+	};
+	await root.commit(async (tx) => {
+		(await tx.doc(Dispatches, root.id)).jobs.push(stopped);
+	}, context);
+
+	const result = await call("reply", { card: "soma-repo-7e33", text: "go on", reason: "人要它繼續" }, "r1");
+
+	expect(result).toEqual({ sent: false, refused: releasedSession("soma-repo-7e33") });
+	expect(releasedSession("x")).toMatch(/session was released after its last turn.*hand off.*dispatch a new job/);
+	expect(agents.prompts).toEqual([]);
+	expect(await jobs()).toEqual([stopped]);
 });
 
 test("reply to a card with no job sends nothing and says why", async () => {

@@ -405,6 +405,12 @@ export async function commitRefusal(
 	if (current !== undefined) doc.jobs[index] = { ...current, toldBack: outcome.back };
 }
 
+/** What `reply` returns for a hand-off job soma stopped once its turn was over, sending nothing. */
+export const releasedSession = (card: string) =>
+	`Not sent: job ${card} is a hand-off whose session was released after its last turn: soma stopped its agent and ` +
+	"gave the Claude Code session back to the human, so nothing runs to take a reply. To give it more work, hand off " +
+	"from that session again (soma defer in it), or dispatch a new job.";
+
 /** A soma given no handover has no rex hangar to hand over to. */
 const NO_HANGAR: AgentHandover = {
 	handOver: async () => ({
@@ -578,6 +584,10 @@ export function dispatchExtension(
 				return found && (JSON.parse(JSON.stringify(found)) as Job);
 			}, context);
 			if (job === undefined) return text({ sent: false, error: `no job for card ${args.card}` });
+			// No process is left to take it, and the session is the human's again: only a new hand-off or dispatch reaches it.
+			if (job.handoff === true && job.reclaim?.phase === "stopped") {
+				return text({ sent: false, refused: releasedSession(job.card) });
+			}
 			await agents.prompt(job.agent, args.text);
 			const decision: Decision = {
 				at: new Date().toISOString(),

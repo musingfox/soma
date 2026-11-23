@@ -2,6 +2,7 @@ import type { Context } from "@earendil-works/chord/context";
 import { defineDoc, defineExtension, defineTask, defineTool, type TaskId } from "@earendil-works/pi-durable";
 import { obj, str } from "@earendil-works/pi-schema";
 import { resolveAt } from "../../domain/schedule.ts";
+import { Rules } from "./recurring.ts";
 
 export type Scheduled = { at: number; instruction: string; callId: string };
 
@@ -88,9 +89,13 @@ export function schedule(abortTask: (id: TaskId, context: Context) => Promise<un
 		replay: "safe",
 		execute: async (_args, api, context) => {
 			const items = (await api.snapshot(Schedules, api.conversationId, context))?.items ?? {};
-			const lines = Object.entries(items).map(
-				([id, item]) => `${id}: ${new Date(item.at).toISOString()} ${item.instruction}`,
-			);
+			const rules = (await api.snapshot(Rules, api.conversationId, context))?.items ?? {};
+			const lines = [
+				...Object.entries(items).map(([id, item]) => `${id}: ${new Date(item.at).toISOString()} ${item.instruction}`),
+				...Object.entries(rules).map(
+					([id, rule]) => `${id}: ${rule.cron} next ${new Date(rule.next).toISOString()} ${rule.instruction}`,
+				),
+			];
 			return text(lines.length === 0 ? "Nothing scheduled." : lines.join("\n"));
 		},
 	});
@@ -102,7 +107,8 @@ export function schedule(abortTask: (id: TaskId, context: Context) => Promise<un
 		replay: "safe",
 		execute: async ({ id }, api, context) => {
 			const items = (await api.snapshot(Schedules, api.conversationId, context))?.items ?? {};
-			if (!Object.hasOwn(items, id)) return text(`Nothing scheduled under ${id}.`);
+			const rules = (await api.snapshot(Rules, api.conversationId, context))?.items ?? {};
+			if (!Object.hasOwn(items, id) && !Object.hasOwn(rules, id)) return text(`Nothing scheduled under ${id}.`);
 			const taskId = Number(id) as TaskId;
 			await abortTask(taskId, context);
 			await api.waitForTask(taskId, context);

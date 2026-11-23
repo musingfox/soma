@@ -31,6 +31,7 @@ import {
 import { deniedSignal } from "../../domain/signal.ts";
 import { homeOf } from "../../home.ts";
 import { noticeEntry } from "../../notice.ts";
+import { RESULT } from "../schedule/recurring.ts";
 
 const RECALL_LIMIT = 20;
 
@@ -227,8 +228,9 @@ const recall = defineTool({
 	},
 });
 
+// A fire's result is a user message no human wrote, so a denial does not count it as an input.
 const says = (entry: EntryRecord, role: "user" | "assistant") =>
-	(entry.model ?? []).some((message) => message.role === role && text(message).trim() !== "");
+	entry.kind !== RESULT && (entry.model ?? []).some((message) => message.role === role && text(message).trim() !== "");
 
 /**
  * Walks the transcript back from the newest input, the one that denies: the answer of the round `turnsAgo` rounds

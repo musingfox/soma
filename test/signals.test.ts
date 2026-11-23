@@ -12,6 +12,7 @@ import { SIGNAL } from "../src/core/domain/signal.ts";
 import { eventBridge, JOB_DONE } from "../src/core/extensions/dispatch/bridge.ts";
 import { dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
 import { Facts, memory } from "../src/core/extensions/memory/index.ts";
+import { resultEntry } from "../src/core/extensions/schedule/recurring.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { openHumanPort } from "../src/core/human-port.ts";
 
@@ -185,6 +186,21 @@ test("the model marks the previous round as denied, and the signal points at tha
 			text: expect.stringContaining(`紀錄 ${by} 的輸入`),
 		}),
 	]);
+});
+
+test("a fire's result between an answer and the human's denial is not counted as a round", async () => {
+	const soma = await core();
+	await soma.ask("台北天氣如何", "terminal:1");
+	const told = "[schedule 7 · */2 * * * *]\n現在是下午三點。";
+	await soma.root.submit(
+		{ type: "write", entry: resultEntry(7, "*/2 * * * *", Date.now(), told, Date.now()) },
+		context,
+	);
+	await soma.ask("不對，往回 1 那個天氣", "terminal:2");
+
+	const denied = await answerTo(soma, "terminal:1");
+	expect(denied).toBeDefined();
+	expect(await soma.signals()).toEqual([expect.objectContaining({ kind: SIGNAL.denied, refs: { entry: denied } })]);
 });
 
 test("a denial two rounds back points at that round, and marking the same answer twice records it once", async () => {

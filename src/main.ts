@@ -37,6 +37,7 @@ import { connectStdio, loadMcpConfig, mcpExtension } from "./core/extensions/mcp
 import { memory } from "./core/extensions/memory/index.ts";
 import { REFLECTION_PERIOD_MS, reflection } from "./core/extensions/reflection/index.ts";
 import { schedule } from "./core/extensions/schedule/index.ts";
+import { recurring } from "./core/extensions/schedule/recurring.ts";
 import { sleeper } from "./core/extensions/sleeper/index.ts";
 import { stopGuard } from "./core/extensions/stop/index.ts";
 import { tools } from "./core/extensions/tools/index.ts";
@@ -135,6 +136,8 @@ const extensions = [
 	...(await Promise.all(mcpClients.map(({ name, client }) => mcpExtension(name, client)))),
 	// After the other tools: a tool new to the transcript is appended, where in the middle the planner re-adds every tool.
 	askExtension({ storage, interfaces: Object.keys(texts) }),
+	// After it for the same reason: added on 2026-11-23, when `ask` was already in the root's transcript.
+	recurring(),
 	// Last: a section new to the transcript costs one patch at the end, where in the middle the prompt planner would
 	// remove and re-add every section shown before it, on the first request after the release that added it.
 	interfaces(storage, { texts, on: () => on }),

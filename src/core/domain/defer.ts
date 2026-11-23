@@ -104,6 +104,9 @@ export const deferNotice = {
 	// transcript.
 	taken: (id: string, item: Deferred, card: string) =>
 		`${named(id, item)} was not sent: when it fell due at ${iso(item.at)}, its session was already that of soma's job ${card}, so soma did not resume it a second time: two claudes would then write one transcript. The instruction was: ${item.instruction}`,
+	// A hand-off whose session a claude soma did not start still had open: soma never writes beside another process.
+	open: (id: string, item: Deferred, pid: number, cwd?: string) =>
+		`${named(id, item)} was not sent: when it fell due at ${iso(item.at)}, its session ${item.session} was still open in a claude soma did not start (pid ${pid}${cwd === undefined ? "" : `, in ${cwd}`}), and soma does not write into a session another process has open. The instruction was: ${item.instruction}`,
 	// The agent was gone at `at`, and starting it again in its session failed.
 	unresumed: (id: string, item: Deferred, error: string) =>
 		`${named(id, item)} was not sent: the agent was gone when it fell due at ${iso(item.at)}, and soma could not start it again: ${error}. The instruction was: ${item.instruction}`,

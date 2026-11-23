@@ -20,6 +20,7 @@ import {
 	ENTRY_KIND as TERMINAL_KIND,
 } from "./adapters/terminal/index.ts";
 import { SERVE_HOST, startWeb, ABILITIES as WEB_ABILITIES, ENTRY_KIND as WEB_KIND } from "./adapters/web/index.ts";
+import { liveSession } from "./agent-cli/process-session.ts";
 import { dispatchOver, openAgentPort } from "./agent-side.ts";
 import { anthropicAuthContext, type Config, ConfigError, configPath, loadConfig } from "./config.ts";
 import { askExtension } from "./core/extensions/ask/index.ts";
@@ -87,6 +88,7 @@ const ready = new Promise<void>((resolve) => {
 const defers = deferExtension(agents, {
 	reclaim: (agent) => ready.then(() => reclaimer(root, agents, context)(agent)),
 	repoRoot: repoRootOf,
+	liveSession: liveSession(),
 });
 const reflections = reflection({
 	repo: config.repo,

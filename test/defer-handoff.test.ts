@@ -65,6 +65,8 @@ async function core(db: string, agents: Agents, options: DeferOptions = {}) {
 	return {
 		harness,
 		root,
+		dispatched: (agent: string, at: string) =>
+			defers.defer(root, { agent, at, instruction: "tell me the word" }, context),
 		handoff: (cwd: string, session = SESSION, at = "PT1H") =>
 			defers.defer(root, { session, cwd, at, instruction: "tell me the word" }, context),
 		jobs: async () => (await harness.snapshot(Dispatches, root.id, context))?.jobs ?? [],
@@ -533,4 +535,153 @@ test("a hand-off whose resume threw but whose agent is listed after it becomes t
 	expect(more).toEqual([]);
 	expect(job).toMatchObject({ agent: "soma-my-repo-7e33", sessionId: SESSION, handoff: true });
 	expect(job?.reclaim).toBeUndefined();
+});
+
+/** Every notice's class and text, in order. */
+const noticesOf = async (soma: Awaited<ReturnType<typeof core>>) =>
+	(await soma.root.entries({ order: "ascending" }, 1000, undefined, context)).items
+		.filter((entry) => entry.kind === NOTICE)
+		.map((entry) => entry.data as { class: string; content: string });
+
+test("a hand-off whose session a claude still has open is not resumed or sent, records no job, and tells the human once", async () => {
+	const { db, src } = await tree();
+	const agents = new FakeAgentPort();
+	const asked: string[] = [];
+	const soma = await core(db, agents, {
+		liveSession: async (session) => {
+			asked.push(session);
+			return { pid: 4242, cwd: "/Users/me/elsewhere" };
+		},
+	});
+
+	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "open" });
+	expect(asked).toEqual([SESSION]);
+	expect([agents.resumed, agents.prompts]).toEqual([[], []]);
+	expect(await soma.jobs()).toEqual([]);
+	expect(await soma.items()).toEqual({});
+	const task = await soma.harness.getTask(Number(deferral) as TaskId, context);
+	const at = new Date((task?.input as { at: number } | undefined)?.at ?? 0).toISOString();
+	expect(await noticesOf(soma)).toEqual([
+		{
+			kind: "report",
+			class: "outcome",
+			content: `Deferred instruction ${deferral} for agent soma-my-repo-7e33 (Claude Code session ${SESSION} in ${src}) was not sent: when it fell due at ${at}, its session ${SESSION} was still open in a claude soma did not start (pid 4242, in /Users/me/elsewhere), and soma does not write into a session another process has open. The instruction was: tell me the word`,
+		},
+	]);
+});
+
+test("a hand-off of an open session leaves the job an earlier resume gave it as it was", async () => {
+	const { db, repo } = await tree();
+	const agents = new FakeAgentPort();
+	const soma = await core(db, agents, { liveSession: async () => ({ pid: 4242 }) });
+	const own: Job = {
+		card: "soma-my-repo-7e33",
+		agent: "soma-my-repo-7e33",
+		sessionId: SESSION,
+		status: { state: "done" },
+		decisions: [],
+		handoff: true,
+		reclaim: { phase: "stopped" },
+	};
+	await soma.root.commit(async (tx) => {
+		(await tx.doc(Dispatches, soma.root.id)).jobs.push(own);
+	}, context);
+
+	const deferral = id(await soma.handoff(repo, SESSION, "PT1S"));
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "open" });
+	expect(agents.resumed).toEqual([]);
+	expect(await soma.jobs()).toEqual([own]);
+	expect(await soma.notices()).toEqual([
+		expect.stringMatching(/was still open in a claude soma did not start \(pid 4242\), and/),
+	]);
+});
+
+test("a look that keeps failing ends the hand-off failed after its tries and never resumes; one that fails once then finds none resumes", {
+	timeout: 20_000,
+}, async () => {
+	const { db, src } = await tree();
+	const failing = new FakeAgentPort();
+	let looks = 0;
+	const soma = await core(db, failing, {
+		retryMs: 20,
+		tries: 3,
+		liveSession: async () => {
+			looks++;
+			throw new Error("EACCES: permission denied, scandir '/Users/me/.claude/sessions'");
+		},
+	});
+	const deferral = id(await soma.handoff(src, SESSION, "PT1S"));
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "failed" });
+	expect(looks).toBe(3);
+	expect([failing.resumed, failing.prompts]).toEqual([[], []]);
+	expect(await soma.jobs()).toEqual([]);
+	expect(await soma.notices()).toEqual([
+		expect.stringMatching(/was not sent after 3 tries: EACCES: permission denied, scandir/),
+	]);
+
+	const { db: second } = await tree();
+	const recovering = new FakeAgentPort();
+	let failed = false;
+	const again = await core(second, recovering, {
+		retryMs: 20,
+		liveSession: async () => {
+			if (failed) return undefined;
+			failed = true;
+			throw new Error("EIO");
+		},
+	});
+	const later = id(await again.handoff(src, SESSION, "PT1S"));
+
+	expect(await again.outcome(later)).toEqual({ status: "completed", result: "sent" });
+	expect(recovering.resumed).toHaveLength(1);
+	expect(recovering.prompts).toHaveLength(1);
+});
+
+test("a deferral of an agent soma dispatched, or of a hand-off whose agent is listed, looks for no open session", async () => {
+	const { db, repo } = await tree();
+	const agents = new FakeAgentPort();
+	let looks = 0;
+	const soma = await core(db, agents, {
+		liveSession: async () => {
+			looks++;
+			return { pid: 4242 };
+		},
+	});
+	const own: Job = {
+		card: "soma-my-repo-7e33",
+		agent: "soma-my-repo-7e33",
+		sessionId: SESSION,
+		status: { state: "done" },
+		decisions: [],
+		handoff: true,
+	};
+	await soma.root.commit(async (tx) => {
+		(await tx.doc(Dispatches, soma.root.id)).jobs.push(own);
+	}, context);
+	agents.emit("soma-my-repo-7e33", { state: "done" });
+
+	const deferral = id(await soma.handoff(repo, SESSION, "PT1S"));
+	const dispatched: Job = {
+		card: "card-a",
+		agent: "card-a",
+		sessionId: "s-card-a",
+		status: { state: "done" },
+		decisions: [],
+	};
+	await soma.root.commit(async (tx) => {
+		(await tx.doc(Dispatches, soma.root.id)).jobs.push(dispatched);
+	}, context);
+	// Not listed when it falls due, so it is resumed in its session as before.
+	agents.emit("card-a", { state: "working" });
+	const theirs = id(await soma.dispatched("card-a", "PT1S"));
+	agents.close("card-a");
+
+	expect(await soma.outcome(deferral)).toEqual({ status: "completed", result: "sent" });
+	expect(await soma.outcome(theirs)).toEqual({ status: "completed", result: "sent" });
+	expect(agents.resumed).toEqual([{ name: "card-a", card: "card-a", sessionId: "s-card-a" }]);
+	expect(looks).toBe(0);
 });

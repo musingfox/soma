@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { type AgentPort, NotImplemented, PromptRefused } from "../../../ports/agent.ts";
 import type { DeferReply, DeferRequest, HandoffRequest } from "../../../ports/defer.ts";
+import type { LiveSession } from "../../../ports/live-session.ts";
 import {
 	type Deferred,
 	deferAt,
@@ -26,8 +27,11 @@ import { Deferrals } from "./deferrals.ts";
 
 export { Deferrals };
 
-/** How a deferral ended: sent, or why it was not, each but `sent` told to the human in one notice: `cancelled`, the move's. */
-export type DeferOutcome = "sent" | "gone" | "unresumed" | "unsure" | "failed" | "cancelled";
+/**
+ * How a deferral ended: sent, or why it was not, each but `sent` told to the human in one notice: `cancelled`, the
+ * move's. `open`: a hand-off whose session another claude still had open.
+ */
+export type DeferOutcome = "sent" | "gone" | "unresumed" | "unsure" | "failed" | "cancelled" | "open";
 
 type Checkpoint =
 	| { phase: "wait"; at: number; tries: number; error?: string }
@@ -183,6 +187,11 @@ export interface DeferOptions {
 	 * the file system's. Unset, every directory is taken as outside any repo.
 	 */
 	readonly repoRoot?: (cwd: string) => Promise<string | undefined>;
+	/**
+	 * The claude that still has a session open, looked for before a hand-off's session is resumed; main.ts gives the one
+	 * that reads claude's pid files. Unset, no session is ever open.
+	 */
+	readonly liveSession?: LiveSession;
 }
 
 /**
@@ -209,6 +218,7 @@ export function deferExtension(
 	const readyMs = options.readyMs ?? 120_000;
 	const pollMs = options.pollMs ?? 1_000;
 	const repoRoot = options.repoRoot ?? (async () => undefined);
+	const liveSession = options.liveSession ?? (async () => undefined);
 
 	const listing = async (agent: string) => (await agents.list()).find((each) => each.name === agent);
 
@@ -362,6 +372,18 @@ export function deferExtension(
 					listed = (await listing(task.input.agent)) !== undefined;
 				} catch (error) {
 					return retry(error);
+				}
+				// A hand-off's session is resumed only when no claude has it open, which is looked for before anything is held
+				// for the resume: never two writers on one transcript. A look that fails is doubt, never "closed".
+				const { session } = task.input;
+				if (!listed && session !== undefined) {
+					let open: Awaited<ReturnType<LiveSession>>;
+					try {
+						open = await liveSession(session);
+					} catch (error) {
+						return retry(error);
+					}
+					if (open !== undefined) return end("open", deferNotice.open(id, task.input, open.pid, open.cwd));
 				}
 				// Gone, as soma stopped it or the human closed its window: it is started again in its session first.
 				return listed ? send() : resume();

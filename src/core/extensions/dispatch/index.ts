@@ -2,10 +2,15 @@ import { randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord/context";
 import {
 	type Conversation,
+	type DocumentWatch,
 	defineDoc,
 	defineExtension,
+	defineTask,
 	defineTool,
+	LiveDoc,
+	type LiveState,
 	section,
+	type TaskRuntime,
 	type ToolExecutionApi,
 	type Tx,
 } from "@earendil-works/pi-durable";
@@ -14,9 +19,10 @@ import { type AgentPort, type Answer, PromptRefused } from "../../../ports/agent
 import type { AgentHandover, HandoverOutcome, HandoverRefusal } from "../../../ports/handover.ts";
 import type { Choices, HumanAnswerOutcome } from "../../../ports/human.ts";
 import { deferCancelled } from "../../domain/defer.ts";
-import { type Decision, type Job, jobQuestions } from "../../domain/dispatch.ts";
+import { type Decision, type Job, jobQuestions, leftUndecided, type Wake } from "../../domain/dispatch.ts";
 import { composeLaunchPrompt, composeTicketPrompt } from "../../domain/launch-prompt.ts";
 import { cutInWindow, cutSentence, HANDOVER_CUT, turning } from "../../domain/reconcile.ts";
+import { clip } from "../../domain/report.ts";
 import { homeOf, homeOfCall } from "../../home.ts";
 import { FORWARDED, noticeEntry } from "../../notice.ts";
 import { Questions } from "../ask/index.ts";
@@ -171,6 +177,103 @@ const decide = (job: Job, decision: Omit<Decision, "at" | "kind">): Decision => 
 	at: new Date().toISOString(),
 	kind: job.status.state === "blocked" ? job.status.kind : "permission",
 	...decision,
+});
+
+/** The options a question about the job's prompt offers as buttons. */
+function promptChoices({ card, status }: Job): Choices | undefined {
+	// Only a prompt the agent side could read into options can be answered by choosing one.
+	return status.state === "blocked" && status.fingerprint !== undefined && (status.options?.length ?? 0) > 0
+		? { card, fingerprint: status.fingerprint, options: status.options ?? [] }
+		: undefined;
+}
+
+/** The reason of the decision soma records for a prompt the model's round left undecided. */
+export const LEFT_UNDECIDED =
+	"the model's round ended with neither respond nor escalate, so soma handed it to the human";
+
+/**
+ * In the commit that sees the wake's round over: a prompt the round left undecided goes to the human as the question
+ * `escalate` writes, stating the prompt as the bridge read it, since the model's own words may be no question at all.
+ * Read with the job, so a prompt answered or moved past since is left alone; the decision recorded with the notice makes
+ * any later look at the same prompt find it decided.
+ */
+async function escalateUndecided(tx: Tx, conversationId: Conversation["id"], wake: Wake): Promise<void> {
+	const doc = await tx.doc(Dispatches, conversationId);
+	const index = doc.jobs.findIndex((each) => each.agent === wake.agent);
+	const current = doc.jobs[index];
+	if (!leftUndecided(current, wake)) return;
+	doc.jobs[index] = {
+		...current,
+		decisions: [...current.decisions, decide(current, { action: "escalated", reason: LEFT_UNDECIDED })],
+	};
+	const screen = current.status.msg ? `\n${clip(current.status.msg)}` : "";
+	const content =
+		`agent ${current.agent} (card ${current.card}) is waiting at a prompt (kind=${current.status.kind}) that ` +
+		`soma's model did not answer: it is yours to decide.${screen}`;
+	await tx.appendEntry(conversationId, noticeEntry("question", "action", content, promptChoices(current)));
+}
+
+type Undecided = { requestId: string; wake: Wake };
+type UndecidedRuntime = TaskRuntime<Undecided, { phase: "wait" }, null, object>;
+
+/** Resolves at the next change of the run the conversation is in, or once the task's invocation is aborted. */
+function nextRound(runtime: UndecidedRuntime, watch: DocumentWatch<LiveState> | undefined) {
+	let round = watch?.value.run?.inputs.join();
+	let resolve = () => {};
+	watch?.start(async (call) => {
+		if (call.kind !== "value") return;
+		const next = call.value.run?.inputs.join();
+		if (next === round) return;
+		round = next;
+		resolve();
+	});
+	runtime.signal.addEventListener("abort", () => resolve());
+	return () =>
+		new Promise<void>((settle) => {
+			resolve = settle;
+			if (runtime.signal.aborted) settle();
+		});
+}
+
+/**
+ * Created by the event bridge with each wake, in the commit of its seq, so a resent event or a restart makes none twice.
+ * It waits for the wake's input to be answered: a run's inputs settle in the commit that ends it, by which time every call
+ * the model made in that round has committed its decision. Only a round that answered: one that failed or was stopped
+ * is told to the human as such. Background, so no idle wait and no stop of the conversation waits for it.
+ */
+export const UndecidedPrompt = defineTask<Undecided, { phase: "wait" }, null>({
+	name: "soma.dispatch.undecided",
+	version: 1,
+	initial: () => ({ phase: "wait" }),
+	phases: {
+		wait: async (task, runtime, context) => {
+			const { requestId, wake } = task.input;
+			// Watched before the first look, so a round that ends between the look and the wait is not missed.
+			const watch = await runtime.watchDoc(LiveDoc, runtime.conversationId, context);
+			const changed = nextRound(runtime, watch);
+			try {
+				for (;;) {
+					runtime.signal.throwIfAborted();
+					const next = changed();
+					let over = false;
+					await runtime.commit(async (tx) => {
+						const record = await tx.submissionByRequest(runtime.conversationId, requestId);
+						if (record !== undefined && record.status !== "done" && record.status !== "unanswered") return undefined;
+						over = true;
+						if (record?.status === "done") await escalateUndecided(tx, runtime.conversationId, wake);
+						return { status: "terminal", outcome: { status: "completed", result: null } };
+					}, context);
+					if (over) return;
+					await next;
+				}
+			} finally {
+				await watch?.stop();
+			}
+		},
+	},
+	abort: async (_task, runtime, context) => {
+		await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context);
+	},
 });
 
 /**
@@ -442,19 +545,13 @@ export function dispatchExtension(
 					...current,
 					decisions: [...current.decisions, decide(current, { action: "escalated", reason: args.reason })],
 				};
-				const { status } = current;
-				// Only a prompt the agent side could read into options can be answered by choosing one.
-				const choices: Choices | undefined =
-					status.state === "blocked" && status.fingerprint !== undefined && (status.options?.length ?? 0) > 0
-						? { card: current.card, fingerprint: status.fingerprint, options: status.options ?? [] }
-						: undefined;
 				await tx.appendEntry(
 					home,
 					noticeEntry(
 						"question",
 						"action",
 						`agent ${current.agent}（卡片 ${current.card}）：${args.question}`,
-						choices,
+						promptChoices(current),
 					),
 				);
 				return true;
@@ -662,6 +759,7 @@ export function dispatchExtension(
 	return defineExtension({
 		name: "soma.dispatch",
 		tools: [dispatch, jobs, respond, escalate, reply, foreignAgents, foreignResult, screen, foreignPrompt, showJob],
+		tasks: [UndecidedPrompt],
 		sections: [
 			section("job_questions", async (input, context) => {
 				const asked = (await input.read.snapshot(Questions, input.conversationId, context))?.questions ?? {};

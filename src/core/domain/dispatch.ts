@@ -90,6 +90,30 @@ export function awaitsAnswer(job: Job | undefined, { turn, at }: Pick<JobQuestio
 	return !job.decisions.some((decision) => decision.action !== "escalated" && decision.at >= at);
 }
 
+/**
+ * A blocked prompt the event bridge handed the model: the job's agent, its card, the prompt's fingerprint when the
+ * screen gave one, and when it was handed over.
+ */
+export type Wake = {
+	readonly agent: string;
+	readonly card: string;
+	readonly fingerprint?: string;
+	readonly at: string;
+};
+
+/**
+ * Whether the prompt `wake` handed the model still waits with no decision on it once the model's round is over: the job
+ * is still blocked on a prompt of the same fingerprint, and nothing was answered or escalated for it since the wake.
+ */
+export function leftUndecided(
+	job: Job | undefined,
+	wake: Wake,
+): job is Job & { readonly status: Extract<AgentState, { state: "blocked" }> } {
+	if (job === undefined || job.status.state !== "blocked" || job.status.kind === "auth") return false;
+	if (job.status.fingerprint !== wake.fingerprint) return false;
+	return !job.decisions.some((decision) => decision.at >= wake.at);
+}
+
 /** What `jobQuestions` shows when no job waits on a question it listed options for; the section is never left out. */
 export const NO_JOB_QUESTIONS = "現在沒有 agent 列了選項在等人選。";
 

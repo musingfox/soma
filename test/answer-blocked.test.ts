@@ -9,7 +9,7 @@ import type { Harness } from "@earendil-works/pi-durable";
 import { afterEach, expect, test } from "vitest";
 import { FakeAgentPort } from "../src/adapters/fake-agent/index.ts";
 import { AGENT_BLOCKED, eventBridge } from "../src/core/extensions/dispatch/bridge.ts";
-import { Dispatches, dispatchExtension } from "../src/core/extensions/dispatch/index.ts";
+import { Dispatches, dispatchExtension, LEFT_UNDECIDED } from "../src/core/extensions/dispatch/index.ts";
 import { openHarness } from "../src/core/harness.ts";
 import { openHumanPort } from "../src/core/human-port.ts";
 import type { SomaEvent } from "../src/ports/human.ts";
@@ -83,6 +83,13 @@ async function core(agents: FakeAgentPort, plan: Plan) {
 			await Promise.all(handled);
 		}
 		await root.waitForIdle(context);
+		// The look at each wake's round runs in the background, after the round.
+		const undecided = () =>
+			root.commit(async (tx) => (await tx.scanTasks({ kind: "soma.dispatch.undecided" }, 100)).items, context);
+		for (const deadline = Date.now() + 5_000; ; await new Promise((resolve) => setTimeout(resolve, 10))) {
+			if ((await undecided()).every((task) => task.state.status === "terminal")) break;
+			expect(Date.now()).toBeLessThan(deadline);
+		}
 	};
 	await settle();
 	return {
@@ -122,7 +129,8 @@ test("an answer decided on a screen that has since changed is refused and report
 
 	expect(agents.responses).toEqual([]);
 	expect(soma.results.at(-1)).toEqual({ sent: false, refusal: "stale" });
-	expect((await soma.job())?.decisions).toEqual([]);
+	// Refused, so the round decided nothing on the prompt that still waits: soma hands it to the human.
+	expect((await soma.job())?.decisions).toMatchObject([{ action: "escalated", reason: LEFT_UNDECIDED }]);
 });
 
 test("an auth block reaches the human as a notice without waking the model", async () => {

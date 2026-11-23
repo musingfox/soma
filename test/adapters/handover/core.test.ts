@@ -136,7 +136,12 @@ async function core(
 		job,
 		bridge,
 		wakes: async () => (await entries(AGENT_BLOCKED)).length,
-		notices: async () => (await entries(NOTICE)).map((entry) => (entry.data as { content: string }).content),
+		// Without the question soma hands the human for each wake the model leaves alone, as this model leaves every one:
+		// it lands once the wake's round is over, at no fixed point among the notices these tests are about.
+		notices: async () =>
+			(await entries(NOTICE))
+				.map((entry) => (entry.data as { content: string }).content)
+				.filter((content) => !content.includes("soma's model did not answer")),
 		turns: async () => (await entries(JOB_DONE)).map((entry) => entry.data as { outcome: string; notified: boolean }),
 		say: async (content: string) => {
 			const submission = await root.submit({ type: "input", content, requestId: `t:${said++}` }, context);

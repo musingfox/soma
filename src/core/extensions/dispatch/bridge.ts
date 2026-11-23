@@ -3,7 +3,7 @@ import type { Conversation } from "@earendil-works/pi-durable";
 import type { AgentPort, AgentState, AgentStatusEvent } from "../../../ports/agent.ts";
 import type { HandoverSettling, Settled } from "../../../ports/handover.ts";
 import { complete, observe } from "../../domain/bridge.ts";
-import type { Decision, Job } from "../../domain/dispatch.ts";
+import type { Decision, Job, Wake } from "../../domain/dispatch.ts";
 import { listedOptions } from "../../domain/options.ts";
 import {
 	CUT,
@@ -20,7 +20,7 @@ import { dispatchSignal, reblockSignal } from "../../domain/signal.ts";
 import { noticeEntry } from "../../notice.ts";
 import { askForJob } from "../ask/index.ts";
 import { recordFact } from "../memory/index.ts";
-import { commitCut, commitMove, commitRefusal, Dispatches, JOB_DONE } from "./index.ts";
+import { commitCut, commitMove, commitRefusal, Dispatches, JOB_DONE, UndecidedPrompt } from "./index.ts";
 import { reclaimer } from "./reclaim.ts";
 
 export { JOB_DONE };
@@ -84,6 +84,16 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 		// A turn that ends without a reply is told apart by its id but says nothing, as an unreadable one.
 		const reply = result?.text || undefined;
 
+		// Taken before the wake goes out, so every decision the model's round makes on it is recorded after it.
+		const wake: Wake | undefined =
+			action === "wake" && event.status.state === "blocked"
+				? {
+						agent: job.agent,
+						card: job.card,
+						...(event.status.fingerprint === undefined ? {} : { fingerprint: event.status.fingerprint }),
+						at: new Date().toISOString(),
+					}
+				: undefined;
 		// Each side effect precedes the commit of its seq, so a crash in between redoes it on restart:
 		// the requestId makes the second submit return the first.
 		if (action === "wake" && event.status.state === "blocked") {
@@ -138,6 +148,15 @@ export function eventBridge(conversation: Conversation, agents: AgentPort, conte
 			if (action === "wake") {
 				const signal = reblockSignal(current, event.status, event.seq, Date.now());
 				if (signal !== undefined) await recordFact(tx, signal);
+			}
+			// With the seq too, so a resent event or a restart waits on the wake's round once.
+			if (wake !== undefined) {
+				const requestId = blockedRequestId(job.agent, event.seq);
+				await tx.createTask(
+					UndecidedPrompt,
+					{ requestId, wake },
+					{ ownership: { kind: "conversation" }, conversationId: conversation.id, background: true },
+				);
 			}
 			if (action === "complete") {
 				// Told now, in the commit of its seq, so a resent event or a restart tells it once; the report skips it.

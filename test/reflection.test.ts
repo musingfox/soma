@@ -184,7 +184,7 @@ async function until(check: () => boolean | Promise<boolean>, ms = 5 * PERIOD) {
 	for (const deadline = Date.now() + ms; !(await check()); await delay(100)) expect(Date.now()).toBeLessThan(deadline);
 }
 
-test("three answers of one kind and a block again lead to a memory revision citing those three decisions", {
+test("three answers of one kind and a block again lead to a memory revision citing those decisions", {
 	timeout: 30_000,
 }, async () => {
 	const soma = await core();
@@ -204,19 +204,23 @@ test("three answers of one kind and a block again lead to a memory revision citi
 	expect(revision).toMatchObject({
 		line: 1,
 		action: "revise",
-		evidence: ["decision:card-a#0", "decision:card-a#1", "decision:card-a#2"],
+		// The block again is the one the model left alone, which soma handed to the human as #3.
+		evidence: ["decision:card-a#0", "decision:card-a#1", "decision:card-a#2", "decision:card-a#3"],
 	});
 	expect((await soma.harness.snapshot(Curated, context))?.lines).toEqual([
 		expect.objectContaining({ id: 1, by: "model", text: expect.stringContaining("轉給人") }),
 	]);
 	expect(soma.notices).toEqual([
+		expect.stringContaining("soma's model did not answer"),
 		expect.stringContaining("soma 修改了長期記憶 #1"),
 		expect.stringMatching(/^soma 開了一張改程式碼的卡 fix-reblock：.*已派進 fleet（agent fix-reblock）/),
 		"觀察：…\n證據 id：…\n改動：…",
 	]);
-	expect(soma.classes).toEqual(["ambient", "ambient", "ambient"]);
+	expect(soma.classes).toEqual(["action", "ambient", "ambient", "ambient"]);
 	expect(soma.agents.started).toEqual([expect.objectContaining({ name: "fix-reblock", cwd: "/soma" })]);
-	expect(soma.cards.get("fix-reblock")).toContain("decision:card-a#0、decision:card-a#1、decision:card-a#2");
+	expect(soma.cards.get("fix-reblock")).toContain(
+		"decision:card-a#0、decision:card-a#1、decision:card-a#2、decision:card-a#3",
+	);
 });
 
 test("a tick with no new signal calls no model and still moves its checkpoint on", { timeout: 30_000 }, async () => {
@@ -255,19 +259,21 @@ test("the same problem the next day wakes no model and tells the human once that
 	};
 	await nextDay("f004");
 
+	// Each block again is one the model left alone, which soma hands to the human: #3 the first day, #5 the next.
 	expect(soma.notices.slice(handled)).toEqual([
+		expect.stringContaining("soma's model did not answer"),
 		"卡片 card-a 的問題處理過之後又出現新的訊號，處理可能沒有奏效。" +
 			`先前的處理：長期記憶 #1 在 ${new Date((await soma.history())[0]?.at ?? 0).toISOString()} 的修改、卡片 fix-reblock。` +
-			"新訊號的證據：decision:card-a#3。soma 不會自動再修訂或開卡，請你看看。",
+			"新訊號的證據：decision:card-a#4。soma 不會自動再修訂或開卡，請你看看。",
 	]);
-	expect(soma.classes.slice(handled)).toEqual(["ambient"]);
+	expect(soma.classes.slice(handled)).toEqual(["action", "ambient"]);
 	expect(await soma.reflections()).toHaveLength(1);
 	expect(await soma.history()).toHaveLength(1);
 	expect([...soma.cards.keys()]).toEqual(["fix-reblock"]);
 
 	// The day after: the same handling has been reported already, so nothing is said again.
 	await nextDay("f005");
-	expect(soma.notices).toHaveLength(handled + 1);
+	expect(soma.notices.slice(handled + 2)).toEqual([expect.stringContaining("soma's model did not answer")]);
 	expect(await soma.reflections()).toHaveLength(1);
 });
 

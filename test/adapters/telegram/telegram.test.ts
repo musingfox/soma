@@ -450,6 +450,127 @@ test("a getUpdates answer of an unexpected shape is reported once per attempt, a
 	]);
 });
 
+// 2026-11-19 08:59 in Taipei, when the outage of that day began.
+const OUTAGE_START = Date.UTC(2026, 10, 19, 0, 59);
+
+/**
+ * The client on a clock the test moves, whose timers run when it passes them, with the outage alert a fake and the
+ * zone Asia/Taipei; each failed poll is reported to `onError` and polled again after 10 ms.
+ */
+async function outageWatch() {
+	const human = new FakeHumanPort();
+	const { api, apiBase } = await bot();
+	let at = OUTAGE_START;
+	const timers = new Set<{ due: number; run: () => void }>();
+	const onError = vi.fn();
+	const alert = vi.fn(async (_text: string) => {});
+	const controller = new AbortController();
+	const running = runTelegram({
+		human,
+		token: TOKEN,
+		chatId: CHAT,
+		apiBase,
+		signal: controller.signal,
+		retryMs: 10,
+		onError,
+		alert,
+		timeZone: "Asia/Taipei",
+		now: () => at,
+		setTimer: (run, ms) => {
+			const timer = { due: at + ms, run };
+			timers.add(timer);
+			return () => timers.delete(timer);
+		},
+	});
+	cleanup.push(() => {
+		controller.abort();
+		return running;
+	});
+	const advance = (ms: number) => {
+		at += ms;
+		for (const timer of [...timers])
+			if (timer.due <= at) {
+				timers.delete(timer);
+				timer.run();
+			}
+	};
+	// Polls that fail from now on, at least `count` of them.
+	const failures = async (count: number) => {
+		const seen = onError.mock.calls.length;
+		await vi.waitFor(() => expect(onError.mock.calls.length).toBeGreaterThanOrEqual(seen + count));
+	};
+	// A message the next poll that succeeds brings, once the client has handled it.
+	const succeeds = async (text: string) => {
+		api.failing.delete("getUpdates");
+		api.deliver(text, CHAT);
+		await vi.waitFor(() => expect(human.inputs.map((input) => input.content)).toContain(text));
+	};
+	return { human, api, alert, advance, failures, succeeds };
+}
+
+test("polling that fails for 10 minutes alerts once, and not again while the outage lasts", async () => {
+	const { api, alert, advance, failures } = await outageWatch();
+	api.failing.add("getUpdates");
+
+	await failures(3);
+	advance(10 * MIN - 1);
+	await failures(3);
+	expect(alert).not.toHaveBeenCalled();
+	advance(1);
+	expect(alert).toHaveBeenCalledOnce();
+	expect(alert).toHaveBeenCalledWith(
+		"Telegram 從 2026-11-19 08:59（Asia/Taipei）起一直連不上。soma 還在執行，會繼續重試，連上後會在 Telegram 告訴你斷了多久。",
+	);
+
+	await failures(3);
+	advance(10 * MIN);
+	await failures(3);
+	advance(4 * 60 * MIN);
+	expect(alert).toHaveBeenCalledOnce();
+	expect(api.methods).not.toContain("sendRichMessage");
+});
+
+test("a single failed poll followed by a success sends nothing", async () => {
+	const { api, alert, advance, failures, succeeds } = await outageWatch();
+	api.answering.set("getUpdates", ["<html>502 Bad Gateway</html>"]);
+
+	await failures(1);
+	await succeeds("在嗎");
+	advance(60 * MIN);
+
+	expect(alert).not.toHaveBeenCalled();
+	expect(api.sent).toEqual([]);
+});
+
+test("the first poll that succeeds after an outage that alerted tells the chat its start and end, once", async () => {
+	const { api, alert, advance, failures, succeeds } = await outageWatch();
+	api.failing.add("getUpdates");
+
+	await failures(1);
+	advance(10 * MIN);
+	expect(alert).toHaveBeenCalledOnce();
+	advance(3 * 60 * MIN + 48 * MIN);
+	await succeeds("壞了嗎");
+	await succeeds("又一則");
+
+	expect(api.sent.map((message) => message.text)).toEqual([
+		"[通知] Telegram 從 2026-11-19 08:59 到 2026-11-19 12:57（Asia/Taipei）連不上，共 3 小時 58 分鐘。",
+	]);
+});
+
+test("an outage shorter than 10 minutes sends nothing on either channel when it ends", async () => {
+	const { api, alert, advance, failures, succeeds } = await outageWatch();
+	api.failing.add("getUpdates");
+
+	await failures(3);
+	advance(10 * MIN - 1);
+	await succeeds("回來了");
+	advance(60 * MIN);
+
+	expect(alert).not.toHaveBeenCalled();
+	expect(api.sent).toEqual([]);
+});
+
 test("an update that does not parse is reported and skipped, the rest of its batch is handled, and it is not asked for again", async () => {
 	const human = new FakeHumanPort();
 	const { api, apiBase } = await bot();

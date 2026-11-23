@@ -34,6 +34,12 @@ export interface TelegramOptions extends TelegramConfig {
 	/** Runs `run` in `ms` on that clock and returns what cancels it; `setTimeout` by default. */
 	readonly setTimer?: (run: () => void, ms: number) => () => void;
 	readonly onError?: (error: unknown) => void;
+	/** Tells the human, on a channel other than Telegram, that polling has failed for `outageAlertMs`; none without it. */
+	readonly alert?: (text: string) => Promise<void>;
+	/** How long every poll fails, from the first failure with no success since, before `alert`; 10 minutes by default. */
+	readonly outageAlertMs?: number;
+	/** The zone an outage's times are told in, the machine's by default. */
+	readonly timeZone?: string;
 }
 
 const REQUEST_PREFIX = "telegram:";
@@ -73,6 +79,8 @@ const DRAFT_REFUSALS = 3;
 // the round's text drafts, and a timer that long would overflow and fire at once.
 const SEND_RETRIES = 2;
 const FLOOD_WAIT_MS = 60_000;
+// Decided by the human on 2026-11-24: a shorter outage tells nothing, on either channel.
+const OUTAGE_ALERT_MS = 10 * 60_000;
 
 // callback_data takes 1-64 bytes: https://core.telegram.org/bots/api#inlinekeyboardbutton
 const CALLBACK_DATA_LIMIT = 64;
@@ -253,12 +261,47 @@ function keyboard(choices: Choices) {
 
 const label = (kind: NoticeKind, content: string) => `[${kind === "question" ? "問題" : "通知"}] ${content}`;
 
+/** `2026-11-19 08:59` in `timeZone`. */
+function localTime(at: number, timeZone: string): string {
+	const parts = Object.fromEntries(
+		new Intl.DateTimeFormat("en-US", {
+			timeZone,
+			year: "numeric",
+			month: "2-digit",
+			day: "2-digit",
+			hour: "2-digit",
+			minute: "2-digit",
+			hourCycle: "h23",
+		})
+			.formatToParts(at)
+			.map((part) => [part.type, part.value]),
+	);
+	return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
+}
+
+const lasted = (ms: number) => {
+	const minutes = Math.floor(ms / 60_000);
+	const hours = Math.floor(minutes / 60);
+	return hours === 0 ? `${minutes} 分鐘` : `${hours} 小時 ${minutes % 60} 分鐘`;
+};
+
+/** The alert: soma itself still runs, which is what the human cannot tell from a silent chat. */
+export const outageAlertText = (since: number, timeZone: string) =>
+	`Telegram 從 ${localTime(since, timeZone)}（${timeZone}）起一直連不上。soma 還在執行，會繼續重試，連上後會在 Telegram 告訴你斷了多久。`;
+
+export const outageEndText = (since: number, until: number, timeZone: string) =>
+	label(
+		"report",
+		`Telegram 從 ${localTime(since, timeZone)} 到 ${localTime(until, timeZone)}（${timeZone}）連不上，共 ${lasted(until - since)}。`,
+	);
+
 /**
  * The Telegram client: each text message from the configured chat is an input, and answers and failures of this
  * client's inputs, failures of rounds the core started, and notices go back to that chat. A question that offers
  * choices gets a button per option; a press from that chat goes to the agent as the human's own answer. A message Telegram delivers again keeps its requestId, so the core admits it
  * once; the update offset only lives in memory. A round's draft offers a stop button; a press from that chat asks the
- * core to stop the round, which ends with only a 🫡 reaction. Resolves when `signal` aborts.
+ * core to stop the round, which ends with only a 🫡 reaction. Polling that fails for `outageAlertMs` calls `alert` once,
+ * and the poll that then succeeds tells the chat when Telegram was unreachable. Resolves when `signal` aborts.
  */
 export async function runTelegram(options: TelegramOptions): Promise<void> {
 	const { human, chatId, signal } = options;
@@ -728,6 +771,30 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 		}
 	};
 
+	// Telegram failed every poll of this bot for hours on 2026-11-19 and 2026-11-23 while soma ran, and a silent chat
+	// looked like a broken soma. An outage starts at the first failed poll; one that lasts `outageAlertMs` with no poll
+	// succeeding alerts once, on a timer, so a poll that hangs still counts, and the next poll that succeeds ends it.
+	const timeZone = options.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+	let outage: { since: number; alerted: boolean; cancel: () => void } | undefined;
+	const pollFailed = () => {
+		if (outage !== undefined || options.alert === undefined || signal.aborted) return;
+		const { alert } = options;
+		const current = { since: now(), alerted: false, cancel: () => {} };
+		current.cancel = setTimer(() => {
+			current.alerted = true;
+			alert(outageAlertText(current.since, timeZone)).catch((error: unknown) => {
+				if (!signal.aborted) onError(error);
+			});
+		}, options.outageAlertMs ?? OUTAGE_ALERT_MS);
+		outage = current;
+	};
+	const polled = () => {
+		if (outage === undefined) return;
+		outage.cancel();
+		if (outage.alerted) send(outageEndText(outage.since, now(), timeZone));
+		outage = undefined;
+	};
+
 	const timeout = options.pollTimeoutSeconds ?? 30;
 	let offset: number | undefined;
 	try {
@@ -738,10 +805,18 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 						offset,
 						timeout,
 						allowed_updates: ["message", "callback_query", "stopped_message_generation"],
+					}).catch((error: unknown) => {
+						pollFailed();
+						throw error;
 					}),
 				);
 				// An update without an id cannot be confirmed, so the batch is asked for again after the wait.
-				if (!batch.success) throw new Error(`getUpdates: the result has an unexpected shape: ${wrong(batch.error)}`);
+				if (!batch.success) {
+					pollFailed();
+					throw new Error(`getUpdates: the result has an unexpected shape: ${wrong(batch.error)}`);
+				}
+				// Before the batch, so the chat hears of the outage before the answers to what was sent during it.
+				polled();
 				for (const each of batch.data) {
 					const { update_id } = each;
 					const update = UpdateSchema.safeParse(each);
@@ -776,6 +851,7 @@ export async function runTelegram(options: TelegramOptions): Promise<void> {
 			}
 		}
 	} finally {
+		outage?.cancel();
 		unsubscribe();
 		for (const round of drafts.values()) close(round);
 		await Promise.all([sending, reacting]);

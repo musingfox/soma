@@ -32,6 +32,7 @@
 		"smoke:digest": "node smoke/digest.ts",
 		"smoke:respond": "node smoke/respond.ts",
 		"smoke:telegram": "node smoke/telegram.ts",
+		"smoke:telegram-outage": "node smoke/telegram-outage.ts",
 		"smoke:memory": "node smoke/memory.ts",
 		"smoke:inspect": "node smoke/inspect.ts",
 		"smoke:signals": "node smoke/signals.ts",

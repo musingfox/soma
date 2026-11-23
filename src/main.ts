@@ -7,6 +7,7 @@ import type { Harness } from "@earendil-works/pi-durable";
 import { serveDrop } from "./adapters/defer-drop/index.ts";
 import { serveDefer } from "./adapters/defer-socket/index.ts";
 import { jobsFile } from "./adapters/jobs/jobs-file.ts";
+import { macNotifier } from "./adapters/macos-notification/index.ts";
 import { createCard, readCard } from "./adapters/obsidian/card.ts";
 import { repoUnder } from "./adapters/repos/folder.ts";
 import { repoRootOf } from "./adapters/repos/root.ts";
@@ -229,7 +230,8 @@ const dropServer = await serveDrop({
 
 const { telegram } = config;
 const stopTelegram = new AbortController();
-const telegramDone = telegram && runTelegram({ ...telegram, human, signal: stopTelegram.signal });
+// The alert of a Telegram outage cannot go through Telegram, so it shows on this Mac, the machine soma runs on.
+const telegramDone = telegram && runTelegram({ ...telegram, human, signal: stopTelegram.signal, alert: macNotifier() });
 // Each open page subscribes on its own, so the web takes none of the notices held for the first subscriber. A page
 // that cannot listen (the tailnet address is down, the port taken) leaves soma running without it, as Telegram stays.
 const webPage =

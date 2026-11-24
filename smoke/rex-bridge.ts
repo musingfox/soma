@@ -1,13 +1,13 @@
 // Event-bridge smoke through the rex adapter, against the real rex server and real claude, with no key pressed by the
 // smoke:
 //   1. a dedicated rex session, labelled soma-smoke-<random>, is the hangar, and a fresh git repo under ~/.cache (not
-//      $TMPDIR, which claude trusts on its own) is the card's repo, so claude stops on its folder-trust dialog, for
-//      which it reports no status record;
-//   2. a core dispatches the card; the adapter's trust-dialog check emits blocked under the seq of claude's start plus
-//      3 s, and the model is woken exactly once; it asks the human whether to trust the folder;
+//      $TMPDIR, which claude trusts on its own) is the card's repo, so claude stops on its folder-trust dialog;
+//   2. a core dispatches the card; the dialog is blocked under the seq of claude's blocked root record, which Claude
+//      Code reports since 2.1.328, or, for an older claude that reports none, of claude's start plus 3 s, from the
+//      adapter's trust-dialog check; the model is woken exactly once; it asks the human whether to trust the folder;
 //   3. the core is killed with SIGKILL after the wake's run finished, before the job's seq was committed;
-//   4. a reopened core sees the block again: its requestId makes the submit a no-op, with no model call, and the
-//      dialog re-detected every 3 s under new seqs wakes nobody;
+//   4. a reopened core sees the block again under that seq: its requestId makes the submit a no-op, with no model
+//      call, and an older claude's dialog, re-detected every 3 s under new seqs, wakes nobody;
 //   5. the human says to trust it; the faux model answers with `respond`, the wake's fingerprint and the option
 //      "Yes, I trust this folder"; the held launch prompt goes out, the agent finishes, and the dispatch list and
 //      transcript record one finished turn, with no further model call;
@@ -24,12 +24,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { seqOf } from "../src/adapters/rex/agent-port.ts";
 import { createRexClient, defaultRexSocket } from "../src/adapters/rex/client.ts";
 import { readProcessStart } from "../src/adapters/rex/process-start.ts";
 import {
 	AttachAllResultSchema,
 	EmptyResultSchema,
 	ProcessResultSchema,
+	ProgramStatusResultSchema,
 	TERMINAL,
 	ViewSchema,
 } from "../src/adapters/rex/schema.ts";
@@ -155,10 +157,25 @@ try {
 		ProcessResultSchema,
 	);
 	check(foreground?.argv0 === "claude", `foreground is ${foreground?.argv0}`);
-	const started = await readProcessStart(foreground?.pid as number);
-	check(started !== undefined, "ps cannot tell when claude started");
-	const anchored = ((started as number) + 3_000) * 1000;
-	check(woke.requestId === `agent:${card}:${anchored}`, `requestId ${woke.requestId}, not claude's start plus 3 s`);
+	// The seq is the root record's, as for any record; only a dialog claude reports no record for is named by claude's
+	// start plus 3 s (ARCHITECTURE.md, "The trust dialog sent no signal before Claude Code 2.1.328").
+	const { records } = await client.call(
+		`${TERMINAL}.program_status`,
+		{ session_id: hangar, block_id: blockId, args: {} },
+		ProgramStatusResultSchema,
+	);
+	const record = records.find((each) => each.id === undefined || each.id === "");
+	let anchored: number;
+	if (record === undefined) {
+		const started = await readProcessStart(foreground?.pid as number);
+		check(started !== undefined, "ps cannot tell when claude started");
+		anchored = ((started as number) + 3_000) * 1000;
+		check(woke.requestId === `agent:${card}:${anchored}`, `requestId ${woke.requestId}, not claude's start plus 3 s`);
+	} else {
+		check(record.state === "blocked", `claude's record is ${record.state}`);
+		anchored = seqOf(record) as number;
+		check(woke.requestId === `agent:${card}:${anchored}`, `requestId ${woke.requestId}, not the record's ${anchored}`);
+	}
 	// Dispatch is two requests (the tool call, then the answer); the wake is the third.
 	check(woke.calls === 3, `expected 3 model calls by the wake, got ${woke.calls}`);
 	const settled = reports(first).length;
@@ -181,13 +198,17 @@ try {
 	children.push(second);
 	const resent = await until(second, "the resent block", (report) => jobOf(report)?.seq !== undefined, 15_000);
 	check(jobOf(resent)?.seq === anchored, `the reopened core saw the block under seq ${jobOf(resent)?.seq}`);
-	// The dialog stays up; the adapter reports it again every 3 s, each time under a new seq.
-	const redetected = await until(
-		second,
-		"a re-detection",
-		(report) => (jobOf(report)?.seq ?? 0) > anchored && (jobOf(report)?.seq ?? 0) !== jobOf(resent)?.seq,
-		15_000,
-	);
+	// The dialog stays up. With no record the adapter reports it again every 3 s, each time under a new seq; a record is
+	// reported again only once it changes.
+	const redetected =
+		record === undefined
+			? await until(
+					second,
+					"a re-detection",
+					(report) => (jobOf(report)?.seq ?? 0) > anchored && (jobOf(report)?.seq ?? 0) !== jobOf(resent)?.seq,
+					15_000,
+				)
+			: undefined;
 	await delay(4_000);
 	const quiet = reports(second).at(-1) as Report;
 	check(quiet.calls === 0, `the resent block cost ${quiet.calls} model calls`);
@@ -202,7 +223,7 @@ try {
 	log("resent", {
 		calls: quiet.calls,
 		wakes: quiet.blocked.length,
-		seqs: { first: anchored, redetected: jobOf(redetected)?.seq, now: jobOf(quiet)?.seq },
+		seqs: { first: anchored, redetected: redetected && jobOf(redetected)?.seq, now: jobOf(quiet)?.seq },
 		wake: firstWake,
 		rootLine,
 	});

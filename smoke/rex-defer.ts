@@ -133,15 +133,23 @@ const claudeIn = (blockId: string) => {
 	});
 };
 
-/** The soma variables of claude's own environment, which its shell tools inherit; ps shows it for a non-system binary. */
+/**
+ * The soma variables of claude's own environment, which its shell tools inherit; ps shows it for a non-system binary.
+ * `pid` is the claude this smoke started, as rex names its block's foreground, and no other process is read. ps's line
+ * also holds claude's command line, so it stays in memory: only these variables and PATH's first entry are taken out,
+ * and nothing of the line is printed, logged or written.
+ */
 function environment(pid: number | undefined) {
-	const shown = spawnSync("ps", ["-Eww", "-p", String(pid), "-o", "command="], { encoding: "utf8" }).stdout;
+	const shown =
+		pid === undefined
+			? ""
+			: spawnSync("ps", ["-Eww", "-p", String(pid), "-o", "command="], { encoding: "utf8" }).stdout;
 	const variable = (name: string) => new RegExp(`(?:^| )${name}=(\\S+)`).exec(shown)?.[1];
 	return {
 		SOMA_AGENT: variable("SOMA_AGENT"),
 		SOMA_SOCKET: variable("SOMA_SOCKET"),
 		SOMA_NODE: variable("SOMA_NODE"),
-		pathFirst: shown.includes(` PATH=${BIN}:`),
+		pathFirst: variable("PATH")?.split(":")[0],
 	};
 }
 
@@ -176,10 +184,16 @@ try {
 
 	// claude's own environment, which the shell its Bash tool opens inherits.
 	const { pathFirst, ...agentEnv } = environment(foreground?.pid);
-	check(agentEnv.SOMA_AGENT === card, `claude's SOMA_AGENT is ${agentEnv.SOMA_AGENT}, not ${card}`);
-	check(agentEnv.SOMA_SOCKET === started.socket, `claude's SOMA_SOCKET is ${agentEnv.SOMA_SOCKET}`);
-	check(pathFirst, "claude's PATH does not start with soma's bin");
-	log("agent env", { ...agentEnv, pathStartsWith: BIN });
+	// What claude holds is never shown: a failure names the variable and what it should be.
+	check(agentEnv.SOMA_AGENT === card, `claude's SOMA_AGENT is not ${card}`);
+	check(agentEnv.SOMA_SOCKET === started.socket, `claude's SOMA_SOCKET is not ${started.socket}`);
+	check(pathFirst === BIN, `claude's PATH does not start with ${BIN}`);
+	log("agent env", {
+		SOMA_AGENT: card,
+		SOMA_SOCKET: started.socket,
+		hasSomaNode: agentEnv.SOMA_NODE !== undefined,
+		pathStartsWith: BIN,
+	});
 
 	// Run as the agent's shell would: its variables, and `soma` found through the PATH soma gave it.
 	const instruction = `Reply with exactly one word: ${marker}. Use no tools.`;
@@ -230,11 +244,19 @@ try {
 	check(resumed.label === job?.sessionId, `the resumed block is labelled ${resumed.label}, not ${job?.sessionId}`);
 	const { foreground: again } = await claudeIn(resumed.id);
 	const { pathFirst: resumedPathFirst, ...resumedEnv } = environment(again?.pid);
-	check(resumedEnv.SOMA_AGENT === card, `the resumed claude's SOMA_AGENT is ${resumedEnv.SOMA_AGENT}`);
-	check(resumedEnv.SOMA_SOCKET === reopened.socket, `the resumed claude's SOMA_SOCKET is ${resumedEnv.SOMA_SOCKET}`);
+	check(resumedEnv.SOMA_AGENT === card, `the resumed claude's SOMA_AGENT is not ${card}`);
+	check(resumedEnv.SOMA_SOCKET === reopened.socket, `the resumed claude's SOMA_SOCKET is not ${reopened.socket}`);
 	check(resumedEnv.SOMA_NODE !== undefined, "the resumed claude has no SOMA_NODE");
-	check(resumedPathFirst, "the resumed claude's PATH does not start with soma's bin");
-	log("resumed", { block: resumed, pid: again?.pid, cwd: again?.cwd, ...resumedEnv });
+	check(resumedPathFirst === BIN, `the resumed claude's PATH does not start with ${BIN}`);
+	log("resumed", {
+		block: resumed,
+		pid: again?.pid,
+		cwd: again?.cwd,
+		SOMA_AGENT: card,
+		SOMA_SOCKET: reopened.socket,
+		hasSomaNode: true,
+		pathStartsWith: BIN,
+	});
 
 	// The instruction is the next turn of the same conversation, in the same file.
 	const turn = await until("the deferred turn to finish", 180_000, async () =>

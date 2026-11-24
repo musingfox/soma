@@ -26,7 +26,13 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { createRexClient, defaultRexSocket } from "../src/adapters/rex/client.ts";
 import { readProcessStart } from "../src/adapters/rex/process-start.ts";
-import { EmptyResultSchema, ProcessResultSchema, TERMINAL, ViewSchema } from "../src/adapters/rex/schema.ts";
+import {
+	AttachAllResultSchema,
+	EmptyResultSchema,
+	ProcessResultSchema,
+	TERMINAL,
+	ViewSchema,
+} from "../src/adapters/rex/schema.ts";
 import { readLastRecord, readSessionModel, resolveTranscriptPath } from "../src/agent-cli/transcript.ts";
 import { type Child, delay, run } from "./driver.ts";
 
@@ -248,7 +254,10 @@ try {
 	check(ours.length === 0, `~/.claude.json gained trust for ${JSON.stringify(ours)}`);
 	console.log("PASS");
 } finally {
+	// Each core stops calling the hangar first: one that still did would find it destroyed, as a hangar lost, and make
+	// one in its place that nothing removes. A kill is only sent, so its port is gone once the core has exited.
 	for (const child of children) child.process.kill("SIGKILL");
+	await Promise.all(children.map((child) => child.exited));
 	const claudes = await claudesIn(hangar).catch((error: Error) => {
 		console.error(`claudes of ${hangar}: ${error.message}`);
 		return [];
@@ -256,6 +265,21 @@ try {
 	await client
 		.call("session.destroy", { session_id: hangar }, EmptyResultSchema)
 		.catch((error: Error) => console.error(`destroy ${hangar}: ${error.message}`));
+	const { sessions } = await client
+		.call("session.attach_all", { event_scope: "session" }, AttachAllResultSchema)
+		.catch(() => ({ sessions: null }));
+	// The tag is this run's alone, so every session of this label is its own: the hangar, or one a port made in its place.
+	const ours = (sessions ?? []).filter((session) => session.label === `soma-smoke-${tag}`);
+	for (const { session_id: each } of ours) {
+		await client
+			.call("session.destroy", { session_id: each }, EmptyResultSchema)
+			.catch((error: Error) => console.error(`destroy ${each}: ${error.message}`));
+	}
+	const made = ours.map((session) => session.session_id).filter((each) => each !== hangar);
+	if (made.length > 0) {
+		console.error(`FAIL: a port made ${made.join(", ")} in place of its hangar as the smoke destroyed it`);
+		process.exitCode = 1;
+	}
 	client.close();
 	// A claude that outlives its core by a moment writes its config back, after a removal that came too soon.
 	if (!(await ended(claudes, 10_000))) {

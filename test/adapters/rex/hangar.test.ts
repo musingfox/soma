@@ -109,6 +109,22 @@ test("a closed port's watch reads the hangar no more, though a listener never un
 	expect(fake.attached.slice(before.attached)).toEqual([]);
 });
 
+test("a listener that comes to a closed port starts neither the watch nor the foreign poll", async () => {
+	const fake = rex([]);
+	const closed = port(fake);
+	closed.close();
+
+	// Either, started, reads rex at once: the watch the hangar, the poll every session.
+	closed.onStatus(() => {});
+	closed.onForeignStatus(() => {});
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	fake.reconnect();
+	await new Promise((resolve) => setTimeout(resolve, 10));
+
+	expect(fake.calls).toEqual([]);
+	expect(fake.attached).toEqual([]);
+});
+
 test("the hangar made under the config's default label is labelled soma-hangar, and a handover opens its window there", async () => {
 	const worktree = join(root, "worktree");
 	const projectsDir = join(root, "projects");

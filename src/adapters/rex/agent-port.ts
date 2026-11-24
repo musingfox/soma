@@ -1561,8 +1561,9 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		label: hangarLabel,
 
 		/**
-		 * Stops the hangar watch and the foreign poll, whoever still listens, and makes no hangar from then on, so the hangar
-		 * can be destroyed with the port still around: a smoke's own, at its end. What finds it gone gets HangarUnmade.
+		 * Stops the hangar watch and the foreign poll, whoever still listens, starts neither for a listener from then on, and
+		 * makes no hangar, so the hangar can be destroyed with the port still around: a smoke's own, at its end. What finds
+		 * it gone gets HangarUnmade.
 		 */
 		close(): void {
 			shut = true;
@@ -1715,6 +1716,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		},
 
 		onStatus(listener: (event: AgentStatusEvent) => void): () => void {
+			if (shut) return () => {};
 			listeners.add(listener);
 			unwatch ??= watch();
 			return () => {
@@ -1822,6 +1824,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 		},
 
 		onForeignStatus(listener: (event: ForeignStatusEvent) => void): () => void {
+			if (shut) return () => {};
 			foreignListeners.add(listener);
 			unwatchForeign ??= watchForeign();
 			return () => {

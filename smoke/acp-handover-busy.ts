@@ -149,6 +149,7 @@ const entry = async () =>
 	};
 let paneClaude: number | undefined;
 let acpAgents: () => Promise<void> = async () => {};
+let closeRex = () => {};
 const sleeps = new Set<number>();
 // Where the job stood, for a run that stops: its cleanup removes everything that would have said.
 let standing: () => Promise<unknown> = async () => undefined;
@@ -185,6 +186,7 @@ try {
 	// Read as the handover goes: what the cut found and how long it took, and that no mark stood until it was over.
 	const order: unknown[] = [];
 	const rex = createRexAgentPort({ client, sessionId: hangar, label, onError, env, path: bin, takeMs: 60_000 });
+	closeRex = () => rex.close();
 	const agents = createHandoverAgentPort({
 		from: {
 			...acp,
@@ -524,8 +526,9 @@ try {
 } finally {
 	log("at the end", await standing().catch((error: Error) => error.message));
 	// The port stops calling its hangar first: one that still did would find it destroyed, as a hangar lost, and make one
-	// in its place that nothing removes. With no listener left its watch ends, and the core, once closed, asks nothing.
+	// in its place that nothing removes. Closed, it makes none, and the core, once closed, asks nothing.
 	for (const each of offs) each();
+	closeRex();
 	await harness?.close(context);
 	await client
 		.call("session.destroy", { session_id: hangar }, EmptyResultSchema)

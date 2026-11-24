@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, expect, test } from "vitest";
-import { createRexAgentPort, type RexAgentPortOptions } from "../../../src/adapters/rex/agent-port.ts";
+import { createRexAgentPort, HangarUnmade, type RexAgentPortOptions } from "../../../src/adapters/rex/agent-port.ts";
 import { RexRpcError } from "../../../src/adapters/rex/client.ts";
 import { hangarFile } from "../../../src/adapters/rex/hangar-file.ts";
 import { readBlockedScreen } from "../../../src/agent-cli/permission/blocked-screen.ts";
@@ -72,6 +72,41 @@ test("a hangar rex does not know is made anew with the configured label, and sta
 	expect(windows(fake)).toEqual([MADE]);
 	expect(fake.attached).not.toContain(HANGAR);
 	expect(fake.attached).toContain(MADE);
+});
+
+test("a closed port makes no hangar in place of a lost one, where a port not closed makes one", async () => {
+	const fake = rex([]);
+	fake.lose();
+	const closed = port(fake);
+	closed.close();
+
+	await expect(closed.start(request)).rejects.toBeInstanceOf(HangarUnmade);
+	expect(await closed.list()).toEqual([]);
+	expect(creates(fake)).toEqual([]);
+	expect(closed.hangar).toBe(HANGAR);
+
+	const open = port(fake);
+	expect(await open.list()).toEqual([]);
+	expect(creates(fake)).toEqual([{ label: "soma-hangar" }]);
+	expect(open.hangar).toBe(MADE);
+});
+
+test("a closed port's watch reads the hangar no more, though a listener never unsubscribed", async () => {
+	const fake = rex([]);
+	const watched = port(fake);
+	watched.onStatus(() => {});
+	// The watch's first read, which a list queued behind on the one connection has seen through.
+	await watched.list();
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	watched.close();
+	const before = { calls: fake.calls.length, attached: fake.attached.length };
+
+	// A watch still up reads the hangar again on a new connection.
+	fake.reconnect();
+	await new Promise((resolve) => setTimeout(resolve, 10));
+
+	expect(fake.calls.slice(before.calls)).toEqual([]);
+	expect(fake.attached.slice(before.attached)).toEqual([]);
 });
 
 test("the hangar made under the config's default label is labelled soma-hangar, and a handover opens its window there", async () => {

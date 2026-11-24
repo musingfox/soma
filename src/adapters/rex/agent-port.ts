@@ -269,7 +269,7 @@ function paneOf(window: RexWindow): Pane | undefined {
  * Dispatches each card's claude into a window of the hangar rex session, in its own `fleet/<card>` worktree.
  * ARCHITECTURE.md "The rex implementation" is the design.
  */
-export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & SessionTaker {
+export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & SessionTaker & { close(): void } {
 	const { client } = options;
 	const git = options.git ?? runGit;
 	const confirmMs = options.confirmMs ?? 3_000;
@@ -309,15 +309,18 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	let making: Promise<string> | undefined;
 	// The lost hangar the last HangarUnmade was logged for.
 	let toldUnmade: string | undefined;
+	// Set by `close`: a hangar found gone from then on is about to be destroyed by the caller, not lost.
+	let shut = false;
 
 	/**
 	 * A hangar in place of `lost`, which rex says does not exist: a new session labelled `madeLabel`, attached and
 	 * remembered, and told in one line naming both. A hangar made in its place already, by another call, is the one.
 	 * Throws HangarUnmade when rex does not make one, logged the first time for `lost`, and the next call that finds
-	 * `lost` gone asks again.
+	 * `lost` gone asks again. A closed port makes none: HangarUnmade, not logged.
 	 */
 	function replace(lost: string): Promise<string> {
 		if (sessionId !== lost) return Promise.resolve(sessionId);
+		if (shut) return Promise.reject(new HangarUnmade(`rex hangar ${lost} does not exist, and this port is closed`));
 		making ??= (async () => {
 			let made: string;
 			try {
@@ -1556,6 +1559,20 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 			return sessionId;
 		},
 		label: hangarLabel,
+
+		/**
+		 * Stops the hangar watch and the foreign poll, whoever still listens, and makes no hangar from then on, so the hangar
+		 * can be destroyed with the port still around: a smoke's own, at its end. What finds it gone gets HangarUnmade.
+		 */
+		close(): void {
+			shut = true;
+			listeners.clear();
+			unwatch?.();
+			unwatch = undefined;
+			foreignListeners.clear();
+			unwatchForeign?.();
+			unwatchForeign = undefined;
+		},
 
 		async start(request: StartRequest): Promise<void> {
 			// Built first, so a card the command cannot hold leaves git and rex alone.

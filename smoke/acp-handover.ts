@@ -158,6 +158,7 @@ const git = (...args: string[]) => runGit(repo, args);
 const identity = ["-c", "user.name=soma smoke", "-c", "user.email=smoke@example.com", "-c", "commit.gpgsign=false"];
 let paneClaude: number | undefined;
 let acpAgents: () => Promise<void> = async () => {};
+let closeRex = () => {};
 // Where the job stood, for a run that stops: its cleanup removes the transcript that would have said.
 let standing: () => Promise<unknown> = async () => undefined;
 let harness: Awaited<ReturnType<typeof openHarness>> | undefined;
@@ -213,6 +214,7 @@ try {
 		sessionsDir,
 		takeMs: 60_000,
 	});
+	closeRex = () => rex.close();
 	const agents = createHandoverAgentPort({ from: acp, to: rex });
 	const statuses: AgentStatusEvent[] = [];
 	const offStatus = agents.onStatus((event) => {
@@ -448,8 +450,9 @@ try {
 } finally {
 	log("at the end", await standing().catch((error: Error) => error.message));
 	// The port stops calling its hangar first: one that still did would find it destroyed, as a hangar lost, and make one
-	// in its place that nothing removes. With no listener left its watch ends, and the core, once closed, asks nothing.
+	// in its place that nothing removes. Closed, it makes none, and the core, once closed, asks nothing.
 	for (const each of offs) each();
+	closeRex();
 	await harness?.close(context);
 	await client
 		.call("session.destroy", { session_id: hangar }, EmptyResultSchema)

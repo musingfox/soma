@@ -79,14 +79,15 @@ async function until<T>(what: string, ms: number, probe: () => Promise<T | undef
 	}
 }
 
-/** Every process under `pid`, with its command, as ps lists them now. */
-function descendants(pid: number): { pid: number; command: string }[] {
-	const rows = spawnSync("ps", ["-A", "-ww", "-o", "pid=,ppid=,command="], { encoding: "utf8" })
-		.stdout.trim()
+/** Every live process under `pid`, by pid: ps is asked for no command line, and the ps that looks is left out. */
+function descendants(pid: number): number[] {
+	const listing = spawnSync("ps", ["-A", "-o", "pid=,ppid=,stat="], { encoding: "utf8" });
+	const rows = listing.stdout
+		.trim()
 		.split("\n")
-		.map((row) => /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(row))
+		.map((row) => /^\s*(\d+)\s+(\d+)\s+(\S+)/.exec(row))
 		.filter((match) => match !== null)
-		.map(([, child, parent, command]) => ({ pid: Number(child), ppid: Number(parent), command: command ?? "" }));
+		.map(([, child, parent, stat]) => ({ pid: Number(child), ppid: Number(parent), stat: stat ?? "" }));
 	const under = new Set([pid]);
 	for (let grew = true; grew; ) {
 		grew = false;
@@ -97,8 +98,17 @@ function descendants(pid: number): { pid: number; command: string }[] {
 			}
 		}
 	}
-	// ps shows a process that has exited, and waits to be reaped, by its name in parentheses; the ps that looks is its own.
-	return rows.filter((row) => row.pid !== pid && under.has(row.pid) && !/^\(|^ps -A/.test(row.command));
+	// A process that has exited, and waits to be reaped, is in state Z.
+	return rows
+		.filter((row) => row.pid !== pid && row.pid !== listing.pid && under.has(row.pid) && !row.stat.startsWith("Z"))
+		.map((row) => row.pid);
+}
+
+/** The pids whose argument list matches `pattern`, an extended regex: pgrep -f prints the pids, and no command line. */
+function matching(pattern: string): Set<number> {
+	const { status, stdout } = spawnSync("pgrep", ["-f", "--", pattern], { encoding: "utf8" });
+	if (status !== 0 && status !== 1) throw new Error(`pgrep -f ${pattern} exited ${status}`);
+	return new Set(stdout.split("\n").filter(Boolean).map(Number));
 }
 
 const mine = () => descendants(process.pid);
@@ -143,7 +153,8 @@ const sleeps = new Set<number>();
 // Where the job stood, for a run that stops: its cleanup removes everything that would have said.
 let standing: () => Promise<unknown> = async () => undefined;
 let harness: Awaited<ReturnType<typeof openHarness>> | undefined;
-let off = () => {};
+// What listens to the agent side's statuses, each one's unsubscribe: the rex port watches its hangar while any listens.
+const offs: (() => void)[] = [];
 // Last before the `try`, whose `finally` destroys it, so nothing that can fail lies between.
 const { session_id: hangar } = await client
 	.call("session.create", { label }, z.object({ session_id: z.string() }).passthrough())
@@ -205,7 +216,7 @@ try {
 		to: rex,
 		onError,
 	});
-	agents.onStatus((event) => {
+	const offStatus = agents.onStatus((event) => {
 		const { state } = event.status;
 		log("status", {
 			agent: event.agent,
@@ -214,6 +225,7 @@ try {
 			...(state === "blocked" ? { kind: event.status.kind, msg: event.status.msg } : {}),
 		});
 	});
+	offs.push(offStatus);
 
 	const sleeping = `Run this exact command with the Bash tool, in the foreground, with a timeout of 600000 ms, and wait for it: echo started && ${sleepCommand}`;
 	// soma's model: dispatches, replies and shows on ask. A wake is left unanswered in `blocked`, with its fingerprint kept
@@ -283,14 +295,10 @@ try {
 	const root = await open.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 	open.resume();
 	// As main.ts starts them.
-	const offSettled = handoverBridge(root, agents, context).listen((error) => console.error("[handover]", error));
+	offs.push(handoverBridge(root, agents, context).listen((error) => console.error("[handover]", error)));
 	await agents.heard();
 	await reconcileDispatches(root, agents, context, await agents.dormant());
-	const offEvents = eventBridge(root, agents, context).listen((error) => console.error("[bridge]", error));
-	off = () => {
-		offEvents();
-		offSettled();
-	};
+	offs.push(eventBridge(root, agents, context).listen((error) => console.error("[bridge]", error)));
 	const job = async () =>
 		(await open.snapshot(Dispatches, root.id, context))?.jobs.find((each) => each.card === card) as Job | undefined;
 	const entries = async (kind: string) =>
@@ -309,7 +317,7 @@ try {
 		notices: (await entries(NOTICE)).map((each) => each.data),
 		done: (await entries(JOB_DONE)).map((each) => each.data),
 		order,
-		processes: mine().map(({ pid, command }) => ({ pid, command: command.slice(0, 120) })),
+		processes: mine(),
 		windows: ((await client.call("session.view", { session_id: hangar }, ViewSchema)).windows ?? []).map(
 			(window) => window.label,
 		),
@@ -344,15 +352,19 @@ try {
 		check(JSON.stringify(results.at(-1)) === '{"sent":true}', `the second prompt: ${JSON.stringify(results.at(-1))}`);
 	}
 	if (scenario !== "blocked") {
+		const sleepingHere = () => {
+			const named = matching(sleepCommand);
+			return mine().filter((pid) => named.has(pid));
+		};
 		await until("the sleep to run", 180_000, async () => {
-			const running = mine().filter(({ command }) => command.includes(sleepCommand));
-			for (const { pid } of running) sleeps.add(pid);
+			const running = sleepingHere();
+			for (const pid of running) sleeps.add(pid);
 			return running.length > 0 ? running : undefined;
 		});
 		log("sleeping", { sleeps: [...sleeps], job: (await job())?.status });
 		// A shell may stand between the Bash tool and the sleep, started a moment after it.
 		await delay(1_000);
-		for (const { pid, command } of mine()) if (command.includes(sleepCommand)) sleeps.add(pid);
+		for (const pid of sleepingHere()) sleeps.add(pid);
 		check((await job())?.status.state === "working", "the job is not recorded working as the sleep runs");
 	} else {
 		await until("the job to be recorded blocked", 180_000, async () =>
@@ -374,7 +386,7 @@ try {
 		outcomeBefore,
 		named: await readSessionModel(transcript),
 		reply: (await readLastRecord(transcript))?.text,
-		processes: under.map(({ pid, command }) => ({ pid, command: command.slice(0, 120) })),
+		processes: under,
 	});
 
 	const started = Date.now();
@@ -401,9 +413,7 @@ try {
 	const left = await until("the ACP processes to end", 20_000, async () => (mine().length === 0 ? [] : undefined));
 	for (const deadline = Date.now() + 15_000; [...sleeps].some(alive) && Date.now() < deadline; ) await delay(250);
 	const running = [...sleeps].filter(alive);
-	const named = spawnSync("ps", ["-A", "-ww", "-o", "pid=,command="], { encoding: "utf8" })
-		.stdout.split("\n")
-		.filter((row) => row.includes(sleepCommand) && !row.includes("ps -A"));
+	const named = [...matching(sleepCommand)];
 	log("acp gone", { processesLeft: left.length, sleepsSeen: [...sleeps], sleepsAlive: running, byCommand: named });
 	check(running.length === 0, `${running.length} of the sleeps it ran are still alive`);
 	check(named.length === 0, `something still runs ${sleepCommand}: ${JSON.stringify(named)}`);
@@ -418,21 +428,21 @@ try {
 	const where = { session_id: hangar, block_id: block?.block_id, args: {} };
 	const { foreground } = await client.call(`${TERMINAL}.process`, where, ProcessResultSchema);
 	paneClaude = foreground?.pid;
-	const command = spawnSync("ps", ["-ww", "-o", "command=", "-p", String(foreground?.pid)], {
-		encoding: "utf8",
-	}).stdout;
+	const resumed = foreground != null && matching(`--resume ${acpSessionId}`).has(foreground.pid);
+	const onHaiku = foreground != null && matching("--model [^ ]*haiku").has(foreground.pid);
 	log("window", {
 		windows: (view.windows ?? []).map((window) => window.label),
 		blockLabel: block?.label,
 		argv0: foreground?.argv0,
 		cwd: foreground?.cwd,
-		command: command.trim(),
+		resumed,
+		onHaiku,
 	});
 	check((view.windows ?? []).length === 1 && view.windows?.[0]?.label === card, "the window is not the card's");
 	check(block?.label === acpSessionId, `the block is labelled ${block?.label}`);
 	check(foreground?.argv0 === "claude", `the pane's foreground is ${foreground?.argv0}`);
-	check(command.includes(`--resume ${acpSessionId}`), "claude was not started with --resume on the ACP session");
-	check(/--model \S*haiku/.test(command), "claude was not started with an explicit haiku model");
+	check(resumed, "claude was not started with --resume on the ACP session");
+	check(onHaiku, "claude was not started with an explicit haiku model");
 
 	// Past anything of the cut turn or the window's first idle that could still reach the bridge.
 	await delay(3_000);
@@ -513,7 +523,10 @@ try {
 	console.log(`PASS ${scenario}`);
 } finally {
 	log("at the end", await standing().catch((error: Error) => error.message));
-	off();
+	// The port stops calling its hangar first: one that still did would find it destroyed, as a hangar lost, and make one
+	// in its place that nothing removes. With no listener left its watch ends, and the core, once closed, asks nothing.
+	for (const each of offs) each();
+	await harness?.close(context);
 	await client
 		.call("session.destroy", { session_id: hangar }, EmptyResultSchema)
 		.catch((error: Error) => console.error(`destroy ${hangar}: ${error.message}`));
@@ -528,19 +541,31 @@ try {
 		}
 	}
 	for (const each of sleeps) if (alive(each)) process.kill(each, "SIGKILL");
+	await delay(1_000);
 	const { sessions } = await client
 		.call("session.attach_all", { event_scope: "session" }, AttachAllResultSchema)
 		.catch(() => ({ sessions: null }));
-	await delay(1_000);
+	// The tag is this run's alone, so every session of this label is its own: the hangar, or one the port made in its place.
+	const ours = (sessions ?? []).filter((session) => session.label === label).map((session) => session.session_id);
+	for (const each of ours) {
+		await client
+			.call("session.destroy", { session_id: each }, EmptyResultSchema)
+			.catch((error: Error) => console.error(`destroy ${each}: ${error.message}`));
+	}
+	const made = ours.filter((each) => each !== hangar);
 	const remaining = mine();
-	for (const { pid: each } of remaining) process.kill(each);
+	for (const each of remaining) process.kill(each);
 	log("cleanup", {
-		sessionGone: !(sessions ?? []).some((session) => session.label === label),
+		sessionGone: sessions !== null && !ours.includes(hangar),
+		madeInPlace: made,
 		paneClaudeAlive: pid !== undefined && alive(pid),
 		sleepsAlive: [...sleeps].filter(alive),
-		processesLeft: remaining.map(({ pid: each, command }) => ({ pid: each, command: command.slice(0, 80) })),
+		processesLeft: remaining,
 	});
-	await harness?.close(context);
+	if (made.length > 0) {
+		console.error(`FAIL: the port made ${made.join(", ")} in place of its hangar as the smoke destroyed it`);
+		process.exitCode = 1;
+	}
 	client.close();
 	// What claude keeps for the fixed repo itself is shared with the other smokes, so only the worktree's goes.
 	const resolved = existsSync(worktree) ? await realpath(worktree) : worktree;

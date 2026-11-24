@@ -54,6 +54,7 @@ async function watching(screen: string) {
 	};
 	const fake = rex([], [{ id: "session:work", label: "work", blocks: [claude] }]);
 	const agents = createRexAgentPort({
+		label: "soma-test",
 		client: fake.client,
 		sessionId: HANGAR,
 		projectsDir: join(directory, "projects"),

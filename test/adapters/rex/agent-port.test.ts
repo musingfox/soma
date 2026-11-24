@@ -29,6 +29,7 @@ test("start adds fleet/<card> under .claude/worktrees and types claude's command
 	const { git: run, runs } = git();
 
 	await createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -90,7 +91,13 @@ test("the launch command sets SOMA_AGENT and PATH for claude in sh, zsh and fish
 test("start refuses a card the launch command cannot quote, before git or rex is touched", async () => {
 	const fake = rex([]);
 	const { git: run, runs } = git();
-	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, git: run });
+	const port = createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+	});
 
 	await expect(port.start({ ...request, card: "it's" })).rejects.toThrow("cannot put");
 	expect(runs).toEqual([]);
@@ -104,6 +111,7 @@ test("start refuses when the hangar's claude blocks already fill the cap, and le
 	]);
 	const { git: run, runs } = git();
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -123,9 +131,14 @@ test("start does not count a hangar block whose foreground is not claude", async
 	]);
 	const { git: run } = git();
 
-	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, git: run, cap: 2 }).start(
-		request,
-	);
+	await createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+		cap: 2,
+	}).start(request);
 
 	expect(fake.methods()).toContain("session.new_window");
 });
@@ -143,6 +156,7 @@ test("two starts at once with one slot left open one window, and the other is re
 	const fake = rex([{ name: "card-b", block: "block:b", argv0: "claude" }]);
 	const { git: run } = git();
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -168,6 +182,7 @@ test("a start whose window still shows its shell holds its slot, which its claud
 	opensShells(fake, blocks);
 	const { git: run } = git();
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -193,6 +208,7 @@ test("a start's claude the watch saw report frees its slot, though it exited bef
 	opensShells(fake, blocks);
 	const { git: run } = git();
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -218,6 +234,7 @@ test("a start's claude another read saw in the foreground frees its slot, though
 	opensShells(fake, blocks);
 	const { git: run } = git();
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -242,6 +259,7 @@ test("a record an exited claude left on its start's block, found by a read, free
 	opensShells(fake, blocks);
 	const { git: run } = git();
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -266,6 +284,7 @@ test("a status on a start's block that is not claude's, by event or read, leaves
 	opensShells(fake, blocks);
 	const { git: run } = git();
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -321,7 +340,14 @@ test("a start's window that opens after another start's count read the hangar st
 		},
 	};
 	const { git: run } = git();
-	const port = createRexAgentPort({ processStart: unstarted, client, sessionId: HANGAR, git: run, cap: 2 });
+	const port = createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client,
+		sessionId: HANGAR,
+		git: run,
+		cap: 2,
+	});
 
 	const started = await Promise.allSettled([
 		port.start(request),
@@ -338,6 +364,7 @@ test("a start's window closed before its claude came frees its slot", async () =
 	opensShells(fake, blocks);
 	const { git: run } = git();
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -359,6 +386,7 @@ test("a start that fails frees its slot for the next start", async () => {
 	const fake = rex([{ name: "card-b", block: "block:b", argv0: "claude" }]);
 	const { git: run } = git();
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -382,9 +410,13 @@ test("start reopens the worktree an earlier attempt left on the branch", async (
 		"worktree /nonexistent/repo\nHEAD abc\nbranch refs/heads/main\n\nworktree /wt/card-a\nHEAD def\nbranch refs/heads/fleet/card-a\n";
 	const { git: run, runs } = git(porcelain, "  fleet/card-a\n");
 
-	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, git: run }).start(
-		request,
-	);
+	await createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		git: run,
+	}).start(request);
 
 	expect(runs).toHaveLength(1);
 	expect(fake.calls.find((call) => call.method === "session.new_window")?.payload).toMatchObject({
@@ -395,9 +427,13 @@ test("start reopens the worktree an earlier attempt left on the branch", async (
 test("start checks out a branch that exists without a worktree", async () => {
 	const { git: run, runs } = git("", "  fleet/card-a\n");
 
-	await createRexAgentPort({ processStart: unstarted, client: rex([]).client, sessionId: HANGAR, git: run }).start(
-		request,
-	);
+	await createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: rex([]).client,
+		sessionId: HANGAR,
+		git: run,
+	}).start(request);
 
 	expect(runs.at(-1)).toEqual([
 		"/nonexistent/repo",
@@ -425,6 +461,7 @@ test("list names each job's window, with the root record's status and seq while 
 	]);
 
 	const listed = await createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -446,7 +483,12 @@ test("list names each job's window, with the root record's status and seq while 
 test("onStatus reports root records off the event stream, one per observation", async () => {
 	const block: Block = { name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [] };
 	const fake = rex([block, { name: "shell", block: "block:s", argv0: "-fish" }]);
-	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
+	const port = createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+	});
 	const seen: AgentStatusEvent[] = [];
 	const off = port.onStatus((event) => seen.push(event));
 	await settle();
@@ -479,8 +521,8 @@ test("onStatus re-reads each block's program_status once after a reconnect", asy
 	const block: Block = { name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [] };
 	const fake = rex([block]);
 	const seen: AgentStatusEvent[] = [];
-	createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR }).onStatus((event) =>
-		seen.push(event),
+	createRexAgentPort({ label: "soma-test", processStart: unstarted, client: fake.client, sessionId: HANGAR }).onStatus(
+		(event) => seen.push(event),
 	);
 	await settle();
 	const reads = () => fake.methods().filter((method) => method.endsWith(".program_status")).length;
@@ -499,8 +541,8 @@ test("onStatus drops a report older than one a resync already emitted", async ()
 	const block: Block = { name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [] };
 	const fake = rex([block]);
 	const seen: AgentStatusEvent[] = [];
-	createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR }).onStatus((event) =>
-		seen.push(event),
+	createRexAgentPort({ label: "soma-test", processStart: unstarted, client: fake.client, sessionId: HANGAR }).onStatus(
+		(event) => seen.push(event),
 	);
 	await settle();
 	let release = () => {};
@@ -535,6 +577,7 @@ test("a status the watch failed to read is read again, with no new event and no 
 	const errors: string[] = [];
 	const seen: AgentStatusEvent[] = [];
 	createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -578,6 +621,7 @@ test("a block a reconnect's re-read failed to read is read again, while the othe
 	const errors: string[] = [];
 	const seen: AgentStatusEvent[] = [];
 	createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -610,6 +654,7 @@ test("a block whose status keeps failing is logged once per streak, and is read 
 	const errors: string[] = [];
 	const seen: AgentStatusEvent[] = [];
 	createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -657,10 +702,13 @@ test("prompt pastes the text and presses \\r, and presses it once more when clau
 		{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [{ state: "idle", updated_at: AT }] },
 	]);
 
-	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt(
-		"card-a",
-		"line 1\nline 2",
-	);
+	await createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		confirmMs: 10,
+	}).prompt("card-a", "line 1\nline 2");
 
 	const sent = fake.calls.filter((call) => call.method === "block.event" || call.method.endsWith(".write"));
 	expect(sent).toEqual([
@@ -696,6 +744,7 @@ test("prompt presses \\r only once when claude turns working", async () => {
 	};
 
 	await createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -724,10 +773,13 @@ test("prompt does not press \\r again when claude goes from idle straight to blo
 		return result;
 	};
 
-	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt(
-		"card-a",
-		"go",
-	);
+	await createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		confirmMs: 10,
+	}).prompt("card-a", "go");
 
 	expect(fake.methods().filter((method) => method.endsWith(".write"))).toHaveLength(1);
 });
@@ -748,10 +800,13 @@ test("prompt does not press \\r again when the status cannot be read", async () 
 		return result;
 	};
 
-	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, confirmMs: 10 }).prompt(
-		"card-a",
-		"go",
-	);
+	await createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		confirmMs: 10,
+	}).prompt("card-a", "go");
 
 	expect(fake.methods().filter((method) => method.endsWith(".write"))).toHaveLength(1);
 });
@@ -766,6 +821,7 @@ test.each([
 		const fake = rex([{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records }]);
 
 		const prompted = createRexAgentPort({
+			label: "soma-test",
 			processStart: unstarted,
 			client: fake.client,
 			sessionId: HANGAR,
@@ -791,6 +847,7 @@ test("prompt that fails after the paste does not call it a refusal", async () =>
 	};
 
 	const prompted = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -815,6 +872,7 @@ test("readResult reads the last reply off the transcript of the session id the b
 	const fake = rex([{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude", cwd }]);
 
 	const result = await createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -829,6 +887,7 @@ test("readResult of a closed window reads the transcript its session left, and i
 	const blocks: Block[] = [{ name: "card-k", block: "block:k", label: SESSION, argv0: "claude", cwd }];
 	const fake = rex(blocks);
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -840,7 +899,12 @@ test("readResult of a closed window reads the transcript its session left, and i
 	blocks.splice(0);
 	expect(await port.readResult("card-k")).toEqual({ id: "a-msg_1", text: "結果：完成" });
 	// As after a restart: this process never saw the window.
-	const fresh = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
+	const fresh = createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+	});
 	expect(await fresh.readResult("card-k")).toBeUndefined();
 });
 
@@ -870,6 +934,7 @@ describe("a job's window whose claude left the job's session, as a /clear does",
 		};
 		const fake = rex([block]);
 		const port = createRexAgentPort({
+			label: "soma-test",
 			processStart: unstarted,
 			client: fake.client,
 			sessionId: HANGAR,
@@ -1119,6 +1184,7 @@ test.each([
 	const block: Block = { name: "card-b", block: "block:b", label: SESSION, argv0: "claude", cwd, records: [] };
 	const fake = rex([block]);
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1138,6 +1204,7 @@ test("a re-check that failed to read the block is tried again, and reports the b
 	const fake = rex([block]);
 	const errors: string[] = [];
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1182,6 +1249,7 @@ test.each([
 	const fake = rex(blocks);
 	const errors: string[] = [];
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1227,6 +1295,7 @@ test("a re-check that fails while a failed read of its block is pending does not
 	const fake = rex([block]);
 	const errors: string[] = [];
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1273,6 +1342,7 @@ test("readResult is the transcript's last record after replyMs when nothing was 
 	const block: Block = { name: "card-c", block: "block:c", label: SESSION, argv0: "claude", cwd, records: [] };
 	const fake = rex([block]);
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1295,6 +1365,7 @@ test("readResult names a turn that ended on the user by its last record after re
 	const block: Block = { name: "card-g", block: "block:g", label: SESSION, argv0: "claude", cwd, records: [] };
 	const fake = rex([block]);
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1323,6 +1394,7 @@ test("readResult answers a re-stamp of the record that ended the turn with its r
 	const fake = rex([block]);
 	const seen: AgentStatusEvent[] = [];
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1350,6 +1422,7 @@ test("readResult reads at once a turn whose start the watch never saw, as at the
 	const records = [{ state: "done", updated_at: new Date(Date.now() + 60_000).toISOString() }];
 	const fake = rex([{ name: "card-f", block: "block:f", label: SESSION, argv0: "claude", cwd, records }]);
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1375,6 +1448,7 @@ test("readResult waits for the turn a resync read the end of, though the working
 	const block: Block = { name: "card-h", block: "block:h", label: SESSION, argv0: "claude", cwd, records: [] };
 	const fake = rex([block]);
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1422,6 +1496,7 @@ test("readResult asked at a resync's done waits for the working queued behind a 
 		return call(method, payload, schema);
 	};
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1468,6 +1543,7 @@ test("readResult does not wait for watch work queued after it was asked", async 
 	};
 	const fake = rex([block, other]);
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1514,6 +1590,7 @@ test.each([
 	const block: Block = { name: "card-i", block: "block:i", label: SESSION, argv0: "claude", cwd, records: [] };
 	const fake = rex([block]);
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1543,6 +1620,7 @@ test("readResult waits at most 2 s by default", async () => {
 	const block: Block = { name: "card-d", block: "block:d", label, argv0: "claude", cwd: "/nonexistent/none" };
 	const fake = rex([block]);
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1562,7 +1640,12 @@ test("readResult waits at most 2 s by default", async () => {
 test("stop closes the agent's block", async () => {
 	const fake = rex([{ name: "card-a", block: "block:a", label: SESSION }]);
 
-	await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR }).stop("card-a");
+	await createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+	}).stop("card-a");
 
 	expect(fake.calls.at(-1)).toEqual({ method: "block.close", payload: { session_id: HANGAR, block_id: "block:a" } });
 });
@@ -1577,7 +1660,12 @@ test("readScreen reads the agent's block in the hangar at every call, whatever i
 		screen: "● Done: the tests pass.",
 	};
 	const fake = rex([{ name: "card-b", block: "block:b", label: SESSION, argv0: "claude", screen: "other" }, block]);
-	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
+	const port = createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+	});
 
 	expect(await port.readScreen("card-a")).toBe("● Done: the tests pass.");
 	// The human answered the agent at its pane since: the next read shows the new turn, not the done one.
@@ -1594,7 +1682,12 @@ test("readScreen reads the agent's block in the hangar at every call, whatever i
 
 test("readScreen reads the shell left in the block once claude exited, and refuses a name with no window", async () => {
 	const fake = rex([{ name: "card-a", block: "block:a", label: SESSION, argv0: "-fish", screen: "$ " }]);
-	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
+	const port = createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+	});
 
 	expect(await port.readScreen("card-a")).toBe("$ ");
 	await expect(port.readScreen("card-z")).rejects.toThrow(`rex hangar ${HANGAR} has no window named card-z`);
@@ -1616,9 +1709,12 @@ test("readScreen reads only the tail of a scrollback too long for one reply", as
 		return original(method, payload, schema);
 	};
 
-	const text = await createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR }).readScreen(
-		"card-a",
-	);
+	const text = await createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+	}).readScreen("card-a");
 
 	expect(text).not.toContain("old output");
 	expect(text.endsWith("\nthe last line")).toBe(true);
@@ -1653,6 +1749,7 @@ test("resume types claude --resume <id> with a dispatch's environment, in the di
 	const { git: run, runs } = git();
 	const env = { SOMA_SOCKET: "/run/soma.sock", SOMA_NODE: "/opt/node/bin/node" };
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1708,7 +1805,13 @@ test("resume refuses, and opens no window, a session whose directory is gone, on
 	];
 	for (const { projectsDir, request: resumed, blocks, error } of cases) {
 		const fake = rex(blocks);
-		const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, projectsDir });
+		const port = createRexAgentPort({
+			label: "soma-test",
+			processStart: unstarted,
+			client: fake.client,
+			sessionId: HANGAR,
+			projectsDir,
+		});
 
 		await expect(port.resume(resumed)).rejects.toThrow(error);
 		expect(fake.methods()).not.toContain("session.new_window");
@@ -1732,6 +1835,7 @@ const keys = (fake: ReturnType<typeof rex>) =>
 async function respond(block: Omit<Block, "name" | "block">, option: string, fingerprint: string) {
 	const fake = rex([{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude", ...block }]);
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -1811,7 +1915,14 @@ describe("an answer that needs an arrow", () => {
 		screen: TRUST,
 	});
 	const answering = (fake: ReturnType<typeof rex>) =>
-		createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, keyGapMs: 0, settleMs: 0 });
+		createRexAgentPort({
+			label: "soma-test",
+			processStart: unstarted,
+			client: fake.client,
+			sessionId: HANGAR,
+			keyGapMs: 0,
+			settleMs: 0,
+		});
 	const onYes = (block: Block) => /❯ Yes, I trust this folder/.test(block.screen ?? "");
 
 	test("the arrow the pane drops gets no Enter, and the next answer travels from a fresh read", async () => {
@@ -1924,6 +2035,7 @@ describe("an answer that needs an arrow", () => {
 			return fake.original("block.event")(payload);
 		});
 		const port = createRexAgentPort({
+			label: "soma-test",
 			processStart: unstarted,
 			client: fake.client,
 			sessionId: HANGAR,
@@ -2006,6 +2118,7 @@ test("respond reads only the tail of a scrollback too long for one reply", async
 	};
 
 	const outcome = await createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -2027,6 +2140,7 @@ test("a blocked record carries the prompt read off the screen, whose fingerprint
 	const block: Block = { name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [], screen: BASH };
 	const fake = rex([block]);
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -2072,6 +2186,7 @@ test("a blocked record whose screen does not parse keeps the record's status, wi
 	]);
 
 	const listed = await createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -2113,6 +2228,7 @@ test("a blocked record's screen that parses only once claude has drawn it carrie
 	};
 	const seen: AgentStatusEvent[] = [];
 	const off = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -2136,7 +2252,12 @@ test("a second prompt under the same record text, with no other status between, 
 	const block: Block = { name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [], screen: BASH };
 	const fake = rex([block]);
 	const seen: AgentStatusEvent[] = [];
-	const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
+	const port = createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+	});
 	const off = port.onStatus((event) => seen.push(event));
 	await settle();
 	const blocked = (updated_at: string) => ({ state: "blocked", kind: "permission", msg: "approve Bash", updated_at });
@@ -2199,6 +2320,7 @@ test("onStatus reports the trust dialog once claude ran trustMs without a record
 	const fake = rex([block]);
 	const seen: AgentStatusEvent[] = [];
 	const port = createRexAgentPort({
+		label: "soma-test",
 		client: fake.client,
 		sessionId: HANGAR,
 		git: mainGit.git,
@@ -2247,6 +2369,7 @@ test("a trust dialog claude reports a blocked record for names the repository ro
 	const fake = rex([block]);
 	const seen: AgentStatusEvent[] = [];
 	const port = createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -2305,6 +2428,7 @@ test("a record arriving while the first dialog check reads the screen wins: the 
 	screen.hold();
 	const seen: AgentStatusEvent[] = [];
 	const off = createRexAgentPort({
+		label: "soma-test",
 		client: fake.client,
 		sessionId: HANGAR,
 		git: mainGit.git,
@@ -2338,6 +2462,7 @@ test("a record arriving while a re-check reads the screen ends the dialog's repo
 	const screen = heldScreen(fake);
 	const seen: AgentStatusEvent[] = [];
 	const off = createRexAgentPort({
+		label: "soma-test",
 		client: fake.client,
 		sessionId: HANGAR,
 		git: mainGit.git,
@@ -2374,6 +2499,7 @@ test("onStatus never reads the screen of a claude that reports records", async (
 	]);
 	const seen: AgentStatusEvent[] = [];
 	const off = createRexAgentPort({
+		label: "soma-test",
 		client: fake.client,
 		sessionId: HANGAR,
 		trustMs: 20,
@@ -2399,6 +2525,7 @@ test("list reports the trust dialog under the seq of the time it first held, whi
 	};
 	const at = (ms: number) =>
 		createRexAgentPort({
+			label: "soma-test",
 			client: rex([block]).client,
 			sessionId: HANGAR,
 			git: mainGit.git,
@@ -2425,6 +2552,7 @@ test("the trust dialog's msg ends naming the repository root a yes trusts, not t
 	const { git: run, runs } = git(`worktree /nonexistent/repo\nHEAD abc\nbranch refs/heads/main\n`);
 	const list = (gitFor: typeof run) =>
 		createRexAgentPort({
+			label: "soma-test",
 			client: rex([block]).client,
 			sessionId: HANGAR,
 			git: gitFor,
@@ -2460,6 +2588,7 @@ test("a git failure's fallback stays the trust dialog's msg, so a git that recov
 	};
 	let fails = true;
 	const port = createRexAgentPort({
+		label: "soma-test",
 		client: rex([block]).client,
 		sessionId: HANGAR,
 		git: async (repo, args) => {
@@ -2503,9 +2632,13 @@ test("seq is updated_at in microseconds, so reports 800 µs apart are two observ
 
 	const fake = rex([{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude", records: [] }]);
 	const seen: AgentStatusEvent[] = [];
-	createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, redrawMs: 0 }).onStatus(
-		(event) => seen.push(event),
-	);
+	createRexAgentPort({
+		label: "soma-test",
+		processStart: unstarted,
+		client: fake.client,
+		sessionId: HANGAR,
+		redrawMs: 0,
+	}).onStatus((event) => seen.push(event));
 	await settle();
 	fake.emit(fake.status("block:a", { state: "working", updated_at: "2026-10-27T01:02:03.456100Z" }));
 	fake.emit(
@@ -2546,6 +2679,7 @@ describe("taking over a session another side ran", () => {
 			return { window_id: "window:new", block_ids: ["block:new"], revision: 2 };
 		});
 		const created = createRexAgentPort({
+			label: "soma-test",
 			processStart: unstarted,
 			client: fake.client,
 			sessionId: HANGAR,
@@ -2857,6 +2991,7 @@ describe("windows the human opens in the hangar", () => {
 			{ name: "claude", block: "block:h2", argv0: "claude" },
 		]);
 		const port = createRexAgentPort({
+			label: "soma-test",
 			processStart: unstarted,
 			client: fake.client,
 			sessionId: HANGAR,
@@ -2887,6 +3022,7 @@ describe("windows the human opens in the hangar", () => {
 		const human: Block = { name: "card-a", block: "block:h", argv0: "claude", records: [] };
 		const fake = rex([human, job]);
 		const port = createRexAgentPort({
+			label: "soma-test",
 			processStart: unstarted,
 			client: fake.client,
 			sessionId: HANGAR,
@@ -2925,7 +3061,13 @@ describe("windows the human opens in the hangar", () => {
 			records: [{ state: "idle", updated_at: AT }],
 		};
 		const fake = rex([human, job]);
-		const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR, confirmMs: 10 });
+		const port = createRexAgentPort({
+			label: "soma-test",
+			processStart: unstarted,
+			client: fake.client,
+			sessionId: HANGAR,
+			confirmMs: 10,
+		});
 		const seen: AgentStatusEvent[] = [];
 		const off = port.onStatus((event) => seen.push(event));
 		await settle();
@@ -2954,7 +3096,12 @@ describe("windows the human opens in the hangar", () => {
 			{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude" },
 			{ name: "card-b", block: "block:f", label: "fish", argv0: "claude" },
 		]);
-		const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
+		const port = createRexAgentPort({
+			label: "soma-test",
+			processStart: unstarted,
+			client: fake.client,
+			sessionId: HANGAR,
+		});
 
 		expect(await port.list()).toEqual([{ name: "card-a", sessionId: SESSION }]);
 		await expect(port.prompt("card-b", "go")).rejects.toThrow("has no window named card-b");
@@ -2965,7 +3112,12 @@ describe("windows the human opens in the hangar", () => {
 			{ name: "card-a", block: "block:a", label: SESSION, argv0: "claude" },
 			{ name: "card-a", block: "block:b", label: OTHER, argv0: "claude" },
 		]);
-		const port = createRexAgentPort({ processStart: unstarted, client: fake.client, sessionId: HANGAR });
+		const port = createRexAgentPort({
+			label: "soma-test",
+			processStart: unstarted,
+			client: fake.client,
+			sessionId: HANGAR,
+		});
 
 		await expect(port.list()).rejects.toThrow("more than one window named card-a");
 		await expect(port.prompt("card-a", "go")).rejects.toThrow("has 2 windows named card-a");

@@ -88,6 +88,7 @@ export async function sides(
 	};
 	if (options.rexDown) rexDown();
 	const onRex = createRexAgentPort({
+		label: "soma-test",
 		client: hangar.client,
 		sessionId: HANGAR,
 		projectsDir: projects,

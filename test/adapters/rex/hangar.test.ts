@@ -48,6 +48,7 @@ function port(fake: ReturnType<typeof rex>, options: Partial<RexAgentPortOptions
 		settleMs: 0,
 		redrawMs: 1,
 		takeMs: 200,
+		label: "soma-hangar",
 		onError: () => {},
 		...options,
 	});
@@ -73,7 +74,7 @@ test("a hangar rex does not know is made anew with the configured label, and sta
 	expect(fake.attached).toContain(MADE);
 });
 
-test("with no label configured, the hangar made is labelled soma-hangar, and a handover opens its window there", async () => {
+test("the hangar made under the config's default label is labelled soma-hangar, and a handover opens its window there", async () => {
 	const worktree = join(root, "worktree");
 	const projectsDir = join(root, "projects");
 	const claude = "5b1c0d2e-3f40-4a51-8b62-7c83d94e0a15";

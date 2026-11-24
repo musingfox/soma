@@ -59,6 +59,7 @@ const home: Session = {
 
 function port(fake: ReturnType<typeof rex>, foreignMs = 60_000) {
 	return createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		processChildren: async () => [],
 		client: fake.client,
@@ -277,6 +278,7 @@ test("a foreign agent's trust dialog, which claude reports a record for, names t
 	const { git: run } = git("worktree /repo/one\nHEAD abc\nbranch refs/heads/main\n");
 
 	const [listed] = await createRexAgentPort({
+		label: "soma-test",
 		processStart: unstarted,
 		client: fake.client,
 		sessionId: HANGAR,
@@ -790,6 +792,7 @@ const pidFile = (pid: number, sessionId: string, procStart: string | null = LSTA
 /** A port on these sessions whose processes all started at STARTED but those in `gone`, and with these children. */
 function finder(blocks: Block[], others: Session[], children: Record<number, number[]> = {}, gone: number[] = []) {
 	return createRexAgentPort({
+		label: "soma-test",
 		processStart: async (pid) => (gone.includes(pid) ? undefined : STARTED),
 		processChildren: async (pid) => children[pid] ?? [],
 		client: rex(blocks, others).client,

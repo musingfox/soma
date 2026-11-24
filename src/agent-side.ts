@@ -46,7 +46,7 @@ export function openAgentPort({ agentAdapter, herdrSocket, rex, hangarCap, defer
 		// Next to the db, as the ACP sessions file is: one soma per db, so prod and a dev instance each keep the hangar
 		// they made, and the config file, which soma never writes, keeps the one the human named.
 		const memory = hangarFile(resolve(`${db}.rex-hangar.json`));
-		return createRexAgentPort({ client, sessionId, memory, onError, env, path, ...cap, ...(label && { label }) });
+		return createRexAgentPort({ client, sessionId, memory, onError, env, path, ...cap, label });
 	};
 	const notAcp = noHandover("not_acp", `this soma runs its jobs on ${agentAdapter}, not over ACP`);
 	if (agentAdapter === "rex") {

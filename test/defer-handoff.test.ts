@@ -1722,6 +1722,7 @@ test("a pane whose claude's pid file is under a child that cannot be listed is n
 	};
 	const fake = rex([], [pane]);
 	const agents = createRexAgentPort({
+		label: "soma-test",
 		processStart: async () => undefined,
 		processChildren: async () => [],
 		client: fake.client,

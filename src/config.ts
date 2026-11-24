@@ -78,10 +78,13 @@ export interface DreamConfig {
  * then on, and remembers it next to the db, never in this file, which soma does not write: a restart uses the session
  * made in place of `sessionId` while it exists, and makes one more once that one is gone too.
  */
+/** The label of a hangar soma makes when the config sets none: prod's. */
+export const DEFAULT_HANGAR_LABEL = "soma-hangar";
+
 export interface RexConfig {
 	readonly sessionId: string;
 	readonly socket: string;
-	readonly label?: string;
+	readonly label: string;
 }
 
 // Checked only when rex or acp is selected, so a herdr setup never trips over a rex block it does not use. rex takes a
@@ -459,7 +462,7 @@ function resolveRex(
 	return {
 		sessionId,
 		socket: fromEnv("SOMA_REX_SOCKET") ?? rex?.socket ?? defaultRexSocket(home),
-		...(rex?.label !== undefined && { label: rex.label }),
+		label: rex?.label ?? DEFAULT_HANGAR_LABEL,
 	};
 }
 

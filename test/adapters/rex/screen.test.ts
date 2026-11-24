@@ -29,6 +29,7 @@ async function dispatched(work: Session) {
 		return original(method, payload, schema);
 	};
 	const agents = createRexAgentPort({
+		label: "soma-test",
 		client: fake.client,
 		sessionId: HANGAR,
 		git: git().git,

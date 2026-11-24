@@ -68,8 +68,8 @@ export interface RexAgentPortOptions {
 	 * not unique. When rex says it does not exist, a new one is made in its place (`replace`).
 	 */
 	readonly sessionId: string;
-	/** The label of a hangar made in place of one that does not exist; HANGAR_LABEL by default. */
-	readonly label?: string;
+	/** The label of a hangar made in place of one that does not exist; required so no caller falls back to prod's. */
+	readonly label: string;
 	/** Where the hangar made in place of `sessionId` is kept across restarts; this process only by default. */
 	readonly memory?: HangarMemory;
 	readonly cap?: number;
@@ -142,9 +142,6 @@ type Foreign = {
  * each other's for the human's; the exception is the port's own hangar, whose panes that are not soma's jobs are.
  */
 const SOMA_SESSION_PREFIX = "soma-";
-
-/** The label of a hangar soma makes when the config sets none: prod's, under SOMA_SESSION_PREFIX. */
-export const HANGAR_LABEL = "soma-hangar";
 
 /** The msg of the error a job's window is reported in once its claude left the job's session (`leftSession`). */
 export const LEFT_SESSION =
@@ -291,7 +288,7 @@ export function createRexAgentPort(options: RexAgentPortOptions): AgentPort & Se
 	const foreignMs = options.foreignMs ?? 15_000;
 	const onError = options.onError ?? ((error: Error) => console.warn(`[rex] ${error.message}`));
 	const cap = options.cap ?? resolveHangarCapWithSource(undefined, readPerfCoresViaSysctl).cap;
-	const madeLabel = options.label ?? HANGAR_LABEL;
+	const madeLabel = options.label;
 
 	/** The hangar a soma before this one made in place of the configured one, if it did. */
 	function recalled(): string | undefined {

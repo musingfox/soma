@@ -290,6 +290,7 @@ test("a rex hangar gone at a restart, and none made in its place, reconciles its
 	});
 	const errors: string[] = [];
 	const onRex = createRexAgentPort({
+		label: "soma-test",
 		client: fake.client,
 		sessionId: HANGAR,
 		cap: 4,
